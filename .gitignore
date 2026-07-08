@@ -1,0 +1,22 @@
+# Node
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# Local state / scratch
+**/announcer.json
+discord/announcer.json
+web/_shots.mjs
+*.tmp
+
+# OS
+.DS_Store
+
+# Map packs (large; provided by the user at runtime)
+server/maps/*.pk3
+
+# SQLite runtime journals
+data/*.sqlite-wal
+data/*.sqlite-shm
+*.sqlite-wal
+*.sqlite-shm

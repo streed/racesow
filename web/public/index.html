@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Racesow · Warsow Race Records</title>
+  <meta name="description" content="World records, maps and player rankings from the livesow Warsow race database.">
+  <link rel="icon" href="/assets/img/warsow-logo.png">
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+  <header class="site">
+    <div class="header-inner">
+      <div class="brand" data-nav="#/">
+        <img src="/assets/img/warsow-logo.png" alt="Warsow">
+        <div>
+          <div class="wordmark">RACE<b>SOW</b></div>
+          <div class="tag">GO FAST · RACE RECORDS</div>
+        </div>
+      </div>
+      <nav class="main">
+        <a data-nav="#/" href="#/">Overview</a>
+        <a data-nav="#/maps" href="#/maps">Maps</a>
+        <a data-nav="#/players" href="#/players">Players</a>
+      </nav>
+      <div class="gsearch">
+        <span class="ico">⌕</span>
+        <input id="gsearch" type="text" placeholder="Search maps &amp; players…" autocomplete="off">
+        <div class="results" id="gresults"></div>
+      </div>
+    </div>
+    <div class="streaks"></div>
+  </header>
+
+  <main id="app">
+    <div class="loading"><span class="spinner"></span></div>
+  </main>
+
+  <footer class="site">
+    <div class="fi">
+      <div>Data: livesow race database · rendered live from SQLite.</div>
+      <div id="foot-updated"></div>
+    </div>
+  </footer>
+
+  <script src="/assets/js/app.js"></script>
+</body>
+</html>

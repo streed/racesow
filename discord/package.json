@@ -1,0 +1,16 @@
+{
+  "name": "racesow-discord-announcer",
+  "version": "1.0.0",
+  "description": "Posts new Warsow race records to a Discord webhook",
+  "type": "module",
+  "main": "announcer.js",
+  "scripts": {
+    "start": "node announcer.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1"
+  }
+}
