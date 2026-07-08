@@ -1,0 +1,44 @@
+# Racesow data services: the stats website + the Discord record announcer.
+# Both read the same race database in ./data.
+#
+#   docker compose up -d --build
+#
+# The Warsow *game server* is a separate, much heavier image; run it from
+# ./server (see server/README.md).
+services:
+  web:
+    build: ./web
+    image: racesow-web:latest
+    container_name: racesow-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      DB_PATH: /data/db.sqlite
+    volumes:
+      # Read-write so the server can add indexes for faster queries. Mount
+      # read-only (append :ro) if you prefer — it falls back gracefully.
+      - ./data:/data
+
+  discord:
+    build: ./discord
+    image: racesow-discord:latest
+    container_name: racesow-discord
+    restart: unless-stopped
+    environment:
+      # Paste your Discord webhook URL here (or use an .env file).
+      DISCORD_WEBHOOK_URL: "${DISCORD_WEBHOOK_URL:-}"
+      DB_PATH: /data/db.sqlite
+      STATE_PATH: /state/announcer.json
+      POLL_INTERVAL: "300"
+      ANNOUNCE_MAX_RANK: "1"        # 1 = world records only
+      SITE_URL: "http://localhost:8080"
+      # To pull a live feed instead of the static snapshot, uncomment:
+      # REMOTE_DB_URL: "http://livesow.net/race/api/db.sqlite"
+    volumes:
+      - ./data:/data
+      - announcer-state:/state
+
+volumes:
+  announcer-state:
