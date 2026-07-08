@@ -1,0 +1,9 @@
+Fork of the hrace racemod, vendored for local modifications.
+
+Upstream: https://github.com/DenMSC/wsw-race
+Branch:   racemod
+Commit:   c63f9f394657f4e091fa5f6ca04da2ddfd9b404c (2021-09-16)
+
+Local additions:
+  - source/progs/gametypes/hrace/racelog.as  (race-finish event log for the
+    stats collector; see ../../collector/)

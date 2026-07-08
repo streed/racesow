@@ -102,28 +102,23 @@ async function viewOverview() {
   loading();
   const d = await api("/overview");
   const t = d.totals;
-  const maxV = Math.max(...d.versions.map((v) => v.races), 1);
+  const maxV = Math.max(...d.versions.map((v) => v.records || v.races), 1);
+  const players = t.canonicalPlayers != null ? t.canonicalPlayers : t.rankedPlayers;
 
   app.innerHTML = `
-    <section class="hero">
-      <h1>WORLD RECORDS<br>OF <b>WARSOW RACE</b></h1>
-      <p>Every strafe, ramp-slide and rocket-jump in the livesow database —
-         ${fmtNum(t.races)} recorded runs across ${fmtNum(t.maps)} maps. Chase the clock.</p>
-    </section>
-
     <div class="tiles">
       ${tile(t.worldRecords, "World Records")}
       ${tile(t.maps, "Maps")}
-      ${tile(t.rankedPlayers, "Ranked Players")}
-      ${tile(t.races, "Total Runs")}
-      ${tile(t.checkpoints, "Checkpoints")}
+      ${tile(players, "Players")}
+      ${tile(t.records != null ? t.records : t.races, "Ranked Times")}
+      ${tile(t.finishes != null ? t.finishes : t.races, "Finishes", "accent")}
     </div>
 
     <div class="grid-2">
       <div class="panel">
         <h3><span class="dot"></span> Hall of Fame</h3>
         <div class="tscroll"><table class="data">
-          <thead><tr><th class="num">#</th><th>Player</th><th class="num">Points</th><th class="num">WRs</th><th class="num">Maps</th></tr></thead>
+          <thead><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num">WRs</th><th class="num">Maps</th></tr></thead>
           <tbody>
             ${d.hallOfFame.map((p) => `
               <tr class="clickable" data-nav="#/player/${p.id}">
@@ -138,35 +133,78 @@ async function viewOverview() {
       </div>
 
       <div>
+        ${d.recent && d.recent.length ? `
         <div class="panel" style="margin-bottom:20px">
-          <h3><span class="dot"></span> Runs by Version</h3>
-          <div class="vbars">
-            ${d.versions.map((v) => `
-              <div class="vbar">
-                <div class="top"><b>${esc(v.name)}</b><span>${fmtNum(v.races)}</span></div>
-                <div class="track"><div class="fill" style="width:${(v.races / maxV) * 100}%"></div></div>
+          <h3><span class="dot teal"></span> Recent Records</h3>
+          <div class="feed">
+            ${d.recent.map((r) => `
+              <div class="feeditem clickable" data-nav="#/map/${r.map_id}">
+                <div class="fi-main">
+                  ${r.global_rank === 1 ? '<span class="pill wr">WR</span> ' : ""}${wname(r.name)}
+                  <span class="fi-map">${esc(r.map)}</span>
+                </div>
+                <div class="fi-side">
+                  <span class="time">${fmtTime(r.time)}</span>
+                  ${r.server ? `<span class="pill srv">${esc(r.server)}</span>` : ""}
+                </div>
               </div>`).join("")}
+          </div>
+        </div>` : ""}
+        <div class="panel" style="margin-bottom:20px">
+          <h3><span class="dot"></span> Finishes by Version</h3>
+          <div class="vbars">
+            ${d.versions.map((v) => { const n = v.records != null ? v.records : v.races; return `
+              <div class="vbar">
+                <div class="top"><b>${esc(v.name)}</b><span>${fmtNum(n)}</span></div>
+                <div class="track"><div class="fill" style="width:${(n / maxV) * 100}%"></div></div>
+              </div>`; }).join("")}
           </div>
         </div>
         <div class="panel">
-          <h3><span class="dot"></span> Most-Run Maps</h3>
+          <h3><span class="dot"></span> Most-Raced Maps</h3>
           <div class="tscroll"><table class="data">
-            <thead><tr><th>Map</th><th class="num">Runs</th></tr></thead>
+            <thead><tr><th>Map</th><th class="num">Records</th><th class="num">Finishes</th></tr></thead>
             <tbody>
               ${d.topMaps.slice(0, 10).map((m) => `
                 <tr class="clickable" data-nav="#/map/${m.id}">
                   <td class="mapname">${esc(m.name)}</td>
-                  <td class="num">${fmtNum(m.races)}</td>
+                  <td class="num">${fmtNum(m.records != null ? m.records : m.races)}</td>
+                  <td class="num">${fmtNum(m.finishes != null ? m.finishes : m.races)}</td>
                 </tr>`).join("")}
             </tbody>
           </table></div>
         </div>
+        ${d.servers && d.servers.length ? `
+        <div class="panel" style="margin-top:20px">
+          <h3><span class="dot teal"></span> Contributing Servers</h3>
+          <div class="tscroll"><table class="data">
+            <thead><tr><th>Server</th><th>Status</th><th class="num">Records</th><th class="num">Last Seen</th></tr></thead>
+            <tbody>
+              ${d.servers.map((s) => `
+                <tr>
+                  <td class="mapname">${esc(s.name)}</td>
+                  <td><span class="pill ${s.status === "trusted" ? "ok" : ""}">${esc(s.status)}</span></td>
+                  <td class="num">${fmtNum(s.records)}</td>
+                  <td class="num"><span class="muted">${s.last_seen_at ? fmtAgo(s.last_seen_at) : "—"}</span></td>
+                </tr>`).join("")}
+            </tbody>
+          </table></div>
+        </div>` : ""}
       </div>
     </div>`;
 }
 
-function tile(num, lbl) {
-  return `<div class="tile"><div class="num">${fmtNum(num)}</div><div class="lbl">${esc(lbl)}</div></div>`;
+/* unix seconds -> "3m ago" / "2h ago" / "5d ago" */
+function fmtAgo(ts) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
+function tile(num, lbl, variant = "") {
+  return `<div class="tile ${variant}"><div class="num">${fmtNum(num)}</div><div class="lbl">${esc(lbl)}</div></div>`;
 }
 
 /* ---- generic sortable header ---- */
@@ -201,7 +239,8 @@ async function viewMaps(params) {
       <table class="data">
         <thead><tr>
           ${th("Map", "name", state)}
-          ${th("Runs", "races", state, "num")}
+          ${th("Records", "records", state, "num")}
+          ${th("Finishes", "finishes", state, "num")}
           ${th("World Record", "wr_time", state, "num")}
           <th>Record Holder</th>
         </tr></thead>
@@ -209,10 +248,11 @@ async function viewMaps(params) {
           ${data.rows.map((m) => `
             <tr class="clickable" data-nav="#/map/${m.id}">
               <td class="mapname">${esc(m.name)}</td>
-              <td class="num">${fmtNum(m.races)}</td>
+              <td class="num">${fmtNum(m.records != null ? m.records : m.races)}</td>
+              <td class="num">${fmtNum(m.finishes != null ? m.finishes : m.races)}</td>
               <td class="num"><span class="time">${m.wr_time != null ? fmtTime(m.wr_time) : "—"}</span></td>
               <td>${m.wr_name ? wname(m.wr_name) : '<span class="pill">no runs</span>'}</td>
-            </tr>`).join("") || `<tr><td colspan="4" class="empty">No maps match “${esc(state.q)}”.</td></tr>`}
+            </tr>`).join("") || `<tr><td colspan="5" class="empty">No maps match “${esc(state.q)}”.</td></tr>`}
         </tbody>
       </table>
     </div>${pager(state, data, "#/maps")}</div>`;
@@ -243,7 +283,7 @@ async function viewPlayers(params) {
     <div class="table-wrap"><div class="tscroll">
       <table class="data">
         <thead><tr>
-          ${th("#", "rank", state, "num")}
+          ${th("#", "rank", state)}
           ${th("Player", "name", state)}
           ${th("Points", "points", state, "num")}
           ${th("WRs", "wr", state, "num")}
@@ -272,11 +312,45 @@ async function viewMap(id) {
   loading();
   const d = await api(`/maps/${id}?limit=100`);
   const wr = d.wr;
+
+  // WR splits as absolute -> per-segment deltas for a fair compare to perfect.
+  const wrDeltas = [];
+  if (wr && wr.splits && wr.splits.length) {
+    let prev = 0;
+    for (const t of wr.splits) { wrDeltas.push(t - prev); prev = t; }
+    wrDeltas.push(wr.time - prev); // final segment to the finish
+  }
+
   let splitsHtml = "";
   if (wr && wr.splits && wr.splits.length) {
     splitsHtml = `<div class="splits">${wr.splits
       .map((t, i) => `<div class="split"><span class="cpn">CP${i + 1}</span> <b>${fmtTime(t)}</b></div>`)
       .join("")}</div>`;
+  }
+
+  const p = d.perfect;
+  let perfectHtml = "";
+  if (p && p.complete) {
+    perfectHtml = `
+      <div class="perfect-banner">
+        <div class="pb-head">
+          <div>
+            <div class="kicker teal">◇ Perfect Run · sum of best splits</div>
+            <div class="pf-time time">${fmtTime(p.time)}</div>
+          </div>
+          ${p.savingVsWr != null && p.savingVsWr > 0 ? `<div class="pf-save"><b>-${fmtTime(p.savingVsWr)}</b><span>vs world record</span></div>` : ""}
+        </div>
+        <div class="splits">
+          ${p.segments.map((s) => {
+            const label = s.seg === p.segments.length - 1 ? "FIN" : "S" + (s.seg + 1);
+            const beatsWr = wrDeltas.length && s.delta != null && wrDeltas[s.seg] != null && s.delta < wrDeltas[s.seg];
+            return `<div class="split ${beatsWr ? "beat" : ""}" title="${esc(s.simplified || "")}">
+              <span class="cpn">${label}</span> <b>${fmtTime(s.delta)}</b>
+              ${s.simplified ? `<span class="seg-by">${wname(s.name)}</span>` : ""}
+            </div>`;
+          }).join("")}
+        </div>
+      </div>`;
   }
 
   app.innerHTML = `
@@ -288,13 +362,14 @@ async function viewMap(id) {
         <div class="holder">by ${wname(wr.name)} <span class="pill v1">${esc(wr.versionName || "")}</span></div>
         ${splitsHtml}
       </div>` : ""}
+    ${perfectHtml}
 
     <div class="page-title">${esc(d.name)}</div>
-    <p class="page-sub">${fmtNum(d.races)} recorded runs · ${fmtNum(d.leaderboard.length)} players on the board</p>
+    <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board</p>
 
     <div class="table-wrap"><div class="tscroll">
       <table class="data">
-        <thead><tr><th class="num">#</th><th>Player</th><th class="num">Time</th><th class="num">Behind</th><th>Version</th></tr></thead>
+        <thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">Behind</th><th>Version</th></tr></thead>
         <tbody>
           ${d.leaderboard.map((r) => `
             <tr class="clickable" data-nav="#/player/${r.playerId}">
@@ -322,16 +397,26 @@ async function viewPlayer(id, params) {
   const s = d.standing;
   const rec = d.records;
 
+  const aliasHtml =
+    d.aliases && d.aliases.length
+      ? `<div class="aliases">also raced as ${d.aliases
+          .slice(0, 12)
+          .map((a) => wname(a.name))
+          .join('<span class="sep">·</span>')}${d.aliases.length > 12 ? ` <span class="muted">+${d.aliases.length - 12} more</span>` : ""}</div>`
+      : "";
+
   app.innerHTML = `
     <div class="crumbs"><a data-nav="#/players">Players</a> / ${esc(d.simplified)}</div>
     <div class="page-title" style="font-size:34px">${wname(d.name)}</div>
     <p class="page-sub">${s.rank ? "Overall rank #" + s.rank : "Unranked"}${d.login ? " · login: " + esc(d.login) : ""}</p>
+    ${aliasHtml}
 
     <div class="statrow">
       <div class="s hl"><div class="n">${fmtNum(s.points)}</div><div class="l">Points</div></div>
       <div class="s"><div class="n">${fmtNum(s.wr)}</div><div class="l">World Records</div></div>
       <div class="s"><div class="n">${fmtNum(s.podium)}</div><div class="l">Podiums</div></div>
       <div class="s"><div class="n">${fmtNum(s.maps)}</div><div class="l">Maps Raced</div></div>
+      ${d.finishes != null ? `<div class="s"><div class="n">${fmtNum(d.finishes)}</div><div class="l">Finishes</div></div>` : ""}
     </div>
 
     <div class="page-title" style="font-size:20px">RECORDS <span class="accent">·</span> ${fmtNum(rec.total)}</div>
@@ -436,7 +521,7 @@ function initGlobalSearch() {
           html += `<div class="rgroup-title">Maps</div>`;
           html += d.maps.map((m) => `
             <div class="ritem" data-nav="#/map/${m.id}">
-              <span class="mapname">${esc(m.name)}</span><small>${fmtNum(m.races)} runs</small>
+              <span class="mapname">${esc(m.name)}</span><small>${fmtNum(m.finishes != null ? m.finishes : m.races)} finishes</small>
             </div>`).join("");
         }
         box.innerHTML = html || `<div class="ritem"><small>No matches.</small></div>`;
@@ -493,7 +578,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     const d = await api("/overview");
     if (d.lastUpdate) {
       const dt = new Date(d.lastUpdate * 1000).toISOString().slice(0, 10);
-      document.getElementById("foot-updated").textContent = "Snapshot: " + dt;
+      document.getElementById("foot-updated").textContent = "Updated: " + dt;
     }
   } catch (e) { /* ignore */ }
 });

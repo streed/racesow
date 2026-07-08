@@ -15,8 +15,17 @@ web/_shots.mjs
 # Map packs (large; provided by the user at runtime)
 server/maps/*.pk3
 
+# Server-written race records / finish-event log (runtime data; the collector
+# ships them into the stats DB)
+server/topscores/**
+server/racelog/**
+!server/topscores/.gitkeep
+!server/racelog/.gitkeep
+
 # SQLite runtime journals
 data/*.sqlite-wal
 data/*.sqlite-shm
 *.sqlite-wal
 *.sqlite-shm
+.env
+backups/

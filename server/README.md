@@ -62,10 +62,16 @@ by default the server rotates through those. To run the real competitive pool:
 ## How it works
 
 - **`Dockerfile`** — Ubuntu 18.04 base (matches the 2018 build's glibc),
-  downloads Warsow 2.1.2, strips non-Linux/32-bit/client files, then
-  `git clone`s the racemod and `zip`s its `source/` tree into
-  `racemod/hrace.pk3`. Warsow's AngelScript VM compiles the gametype at
-  runtime — there is no separate compile step.
+  downloads Warsow 2.1.2, strips non-Linux/32-bit/client files, then `zip`s
+  the vendored racemod's `source/` tree into `racemod/hrace.pk3`. Warsow's
+  AngelScript VM compiles the gametype at runtime — there is no separate
+  compile step.
+- **`racemod/`** — our fork of the hrace racemod (upstream `DenMSC/wsw-race`,
+  branch `racemod`; provenance in `racemod/UPSTREAM`). Local addition:
+  `source/progs/gametypes/hrace/racelog.as` appends one tab-separated line per
+  finished (non-practice) race to `racelog/events.log`, which the stats
+  collector (`../collector`) ships to the central database. Edit the source
+  and `docker compose up -d --build` to deploy mod changes.
 - **`entrypoint.sh`** — resolves the map pool against the maps that are
   actually installed, assembles the `+set` launch arguments from the
   environment, and runs `wsw_server.x86_64` in a restart loop (mirroring the
@@ -73,27 +79,26 @@ by default the server rotates through those. To run the real competitive pool:
 - **`configs/server.cfg`** — race gameplay cvars.
 - **`configs/mappool.txt`** — the rotation list.
 
-### Choosing the racemod fork
+### Record files
 
-Both forks build the `hrace` gametype. Switch via build args:
+With `fs_usehomedir 0` the mod writes everything under `/warsow/racemod`;
+two of those paths are bind-mounted to the host so records survive image
+rebuilds and feed the stats pipeline:
 
-```bash
-docker build -t warsow-race:2.1.2 \
-  --build-arg RACEMOD_REPO=https://github.com/hettoo/wsw-race.git \
-  --build-arg RACEMOD_BRANCH=racemod \
-  server
-```
+- `./topscores` ⇢ `topscores/race/<map>.txt` — the mod's top-50 record list
+  per map (written on every record and at match end).
+- `./racelog` ⇢ `racelog/events.log` — our fork's per-finish event log.
 
-- `DenMSC/wsw-race` (default) — the fork referenced by the community
-  `racemod_2.1` deployment, a few extra features over upstream.
-- `hettoo/wsw-race` — the original racemod.
+Both host dirs must stay writable by the container user (uid 999); they are
+created world-writable and gitignored.
 
 ## Notes & caveats
 
 - The Warsow master server / auth infrastructure is community-run and may be
   offline; `SV_PUBLIC=0` (LAN/direct-connect) always works regardless.
-- This image serves the **game server** only. The stats **website** in
-  `../website` is a separate, static deliverable built from the race database.
-- The record-database integration used by the original livesow servers relied
-  on an external MySQL/HTTP auth service (Racenet). It is not wired up here;
-  the server keeps local records via the racemod itself.
+- This image serves the **game server** only. The stats website, collector
+  and Discord announcer live in the repo root compose file.
+- The original livesow record integration relied on an external MySQL/HTTP
+  auth service (Racenet) that no longer exists. This deployment replaces it
+  with the racelog → collector → `/api/ingest` pipeline; player identity is
+  by name only since the auth (`login`) servers are gone.

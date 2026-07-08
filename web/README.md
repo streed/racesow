@@ -54,6 +54,7 @@ All responses are JSON. List endpoints accept `q`, `sort`, `order`
 | `GET /api/players/:id`   | Player detail: standing + every map record. Sort: `map`, `time`, `rank`. |
 | `GET /api/search?q=`     | Combined quick search across maps and players.                   |
 | `GET /api/health`        | Liveness check.                                                  |
+| `POST /api/ingest`       | Record ingest for the collector. `Authorization: Bearer $INGEST_TOKEN`; body `{version, map, records:[{name, login, time, checkpoints}]}`. Upserts best time per player/map/version, recomputes the map's ranks, refreshes aggregates (debounced). Disabled unless `INGEST_TOKEN` is set. |
 
 Example:
 

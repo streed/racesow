@@ -1,0 +1,11 @@
+{
+  "name": "racesow-collector",
+  "version": "1.0.0",
+  "description": "Ships race results from the game server's racelog/topscores files to the stats ingest API",
+  "type": "module",
+  "main": "collector.js",
+  "scripts": {
+    "start": "node collector.js"
+  },
+  "license": "MIT"
+}

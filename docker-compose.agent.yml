@@ -1,0 +1,64 @@
+# Racesow game-server AGENT bundle.
+#
+# For operators who want to run a Warsow race server that feeds records to
+# SOMEONE ELSE'S central stats site. This runs just the game server + the
+# collector; it needs no database, no Git-LFS, and no clone of the central web
+# app — only this file, the server/ build context, and a small .env.
+#
+#   1. Get a per-server INGEST_TOKEN from the central site admin.
+#   2. Copy .env.example -> .env and set INGEST_URL, INGEST_TOKEN, SERVER_NAME.
+#   3. docker compose -f docker-compose.agent.yml up -d --build
+#
+# See AGENT.md for the full walkthrough (including the stock-server, no-fork
+# "topscores only" tier).
+services:
+  warsow-race:
+    build:
+      context: ./server
+    image: warsow-race:2.1.2
+    container_name: warsow-race
+    restart: unless-stopped
+    ports:
+      - "${SV_PORT:-44400}:44400/udp"
+    environment:
+      SV_HOSTNAME: "${SV_HOSTNAME:-Racesow Community Server}"
+      SV_MAXCLIENTS: "${SV_MAXCLIENTS:-16}"
+      SV_PUBLIC: "${SV_PUBLIC:-1}"
+      G_GAMETYPE: "hrace"
+      MAP_ROTATION: "2"
+      RCON_PASSWORD: "${RCON_PASSWORD:-}"
+    volumes:
+      - ./server/maps:/warsow/maps_extra:ro
+      # Records + per-finish event log the collector reads (shared with it below).
+      - racelog:/warsow/racemod/racelog
+      - topscores:/warsow/racemod/topscores
+
+  collector:
+    build: ./collector
+    image: racesow-collector:latest
+    container_name: racesow-collector
+    restart: unless-stopped
+    depends_on:
+      - warsow-race
+    environment:
+      # The central site's public ingest endpoint — use https:// over the WAN.
+      INGEST_URL: "${INGEST_URL:?set INGEST_URL in .env}"
+      INGEST_TOKEN: "${INGEST_TOKEN:?set INGEST_TOKEN in .env}"
+      SERVER_NAME: "${SERVER_NAME:-unnamed}"
+      VERSION_NAME: "${VERSION_NAME:-wsw 2.1}"
+      RACELOG_FILE: /racelog/events.log
+      TOPSCORES_DIR: /topscores/race
+      STATE_PATH: /state/collector.json
+      POLL_INTERVAL: "3"
+      TOPSCORES_RESCAN: "300"
+      # For a private/self-signed central cert, mount the CA and point Node at it:
+      # NODE_EXTRA_CA_CERTS: /certs/ca.pem
+    volumes:
+      - racelog:/racelog:ro
+      - topscores:/topscores:ro
+      - collector-state:/state
+
+volumes:
+  racelog:
+  topscores:
+  collector-state:

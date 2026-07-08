@@ -23,6 +23,23 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 cd "${WARSOW_DIR}"
 
+# --- Ensure the stats output dirs are writable by the server user -----------
+# The racemod writes records to topscores/ and (our fork) per-finish events to
+# racelog/events.log under the mod dir. These are bind-mounted from the host;
+# if the host pre-created events.log as another user the append silently fails
+# (the mod now logs it, but pre-creating here as our uid avoids it entirely).
+MOD_DIR="${WARSOW_DIR}/${FS_GAME}"
+for d in "${MOD_DIR}/racelog" "${MOD_DIR}/topscores/race"; do
+    mkdir -p "${d}" 2>/dev/null || true
+done
+if [ -w "${MOD_DIR}/racelog" ]; then
+    touch "${MOD_DIR}/racelog/events.log" 2>/dev/null || true
+fi
+if [ -e "${MOD_DIR}/racelog/events.log" ] && [ ! -w "${MOD_DIR}/racelog/events.log" ]; then
+    echo ">> WARNING: ${MOD_DIR}/racelog/events.log is not writable by $(id -un) (uid $(id -u));" \
+         "race finishes will NOT be recorded. Fix host ownership (chown $(id -u) on ./server/racelog)."
+fi
+
 # --- Expose mounted map packs to the engine ---------------------------------
 # Warsow only scans pk3 files that live directly inside a game directory
 # (basewsw / the mod dir). Symlink any pk3s from the read-only /warsow/maps_extra

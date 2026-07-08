@@ -6,17 +6,15 @@
 # map pack without rebuilding the image.
 services:
   warsow-race:
-    build:
-      context: .
-      args:
-        # Swap to hettoo/wsw-race for the upstream racemod; both build `hrace`.
-        RACEMOD_REPO: https://github.com/DenMSC/wsw-race.git
-        RACEMOD_BRANCH: racemod
+    # The hrace mod source is vendored (forked) at ./racemod — see
+    # racemod/UPSTREAM. Local changes there rebuild straight into the image.
+    build: .
     image: warsow-race:2.1.2
     container_name: warsow-race
     restart: unless-stopped
     ports:
       - "44400:44400/udp"
+      - "44444:44444"
     environment:
       SV_HOSTNAME: "Dockerized Warsow Race - go fast!"
       SV_MAXCLIENTS: "16"
@@ -30,6 +28,12 @@ services:
       # Drop extra .pk3 map packs here to expand the rotation (optional).
       # They are symlinked into the mod dir at startup so the engine loads them.
       - ./maps:/warsow/maps_extra:ro
+      # Records + race-finish event log written by the mod (fs_usehomedir=0 →
+      # everything lands under /warsow/racemod). Bind-mounted so they survive
+      # rebuilds and so the stats collector (../docker-compose.yml) can read
+      # them. The host dirs must be writable by the container user (uid 999).
+      - ./topscores:/warsow/racemod/topscores
+      - ./racelog:/warsow/racemod/racelog
       # Persist server-written state (bans, logs) across restarts (optional).
       - warsow-state:/home/warsow/.local/share/warsow-2.1
 

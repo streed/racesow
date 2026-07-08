@@ -15,7 +15,7 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY server.js db.js ./
+COPY server.js db.js admin.js ./
 COPY public ./public
 
 # The database is provided at runtime via a bind mount / volume (see
@@ -23,6 +23,9 @@ COPY public ./public
 ENV DB_PATH=/data/db.sqlite
 ENV PORT=8080
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=4s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://localhost:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 USER node
 CMD ["node", "server.js"]

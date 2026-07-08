@@ -11,10 +11,11 @@
 
 FROM ubuntu:18.04
 
-# --- Which racemod fork/branch to build into the server ----------------------
-# DenMSC/wsw-race (racemod) is the fork referenced by the community start.sh
-# and matches the `racemod_2.1` deployment style. hettoo/wsw-race (racemod) is
-# the upstream. Both compile to the `hrace` gametype.
+# The racemod source is now vendored at ./racemod/source (our fork of
+# DenMSC/wsw-race, branch racemod — see racemod/UPSTREAM) and copied into the
+# image below. The RACEMOD_* args are legacy from the git-clone setup and are
+# unused; they are kept only so the instruction chain (and therefore the
+# cached ~465 MB Warsow download layer) is not invalidated.
 ARG RACEMOD_REPO=https://github.com/DenMSC/wsw-race.git
 ARG RACEMOD_BRANCH=racemod
 ARG WARSOW_URL=https://warsow.net/warsow-2.1.2.tar.gz
@@ -63,11 +64,13 @@ RUN set -eux; \
     test -f wsw_server.x86_64
 
 # --- Build the racemod (hrace gametype) into a pk3 ---------------------------
-# The pk3 is simply a zip of the mod's `source/` tree; Warsow's AngelScript VM
-# compiles the gametype scripts at runtime. It is dropped into a dedicated
-# fs_game directory so the base install stays pristine.
+# The mod source is vendored at ./racemod/source — our fork with local
+# additions such as the race event log (hrace/racelog.as). The pk3 is simply a
+# zip of the `source/` tree; Warsow's AngelScript VM compiles the gametype
+# scripts at runtime. It is dropped into a dedicated fs_game directory so the
+# base install stays pristine.
+COPY racemod/source /tmp/racemod/source
 RUN set -eux; \
-    git clone --depth 1 -b "${RACEMOD_BRANCH}" "${RACEMOD_REPO}" /tmp/racemod; \
     mkdir -p "${WARSOW_DIR}/${FS_GAME}"; \
     cd /tmp/racemod/source; \
     zip -r "${WARSOW_DIR}/${FS_GAME}/hrace.pk3" . -x '.*'; \

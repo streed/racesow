@@ -16,10 +16,21 @@ services:
     environment:
       PORT: "8080"
       DB_PATH: /data/db.sqlite
+      # Optional shared secret for POST /api/ingest. Empty by default → ingest
+      # stays disabled until you either set a real secret here (openssl rand
+      # -hex 32) or enroll per-server tokens (recommended for multiple servers):
+      #   docker compose exec web node admin.js enroll "My Server"
+      INGEST_TOKEN: "${INGEST_TOKEN:-}"
     volumes:
-      # Read-write so the server can add indexes for faster queries. Mount
-      # read-only (append :ro) if you prefer — it falls back gracefully.
+      # Read-write: the server adds indexes at startup and the collector's
+      # ingested records are written here.
       - ./data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 4s
+      retries: 3
+      start_period: 20s
 
   discord:
     build: ./discord
@@ -40,5 +51,32 @@ services:
       - ./data:/data
       - announcer-state:/state
 
+  # Ships race results from the game server (racelog + topscores files under
+  # ./server, written by our racemod fork) into the stats DB via the web
+  # service's /api/ingest. See collector/README.md.
+  collector:
+    build: ./collector
+    image: racesow-collector:latest
+    container_name: racesow-collector
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      INGEST_URL: http://web:8080/api/ingest
+      INGEST_TOKEN: "${INGEST_TOKEN:-}"
+      SERVER_NAME: "${SERVER_NAME:-local}"
+      VERSION_NAME: "wsw 2.1"
+      RACELOG_FILE: /racelog/events.log
+      TOPSCORES_DIR: /topscores/race
+      STATE_PATH: /state/collector.json
+      POLL_INTERVAL: "3"
+      TOPSCORES_RESCAN: "300"
+    volumes:
+      - ./server/racelog:/racelog:ro
+      - ./server/topscores:/topscores:ro
+      - collector-state:/state
+
 volumes:
   announcer-state:
+  collector-state:
