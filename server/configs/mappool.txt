@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# mappool.txt  --  map rotation for the Warsow race server
+#
+# One map name per line (no .bsp extension). Lines starting with '#' and blank
+# lines are ignored. At startup entrypoint.sh keeps only the maps that are
+# actually installed; anything not found is skipped with a log line.
+#
+# If this file is empty (all comments), the server auto-rotates through EVERY
+# installed map instead -- which, on a fresh image, is whatever ships in the
+# base Warsow install.
+#
+# To run the classic competitive pool, download the community map pack:
+#   http://msocalpug.site.nfoservers.com/warsow/warsow_maps_pack_livesow_1.20.26.zip
+# unzip the .pk3 files into a directory and mount it into the container at
+#   /warsow/racemod/maps      (see docker-compose.yml)
+# then uncomment the maps you want below. These are the most-played maps in the
+# livesow race database:
+#
+# aurora-speed1
+# aurora-sunday
+# pornstar-slopin
+# coldrun
+# bull-highway
+# pornstar-redemption-long
+# scratchystrafe1
+# pornstar-lamba-slick
+# killua-pornstar
+# zeel-recapture
