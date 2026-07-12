@@ -29,6 +29,13 @@ cd "${WARSOW_DIR}"
 # if the host pre-created events.log as another user the append silently fails
 # (the mod now logs it, but pre-creating here as our uid avoids it entirely).
 MOD_DIR="${WARSOW_DIR}/${FS_GAME}"
+
+# Clear any stale extracted game modules. The engine unpacks libgame_x86_64.so
+# from modules_racesow_21pure.pk3 into a tempmodules_* dir and reuses it if
+# present; wiping it guarantees the current (patched) module is re-extracted
+# after an image rebuild or module change.
+rm -rf "${MOD_DIR}"/tempmodules_* 2>/dev/null || true
+
 for d in "${MOD_DIR}/racelog" "${MOD_DIR}/topscores/race"; do
     mkdir -p "${d}" 2>/dev/null || true
 done
@@ -98,11 +105,19 @@ echo "   map pool   : ${MAPLIST:-<none found>}"
 echo "=============================================================="
 
 # --- Assemble launch arguments ----------------------------------------------
+# sv_http 0: disable the engine's built-in HTTP server (TCP 44444). With it on,
+# pk3 downloads (e.g. the client UI pak on the pure list) are redirected to
+# HTTP, which is fragile behind Docker NAT (per-client source-IP gating) and
+# failed clients with "Pure check failed". With it off, downloads fall back to
+# the engine's UDP transfer over the game connection itself — no extra port,
+# and our downloadable paks are tiny. sv_http is latched, so it must be set
+# here on the command line, before the web server would start.
 set -- \
     +set fs_basepath "${WARSOW_DIR}" \
     +set fs_usehomedir 0 \
     +set fs_game "${FS_GAME}" \
     +set dedicated 1 \
+    +set sv_http 0 \
     +set sv_port "${SV_PORT}" \
     +set sv_hostname "${SV_HOSTNAME}" \
     +set sv_maxclients "${SV_MAXCLIENTS}" \
@@ -120,7 +135,10 @@ set -- "$@" +map "${FIRST_MAP}"
 trap 'echo "Shutting down."; exit 0' INT TERM
 while true; do
     echo ">> launching wsw_server.x86_64 $*"
-    "${WARSOW_DIR}/wsw_server.x86_64" "$@" || true
+    # Force line-buffered stdout/stderr. In a detached container the engine's
+    # stdout is a pipe, so glibc block-buffers it and `docker logs` looks frozen
+    # mid-startup. stdbuf keeps output flowing even if no TTY is allocated.
+    stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" || true
     echo ">> server exited, restarting in 5s..."
     sleep 5
 done

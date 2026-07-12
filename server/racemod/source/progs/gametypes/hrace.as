@@ -696,6 +696,14 @@ void GT_InitGametype()
     gametype.version = "1.02";
     gametype.author = "Warsow Development Team";
 
+    // Pure-index a (silent) sound that lives inside the client UI pak
+    // (racemod_ui_v4_local.pk3, built from server/clientdata). This puts the
+    // pak on the sv_pure list as a *referenced* file, so connecting clients
+    // download it from this server over the game connection. The pak must NOT
+    // be *pure-named: clients only fetch explicit-pure paks from the official
+    // update mirror (update.warsow.gg), which is long dead.
+    G_SoundIndex( "sounds/racemod/silence", true );
+
     // if the gametype doesn't have a config file, create it
     if ( !G_FileExists( "configs/server/gametypes/" + gametype.name + ".cfg" ) )
     {

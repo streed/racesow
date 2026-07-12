@@ -61,11 +61,32 @@ by default the server rotates through those. To run the real competitive pool:
 
 ## How it works
 
-- **`Dockerfile`** — Ubuntu 18.04 base (matches the 2018 build's glibc),
-  downloads Warsow 2.1.2, strips non-Linux/32-bit/client files, then `zip`s
-  the vendored racemod's `source/` tree into `racemod/hrace.pk3`. Warsow's
-  AngelScript VM compiles the gametype at runtime — there is no separate
-  compile step.
+- **`Dockerfile`** — two stages. Stage 1 compiles a **patched game module**
+  (`libgame_x86_64.so`) from DenMSC's `racemod_2.1` fork of the warsow_21_sdk
+  against the official AngelScript 2.29.2: the hrace gametype calls racesow
+  natives (`RS_QueryPjState`, `RS_ResetPjState`, `G_RemoveProjectiles(Entity@)`)
+  that stock Warsow lacks — without the patched module the gametype script
+  fails to compile and no race logic runs. Stage 2 is the Ubuntu 18.04 server
+  (matches the 2018 build's glibc): downloads Warsow 2.1.2, strips
+  non-Linux/32-bit/client files, `zip`s the vendored racemod's `source/` tree
+  into `racemod/hrace.pk3`, packages the patched module as
+  `racemod/modules_racesow_21.pk3`, and builds the client UI pak (below).
+  Warsow's AngelScript VM compiles the gametype at runtime — there is no
+  separate script-compile step.
+- **`clientdata/`** — the racemod client menu + HUD (vendored from
+  `DenMSC/racemod_data`, see `clientdata/UPSTREAM`), packaged as
+  `racemod/racemod_ui_v4_local_21pure.pk3`. The `*21pure` name puts it on the
+  `sv_pure` list so connecting clients download it automatically; it powers the
+  in-game **"Race" options** menu (`gametypemenu` → `menu_open racemod_main`).
+- **Pure setup** — `sv_pure 1` with `sv_pure_forcemodulepk3
+  "basewsw/modules_21.pk3"`: clients verify against the *stock* modules pak
+  they already have, while the server's patched module pak is deliberately
+  non-pure-named (clients refuse to download pk3s containing `.so`) yet still
+  wins the module search because the mod dir is searched before `basewsw`.
+- **Seeding records** — `docker compose --profile seed run --rm seed-topscores`
+  (repo root) exports each map's top-50 from `data/db.sqlite` into
+  `./topscores/race/`, so the in-game `top` list matches the central site.
+  Merge-only and idempotent; restart the game server afterwards.
 - **`racemod/`** — our fork of the hrace racemod (upstream `DenMSC/wsw-race`,
   branch `racemod`; provenance in `racemod/UPSTREAM`). Local addition:
   `source/progs/gametypes/hrace/racelog.as` appends one tab-separated line per

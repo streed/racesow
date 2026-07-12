@@ -133,9 +133,9 @@ async function viewOverview() {
       </div>
 
       <div>
-        ${d.recent && d.recent.length ? `
         <div class="panel" style="margin-bottom:20px">
           <h3><span class="dot teal"></span> Recent Records</h3>
+          ${d.recent && d.recent.length ? `
           <div class="feed">
             ${d.recent.map((r) => `
               <div class="feeditem clickable" data-nav="#/map/${r.map_id}">
@@ -148,8 +148,9 @@ async function viewOverview() {
                   ${r.server ? `<span class="pill srv">${esc(r.server)}</span>` : ""}
                 </div>
               </div>`).join("")}
-          </div>
-        </div>` : ""}
+          </div>` : `
+          <div class="muted" style="padding:8px 2px">No records set recently &mdash; a run only appears here when it beats the player's existing best on a map.</div>`}
+        </div>
         <div class="panel" style="margin-bottom:20px">
           <h3><span class="dot"></span> Finishes by Version</h3>
           <div class="vbars">

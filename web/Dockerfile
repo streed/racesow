@@ -15,7 +15,7 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY server.js db.js admin.js ./
+COPY server.js db.js admin.js seed-topscores.js ./
 COPY public ./public
 
 # The database is provided at runtime via a bind mount / volume (see

@@ -1,0 +1,4 @@
+setScale #DEFAULTSCALE
+setAlign #CENTER, #MIDDLE
+setCursor #WIDTH / 2, #HEIGHT / 2
+drawCrosshair

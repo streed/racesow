@@ -276,7 +276,12 @@ uint RACE_AddTopScore( RecordTime record, bool take_priority = true )
 
     bool found = false;
     uint end = MAX_RECORDS - 1;
-    // if there is a duplicate, remove it and move other records up
+    // if there is a duplicate, remove it and move other records up.
+    // Match on identity (same as the insert-scan check above) rather than
+    // hasPriority(): hasPriority() requires a non-empty login, but the auth
+    // servers are gone so logins are always empty — using it here meant a
+    // player's older, slower entry was never removed and the same nick piled
+    // up multiple rows in the top scores.
     for ( uint i = id; i < MAX_RECORDS - 1; i++ )
     {
         if ( !levelRecords[ i ].isFinished() )
@@ -284,7 +289,7 @@ uint RACE_AddTopScore( RecordTime record, bool take_priority = true )
             end = i;
             break;
         }
-        if ( record.ident.hasPriority( levelRecords[ i ].ident ) )
+        if ( record.ident.equals( levelRecords[ i ].ident, !take_priority ) )
             found = true;
         if ( found )
             levelRecords[ i ] = levelRecords[ i + 1 ];

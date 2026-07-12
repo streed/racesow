@@ -1,0 +1,12 @@
+"checkboxes" "Strafe HUD" "cg_strafeHUD"
+"8" "Show strafe bars"
+"4" "Show angles"
+"2" "Show acceleration bar"
+"-16" "Show bunny helper"
+
+"checkbox" "Show speed" "cg_showSpeed"
+
+"dropdown" "Show pressed keys" "cg_showPressedKeys"
+"1" "show in spec only"
+"2" "always show"
+"0" "none"

@@ -77,6 +77,23 @@ services:
       - ./server/topscores:/topscores:ro
       - collector-state:/state
 
+  # One-shot: seed the game server's topscores files from the race DB so the
+  # in-game `top` lists reflect the central records (merge-only, never loses a
+  # local record). Run manually, then restart the game server:
+  #   docker compose --profile seed run --rm seed-topscores
+  #   docker compose -f server/docker-compose.yml restart
+  seed-topscores:
+    build: ./web
+    image: racesow-web:latest
+    profiles: ["seed"]
+    environment:
+      DB_PATH: /data/db.sqlite
+      TOPSCORES_DIR: /topscores/race
+    volumes:
+      - ./data:/data
+      - ./server/topscores:/topscores
+    command: ["node", "seed-topscores.js"]
+
 volumes:
   announcer-state:
   collector-state:

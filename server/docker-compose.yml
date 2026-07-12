@@ -12,9 +12,15 @@ services:
     image: warsow-race:2.1.2
     container_name: warsow-race
     restart: unless-stopped
+    # Allocate a pseudo-TTY so the engine line-buffers stdout. Without it,
+    # glibc block-buffers stdout (it's a pipe, not a terminal) and `docker logs`
+    # appears frozen mid-startup until ~4 KB accumulates. See entrypoint.sh,
+    # which also wraps the launch in stdbuf as a belt-and-suspenders fallback.
+    tty: true
     ports:
+      # Warsow uses a single UDP port; pk3 downloads also flow over it (the
+      # engine's HTTP server is disabled via sv_http 0 in entrypoint.sh).
       - "44400:44400/udp"
-      - "44444:44444"
     environment:
       SV_HOSTNAME: "Dockerized Warsow Race - go fast!"
       SV_MAXCLIENTS: "16"

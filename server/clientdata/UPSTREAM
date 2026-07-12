@@ -1,0 +1,10 @@
+Racemod client UI + HUD data, vendored for the client-download pk3.
+
+Upstream: https://github.com/DenMSC/racemod_data
+Commit:   9aa3560a82cc4adcd7e8adb215f2fc205bfda40e (2024-04-02)
+
+Contents: the "Racemod Options" gametype menu (ui/porkui/racemod_main.rml and
+friends) plus the ale_racemod HUD and strafe-arrow assets. Packaged by the
+server Dockerfile into racemod_ui_v4_local_21pure.pk3 — the *21pure name makes
+it explicit-pure, so with sv_pure 1 clients are offered it for download
+automatically (it contains no native libraries, which clients would refuse).
