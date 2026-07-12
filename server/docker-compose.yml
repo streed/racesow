@@ -22,13 +22,19 @@ services:
       # engine's HTTP server is disabled via sv_http 0 in entrypoint.sh).
       - "44400:44400/udp"
     environment:
-      SV_HOSTNAME: "Dockerized Warsow Race - go fast!"
-      SV_MAXCLIENTS: "16"
-      SV_PUBLIC: "0"            # set to 1 to advertise on the master server list
+      SV_HOSTNAME: "${SV_HOSTNAME:-Dockerized Warsow Race - go fast!}"
+      SV_MAXCLIENTS: "${SV_MAXCLIENTS:-16}"
+      SV_PUBLIC: "${SV_PUBLIC:-0}"   # set to 1 to advertise on the master server list
       SV_PORT: "44400"
       G_GAMETYPE: "hrace"
       MAP_ROTATION: "2"        # 0 none, 1 sequential, 2 random
-      RCON_PASSWORD: "change-me-please"
+      # Empty disables rcon. Set it in server/.env (or the shell environment);
+      # never commit a real password.
+      RCON_PASSWORD: "${RCON_PASSWORD:-}"
+      # Optional: client-reachable base URL for HTTP pak downloads — see the
+      # pakserver service below. Empty (default) = UDP transfer over the game
+      # port, which always works but is slow for big map packs.
+      SV_UPLOADS_BASEURL: "${SV_UPLOADS_BASEURL:-}"
       # EXTRA_ARGS: "+set sv_maxrate 0"
     volumes:
       # Drop extra .pk3 map packs here to expand the rotation (optional).
@@ -42,6 +48,30 @@ services:
       - ./racelog:/warsow/racemod/racelog
       # Persist server-written state (bans, logs) across restarts (optional).
       - warsow-state:/home/warsow/.local/share/warsow-2.1
+      # Downloadable pk3s are exported here at startup for the pakserver below.
+      - pakshare:/pakshare
+
+  # Optional plain-HTTP pak server for fast client downloads (mainly big map
+  # packs; the tiny UI pak is fine over UDP). Start it with:
+  #   docker compose --profile httpdl up -d
+  # and set SV_UPLOADS_BASEURL to a URL *clients* can reach, e.g.
+  #   SV_UPLOADS_BASEURL=http://your-host-or-ip:44445
+  # Note: when a base URL is set, clients that cannot reach it will fail
+  # downloads entirely (the engine does not fall back to UDP after a failed
+  # web attempt) — so only set it if the port is reachable by every player.
+  pakserver:
+    image: nginx:alpine
+    container_name: racesow-pakserver
+    restart: unless-stopped
+    profiles: ["httpdl"]
+    ports:
+      - "${PAK_HTTP_PORT:-44445}:80"
+    volumes:
+      - pakshare:/usr/share/nginx/html
+    # Chown the share to the game-server user (uid 999) before serving, so the
+    # export works even if this container initialized the volume first.
+    command: ["/bin/sh", "-c", "chown -R 999:999 /usr/share/nginx/html 2>/dev/null || true; exec nginx -g 'daemon off;'"]
 
 volumes:
   warsow-state:
+  pakshare:

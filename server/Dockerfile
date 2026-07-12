@@ -192,9 +192,12 @@ COPY configs/mappool.txt "${WARSOW_DIR}/${FS_GAME}/mappool.txt"
 COPY entrypoint.sh       /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Run as a non-root user.
+# Run as a non-root user. /pakshare is the export point for the optional HTTP
+# pak mirror (docker-compose.yml pakserver); pre-owning it makes the named
+# volume writable by the server user when this container initializes it.
 RUN useradd -r -m -d /home/warsow warsow \
-    && chown -R warsow:warsow "${WARSOW_DIR}"
+    && mkdir -p /pakshare \
+    && chown -R warsow:warsow "${WARSOW_DIR}" /pakshare
 USER warsow
 WORKDIR ${WARSOW_DIR}
 

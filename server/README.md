@@ -41,10 +41,39 @@ Everything is driven by environment variables (see `docker-compose.yml`):
 | `G_GAMETYPE`    | `hrace`                       | Gametype to load                                |
 | `MAP_ROTATION`  | `2`                           | `0` none, `1` sequential, `2` random            |
 | `RCON_PASSWORD` | *(empty)*                     | Enables remote console when set                 |
+| `SV_UPLOADS_BASEURL` | *(empty)*                | HTTP pak mirror for client downloads (see below)|
 | `EXTRA_ARGS`    | *(empty)*                     | Extra `+set ...` args appended verbatim         |
 
 Race gameplay tuning (no fall/self damage, bunnyhop, voting, flood protection)
-lives in `configs/server.cfg` and is `+exec`'d at launch.
+lives in `configs/server.cfg` and is `+exec`'d at launch. Secrets like
+`RCON_PASSWORD` belong in `server/.env` (gitignored), never in the compose file.
+
+## Client downloads (the UI pak, custom maps)
+
+Connecting clients automatically download `racemod_ui_v4_local.pk3` (and any
+pure-referenced content they lack). Two transports:
+
+- **UDP (default).** Chunks flow over the game port itself — nothing extra to
+  expose. Requires the patched engine this image builds (stock Warsow's UDP
+  pak path was broken; see `enginepatches/`). Fine for small paks; slow for
+  multi-MB map packs.
+- **HTTP (optional, faster).** Start the bundled nginx pak mirror and point
+  clients at it:
+
+  ```bash
+  docker compose --profile httpdl up -d
+  # in server/.env:
+  SV_UPLOADS_BASEURL=http://your-host-or-ip:44445
+  ```
+
+  The entrypoint exports the mod dir's pk3s into the shared `pakshare` volume
+  that nginx serves. **The URL must be reachable by every game client** — when
+  a base URL is set the engine does not fall back to UDP after a failed web
+  download, so an unreachable mirror breaks downloads entirely.
+
+Either way, clients first try the hardcoded official mirror
+(`update.warsow.gg`, long dead) and log one `Web download failed` before using
+our transport — harmless.
 
 ## Maps
 
@@ -61,18 +90,22 @@ by default the server rotates through those. To run the real competitive pool:
 
 ## How it works
 
-- **`Dockerfile`** — two stages. Stage 1 compiles a **patched game module**
-  (`libgame_x86_64.so`) from DenMSC's `racemod_2.1` fork of the warsow_21_sdk
-  against the official AngelScript 2.29.2: the hrace gametype calls racesow
-  natives (`RS_QueryPjState`, `RS_ResetPjState`, `G_RemoveProjectiles(Entity@)`)
-  that stock Warsow lacks — without the patched module the gametype script
-  fails to compile and no race logic runs. Stage 2 is the Ubuntu 18.04 server
-  (matches the 2018 build's glibc): downloads Warsow 2.1.2, strips
-  non-Linux/32-bit/client files, `zip`s the vendored racemod's `source/` tree
-  into `racemod/hrace.pk3`, packages the patched module as
-  `racemod/modules_racesow_21.pk3`, and builds the client UI pak (below).
-  Warsow's AngelScript VM compiles the gametype at runtime — there is no
-  separate script-compile step.
+- **`Dockerfile`** — two stages. Stage 1 compiles, from DenMSC's `racemod_2.1`
+  fork of the warsow_21_sdk against the official AngelScript 2.29.2:
+  - a **patched game module** (`libgame_x86_64.so`) — the hrace gametype calls
+    racesow natives (`RS_QueryPjState`, `RS_ResetPjState`,
+    `G_RemoveProjectiles(Entity@)`) that stock Warsow lacks; without it the
+    gametype script fails to compile and no race logic runs;
+  - a **patched dedicated server** (`wsw_server.x86_64`) — fixes the stock
+    engine's broken UDP pak-download filename handling (see
+    `enginepatches/patch-udp-download.py`; the stock binary is kept in the
+    image as `wsw_server.x86_64.stock`).
+  Stage 2 is the Ubuntu 18.04 runtime (matches the 2018 build's glibc):
+  downloads Warsow 2.1.2, strips non-Linux/32-bit/client files, `zip`s the
+  vendored racemod's `source/` tree into `racemod/hrace.pk3`, packages the
+  patched module as `racemod/modules_racesow_21.pk3`, swaps in the patched
+  server binary, and builds the client UI pak (below). Warsow's AngelScript VM
+  compiles the gametype at runtime — there is no separate script-compile step.
 - **`clientdata/`** — the racemod client menu + HUD (vendored from
   `DenMSC/racemod_data`, see `clientdata/UPSTREAM`), packaged as
   `racemod/racemod_ui_v4_local_21pure.pk3`. The `*21pure` name puts it on the

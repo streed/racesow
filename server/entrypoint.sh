@@ -19,6 +19,7 @@ SV_PORT="${SV_PORT:-44400}"
 RCON_PASSWORD="${RCON_PASSWORD:-}"
 G_GAMETYPE="${G_GAMETYPE:-hrace}"
 MAP_ROTATION="${MAP_ROTATION:-2}"           # 0 none, 1 sequential, 2 random
+SV_UPLOADS_BASEURL="${SV_UPLOADS_BASEURL:-}"  # client-reachable HTTP pak mirror (optional)
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 cd "${WARSOW_DIR}"
@@ -58,6 +59,20 @@ if [ -d "${MAPS_EXTRA}" ]; then
         ln -sf "${pk}" "${WARSOW_DIR}/${FS_GAME}/$(basename "${pk}")" 2>/dev/null || true
     done
 fi
+
+# --- Export downloadable paks for the optional HTTP pak server ---------------
+# When the pakshare volume is mounted (see docker-compose.yml pakserver), copy
+# the mod dir's pk3s there (dereferencing map-pack symlinks) so nginx can serve
+# them at <SV_UPLOADS_BASEURL>/racemod/<pak>. Called before every server
+# (re)launch so pak changes and first-run volume-ownership races self-heal.
+export_pakshare() {
+    [ -d /pakshare ] || return 0
+    mkdir -p /pakshare/racemod 2>/dev/null || true
+    for pk in "${MOD_DIR}"/*.pk3; do
+        [ -e "${pk}" ] && cp -Lf "${pk}" /pakshare/racemod/ 2>/dev/null || true
+    done
+}
+export_pakshare
 
 # --- Discover every installed map -------------------------------------------
 # A map is playable if a maps/<name>.bsp exists inside a pk3 in one of the two
@@ -127,6 +142,9 @@ set -- \
     +set g_maplist "${MAPLIST}"
 
 [ -n "${RCON_PASSWORD}" ] && set -- "$@" +set rcon_password "${RCON_PASSWORD}"
+# HTTP pak mirror: when set, the engine redirects pak downloads there instead
+# of the (patched) UDP transfer. Must be reachable by game clients.
+[ -n "${SV_UPLOADS_BASEURL}" ] && set -- "$@" +set sv_uploads_baseurl "${SV_UPLOADS_BASEURL}"
 set -- "$@" +exec configs/server/server.cfg
 [ -n "${EXTRA_ARGS}" ] && set -- "$@" ${EXTRA_ARGS}
 set -- "$@" +map "${FIRST_MAP}"
@@ -134,6 +152,7 @@ set -- "$@" +map "${FIRST_MAP}"
 # --- Restart loop -----------------------------------------------------------
 trap 'echo "Shutting down."; exit 0' INT TERM
 while true; do
+    export_pakshare
     echo ">> launching wsw_server.x86_64 $*"
     # Force line-buffered stdout/stderr. In a detached container the engine's
     # stdout is a pipe, so glibc block-buffers it and `docker logs` looks frozen
