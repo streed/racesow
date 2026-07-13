@@ -35,7 +35,19 @@ services:
       # pakserver service below. Empty (default) = UDP transfer over the game
       # port, which always works but is slow for big map packs.
       SV_UPLOADS_BASEURL: "${SV_UPLOADS_BASEURL:-}"
+      # Direct-to-API race reporting: the gametype POSTs every finish straight
+      # to the stats ingest endpoint (no collector needed for the racelog
+      # feed). For the co-located stack this container joins the web stack's
+      # network (see `networks:` below), so use http://web:8080/api/ingest.
+      # Set both in server/.env; token via `node admin.js enroll`.
+      INGEST_URL: "${INGEST_URL:-}"
+      INGEST_TOKEN: "${INGEST_TOKEN:-}"
       # EXTRA_ARGS: "+set sv_maxrate 0"
+    networks:
+      - default
+      # The central stats stack's network (created by the repo-root compose),
+      # so INGEST_URL can point at the web service directly.
+      - stats
     volumes:
       # Drop extra .pk3 map packs here to expand the rotation (optional).
       # They are symlinked into the mod dir at startup so the engine loads them.
@@ -75,3 +87,8 @@ services:
 volumes:
   warsow-state:
   pakshare:
+
+networks:
+  stats:
+    external: true
+    name: racesow_default

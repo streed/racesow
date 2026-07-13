@@ -17,6 +17,15 @@
 
 const String RACELOG_FILE = "racelog/events.log";
 
+// Direct-to-API reporting (RS_ApiReportRace native, see the deployment repo's
+// server/enginepatches/g_rs_api.cpp). When rs_api_url is set, every finish is
+// POSTed straight to the central /api/ingest with the rs_api_token bearer
+// token — no log-scraping sidecar needed. The events.log append below is kept
+// as a local audit trail / fallback either way.
+Cvar rsApiUrl( "rs_api_url", "", 0 );
+Cvar rsApiToken( "rs_api_token", "", 0 );
+Cvar rsApiVersion( "rs_api_version", "wsw 2.1", 0 );
+
 void RACE_LogFinish( Player @player )
 {
     if ( !player.current_recordTime.isFinished() )
@@ -31,6 +40,16 @@ void RACE_LogFinish( Player @player )
         if ( i > 0 )
             cps += ",";
         cps += int( player.current_recordTime.checkpoints[ i ].time );
+    }
+
+    if ( rsApiUrl.string.length() > 0 )
+    {
+        RS_ApiReportRace( rsApiUrl.string, rsApiToken.string, rsApiVersion.string,
+                mapName,
+                player.current_recordTime.ident.playerName,
+                player.current_recordTime.ident.login,
+                int( player.current_recordTime.getFinishTime() ),
+                cps );
     }
 
     bool ok = G_AppendToFile( RACELOG_FILE, "R1\t" + mapName

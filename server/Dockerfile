@@ -52,10 +52,24 @@ RUN make -C repo/libsrcs/angelscript/sdk/angelscript/projects/gnuc -j"$(nproc)"
 RUN sed -i -E \
         's#add_custom_target\(angelscript .*#add_custom_target(angelscript ${CMAKE_COMMAND} -E echo angelscript-prebuilt)#' \
         repo/source/CMakeLists.txt
+# 6. Direct-to-API race reporting: add the RS_ApiReportRace native (libcurl on
+#    a worker thread) so the hrace gametype POSTs finishes straight to the
+#    stats /api/ingest — no racelog-scraping sidecar needed. g_rs_api.cpp is
+#    picked up by the game CMakeLists' *.cpp glob; the patch script registers
+#    the AngelScript binding and links curl. The greps assert it landed.
+COPY enginepatches/g_rs_api.cpp /build/repo/source/game/g_rs_api.cpp
+COPY enginepatches/patch-api-natives.py /tmp/patch-api-natives.py
 WORKDIR /build/repo/source
+RUN python3 /tmp/patch-api-natives.py \
+    && grep -q "RS_ApiReportRace" game/g_ascript.cpp \
+    && grep -q "curl pthread" game/CMakeLists.txt
+
 RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Release . \
     && make game -j"$(nproc)" \
-    && cp build/basewsw/libgame_x86_64.so /libgame_x86_64.so
+    && cp build/basewsw/libgame_x86_64.so /libgame_x86_64.so \
+    # the module must carry the native and require libcurl at runtime
+    && strings /libgame_x86_64.so | grep -q "RS_ApiReportRace" \
+    && objdump -p /libgame_x86_64.so | grep -q "NEEDED.*libcurl"
 
 # --- Patched dedicated server binary ----------------------------------------
 # Stock Warsow's UDP pak-download path is broken: clients save non-official

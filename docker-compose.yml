@@ -51,31 +51,11 @@ services:
       - ./data:/data
       - announcer-state:/state
 
-  # Ships race results from the game server (racelog + topscores files under
-  # ./server, written by our racemod fork) into the stats DB via the web
-  # service's /api/ingest. See collector/README.md.
-  collector:
-    build: ./collector
-    image: racesow-collector:latest
-    container_name: racesow-collector
-    restart: unless-stopped
-    depends_on:
-      web:
-        condition: service_healthy
-    environment:
-      INGEST_URL: http://web:8080/api/ingest
-      INGEST_TOKEN: "${INGEST_TOKEN:-}"
-      SERVER_NAME: "${SERVER_NAME:-local}"
-      VERSION_NAME: "wsw 2.1"
-      RACELOG_FILE: /racelog/events.log
-      TOPSCORES_DIR: /topscores/race
-      STATE_PATH: /state/collector.json
-      POLL_INTERVAL: "3"
-      TOPSCORES_RESCAN: "300"
-    volumes:
-      - ./server/racelog:/racelog:ro
-      - ./server/topscores:/topscores:ro
-      - collector-state:/state
+  # NOTE: there is no collector service anymore — the game server POSTs every
+  # finish straight to /api/ingest itself (racelog.as -> RS_ApiReportRace
+  # native; INGEST_URL/INGEST_TOKEN in server/.env). collector/ remains in the
+  # tree only for feeding the site from a stock, unmodified race server (see
+  # AGENT.md "basic tier").
 
   # One-shot: seed the game server's topscores files from the race DB so the
   # in-game `top` lists reflect the central records (merge-only, never loses a
@@ -96,4 +76,3 @@ services:
 
 volumes:
   announcer-state:
-  collector-state:

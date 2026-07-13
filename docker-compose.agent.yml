@@ -27,38 +27,23 @@ services:
       G_GAMETYPE: "hrace"
       MAP_ROTATION: "2"
       RCON_PASSWORD: "${RCON_PASSWORD:-}"
+      # The gametype POSTs every finish straight to the central ingest
+      # endpoint (racelog.as -> RS_ApiReportRace). The collector below then
+      # only backfills from topscores files.
+      INGEST_URL: "${INGEST_URL:?set INGEST_URL in .env}"
+      INGEST_TOKEN: "${INGEST_TOKEN:?set INGEST_TOKEN in .env}"
+      VERSION_NAME: "${VERSION_NAME:-wsw 2.1}"
     volumes:
       - ./server/maps:/warsow/maps_extra:ro
-      # Records + per-finish event log the collector reads (shared with it below).
+      # Local record files (topscores) + finish-event audit log, persisted
+      # across container rebuilds.
       - racelog:/warsow/racemod/racelog
       - topscores:/warsow/racemod/topscores
 
-  collector:
-    build: ./collector
-    image: racesow-collector:latest
-    container_name: racesow-collector
-    restart: unless-stopped
-    depends_on:
-      - warsow-race
-    environment:
-      # The central site's public ingest endpoint — use https:// over the WAN.
-      INGEST_URL: "${INGEST_URL:?set INGEST_URL in .env}"
-      INGEST_TOKEN: "${INGEST_TOKEN:?set INGEST_TOKEN in .env}"
-      SERVER_NAME: "${SERVER_NAME:-unnamed}"
-      VERSION_NAME: "${VERSION_NAME:-wsw 2.1}"
-      RACELOG_FILE: /racelog/events.log
-      TOPSCORES_DIR: /topscores/race
-      STATE_PATH: /state/collector.json
-      POLL_INTERVAL: "3"
-      TOPSCORES_RESCAN: "300"
-      # For a private/self-signed central cert, mount the CA and point Node at it:
-      # NODE_EXTRA_CA_CERTS: /certs/ca.pem
-    volumes:
-      - racelog:/racelog:ro
-      - topscores:/topscores:ro
-      - collector-state:/state
+  # No collector service: the gametype POSTs finishes to the central API
+  # directly (RS_ApiReportRace). If you instead run a stock, unmodified race
+  # server, see AGENT.md "basic tier" for the standalone collector.
 
 volumes:
   racelog:
   topscores:
-  collector-state:
