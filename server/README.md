@@ -116,10 +116,12 @@ by default the server rotates through those. To run the real competitive pool:
   they already have, while the server's patched module pak is deliberately
   non-pure-named (clients refuse to download pk3s containing `.so`) yet still
   wins the module search because the mod dir is searched before `basewsw`.
-- **Seeding records** — `docker compose --profile seed run --rm seed-topscores`
-  (repo root) exports each map's top-50 from `data/db.sqlite` into
-  `./topscores/race/`, so the in-game `top` list matches the central site.
-  Merge-only and idempotent; restart the game server afterwards.
+- **Seeding records** — `scripts/seed-server.sh` (repo root) exports each
+  map's top-50 from `data/db.sqlite` into `./topscores/race/`, so the in-game
+  `top` list matches the central site. It archives the current files into
+  `backups/`, runs the merge-only/idempotent seeder, sanity-checks the output
+  and restarts the game server. `--wipe` clears the directory first for a
+  true initial seed; `--no-restart` skips the reload.
 - **`racemod/`** — our fork of the hrace racemod (upstream `DenMSC/wsw-race`,
   branch `racemod`; provenance in `racemod/UPSTREAM`). Local addition:
   `source/progs/gametypes/hrace/racelog.as` appends one tab-separated line per
