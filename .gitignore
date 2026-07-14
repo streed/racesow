@@ -14,6 +14,9 @@ web/_shots.mjs
 
 # Map packs (large; provided by the user at runtime)
 server/maps/*.pk3
+# fetch-maps.sh working files (lock, failure list, in-flight temps)
+server/maps/.fetch-*
+server/maps/.part-*
 
 # Server-written race records / finish-event log (runtime data; the collector
 # ships them into the stats DB)

@@ -9,12 +9,13 @@
 # installed map instead -- which, on a fresh image, is whatever ships in the
 # base Warsow install.
 #
-# To run the classic competitive pool, download the community map pack:
-#   http://msocalpug.site.nfoservers.com/warsow/warsow_maps_pack_livesow_1.20.26.zip
-# unzip the .pk3 files into a directory and mount it into the container at
-#   /warsow/racemod/maps      (see docker-compose.yml)
-# then uncomment the maps you want below. These are the most-played maps in the
-# livesow race database:
+# To install community maps, drop .pk3 packs into server/maps/ on the host
+# (scripts/fetch-maps.sh mirrors the whole livesow.net collection there). The
+# directory is mounted read-only at /warsow/maps_extra and entrypoint.sh
+# symlinks the packs into the mod dir at container start (see
+# docker-compose.yml and server/maps/README.md).
+# Then uncomment the maps you want below. These are the most-played maps in
+# the livesow race database:
 #
 # aurora-speed1
 # aurora-sunday

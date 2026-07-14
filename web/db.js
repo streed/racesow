@@ -87,6 +87,7 @@ export function openDatabase(dbPath) {
   const t0 = Date.now();
   if (!readonly) {
     try {
+      ensureBaseSchema(db);
       db.exec(`
         CREATE INDEX IF NOT EXISTS idx_race_map    ON race(map_id);
         CREATE INDEX IF NOT EXISTS idx_race_player ON race(player_id);
@@ -107,6 +108,55 @@ export function openDatabase(dbPath) {
   buildAggregates(db, caps);
   console.log(`Database ready in ${Date.now() - t0}ms (schema v${userVersion(db)})`);
   return new RaceDB(db, caps);
+}
+
+// Base livesow tables, mirroring the shipped snapshot's schema exactly. A
+// brand-new deploy (no Git-LFS snapshot) starts from an empty SQLite file;
+// without these the aggregate build crashes on the missing `race` table. All
+// idempotent, so running against the real snapshot is a no-op.
+function ensureBaseSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS version (
+      id   INTEGER PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE IF NOT EXISTS map (
+      id   INTEGER PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE
+    );
+    CREATE TABLE IF NOT EXISTS player (
+      id         INTEGER PRIMARY KEY,
+      name       TEXT NOT NULL,
+      simplified TEXT NOT NULL,
+      trimmed    TEXT NOT NULL,
+      login      TEXT NOT NULL,
+      UNIQUE( name, login )
+    );
+    CREATE TABLE IF NOT EXISTS race (
+      id           INTEGER NOT NULL PRIMARY KEY,
+      version_id   INTEGER NOT NULL,
+      player_id    INTEGER NOT NULL,
+      map_id       INTEGER NOT NULL,
+      time         INTEGER NOT NULL,
+      version_rank INTEGER NOT NULL DEFAULT 99999,
+      global_rank  INTEGER NOT NULL DEFAULT 99999,
+      UNIQUE( player_id, map_id, version_id ),
+      CONSTRAINT fk_map    FOREIGN KEY ( map_id )    REFERENCES map( id )    ON DELETE CASCADE ON UPDATE CASCADE,
+      CONSTRAINT fk_player FOREIGN KEY ( player_id ) REFERENCES player( id ) ON DELETE CASCADE ON UPDATE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS checkpoint (
+      id      INTEGER NOT NULL PRIMARY KEY,
+      race_id INTEGER NOT NULL,
+      number  INTEGER NOT NULL,
+      time    INTEGER NOT NULL,
+      UNIQUE( race_id, number ),
+      CONSTRAINT fk_race FOREIGN KEY ( race_id ) REFERENCES race( id ) ON DELETE CASCADE ON UPDATE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS config (
+      key   TEXT NOT NULL UNIQUE,
+      value TEXT NOT NULL
+    );
+  `);
 }
 
 // --------------------------------------------------------------------------
@@ -469,7 +519,9 @@ class RaceDB {
     const map = this.db.prepare("SELECT id, name FROM map WHERE id = ?").get(id);
     if (!map) return null;
     const idx = this.db.prepare("SELECT * FROM map_index WHERE map_id = ?").get(id);
-    const lim = clampLimit(limit, 50, 500);
+    // The map page shows EVERY player's PR on the map, not a top-N cut. The cap
+    // only bounds a hostile query; the busiest map has ~180 distinct players.
+    const lim = clampLimit(limit, 50, 10000);
 
     // Leaderboard: best time per canonical player on this map, fastest first.
     const leaderboard = this.db

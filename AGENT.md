@@ -84,6 +84,22 @@ is absent and runs topscores-only.
 (`POLL_INTERVAL`, `TOPSCORES_RESCAN` and `NODE_EXTRA_CA_CERTS` only apply to
 the standalone collector of the basic tier below.)
 
+## Testing
+
+Three layers, all runnable on a dev box (node ≥ 18, g++, libcurl headers):
+
+```bash
+cd web && npm test                    # DB semantics + HTTP API (fresh SQLite per test)
+sh server/test/entrypoint.test.sh     # env vars -> env.cfg -> launch-args contract
+sh e2e/run.sh                         # the REAL g_rs_api.cpp -> live server.js -> API
+```
+
+The e2e compiles `server/enginepatches/g_rs_api.cpp` into a harness that calls
+`RS_ApiReportRace` exactly like `racelog.as` does, so the bytes on the wire are
+the game module's. It covers: every finish counted as an attempt, PR upserts,
+leaderboard for all players, WR splits, the perfect-run (sum of best splits)
+computation, and delivery via the retry queue across a server restart.
+
 ## Notes
 
 - **HTTPS.** The token authenticates every push; put the central site behind a

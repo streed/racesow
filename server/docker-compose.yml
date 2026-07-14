@@ -42,6 +42,7 @@ services:
       # Set both in server/.env; token via `node admin.js enroll`.
       INGEST_URL: "${INGEST_URL:-}"
       INGEST_TOKEN: "${INGEST_TOKEN:-}"
+      VERSION_NAME: "${VERSION_NAME:-wsw 2.1}"
       # EXTRA_ARGS: "+set sv_maxrate 0"
     networks:
       - default

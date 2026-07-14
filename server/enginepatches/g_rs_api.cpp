@@ -49,12 +49,25 @@ struct ApiRequest {
 constexpr size_t QUEUE_MAX = 256;
 constexpr int MAX_ATTEMPTS = 3;
 
-std::mutex g_mutex;
-std::condition_variable g_cv;
-std::deque<ApiRequest> g_queue;
-std::thread g_worker;
-bool g_started = false;
-std::atomic<bool> g_stop{ false };
+// All mutable state lives on the heap behind a raw pointer, NOT in static
+// objects. Static C++ objects get their destructors run from the __cxa_atexit
+// list BEFORE this translation unit's __attribute__((destructor)) fires (both
+// at process exit and, depending on glibc, at dlclose) — with a static
+// std::thread that means ~thread() on a still-joinable worker, i.e.
+// std::terminate on every clean shutdown. The struct is deliberately never
+// freed: after rsApiShutdown joins the worker it is dead weight, and freeing
+// it would just reopen the ordering race.
+struct ApiState {
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::deque<ApiRequest> queue;
+	std::thread worker;
+	std::atomic<bool> stop;
+
+	ApiState() : stop( false ) {}
+};
+
+ApiState *g_state = nullptr;
 
 // Swallow the response body; we only care about the status code.
 size_t discardBody( void *, size_t size, size_t nmemb, void * )
@@ -99,17 +112,17 @@ long doPost( const ApiRequest &req )
 	return status;
 }
 
-void workerMain()
+void workerMain( ApiState *s )
 {
 	for( ;; ) {
 		ApiRequest req;
 		{
-			std::unique_lock<std::mutex> lock( g_mutex );
-			g_cv.wait( lock, [] { return g_stop.load() || !g_queue.empty(); } );
-			if( g_queue.empty() )
+			std::unique_lock<std::mutex> lock( s->mutex );
+			s->cv.wait( lock, [s] { return s->stop.load() || !s->queue.empty(); } );
+			if( s->queue.empty() )
 				return; // stop requested and nothing left to send
-			req = std::move( g_queue.front() );
-			g_queue.pop_front();
+			req = std::move( s->queue.front() );
+			s->queue.pop_front();
 		}
 
 		long status = doPost( req );
@@ -125,23 +138,25 @@ void workerMain()
 		}
 
 		// brief pause, then requeue at the back
-		if( !g_stop.load() )
+		if( !s->stop.load() )
 			std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
 		{
-			std::lock_guard<std::mutex> lock( g_mutex );
-			g_queue.push_back( std::move( req ) );
+			std::lock_guard<std::mutex> lock( s->mutex );
+			s->queue.push_back( std::move( req ) );
 		}
 	}
 }
 
-void ensureStarted()
+// Only ever called from the game's script thread, so plain-pointer init is
+// race-free; the worker never touches g_state itself.
+ApiState *ensureStarted()
 {
-	std::lock_guard<std::mutex> lock( g_mutex );
-	if( g_started )
-		return;
-	curl_global_init( CURL_GLOBAL_DEFAULT );
-	g_worker = std::thread( workerMain );
-	g_started = true;
+	if( !g_state ) {
+		curl_global_init( CURL_GLOBAL_DEFAULT );
+		g_state = new ApiState();
+		g_state->worker = std::thread( workerMain, g_state );
+	}
+	return g_state;
 }
 
 void jsonEscapeInto( std::string &out, const char *s )
@@ -168,18 +183,24 @@ void jsonEscapeInto( std::string &out, const char *s )
 	}
 }
 
-// Stop and join the worker before the library is unloaded.
+// Stop and join the worker before the library is unloaded, draining whatever
+// is still queued (bounded by MAX_ATTEMPTS, so this cannot hang forever).
 __attribute__(( destructor )) void rsApiShutdown()
 {
+	ApiState *s = g_state;
+	if( !s )
+		return;
 	{
-		std::lock_guard<std::mutex> lock( g_mutex );
-		if( !g_started )
-			return;
+		// Set stop under the lock: setting it between the worker's predicate
+		// check and its block-on-wait would otherwise lose the wakeup and
+		// deadlock the join below.
+		std::lock_guard<std::mutex> lock( s->mutex );
+		s->stop.store( true );
 	}
-	g_stop.store( true );
-	g_cv.notify_all();
-	if( g_worker.joinable() )
-		g_worker.join();
+	s->cv.notify_all();
+	if( s->worker.joinable() )
+		s->worker.join();
+	// s is intentionally leaked; see the ApiState comment.
 }
 
 } // namespace
@@ -230,14 +251,14 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	}
 	body += "]}]}";
 
-	ensureStarted();
+	ApiState *s = ensureStarted();
 	{
-		std::lock_guard<std::mutex> lock( g_mutex );
-		if( g_queue.size() >= QUEUE_MAX ) {
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
 			fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
-			g_queue.pop_front();
+			s->queue.pop_front();
 		}
-		g_queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0 } );
+		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0 } );
 	}
-	g_cv.notify_one();
+	s->cv.notify_one();
 }

@@ -110,6 +110,31 @@ if [ -z "${MAPLIST}" ]; then
     MAPLIST="$(echo "${INSTALLED}" | tr '\n' ' ')"
 fi
 MAPLIST="$(echo "${MAPLIST}" | sed 's/  */ /g;s/^ //;s/ $//')"
+
+# The engine executes env.cfg through a 1024-char per-command buffer
+# (MAX_STRING_CHARS): a longer `set g_maplist "..."` line gets chopped there,
+# corrupting the list and executing the tail as garbage commands. With a big
+# map mirror (scripts/fetch-maps.sh) the full installed list runs to tens of
+# KB, so cap it at a map-name boundary. Rotation then covers only the maps
+# that fit — curate mappool.txt to choose which maps rotate.
+MAPLIST_MAX=1000
+if [ "${#MAPLIST}" -gt "${MAPLIST_MAX}" ]; then
+    installed_count=$(echo "${MAPLIST}" | wc -w)
+    MAPLIST="$(echo "${MAPLIST}" | awk -v max="${MAPLIST_MAX}" '{
+        out = ""
+        for (i = 1; i <= NF; i++) {
+            cand = (out == "" ? $i : out " " $i)
+            if (length(cand) > max) break
+            out = cand
+        }
+        print out
+    }')"
+    kept_count=$(echo "${MAPLIST}" | wc -w)
+    echo ">> WARNING: ${installed_count} maps installed, but g_maplist only holds ${kept_count}"
+    echo ">>          (the engine caps command lines at 1024 chars). Rotation uses the"
+    echo ">>          first ${kept_count} alphabetically; set mappool.txt to pick the rotation."
+fi
+
 FIRST_MAP="${MAPLIST%% *}"
 : "${FIRST_MAP:=race}"
 

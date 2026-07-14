@@ -1,0 +1,97 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# Full end-to-end test of the race reporting pipeline, minus only the game
+# engine itself:
+#
+#   RS_ApiReportRace (the REAL g_rs_api.cpp, compiled here)
+#     -> HTTP POST /api/ingest (the real web/server.js on a fresh SQLite DB)
+#       -> attempts (run_tally), PRs (race), checkpoints
+#         -> the API the site renders: leaderboard for all players, WR splits,
+#            perfect run (best possible split time), player PRs.
+#
+# Phase A: a player sets a PR over three attempts; a second player joins.
+# Phase B: a finish is reported WHILE THE SERVER IS DOWN; the native's retry
+#          queue must deliver it once the server is back.
+#
+# Requirements: g++, libcurl headers, node >= 18 (web/node_modules installed).
+#   sh e2e/run.sh
+# ---------------------------------------------------------------------------
+set -eu
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "${HERE}/.." && pwd)"
+
+TMP="$(mktemp -d)"
+SERVER_PID=""
+cleanup() {
+    [ -n "${SERVER_PID}" ] && kill "${SERVER_PID}" 2>/dev/null || true
+    rm -rf "${TMP}"
+}
+trap cleanup EXIT INT TERM
+
+PORT="$(( 20000 + $$ % 10000 ))"
+BASE="http://127.0.0.1:${PORT}"
+TOKEN="e2e-ingest-token"
+VERSION="wsw 2.1"
+
+step() { echo ""; echo "== $*"; }
+
+# --- Build the harness around the real native --------------------------------
+step "compiling report harness (real g_rs_api.cpp + libcurl)"
+g++ -std=c++11 -Wall -Wextra -o "${TMP}/harness" \
+    "${HERE}/report_harness.cpp" \
+    "${ROOT}/server/enginepatches/g_rs_api.cpp" \
+    -lcurl -lpthread
+
+start_server() {
+    DB_PATH="${TMP}/db.sqlite" PORT="${PORT}" INGEST_TOKEN="${TOKEN}" \
+        node "${ROOT}/web/server.js" > "${TMP}/server.log" 2>&1 &
+    SERVER_PID=$!
+    i=0
+    while ! curl -fsS "${BASE}/api/health" > /dev/null 2>&1; do
+        i=$((i + 1))
+        [ "${i}" -gt 100 ] && { cat "${TMP}/server.log" >&2; echo "server did not start" >&2; exit 1; }
+        sleep 0.1
+    done
+}
+
+# --- Phase A: normal play ----------------------------------------------------
+# Nova: three attempts, PR on the second. Wave: one finish. Colour-coded names
+# exercise the full name pipeline. Fields: map, name, login, timeMs, cps-csv.
+step "phase A: server up, 4 finishes reported through the native"
+start_server
+
+"${TMP}/harness" "${BASE}/api/ingest" "${TOKEN}" "${VERSION}" <<'EOF'
+testrace	^1No^7va		52000	11000,30000
+testrace	^1No^7va		48000	10000,28000
+testrace	^1No^7va		50000	10500,29000
+testrace	^4Wa^5ve		49000	9800,27500
+EOF
+
+step "phase A: asserting attempts, PRs, leaderboard, WR splits, perfect run"
+node "${HERE}/assert.mjs" "${BASE}" phaseA
+
+# --- Phase B: report while the server is down (retry path) -------------------
+step "phase B: server DOWN, Wave sets a 47.0 PR; native must retry"
+kill "${SERVER_PID}"
+wait "${SERVER_PID}" 2>/dev/null || true
+SERVER_PID=""
+
+# Queue the report against the dead server in the background; g_rs_api retries
+# (up to 3 attempts, 2s apart) while we bring the server back up. The linger
+# keeps the harness alive through the retry window, as a real game server
+# would be — shutdown drains the queue with the pacing disabled.
+"${TMP}/harness" "${BASE}/api/ingest" "${TOKEN}" "${VERSION}" 8 <<'EOF' &
+testrace	^4Wa^5ve		47000	9500,27000
+EOF
+HARNESS_PID=$!
+
+sleep 0.5
+start_server
+wait "${HARNESS_PID}"
+
+step "phase B: asserting the retried finish landed (new WR, updated perfect run)"
+node "${HERE}/assert.mjs" "${BASE}" phaseB
+
+echo ""
+echo "OK: end-to-end pipeline test passed"

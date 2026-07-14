@@ -311,7 +311,9 @@ async function viewPlayers(params) {
 
 async function viewMap(id) {
   loading();
-  const d = await api(`/maps/${id}?limit=100`);
+  // limit=10000 = "everyone": the leaderboard lists every player's PR on the
+  // map (the busiest map has ~180), not a top-100 cut.
+  const d = await api(`/maps/${id}?limit=10000`);
   const wr = d.wr;
 
   // WR splits as absolute -> per-segment deltas for a fair compare to perfect.
