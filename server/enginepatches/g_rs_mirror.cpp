@@ -75,7 +75,7 @@ namespace {
 
 constexpr size_t DGRAM_MAX_SEND = 1200; // stay under a 1500-MTU IPv4 payload
 constexpr size_t DGRAM_MAX_RECV = 1400;
-constexpr long long STATE_MIN_INTERVAL_MS = 80; // flood guard under the script's 100ms cadence
+constexpr long long STATE_MIN_INTERVAL_MS = 14; // flood guard under the script's ~16ms (60Hz) cadence
 constexpr long long PLAYER_TTL_MS = 3000;
 constexpr long long PEER_TTL_MS = 15000;
 constexpr long long RESOLVE_INTERVAL_MS = 60000; // re-resolve peers (containers change IPs)

@@ -1,7 +1,7 @@
 {
   "name": "racesow-web",
   "version": "1.0.0",
-  "description": "Node.js API + frontend that hosts the livesow race SQLite database",
+  "description": "Node.js API + frontend that hosts the race database on PostgreSQL",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -11,9 +11,11 @@
   "engines": {
     "node": ">=18"
   },
+  "//": "better-sqlite3 is used ONLY by the one-time migrate-sqlite-to-pg.js, but stays a runtime dependency because that tool runs inside the production image (which installs with --omit=dev). pg is the live driver.",
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",
     "better-sqlite3": "^11.8.1",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "pg": "^8.22.0"
   }
 }

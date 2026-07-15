@@ -7,7 +7,7 @@ site. Two tiers, depending on how much you want to run.
    your box                                central stats box
  ┌───────────────────────────┐          ┌───────────────────────────┐
  │ warsow-race (hrace fork)   │  HTTPS   │ web (/api/ingest)         │
- │   └─ POSTs each finish ────┼─────────▶│   └─ data/db.sqlite        │
+ │   └─ POSTs each finish ────┼─────────▶│   └─ PostgreSQL            │
  │      (RS_ApiReportRace)    │  token   │ discord announcer          │
  └───────────────────────────┘          └───────────────────────────┘
 ```
@@ -91,10 +91,11 @@ the standalone collector of the basic tier below.)
 
 ## Testing
 
-Three layers, all runnable on a dev box (node ≥ 18, g++, libcurl headers):
+Layers, all runnable on a dev box (node ≥ 18, g++, libcurl headers, and a
+throwaway PostgreSQL — see `web/README.md` — reachable via `TEST_PG_URL`):
 
 ```bash
-cd web && npm test                    # DB semantics + HTTP API (fresh SQLite per test)
+cd web && npm test                    # DB semantics + HTTP API (throwaway pg database per test)
 sh server/test/entrypoint.test.sh     # env vars -> env.cfg -> launch-args contract
 sh e2e/run.sh                         # the REAL g_rs_api.cpp -> live server.js -> API
 sh e2e/mirror_fuzz_run.sh             # mesh parser vs ~300k hostile datagrams (ASan+UBSan)

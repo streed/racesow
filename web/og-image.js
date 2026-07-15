@@ -61,7 +61,7 @@ function statBlock(x, value, label, hl = false) {
     </g>`;
 }
 
-export function playerCardSvg({ name, rank, points, wr, maps, finishes, host }) {
+export function playerCardSvg({ name, rank, points, wr, maps, finishes, attempts, host }) {
   const visible = String(name).replace(/\^[0-9]/g, "") || "?";
   // Fit the (condensed, bold) name into the card: ~0.5em average advance.
   const nameSize = Math.max(40, Math.min(96, Math.floor(1080 / (0.52 * visible.length))));
@@ -72,6 +72,7 @@ export function playerCardSvg({ name, rank, points, wr, maps, finishes, host }) 
     [Number(wr || 0).toLocaleString("en-US"), "world records", false],
     [Number(maps || 0).toLocaleString("en-US"), "maps ranked", false],
     ...(finishes != null ? [[Number(finishes).toLocaleString("en-US"), "finishes", false]] : []),
+    ...(attempts != null ? [[Number(attempts).toLocaleString("en-US"), "attempts", false]] : []),
   ];
   const step = 1080 / stats.length;
   const blocks = stats.map(([v, l, hl], i) => statBlock(60 + i * step, v, l, hl)).join("");

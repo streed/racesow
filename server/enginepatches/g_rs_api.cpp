@@ -375,11 +375,14 @@ __attribute__(( destructor )) void rsApiShutdown()
  *
  * Queue one finished race for delivery to <url> (the central /api/ingest).
  * cpsCsv is the comma-separated absolute checkpoint times in milliseconds
- * (the finish time is not part of the list). No-op when url is empty.
+ * (the finish time is not part of the list). attemptsSinceLast is the number
+ * of race STARTS since this player's last flush, including the start that
+ * produced this finish (pass a negative value to omit — the API then counts
+ * the finish as a single attempt). No-op when url is empty.
  */
 void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	const char *mapname, const char *player, const char *login,
-	int timeMs, const char *cpsCsv )
+	int timeMs, int attemptsSinceLast, const char *cpsCsv )
 {
 	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] || timeMs <= 0 )
 		return;
@@ -396,6 +399,10 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	jsonEscapeInto( body, login ? login : "" );
 	body += "\",\"time\":";
 	body += std::to_string( timeMs );
+	if( attemptsSinceLast >= 0 ) {
+		body += ",\"attempts\":";
+		body += std::to_string( attemptsSinceLast );
+	}
 	body += ",\"checkpoints\":[";
 
 	// keep only well-formed integers from the csv
@@ -415,6 +422,47 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
 			break;
 	}
 	body += "]}]}";
+
+	ApiState *s = ensureStarted();
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+			s->queue.pop_front();
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
+			REQ_POST_REPORT, "", 0 } );
+	}
+	s->cv.notify_one();
+}
+
+/*
+ * RS_ApiReportAttempts
+ *
+ * Queue a finish-less attempt flush: <count> race starts by <player> on
+ * <mapname> that have no finish report to ride on (the player disconnected
+ * or the map ended mid-run). Same idempotency posture as finish reports:
+ * bounded retries, dropped on permanent failure.
+ */
+void RS_ApiReportAttempts( const char *url, const char *token, const char *version,
+	const char *mapname, const char *player, const char *login, int count )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] || count <= 0 )
+		return;
+
+	std::string body;
+	body.reserve( 192 );
+	body += "{\"version\":\"";
+	jsonEscapeInto( body, version && version[0] ? version : "wsw 2.1" );
+	body += "\",\"map\":\"";
+	jsonEscapeInto( body, mapname );
+	body += "\",\"source\":\"racelog\",\"attempts\":[{\"name\":\"";
+	jsonEscapeInto( body, player );
+	body += "\",\"login\":\"";
+	jsonEscapeInto( body, login ? login : "" );
+	body += "\",\"count\":";
+	body += std::to_string( count );
+	body += "}]}";
 
 	ApiState *s = ensureStarted();
 	{

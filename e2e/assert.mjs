@@ -39,8 +39,13 @@ async function until(desc, fn, timeoutMs = 30000) {
 
 const expected =
   phase === "phaseA"
-    ? { finishes: 4, wr: 48000, wrHolder: "Nova", wrSplits: [10000, 28000], perfect: 47500, board: [["Nova", 48000], ["Wave", 49000]] }
-    : { finishes: 5, wr: 47000, wrHolder: "Wave", wrSplits: [9500, 27000], perfect: 47000, board: [["Wave", 47000], ["Nova", 48000]] };
+    ? { finishes: 4, wr: 48000, wrHolder: "Nova", wrSplits: [10000, 28000], perfect: 47500, board: [["Nova", 48000], ["Wave", 49000]],
+        // starts: Nova 2+1+3 riding her finish reports; Wave 2 + a 4-start
+        // standalone flush (run.sh curls it after the harness)
+        novaAttempts: 6, waveAttempts: 6 }
+    : { finishes: 5, wr: 47000, wrHolder: "Wave", wrSplits: [9500, 27000], perfect: 47000, board: [["Wave", 47000], ["Nova", 48000]],
+        // phase B: Wave's retried finish carries the default 1 attempt
+        novaAttempts: 6, waveAttempts: 7 };
 
 // 1. Every finish is recorded as an attempt (run tally, straight from the DB).
 const ov = await until(`overview.finishes == ${expected.finishes}`, async () => {
@@ -77,12 +82,20 @@ assert.ok(d.perfect && d.perfect.complete, "perfect run computed");
 assert.equal(d.perfect.time, expected.perfect, "best possible time = sum of best splits");
 assert.ok(d.perfect.time <= d.wr.time, "perfect run never slower than the WR");
 
-// 3. Player page: PR + attempt count for Nova (3 finishes in phase A, still 3 in B).
+// 3. Player page: PR + finish/attempt tallies for Nova (3 finishes in phase A,
+//    still 3 in B; starts accumulate from the per-report attempts field).
 const nova = d.leaderboard.find((r) => r.simplified === "Nova");
 const pd = await get(`/players/${nova.playerId}`);
 assert.equal(pd.records.rows.length, 1, "one PR per map on the player page");
 assert.equal(pd.records.rows[0].time, 48000, "Nova's PR");
-assert.equal(pd.finishes, 3, "Nova's attempt count");
+assert.equal(pd.finishes, 3, "Nova's finish count");
+assert.equal(pd.attempts, expected.novaAttempts, "Nova's total attempts (race starts)");
+assert.equal(pd.records.rows[0].attempts, expected.novaAttempts, "per-map attempts on the profile");
+
+// 3b. Wave's total includes the standalone (finish-less) attempt flush.
+const wave = d.leaderboard.find((r) => r.simplified === "Wave");
+const wd = await get(`/players/${wave.playerId}`);
+assert.equal(wd.attempts, expected.waveAttempts, "Wave's attempts include the standalone flush");
 
 // 4. Colour codes survive to the API for rendering (name vs simplified).
 assert.ok(nova.name.includes("^"), "raw colour-coded name preserved");

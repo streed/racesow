@@ -26,7 +26,7 @@
 
 void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	const char *mapname, const char *player, const char *login,
-	int timeMs, const char *cpsCsv );
+	int timeMs, int attemptsSinceLast, const char *cpsCsv );
 
 // Split on single tabs, preserving empty fields (strtok would collapse them).
 static std::vector<std::string> splitTabs( const char *line )
@@ -58,13 +58,16 @@ int main( int argc, char **argv )
 		if( line[0] == '\0' || line[0] == '\n' || line[0] == '#' )
 			continue;
 		std::vector<std::string> f = splitTabs( line );
-		if( f.size() != 5 ) {
-			fprintf( stderr, "harness: bad line (want 5 tab-separated fields): %s", line );
+		if( f.size() != 5 && f.size() != 6 ) {
+			fprintf( stderr, "harness: bad line (want 5-6 tab-separated fields): %s", line );
 			return 2;
 		}
+		// optional 6th field: attempts since the player's last flush
+		// (racelog.as counts starts and attaches them the same way)
+		int attempts = f.size() == 6 ? atoi( f[5].c_str() ) : 1;
 		RS_ApiReportRace( argv[1], argv[2], argv[3],
 			f[0].c_str(), f[1].c_str(), f[2].c_str(),
-			atoi( f[3].c_str() ), f[4].c_str() );
+			atoi( f[3].c_str() ), attempts, f[4].c_str() );
 		queued++;
 	}
 	int linger = argc == 5 ? atoi( argv[4] ) : 0;

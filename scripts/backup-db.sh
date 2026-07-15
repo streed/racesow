@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# backup-db.sh — consistent online snapshot of data/db.sqlite.
+# backup-db.sh — consistent nightly dump of the PostgreSQL race database.
 #
-# Uses better-sqlite3's backup API inside the running racesow-web container
-# (safe against concurrent writes; captures WAL contents), gzips the result
-# into backups/db/ and prunes snapshots older than RETENTION_DAYS (14).
+# Runs pg_dump inside the running racesow-postgres container (a consistent
+# snapshot via a single transaction), gzips the custom-format dump into
+# backups/db/ and prunes snapshots older than RETENTION_DAYS (14).
+#
+# Restore with:
+#   gunzip -c backups/db/db-YYYYMMDD-HHMMSS.dump.gz \
+#     | docker exec -i racesow-postgres pg_restore -U racesow -d racesow --clean --if-exists
 #
 # Run manually, or nightly via the systemd timer:
 #   systemd/install.sh full     # installs + enables racesow-db-backup.timer
@@ -13,28 +17,24 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${REPO_ROOT}/backups/db"
 RETENTION_DAYS="${RETENTION_DAYS:-14}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-TMP="${REPO_ROOT}/data/.backup-tmp.sqlite"
+OUT="${OUT_DIR}/db-${STAMP}.dump.gz"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-docker inspect -f '{{.State.Running}}' racesow-web 2>/dev/null | grep -qx true \
-    || die "racesow-web is not running — it owns the DB file and the sqlite driver"
+docker inspect -f '{{.State.Running}}' racesow-postgres 2>/dev/null | grep -qx true \
+    || die "racesow-postgres is not running"
 
 mkdir -p "${OUT_DIR}"
-rm -f "${TMP}"
 
-# /data inside the container is the repo's ./data bind mount, so the snapshot
-# lands next to the live DB and is gzipped from the host side.
-docker exec racesow-web node -e '
-  require("better-sqlite3")("/data/db.sqlite", { readonly: true })
-    .backup("/data/.backup-tmp.sqlite")
-    .then(() => process.exit(0))
-    .catch((e) => { console.error(e); process.exit(1); })'
+# -Fc = custom format (compressed, selective restore). Pipe straight to gzip on
+# the host so nothing large is written inside the container. pg_dump takes a
+# consistent snapshot, so this is safe against concurrent ingest writes.
+docker exec racesow-postgres pg_dump -U racesow -d racesow -Fc \
+    | gzip > "${OUT}.tmp"
+mv "${OUT}.tmp" "${OUT}"
 
-[ -s "${TMP}" ] || die "backup produced no file at ${TMP}"
-gzip -c "${TMP}" > "${OUT_DIR}/db-${STAMP}.sqlite.gz"
-rm -f "${TMP}"
+[ -s "${OUT}" ] || die "backup produced no file at ${OUT}"
 
-find "${OUT_DIR}" -name 'db-*.sqlite.gz' -mtime +"${RETENTION_DAYS}" -delete
+find "${OUT_DIR}" -name 'db-*.dump.gz' -mtime +"${RETENTION_DAYS}" -delete
 
-echo "backup: ${OUT_DIR}/db-${STAMP}.sqlite.gz ($(du -h "${OUT_DIR}/db-${STAMP}.sqlite.gz" | cut -f1)); $(find "${OUT_DIR}" -name 'db-*.sqlite.gz' | wc -l) snapshot(s) kept"
+echo "backup: ${OUT} ($(du -h "${OUT}" | cut -f1)); $(find "${OUT_DIR}" -name 'db-*.dump.gz' | wc -l) snapshot(s) kept"

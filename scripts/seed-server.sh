@@ -21,7 +21,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TOPSCORES_DIR="${REPO_ROOT}/server/topscores/race"
-DB="${REPO_ROOT}/data/db.sqlite"
 BACKUP_DIR="${REPO_ROOT}/backups"
 
 WIPE=0
@@ -41,7 +40,6 @@ say() { printf '>> %s\n' "$*"; }
 # --- Preflight ---------------------------------------------------------------
 command -v docker >/dev/null 2>&1 || die "docker is not installed / not in PATH"
 docker compose version >/dev/null 2>&1 || die "docker compose v2 is required"
-[ -f "${DB}" ] || die "${DB} not found — this script runs on the central stats box"
 [ -d "${REPO_ROOT}/server" ] || die "server/ directory missing — run from a full clone"
 
 cd "${REPO_ROOT}"
@@ -51,6 +49,15 @@ if ! docker image inspect racesow-web:latest >/dev/null 2>&1; then
     say "racesow-web image not built yet — building"
     docker compose build web
 fi
+
+# The data source is the central Postgres, not a file. Require it to be up and
+# populated, or the seeder would produce empty topscores and abort at line ~75.
+races=$(docker compose exec -T postgres psql -U racesow -d racesow -qtA -c "SELECT COUNT(*) FROM race" 2>/dev/null | tr -d '[:space:]' || true)
+case "${races}" in
+    ''|*[!0-9]*) die "cannot reach Postgres (is 'docker compose up -d' running?)" ;;
+    0)           die "Postgres has no races — run the migration first: docker compose run --rm web node migrate-sqlite-to-pg.js /data/db.sqlite" ;;
+esac
+say "central database has ${races} races"
 
 mkdir -p "${TOPSCORES_DIR}" "${BACKUP_DIR}"
 
@@ -68,7 +75,7 @@ if [ "${WIPE}" = "1" ] && [ "${existing}" -gt 0 ]; then
 fi
 
 # --- Seed ---------------------------------------------------------------------
-say "seeding topscores from data/db.sqlite (merge-only, idempotent)"
+say "seeding topscores from the central Postgres database (merge-only, idempotent)"
 docker compose --profile seed run --rm seed-topscores
 
 seeded=$(find "${TOPSCORES_DIR}" -name '*.txt' | wc -l)

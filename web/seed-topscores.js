@@ -1,41 +1,21 @@
-// Seed the game server's topscores files from the central race database.
+// Seed the game server's topscores files from the central race database
+// (PostgreSQL edition — behaviour and file format identical to the SQLite-era
+// version; see git history for the long-form comments).
 //
-// For every map in db.sqlite this writes topscores/race/<map>.txt in the exact
-// format the hrace racemod reads (RACE_LoadTopScores in
-// server/racemod/source/progs/gametypes/hrace/recordtime.as):
+// For every map this writes topscores/race/<map>.txt in the exact format the
+// hrace racemod reads: merge-only (an on-disk record that beats the DB time
+// for the same nick is kept), idempotent (files rewritten only on change).
 //
-//   //<map> top scores
-//
-//   "<finishMs>" "<playerName>" "<numSectors>" "<cp1Ms>" ... "<cpNMs>"
-//
-// One line per player (their best time), fastest first, capped at MAX_RECORDS
-// (50, matching the mod). Sector times are absolute milliseconds from the
-// checkpoint table; 0 means "not passed". Logins are deliberately omitted:
-// the auth servers are gone, and mixing logins into otherwise login-less
-// records makes the mod treat same-nick entries as different players.
-//
-// Existing files are MERGED, not clobbered: entries already on disk (e.g. a
-// record set on the server moments ago that the collector hasn't shipped yet)
-// are kept when they beat the DB time for the same nick. The merge also
-// collapses same-nick duplicates left behind by the pre-fix racemod. Files are
-// only rewritten when content changes, so the collector's mtime-based rescan
-// isn't churned.
-//
-// Run via the one-shot compose service (see docker-compose.yml):
-//
+// Run via the one-shot compose service:
 //   docker compose --profile seed run --rm seed-topscores
-//
-// then restart the game server so already-loaded maps re-read their files.
-import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
+import { openDatabase } from "./db.js";
 
-const DB_PATH = process.env.DB_PATH || "/data/db.sqlite";
+const DATABASE_URL =
+  process.env.DATABASE_URL || "postgres://racesow:racesow@127.0.0.1:5432/racesow";
 const OUT_DIR = process.env.TOPSCORES_DIR || "/topscores/race";
 const MAX_RECORDS = 50; // mirrors the mod
-
-const db = new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
 
 // Same normalization the mod applies for identity: strip ^N color tokens,
 // lowercase. (^^ escapes a literal caret.)
@@ -86,7 +66,7 @@ function parseExisting(file) {
   const tokens = tokenize(text);
   const entries = [];
   let i = 0;
-  while (i + 2 < tokens.length + 1 && i < tokens.length) {
+  while (i < tokens.length) {
     let timeTok = tokens[i++];
     const pipe = timeTok.indexOf("|"); // drop any legacy login suffix
     if (pipe !== -1) timeTok = timeTok.slice(0, pipe);
@@ -103,35 +83,37 @@ function parseExisting(file) {
   return entries;
 }
 
-const maps = db
-  .prepare("SELECT DISTINCT m.id, m.name FROM map m JOIN race r ON r.map_id = m.id ORDER BY m.name")
-  .all()
-  .filter((m) => /^[a-z0-9][a-z0-9_.-]*$/i.test(m.name)); // path-safe names only
+const race = await openDatabase(DATABASE_URL);
 
-// Best race per canonical player for a map; display name = canonical rep's.
-const bestStmt = db.prepare(`
-  WITH k AS (
-    SELECT pl.canonical_id cid, r.id rid, r.time,
-           ROW_NUMBER() OVER (PARTITION BY pl.canonical_id ORDER BY r.time, r.id) rn
-    FROM race r JOIN player pl ON pl.id = r.player_id
-    WHERE r.map_id = ?
-  )
-  SELECT k.rid, k.time, rep.name
-  FROM k JOIN player rep ON rep.id = k.cid
-  WHERE k.rn = 1 ORDER BY k.time, k.rid LIMIT ${MAX_RECORDS}
-`);
-const cpStmt = db.prepare("SELECT time FROM checkpoint WHERE race_id = ? ORDER BY number");
+const maps = (
+  await race.all("SELECT DISTINCT m.id, m.name FROM map m JOIN race r ON r.map_id = m.id ORDER BY m.name")
+).filter((m) => /^[a-z0-9][a-z0-9_.-]*$/i.test(m.name)); // path-safe names only
 
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
 let written = 0;
 let unchanged = 0;
 for (const map of maps) {
-  const fromDb = bestStmt.all(map.id).map((r) => ({
-    time: r.time,
-    name: sanitizeName(r.name),
-    sectors: cpStmt.all(r.rid).map((c) => c.time | 0),
-  }));
+  // Best race per canonical player; display name = canonical rep's.
+  const rows = await race.all(
+    `WITH k AS (
+       SELECT pl.canonical_id cid, r.id rid, r.time,
+              ROW_NUMBER() OVER (PARTITION BY pl.canonical_id ORDER BY r.time, r.id) rn
+       FROM race r JOIN player pl ON pl.id = r.player_id
+       WHERE r.map_id = $1
+     )
+     SELECT k.rid, k.time, rep.name
+     FROM k JOIN player rep ON rep.id = k.cid
+     WHERE k.rn = 1 ORDER BY k.time, k.rid LIMIT ${MAX_RECORDS}`,
+    [map.id]
+  );
+  const fromDb = [];
+  for (const r of rows) {
+    const sectors = (
+      await race.all("SELECT time FROM checkpoint WHERE race_id = $1 ORDER BY number", [r.rid])
+    ).map((c) => c.time | 0);
+    fromDb.push({ time: r.time, name: sanitizeName(r.name), sectors });
+  }
   const file = path.join(OUT_DIR, `${map.name.toLowerCase()}.txt`);
 
   // Merge: union of DB bests and on-disk entries, best time per clean nick.
@@ -170,3 +152,4 @@ for (const map of maps) {
 }
 
 console.log(`seed-topscores: ${written} file(s) written, ${unchanged} unchanged, ${maps.length} maps considered`);
+await race.close();

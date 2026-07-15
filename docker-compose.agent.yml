@@ -18,8 +18,21 @@ services:
     image: warsow-race:2.1.2
     container_name: warsow-race
     restart: unless-stopped
+    # Line-buffer the engine's stdout so `docker logs` isn't frozen mid-startup
+    # (glibc block-buffers a pipe); entrypoint.sh also wraps launch in stdbuf.
+    tty: true
+    # A full livesow map mirror is 4000+ pk3s the engine holds open at once,
+    # past the default 2048-fd soft limit ("Error opening PK3 file").
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
     ports:
       - "${SV_PORT:-44400}:44400/udp"
+      # Cross-server player-mesh port. Published so peers on OTHER hosts can
+      # reach this server's mirror; harmless (nothing binds it) when MIRROR_*
+      # is unset. Same-host peers don't need it.
+      - "${MIRROR_PORT:-44450}:44450/udp"
     environment:
       SV_HOSTNAME: "${SV_HOSTNAME:-Racesow Community Server}"
       SV_MAXCLIENTS: "${SV_MAXCLIENTS:-16}"
@@ -28,17 +41,47 @@ services:
       MAP_ROTATION: "2"
       RCON_PASSWORD: "${RCON_PASSWORD:-}"
       # The gametype POSTs every finish straight to the central ingest
-      # endpoint (racelog.as -> RS_ApiReportRace). The collector below then
-      # only backfills from topscores files.
+      # endpoint (racelog.as -> RS_ApiReportRace).
       INGEST_URL: "${INGEST_URL:?set INGEST_URL in .env}"
       INGEST_TOKEN: "${INGEST_TOKEN:?set INGEST_TOKEN in .env}"
       VERSION_NAME: "${VERSION_NAME:-wsw 2.1}"
+      # Client-reachable HTTP pak mirror (optional; see server/docker-compose.yml).
+      SV_UPLOADS_BASEURL: "${SV_UPLOADS_BASEURL:-}"
+      # Cross-server player mirroring (UDP mesh). Peers exchange live player
+      # positions + chat so players on one server see the others as ghosts.
+      # Set all of these in .env; empty MIRROR_PEERS = feature off.
+      MIRROR_PEERS: "${MIRROR_PEERS:-}"     # "peer-host:44450 other-host:44450"
+      MIRROR_SECRET: "${MIRROR_SECRET:-}"   # shared HMAC key: openssl rand -hex 24
+      MIRROR_PORT: "${MIRROR_PORT:-44450}"
+      MIRROR_TAG: "${MIRROR_TAG:-}"         # short id shown as [TAG] in chat
     volumes:
       - ./server/maps:/warsow/maps_extra:ro
       # Local record files (topscores) + finish-event audit log, persisted
       # across container rebuilds.
       - racelog:/warsow/racemod/racelog
       - topscores:/warsow/racemod/topscores
+      # Downloadable pk3s are exported here at startup for the pakserver below.
+      - pakshare:/pakshare
+
+  # Optional plain-HTTP pak mirror so LOCAL players download maps from THIS
+  # server instead of the central site (fast, no cross-region transfer). Start
+  # it with the httpdl profile and point clients at it:
+  #   docker compose -f docker-compose.agent.yml --profile httpdl up -d --build
+  #   SV_UPLOADS_BASEURL=http://your-host:44445   (in .env)
+  # The port must be reachable by every player (the engine won't fall back to
+  # UDP after a failed web download), so publish it on 0.0.0.0 and open it.
+  pakserver:
+    image: nginx:alpine
+    container_name: racesow-pakserver
+    restart: unless-stopped
+    profiles: ["httpdl"]
+    ports:
+      - "${PAK_HTTP_PORT:-44445}:80"
+    volumes:
+      - pakshare:/usr/share/nginx/html
+    # Chown the share to the game-server user (uid 999) so the export works
+    # even if this container initialised the volume first.
+    command: ["/bin/sh", "-c", "chown -R 999:999 /usr/share/nginx/html 2>/dev/null || true; exec nginx -g 'daemon off;'"]
 
   # No collector service: the gametype POSTs finishes to the central API
   # directly (RS_ApiReportRace). If you instead run a stock, unmodified race
@@ -47,3 +90,4 @@ services:
 volumes:
   racelog:
   topscores:
+  pakshare:

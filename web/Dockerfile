@@ -1,8 +1,9 @@
-# Race stats web server — Node.js API + static frontend over the SQLite DB.
+# Race stats web server — Node.js API + static frontend over PostgreSQL.
 FROM node:20-bookworm-slim
 
-# better-sqlite3 ships prebuilt binaries for this platform, but keep build
-# tooling available as a fallback for architectures without a prebuild.
+# The runtime driver is pg (pure JS). better-sqlite3 is a dependency only for
+# the one-time migrate-sqlite-to-pg.js tool, and it needs a build toolchain on
+# platforms without a prebuilt binary — installed then purged in one layer.
 ENV NODE_ENV=production
 WORKDIR /app
 
@@ -15,13 +16,13 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY server.js db.js live.js og-image.js admin.js seed-topscores.js ./
+COPY server.js db.js live.js og-image.js admin.js seed-topscores.js migrate-sqlite-to-pg.js ./
 COPY og-assets ./og-assets
 COPY public ./public
 
-# The database is provided at runtime via a bind mount / volume (see
-# docker-compose.yml). DB_PATH can override the default location.
-ENV DB_PATH=/data/db.sqlite
+# Runtime store is Postgres via DATABASE_URL (see docker-compose.yml). The
+# legacy /data/db.sqlite path is read ONLY by the one-time migration tool
+# (docker compose run --rm web node migrate-sqlite-to-pg.js /data/db.sqlite).
 ENV PORT=8080
 EXPOSE 8080
 

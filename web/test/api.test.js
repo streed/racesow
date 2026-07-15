@@ -1,38 +1,50 @@
 // Integration tests for the HTTP API: spawn the real server.js on a fresh
-// database and drive it over HTTP, including the exact JSON contract the game
-// module's RS_ApiReportRace native emits.
+// throwaway PostgreSQL database and drive it over HTTP, including the exact
+// JSON contract the game module's RS_ApiReportRace native emits.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import pg from "pg";
+import { ADMIN_URL } from "./pg-util.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_JS = path.join(__dirname, "..", "server.js");
 
 const TOKEN = "test-shared-token-1234";
 let proc;
-let dir;
+let dbName;
 let base;
 
+async function adminQuery(sql) {
+  const c = new pg.Client({ connectionString: ADMIN_URL });
+  await c.connect();
+  try {
+    await c.query(sql);
+  } finally {
+    await c.end();
+  }
+}
+
 before(async () => {
-  dir = mkdtempSync(path.join(tmpdir(), "raceapi-"));
+  dbName = "test_api_" + crypto.randomBytes(6).toString("hex");
+  await adminQuery(`CREATE DATABASE ${dbName}`);
   const port = 18000 + Math.floor(Math.random() * 2000);
   base = `http://127.0.0.1:${port}`;
   proc = spawn(process.execPath, [SERVER_JS], {
     env: {
       ...process.env,
       PORT: String(port),
-      DB_PATH: path.join(dir, "db.sqlite"),
+      DATABASE_URL: ADMIN_URL.replace(/\/[^/]*$/, `/${dbName}`),
       INGEST_TOKEN: TOKEN,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
   proc.stderr.on("data", (d) => process.stderr.write(`[server] ${d}`));
   // Wait for /api/health.
-  const deadline = Date.now() + 15000;
+  const deadline = Date.now() + 20000;
   for (;;) {
     try {
       const r = await fetch(`${base}/api/health`);
@@ -43,17 +55,21 @@ before(async () => {
   }
 });
 
-after(() => {
+after(async () => {
   if (proc) proc.kill("SIGTERM");
-  if (dir) rmSync(dir, { recursive: true, force: true });
+  await new Promise((r) => setTimeout(r, 300)); // let the pool disconnect
+  if (dbName) await adminQuery(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
 });
 
 // The byte-exact body shape g_rs_api.cpp builds (field order and all).
-function gameBody({ version = "wsw 2.1", map, name, login = "", time, cps = [] }) {
+// attempts = starts since the player's last flush; the module omits the
+// field entirely when negative (old-server compatibility path).
+function gameBody({ version = "wsw 2.1", map, name, login = "", time, attempts = 1, cps = [] }) {
+  const attemptsPart = attempts >= 0 ? `"attempts":${attempts},` : "";
   return (
     `{"version":${JSON.stringify(version)},"map":${JSON.stringify(map)},` +
     `"source":"racelog","records":[{"name":${JSON.stringify(name)},` +
-    `"login":${JSON.stringify(login)},"time":${time},"checkpoints":[${cps.join(",")}]}]}`
+    `"login":${JSON.stringify(login)},"time":${time},${attemptsPart}"checkpoints":[${cps.join(",")}]}]}`
   );
 }
 
@@ -131,18 +147,51 @@ test("a finish POSTed exactly as the game module sends it lands in the DB and th
   assert.equal(detail.perfect.time, 9800 + 17700 + 20000);
   assert.ok(detail.perfect.time <= detail.wr.time);
 
-  // The player page shows the PR and the attempt count.
+  // The player page shows the PR, the finish count, and the attempt count
+  // (each report above carried the default attempts=1).
   const player = detail.leaderboard[0];
   const pd = await get(`/players/${player.playerId}`);
   assert.equal(pd.records.rows.length, 1);
   assert.equal(pd.records.rows[0].time, 48000);
   assert.equal(pd.finishes, 3);
+  assert.equal(pd.attempts, 3);
+  assert.equal(pd.records.rows[0].attempts, 3, "per-map attempts on the profile rows");
 
   // Overview totals reflect the ingested world.
   const ov = await get("/overview");
   assert.equal(ov.totals.finishes, 4);
   assert.equal(ov.totals.records, 2);
   assert.ok(ov.recent.length >= 1); // recent-records feed has entries
+});
+
+test("attempts accumulate: per-record counts, standalone flushes, old-server fallback", async () => {
+  // Two finishes with multi-start counts riding along (5 starts, 2 finishes).
+  assert.equal((await ingest(gameBody({ map: "attmap", name: "Grinder", time: 30000, attempts: 3 }))).status, 200);
+  assert.equal((await ingest(gameBody({ map: "attmap", name: "Grinder", time: 29000, attempts: 2 }))).status, 200);
+  // Standalone flush: 4 more starts with no finish (disconnect/map-end path,
+  // the exact JSON RS_ApiReportAttempts emits).
+  const flush = await ingest(
+    `{"version":"wsw 2.1","map":"attmap","source":"racelog","attempts":[{"name":"Grinder","login":"","count":4}]}`
+  );
+  assert.equal(flush.status, 200);
+  // Old server: no attempts field at all -> the finish implies one attempt.
+  assert.equal((await ingest(gameBody({ map: "attmap", name: "Grinder", time: 28000, attempts: -1 }))).status, 200);
+
+  await new Promise((r) => setTimeout(r, 3600)); // aggregate debounce for /search
+  const found = await get("/players?q=Grinder");
+  const pd = await get(`/players/${found.rows[0].id}`);
+  assert.equal(pd.finishes, 3, "three finishes");
+  assert.equal(pd.attempts, 3 + 2 + 4 + 1, "starts: 3+2 riding finishes, 4 standalone, 1 implied");
+
+  // Garbage flushes are rejected or ignored, never counted.
+  assert.equal(
+    (await ingest(`{"version":"v","map":"attmap","source":"racelog","attempts":[{"name":"Grinder","count":-5}]}`)).status,
+    400
+  );
+  assert.equal(
+    (await ingest(`{"version":"v","map":"attmap","source":"racelog","attempts":[]}`)).status,
+    400
+  );
 });
 
 test("re-sending the same finish is idempotent for records", async () => {

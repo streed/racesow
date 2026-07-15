@@ -23,11 +23,27 @@ ROOT="$(cd "${HERE}/.." && pwd)"
 
 TMP="$(mktemp -d)"
 SERVER_PID=""
+
+# A throwaway PostgreSQL database for this run (the web app is pg-backed now).
+# It persists across the phase-B kill/restart so the retry-queue delivery is
+# still exercised, and is dropped on exit. Point E2E_PG_URL at any owner
+# connection; defaults to the dev/CI test instance on :5433.
+ADMIN_PG_URL="${E2E_PG_URL:-${TEST_PG_URL:-postgres://racesow:racesow@127.0.0.1:5433/racesow}}"
+E2E_DB="e2e_$$_$(date +%s 2>/dev/null || echo 0)"
+psql_admin() { psql "${ADMIN_PG_URL}" -v ON_ERROR_STOP=1 -qtA "$@"; }
+
 cleanup() {
     [ -n "${SERVER_PID}" ] && kill "${SERVER_PID}" 2>/dev/null || true
+    psql_admin -c "DROP DATABASE IF EXISTS ${E2E_DB} WITH (FORCE)" >/dev/null 2>&1 || true
     rm -rf "${TMP}"
 }
 trap cleanup EXIT INT TERM
+
+command -v psql >/dev/null 2>&1 || { echo "psql not found (install postgresql-client)" >&2; exit 1; }
+psql_admin -c "SELECT 1" >/dev/null 2>&1 \
+    || { echo "cannot reach PostgreSQL at ${ADMIN_PG_URL}" >&2; exit 1; }
+psql_admin -c "CREATE DATABASE ${E2E_DB}" >/dev/null
+DATABASE_URL="$(printf '%s' "${ADMIN_PG_URL}" | sed "s#/[^/]*\$#/${E2E_DB}#")"
 
 PORT="$(( 20000 + $$ % 10000 ))"
 BASE="http://127.0.0.1:${PORT}"
@@ -44,7 +60,7 @@ g++ -std=c++11 -Wall -Wextra -o "${TMP}/harness" \
     -lcurl -lpthread
 
 start_server() {
-    DB_PATH="${TMP}/db.sqlite" PORT="${PORT}" INGEST_TOKEN="${TOKEN}" \
+    DATABASE_URL="${DATABASE_URL}" PORT="${PORT}" INGEST_TOKEN="${TOKEN}" \
         node "${ROOT}/web/server.js" > "${TMP}/server.log" 2>&1 &
     SERVER_PID=$!
     i=0
@@ -61,12 +77,20 @@ start_server() {
 step "phase A: server up, 4 finishes reported through the native"
 start_server
 
+# 6th column: race starts since the player's last flush (Nova restarted a few
+# times before finishing; totals asserted in assert.mjs).
 "${TMP}/harness" "${BASE}/api/ingest" "${TOKEN}" "${VERSION}" <<'EOF'
-testrace	^1No^7va		52000	11000,30000
-testrace	^1No^7va		48000	10000,28000
-testrace	^1No^7va		50000	10500,29000
-testrace	^4Wa^5ve		49000	9800,27500
+testrace	^1No^7va		52000	11000,30000	2
+testrace	^1No^7va		48000	10000,28000	1
+testrace	^1No^7va		50000	10500,29000	3
+testrace	^4Wa^5ve		49000	9800,27500	2
 EOF
+
+step "phase A: standalone attempt flush (starts with no finish, e.g. disconnect)"
+curl -fsS -X POST "${BASE}/api/ingest" \
+    -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
+    -d '{"version":"wsw 2.1","map":"testrace","source":"racelog","attempts":[{"name":"^4Wa^5ve","login":"","count":4}]}' \
+    > /dev/null
 
 step "phase A: asserting attempts, PRs, leaderboard, WR splits, perfect run"
 node "${HERE}/assert.mjs" "${BASE}" phaseA

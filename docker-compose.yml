@@ -1,34 +1,57 @@
-# Racesow data services: the stats website + the Discord record announcer.
-# Both read the same race database in ./data.
+# Racesow data services: PostgreSQL + the stats website + the Discord record
+# announcer.
 #
 #   docker compose up -d --build
+#
+# The race data lives in the postgres service (pgdata volume). The legacy
+# SQLite file in ./data is kept mounted for the one-time migration and as a
+# rollback artifact:
+#   docker compose run --rm web node migrate-sqlite-to-pg.js /data/db.sqlite
 #
 # The Warsow *game server* is a separate, much heavier image; run it from
 # ./server (see server/README.md).
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: racesow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: racesow
+      POSTGRES_DB: racesow
+      # Generate with: openssl rand -hex 24 (set it in .env)
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U racesow -d racesow"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
   web:
     build: ./web
     image: racesow-web:latest
     container_name: racesow-web
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8080:8080"
     environment:
       PORT: "8080"
-      DB_PATH: /data/db.sqlite
+      DATABASE_URL: "postgres://racesow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/racesow"
       # Canonical public origin for server-rendered share URLs + OG cards. Set
       # this in production (e.g. https://eu.frankfurt.racesow.org) so og:url/
       # og:image and the OG image footer never derive from the request Host
       # header (prevents host-header cache poisoning). Empty → per-request (dev).
       PUBLIC_ORIGIN: "${PUBLIC_ORIGIN:-}"
-      # Optional shared secret for POST /api/ingest. Empty by default → ingest
-      # stays disabled until you either set a real secret here (openssl rand
-      # -hex 32) or enroll per-server tokens (recommended for multiple servers):
-      #   docker compose exec web node admin.js enroll "My Server"
+      # Optional shared secret for POST /api/ingest. Empty by default → prefer
+      # per-server tokens: docker compose exec web node admin.js enroll "Name"
       INGEST_TOKEN: "${INGEST_TOKEN:-}"
     volumes:
-      # Read-write: the server adds indexes at startup and the collector's
-      # ingested records are written here.
+      # Legacy SQLite location — only read by migrate-sqlite-to-pg.js now.
       - ./data:/data
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -42,18 +65,18 @@ services:
     image: racesow-discord:latest
     container_name: racesow-discord
     restart: unless-stopped
+    depends_on:
+      - web
     environment:
       # Paste your Discord webhook URL here (or use an .env file).
       DISCORD_WEBHOOK_URL: "${DISCORD_WEBHOOK_URL:-}"
-      DB_PATH: /data/db.sqlite
+      # The announcer polls the stats API (no database access needed).
+      API_URL: "http://web:8080"
       STATE_PATH: /state/announcer.json
       POLL_INTERVAL: "300"
       ANNOUNCE_MAX_RANK: "1"        # 1 = world records only
       SITE_URL: "http://localhost:8080"
-      # To pull a live feed instead of the static snapshot, uncomment:
-      # REMOTE_DB_URL: "http://livesow.net/race/api/db.sqlite"
     volumes:
-      - ./data:/data
       - announcer-state:/state
 
   # NOTE: there is no collector service anymore — the game server POSTs every
@@ -71,13 +94,16 @@ services:
     build: ./web
     image: racesow-web:latest
     profiles: ["seed"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      DB_PATH: /data/db.sqlite
+      DATABASE_URL: "postgres://racesow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/racesow"
       TOPSCORES_DIR: /topscores/race
     volumes:
-      - ./data:/data
       - ./server/topscores:/topscores
     command: ["node", "seed-topscores.js"]
 
 volumes:
   announcer-state:
+  pgdata:

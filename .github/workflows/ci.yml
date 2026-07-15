@@ -1,7 +1,7 @@
 # The three test layers documented in AGENT.md, run on every push/PR:
-#   web unit + HTTP API tests (fresh SQLite per test — no LFS needed),
+#   web unit + HTTP API tests (throwaway PostgreSQL database per test),
 #   the entrypoint env->cfg contract, and the e2e pipeline that compiles the
-#   REAL g_rs_api.cpp natives against the REAL web server.
+#   REAL g_rs_api.cpp natives against the REAL web server (also on Postgres).
 name: ci
 on:
   push:
@@ -10,13 +10,29 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: racesow
+          POSTGRES_PASSWORD: racesow
+          POSTGRES_DB: racesow
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U racesow"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      # web tests (pg-util.js) and the e2e server both use this.
+      TEST_PG_URL: postgres://racesow:racesow@127.0.0.1:5433/racesow
+      DATABASE_URL: postgres://racesow:racesow@127.0.0.1:5433/racesow
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
       - name: build deps for the e2e harnesses
-        run: sudo apt-get update && sudo apt-get install -y g++ libcurl4-openssl-dev
+        run: sudo apt-get update && sudo apt-get install -y g++ libcurl4-openssl-dev postgresql-client
       - name: web unit + API tests
         run: cd web && npm install && npm test
       - name: entrypoint contract test

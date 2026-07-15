@@ -1,33 +1,31 @@
-// Racesow Discord announcer.
+// Racesow Discord announcer — API edition.
 //
-// Watches the race database for newly-inserted records and posts a rich embed
-// to a Discord webhook for each one worth shouting about (world records by
-// default). New rows are detected by race id — every new run gets a higher id
-// than the last, so we simply remember the highest id we have already handled.
+// Polls the stats web service for newly-inserted records and posts a rich
+// embed to a Discord webhook for each one worth shouting about (world records
+// by default). New rows are detected by race id — every new run gets a higher
+// id than the last (the API preserves the monotonic-id contract), so we
+// simply remember the highest id we have already handled.
 //
-// On first run it records the current maximum id as a baseline WITHOUT posting
-// anything, so it never floods a channel with the entire back catalogue.
+// On first run it records the current maximum id as a baseline WITHOUT
+// posting anything, so it never floods a channel with the back catalogue.
 //
-// Optionally it can refresh the database from a remote URL before each poll
-// (e.g. the livesow snapshot), which is what makes "new records" actually
-// appear in a static file over time.
-import Database from "better-sqlite3";
-import { writeFile, readFile, rename } from "node:fs/promises";
+// This service has NO database access: GET /api/records?after_id= returns the
+// new records with the margin-to-#2 and version name precomputed. (The old
+// better-sqlite3 + REMOTE_DB_URL snapshot mode died with the move to
+// PostgreSQL — see git history.)
+import { writeFile, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
 const CFG = {
   webhook: process.env.DISCORD_WEBHOOK_URL || "",
-  dbPath: process.env.DB_PATH || "/data/db.sqlite",
+  apiUrl: (process.env.API_URL || "http://web:8080").replace(/\/+$/, ""),
   statePath: process.env.STATE_PATH || "/state/announcer.json",
   pollSeconds: Math.max(15, parseInt(process.env.POLL_INTERVAL || "300", 10)),
-  // Announce records whose global rank is <= this (1 = world records only,
-  // 3 = podiums, etc.).
+  // Announce records whose global rank is <= this (1 = world records only).
   maxRank: Math.max(1, parseInt(process.env.ANNOUNCE_MAX_RANK || "1", 10)),
   // Safety cap on how many embeds to post per poll.
   maxPerPoll: Math.max(1, parseInt(process.env.MAX_PER_POLL || "10", 10)),
-  // If set, download a fresh DB from here before each poll.
-  remoteDbUrl: process.env.REMOTE_DB_URL || "",
   username: process.env.WEBHOOK_USERNAME || "Racesow",
   siteUrl: process.env.SITE_URL || "", // optional link back to the stats site
 };
@@ -74,60 +72,16 @@ async function saveState(state) {
   }
 }
 
-async function refreshDb() {
-  if (!CFG.remoteDbUrl) return;
-  log(`refreshing DB from ${CFG.remoteDbUrl} ...`);
-  const res = await fetch(CFG.remoteDbUrl);
-  if (!res.ok) throw new Error(`remote DB fetch ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  const tmp = CFG.dbPath + ".tmp";
-  await writeFile(tmp, buf);
-  await rename(tmp, CFG.dbPath);
-  log(`DB refreshed (${(buf.length / 1024 / 1024).toFixed(1)} MiB)`);
+async function fetchRecords(afterId) {
+  const url =
+    `${CFG.apiUrl}/api/records?after_id=${afterId}` +
+    `&max_rank=${CFG.maxRank}&limit=${CFG.maxPerPoll}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`GET /api/records ${res.status}`);
+  return res.json(); // { maxId, records: [...] }
 }
 
-function openDb() {
-  const db = new Database(CFG.dbPath, { readonly: true, fileMustExist: true });
-  return db;
-}
-
-function findNewRecords(db, lastId) {
-  return db
-    .prepare(
-      `SELECT r.id, r.time, r.global_rank, r.version_rank, r.version_id,
-              m.id AS map_id, m.name AS map,
-              p.name AS raw_name, p.simplified AS player
-       FROM race r
-       JOIN map m ON m.id = r.map_id
-       JOIN player p ON p.id = r.player_id
-       WHERE r.id > ? AND r.global_rank <= ?
-       ORDER BY r.id ASC
-       LIMIT ?`
-    )
-    .all(lastId, CFG.maxRank, CFG.maxPerPoll);
-}
-
-// Margin to the next-best time on the same map (how far ahead this run is).
-function marginToNext(db, mapId, time) {
-  const row = db
-    .prepare(
-      `SELECT MIN(time) AS t FROM (
-         SELECT player_id, MIN(time) AS time FROM race WHERE map_id = ? GROUP BY player_id
-       ) WHERE time > ?`
-    )
-    .get(mapId, time);
-  return row && row.t != null ? row.t - time : null;
-}
-
-function versionName(db, id, cache) {
-  if (cache.has(id)) return cache.get(id);
-  const row = db.prepare("SELECT name FROM version WHERE id = ?").get(id);
-  const name = row ? row.name : String(id);
-  cache.set(id, name);
-  return name;
-}
-
-function buildEmbed(rec, db, vcache) {
+function buildEmbed(rec) {
   const isWR = rec.global_rank === 1;
   const player = rec.player || stripColors(rec.raw_name) || "unknown";
   const fields = [
@@ -135,13 +89,10 @@ function buildEmbed(rec, db, vcache) {
     { name: "Time", value: "`" + fmtTime(rec.time) + "`", inline: true },
     { name: "Rank", value: `#${rec.global_rank}`, inline: true },
   ];
-  if (isWR) {
-    const margin = marginToNext(db, rec.map_id, rec.time);
-    if (margin != null) {
-      fields.push({ name: "Ahead of #2 by", value: "`" + fmtTime(margin) + "`", inline: true });
-    }
+  if (isWR && rec.margin != null) {
+    fields.push({ name: "Ahead of #2 by", value: "`" + fmtTime(rec.margin) + "`", inline: true });
   }
-  fields.push({ name: "Version", value: versionName(db, rec.version_id, vcache), inline: true });
+  fields.push({ name: "Version", value: rec.version, inline: true });
 
   const title = isWR ? "🏆 New World Record!" : `🏁 New Top-${CFG.maxRank} Record`;
   const embed = {
@@ -178,64 +129,50 @@ async function postEmbeds(embeds) {
 }
 
 async function poll(state) {
-  if (CFG.remoteDbUrl) {
-    try {
-      await refreshDb();
-    } catch (e) {
-      log("DB refresh failed (using existing file):", e.message);
-    }
-  }
-
-  let db;
+  let data;
   try {
-    db = openDb();
+    data = await fetchRecords(state.lastId ?? 0);
   } catch (e) {
-    log("cannot open DB:", e.message);
+    log("cannot reach the stats API:", e.message);
     return state;
   }
 
   try {
-    const maxRow = db.prepare("SELECT MAX(id) AS m FROM race").get();
-    const maxId = maxRow ? maxRow.m : 0;
-
     if (state.lastId == null) {
       // First run: baseline, do not announce history.
-      state.lastId = maxId;
+      state.lastId = data.maxId;
       await saveState(state);
-      log(`baseline established at race id ${maxId} (no historical announcements)`);
+      log(`baseline established at race id ${data.maxId} (no historical announcements)`);
       return state;
     }
 
-    if (maxId <= state.lastId) {
-      log(`no new records (max id ${maxId})`);
+    if (data.maxId <= state.lastId) {
+      log(`no new records (max id ${data.maxId})`);
       return state;
     }
 
-    const recs = findNewRecords(db, state.lastId);
+    const recs = data.records;
     if (!recs.length) {
       // New rows exist but none met the rank threshold; advance the cursor.
-      state.lastId = maxId;
+      state.lastId = data.maxId;
       await saveState(state);
       return state;
     }
 
     log(`announcing ${recs.length} new record(s)`);
-    const vcache = new Map();
-    const embeds = recs.map((r) => buildEmbed(r, db, vcache));
+    const embeds = recs.map(buildEmbed);
     if (CFG.webhook) {
       await postEmbeds(embeds);
     } else {
       log("DISCORD_WEBHOOK_URL not set — would post:", JSON.stringify(embeds, null, 2));
     }
 
-    // Advance cursor to the highest id we processed (or the true max if the
-    // threshold filtered out the tail).
-    state.lastId = Math.max(maxId, recs[recs.length - 1].id);
+    // Advance the cursor to the highest id we processed (or the true max if
+    // the threshold filtered out the tail).
+    state.lastId = Math.max(data.maxId, recs[recs.length - 1].id);
     await saveState(state);
   } catch (e) {
     log("poll error:", e.message);
-  } finally {
-    db.close();
   }
   return state;
 }
@@ -244,11 +181,9 @@ async function main() {
   if (!CFG.webhook) {
     log("WARNING: DISCORD_WEBHOOK_URL is not set — running in dry-run (log only) mode.");
   }
-  log(`announcer starting: db=${CFG.dbPath} poll=${CFG.pollSeconds}s maxRank=${CFG.maxRank}` +
-      (CFG.remoteDbUrl ? ` remote=${CFG.remoteDbUrl}` : ""));
+  log(`announcer starting: api=${CFG.apiUrl} poll=${CFG.pollSeconds}s maxRank=${CFG.maxRank}`);
 
   let state = await loadState();
-  // Run immediately, then on an interval.
   const tick = async () => {
     state = await poll(state);
   };

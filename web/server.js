@@ -12,7 +12,10 @@ import { playerCardCached } from "./og-image.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data", "db.sqlite");
+// PostgreSQL connection (see docker-compose.yml postgres service). The old
+// DB_PATH/SQLite file is only used by the one-time migrate-sqlite-to-pg.js.
+const DATABASE_URL =
+  process.env.DATABASE_URL || "postgres://racesow:racesow@127.0.0.1:5432/racesow";
 
 // Canonical public origin for server-rendered share URLs (og:url/og:image) and
 // the OG card footer. Pinning it here means those never depend on the
@@ -47,8 +50,8 @@ const MAX_CHECKPOINTS = 4096;
 const MAX_TIME_MS = 24 * 60 * 60 * 1000;
 const MAX_RECORDS_PER_REQUEST = 1000;
 
-console.log(`Opening database at ${DB_PATH} ...`);
-const race = openDatabase(DB_PATH);
+console.log(`Connecting to database ...`);
+const race = await openDatabase(DATABASE_URL);
 
 // Live "who's playing" poller: UDP getstatus against each enrolled server
 // that has a query address (admin.js address). /api/live serves the cache.
@@ -116,38 +119,55 @@ function asInt(v) {
   return Number.isNaN(n) ? null : n;
 }
 
-api.get("/overview", (_req, res) => res.json(race.overview()));
-api.get("/servers", (_req, res) => res.json({ servers: race.servers() }));
+// Express 4 does not catch rejected async handlers; route through this so a
+// DB error becomes a 500 via the error middleware instead of a hung request.
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-api.get("/maps", (req, res) => res.json(race.maps(req.query)));
+api.get("/overview", wrap(async (_req, res) => res.json(await race.overview())));
+api.get("/servers", wrap(async (_req, res) => res.json({ servers: await race.servers() })));
 
-api.get("/maps/:id", (req, res) => {
+api.get("/maps", wrap(async (req, res) => res.json(await race.maps(req.query))));
+
+api.get("/maps/:id", wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid map id" });
-  const detail = race.mapDetail(id, req.query);
+  const detail = await race.mapDetail(id, req.query);
   if (!detail) return res.status(404).json({ error: "map not found" });
   res.json(detail);
-});
+}));
 
-api.get("/players", (req, res) => res.json(race.players(req.query)));
+api.get("/players", wrap(async (req, res) => res.json(await race.players(req.query))));
 
-api.get("/players/:id", (req, res) => {
+api.get("/players/:id", wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid player id" });
-  const detail = race.playerDetail(id, req.query);
+  const detail = await race.playerDetail(id, req.query);
   if (!detail) return res.status(404).json({ error: "player not found" });
   res.json(detail);
-});
+}));
 
-api.get("/search", (req, res) => res.json(race.search(req.query.q || "", { limit: 8 })));
+api.get("/search", wrap(async (req, res) => res.json(await race.search(req.query.q || "", { limit: 8 }))));
 
-api.get("/live", (_req, res) => {
+// New records after a race id — the Discord announcer polls this (it has no
+// database access; margin-to-#2 and version names are computed here). Public
+// read: nothing the site's recent-records feed doesn't already show.
+api.get("/records", wrap(async (req, res) => {
+  res.json(
+    await race.recordsAfter({
+      afterId: asInt(req.query.after_id) ?? 0,
+      maxRank: asInt(req.query.max_rank) ?? 1,
+      limit: asInt(req.query.limit) ?? 10,
+    })
+  );
+}));
+
+api.get("/live", wrap(async (_req, res) => {
   const snap = live.getLive();
-  res.json({
-    ...snap,
-    servers: snap.servers.map((s) => ({ ...s, mapId: s.map ? race.mapIdByName(s.map) : null })),
-  });
-});
+  const servers = await Promise.all(
+    snap.servers.map(async (s) => ({ ...s, mapId: s.map ? await race.mapIdByName(s.map) : null }))
+  );
+  res.json({ ...snap, servers });
+}));
 
 // Live topscores for game servers: the hrace gametype's RS_ApiFetchTop
 // native GETs this on map load and on a refresh interval, and swaps the
@@ -156,11 +176,11 @@ api.get("/live", (_req, res) => {
 // every server connected to this API serves the same in-game `top` lists,
 // HUD record lines and record announcements. Public read — it exposes
 // nothing the map leaderboard pages don't already show.
-api.get("/game/topscores", (req, res) => {
-  const body = race.gameTopscoresText(req.query.map);
+api.get("/game/topscores", wrap(async (req, res) => {
+  const body = await race.gameTopscoresText(req.query.map);
   if (body == null) return res.status(404).type("text/plain").send("// unknown map\n");
   res.type("text/plain").send(body);
-});
+}));
 
 api.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -168,16 +188,31 @@ api.get("/health", (_req, res) => res.json({ ok: true }));
 // stream from many servers can't starve the rebuild indefinitely). ----------
 let refreshTimer = null;
 let firstDirtyAt = 0;
-function doRefresh() {
+let refreshRunning = false;
+let refreshAgain = false;
+async function doRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = null;
   firstDirtyAt = 0;
+  // The rebuild is async now: never run two at once (they'd deadlock on the
+  // table swap); a request arriving mid-rebuild queues exactly one more pass.
+  if (refreshRunning) {
+    refreshAgain = true;
+    return;
+  }
+  refreshRunning = true;
   try {
     const t0 = Date.now();
-    race.refreshAggregates();
+    await race.refreshAggregates();
     console.log(`aggregates refreshed in ${Date.now() - t0}ms`);
   } catch (e) {
     console.error("aggregate refresh failed (will retry on next ingest):", e.message);
+  } finally {
+    refreshRunning = false;
+    if (refreshAgain) {
+      refreshAgain = false;
+      doRefresh();
+    }
   }
 }
 function scheduleAggregateRefresh() {
@@ -201,14 +236,14 @@ function tokenMatches(presented, expectedHash) {
 // Resolve the Authorization header to an ingest identity, or null.
 //   -> { serverId, serverName } for a per-server token
 //   -> { serverId: null, serverName: 'shared' } for the legacy shared token
-function authenticateIngest(req) {
+async function authenticateIngest(req) {
   const h = req.headers.authorization || "";
   if (!h.startsWith("Bearer ")) return null;
   const token = h.slice(7);
   if (!token) return null;
 
   // Per-server token (preferred).
-  const srv = race.serverByTokenHash(sha256(token));
+  const srv = await race.serverByTokenHash(sha256(token));
   if (srv) {
     if (srv.status === "revoked") return { revoked: true };
     return { serverId: srv.id, serverName: srv.name };
@@ -220,15 +255,26 @@ function authenticateIngest(req) {
   return null;
 }
 
+// Cap on attempt counts per entry: at humanly-possible restart spam (~1/s)
+// a full map's worth of attempts stays well under this; anything above is a
+// buggy or hostile server inflating a counter.
+const MAX_ATTEMPTS_PER_ENTRY = 10000;
+
 function sanitizeRecord(r) {
   if (!r || typeof r.name !== "string" || r.name.length === 0) return null;
   const time = Number(r.time);
   if (!Number.isInteger(time) || time <= 0 || time > MAX_TIME_MS) return null;
   const cpsIn = Array.isArray(r.checkpoints) ? r.checkpoints.slice(0, MAX_CHECKPOINTS) : [];
+  // attempts = race starts since the player's last flush (includes the start
+  // that produced this finish). Absent/invalid -> null: an old server that
+  // predates attempt tracking (its finish still implies one attempt).
+  const attempts = Number(r.attempts);
   return {
     name: r.name.slice(0, MAX_NAME_LEN),
     login: typeof r.login === "string" ? r.login.slice(0, MAX_NAME_LEN) : "",
     time,
+    attempts:
+      Number.isInteger(attempts) && attempts >= 0 ? Math.min(attempts, MAX_ATTEMPTS_PER_ENTRY) : null,
     checkpoints: cpsIn.map((t) => {
       const n = Number(t);
       return Number.isInteger(n) && n > 0 ? n : 0;
@@ -236,23 +282,33 @@ function sanitizeRecord(r) {
   };
 }
 
+// Standalone attempt flush entries (body.attempts[]): starts with no finish
+// to ride on — the player disconnected or the map ended mid-run.
+function sanitizeAttempt(a) {
+  if (!a || typeof a.name !== "string" || a.name.length === 0) return null;
+  const count = Number(a.count);
+  if (!Number.isInteger(count) || count <= 0) return null;
+  return {
+    name: a.name.slice(0, MAX_NAME_LEN),
+    login: typeof a.login === "string" ? a.login.slice(0, MAX_NAME_LEN) : "",
+    count: Math.min(count, MAX_ATTEMPTS_PER_ENTRY),
+  };
+}
+
 // Auth BEFORE body parsing so unauthenticated clients can't make us JSON.parse
 // up to the body limit. Ingest identity is attached to req for the handler.
 api.post(
   "/ingest",
-  (req, res, next) => {
-    const ident = authenticateIngest(req);
-    if (!ident && !INGEST_TOKEN_HASH && !race.caps.server) {
-      return res.status(503).json({ error: "ingest disabled (no tokens configured)" });
-    }
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
     if (!ident) return res.status(401).json({ error: "unauthorized" });
     if (ident.revoked) return res.status(403).json({ error: "server revoked" });
     req.ingest = ident;
     next();
-  },
+  }),
   ingestLimiter, // per-server cap (after auth so req.ingest is set)
   express.json({ limit: "2mb" }),
-  (req, res) => {
+  async (req, res) => {
     const body = req.body || {};
     const source = body.source === "racelog" ? "racelog" : "topscores";
     if (typeof body.version !== "string" || !body.version || typeof body.map !== "string" || !body.map) {
@@ -262,22 +318,30 @@ api.post(
     // enrolled server can't persist multi-KB map/version rows (DB bloat).
     const version = body.version.slice(0, MAX_VERSION_LEN);
     const map = body.map.slice(0, MAX_MAP_LEN);
-    const records = body.records;
-    if (!Array.isArray(records) || records.length === 0 || records.length > MAX_RECORDS_PER_REQUEST) {
-      return res.status(400).json({ error: `records must be a non-empty array (max ${MAX_RECORDS_PER_REQUEST})` });
+    // A request carries finish records, standalone attempt flushes, or both.
+    const records = Array.isArray(body.records) ? body.records : [];
+    const attempts = Array.isArray(body.attempts) ? body.attempts : [];
+    if (records.length > MAX_RECORDS_PER_REQUEST || attempts.length > MAX_RECORDS_PER_REQUEST) {
+      return res.status(400).json({ error: `too many entries (max ${MAX_RECORDS_PER_REQUEST})` });
     }
     const clean = records.map(sanitizeRecord).filter(Boolean);
-    if (!clean.length) return res.status(400).json({ error: "no valid records" });
+    const cleanAttempts = attempts.map(sanitizeAttempt).filter(Boolean);
+    if (!clean.length && !cleanAttempts.length) {
+      return res.status(400).json({ error: "no valid records or attempts" });
+    }
 
     try {
-      const counts = race.ingest({
+      const counts = await race.ingest({
         version,
         map: map.toLowerCase(),
         records: clean,
+        attempts: cleanAttempts,
         source,
         serverId: req.ingest.serverId,
       });
-      if (req.ingest.serverId != null) race.touchServer(req.ingest.serverId, counts.inserted + counts.improved);
+      if (req.ingest.serverId != null) {
+        await race.touchServer(req.ingest.serverId, counts.inserted + counts.improved);
+      }
       if (counts.inserted || counts.improved) {
         console.log(
           `ingest ${map} from ${req.ingest.serverName} [${source}]: +${counts.inserted} new, ${counts.improved} improved`
@@ -333,9 +397,9 @@ function withOgTags(tags) {
   return INDEX_HTML.replace(/<!-- og -->[\s\S]*?<!-- \/og -->/, `<!-- og -->\n  ${block}\n  <!-- /og -->`);
 }
 
-app.get("/player/:id", renderLimiter, (req, res, next) => {
+app.get("/player/:id", renderLimiter, wrap(async (req, res, next) => {
   const id = parseInt(req.params.id, 10);
-  const d = Number.isNaN(id) ? null : race.playerDetail(id, { limit: 1 });
+  const d = Number.isNaN(id) ? null : await race.playerDetail(id, { limit: 1 });
   if (!d) return next(); // unknown player -> plain SPA shell (default tags)
   const origin = siteOrigin(req);
   const name = simplifyName(d.name);
@@ -346,6 +410,7 @@ app.get("/player/:id", renderLimiter, (req, res, next) => {
     `${s.wr || 0} world record${s.wr === 1 ? "" : "s"}`,
     `${s.maps || 0} maps ranked`,
     d.finishes != null ? `${d.finishes.toLocaleString("en-US")} finishes` : null,
+    d.attempts != null ? `${d.attempts.toLocaleString("en-US")} attempts` : null,
   ].filter(Boolean);
   const image = `${origin}/og/player/${d.id}.png`;
   res.send(
@@ -366,12 +431,12 @@ app.get("/player/:id", renderLimiter, (req, res, next) => {
       ["twitter:image", image],
     ])
   );
-});
+}));
 
 // The stats card behind og:image — rendered per player, cached a few minutes.
-app.get("/og/player/:id.png", renderLimiter, (req, res) => {
+app.get("/og/player/:id.png", renderLimiter, wrap(async (req, res) => {
   const id = parseInt(req.params.id, 10);
-  const d = Number.isNaN(id) ? null : race.playerDetail(id, { limit: 1 });
+  const d = Number.isNaN(id) ? null : await race.playerDetail(id, { limit: 1 });
   if (!d) return res.status(404).end();
   try {
     const png = playerCardCached(d.id, () => ({
@@ -381,6 +446,7 @@ app.get("/og/player/:id.png", renderLimiter, (req, res) => {
       wr: d.standing.wr,
       maps: d.standing.maps,
       finishes: d.finishes,
+      attempts: d.attempts,
       // Fixed, config-derived host so the id-keyed cache render is
       // deterministic and can't be poisoned via the request's Host header.
       host: PUBLIC_HOST,
@@ -392,7 +458,7 @@ app.get("/og/player/:id.png", renderLimiter, (req, res) => {
     console.error("og card render failed:", e.message);
     res.status(500).end();
   }
-});
+}));
 
 // Default tags with an absolute og:image (crawlers ignore relative URLs).
 function defaultShell(req) {
@@ -419,13 +485,14 @@ app.get("*", (req, res, next) => {
   res.send(defaultShell(req));
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Race stats server listening on http://0.0.0.0:${PORT}`);
+  const servers = await race.servers();
   const modes = [];
   if (INGEST_TOKEN_HASH) modes.push("shared-token");
-  if (race.caps.server) modes.push(`${race.servers().length} enrolled server(s)`);
-  console.log(`Ingest: ${modes.length ? modes.join(" + ") : "DISABLED"}`);
+  modes.push(`${servers.length} enrolled server(s)`);
+  console.log(`Ingest: ${modes.join(" + ")}`);
   live.start();
-  const liveTargets = race.servers().filter((s) => s.address).length;
+  const liveTargets = servers.filter((s) => s.address).length;
   console.log(`Live poller: ${liveTargets} server(s) with a query address`);
 });

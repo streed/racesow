@@ -69,22 +69,27 @@ RUN python3 /tmp/patch-api-natives.py \
 #    player positions and chat. The patch also hooks Cmd_Say_f so public chat
 #    reaches the mesh. Runs after patch-api-natives.py (anchor order).
 COPY enginepatches/g_rs_mirror.cpp /build/repo/source/game/g_rs_mirror.cpp
+COPY enginepatches/g_rs_mirrorbots.cpp /build/repo/source/game/g_rs_mirrorbots.cpp
 COPY enginepatches/patch-mirror-natives.py /tmp/patch-mirror-natives.py
 RUN python3 /tmp/patch-mirror-natives.py \
     && grep -q "asFunc_RS_MirrorRefresh" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_MirrorBotAdd" game/g_ascript.cpp \
     && grep -q "RS_MirrorLocalChat" game/g_cmds.cpp
 
 RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Release . \
     && make game -j"$(nproc)" \
     && cp build/basewsw/libgame_x86_64.so /libgame_x86_64.so \
-    # the module must carry the natives and require libcurl at runtime.
-    # nm --defined-only (not strings): the registration string in g_ascript
-    # would pass a strings grep even if g_rs_api.cpp never compiled in — the
-    # unresolved symbol would then only abort at runtime, 60s into a map.
-    && nm -D --defined-only /libgame_x86_64.so | grep -q "RS_ApiReportRace" \
-    && nm -D --defined-only /libgame_x86_64.so | grep -q "RS_ApiFetchTop" \
-    && nm -D --defined-only /libgame_x86_64.so | grep -q "RS_ApiPollTop" \
+    # The module must carry the natives and require libcurl at runtime. The
+    # Release .so is fully stripped and the natives are hidden-visibility, so
+    # NO symbol table can prove they compiled in (nm shows "no symbols";
+    # nm -D lacks them). Instead assert on log-string literals that exist
+    # ONLY in g_rs_api.cpp — present iff the implementation was compiled in —
+    # plus the registration string from the g_ascript patch.
+    && strings /libgame_x86_64.so | grep -q "RS_ApiReportRace" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: dropping report" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: top-scores fetch failed" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: configured" \
+    && strings /libgame_x86_64.so | grep -q "rs_mirror: bot slot" \
     && objdump -p /libgame_x86_64.so | grep -q "NEEDED.*libcurl"
 
 # --- Patched dedicated server binary ----------------------------------------

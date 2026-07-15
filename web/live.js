@@ -128,9 +128,9 @@ export function createLivePoller(race, { intervalMs = POLL_INTERVAL_MS, timeoutM
     if (polling) return snapshot; // a slow round must not stack another
     polling = true;
     try {
-      const targets = race
-        .servers()
-        .filter((s) => s.status !== "revoked" && s.address && parseAddress(s.address));
+      const targets = (await race.servers()).filter(
+        (s) => s.status !== "revoked" && s.address && parseAddress(s.address)
+      );
       const results = await Promise.all(
         targets.map(async (s) => {
           const { host, port } = parseAddress(s.address);

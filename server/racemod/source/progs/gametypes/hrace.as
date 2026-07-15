@@ -319,7 +319,11 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
         // fired by p_client.cpp ClientDisconnect; announce the leave to the
         // mirror mesh so peers drop the ghost instantly instead of aging it out
         if ( @client != null )
+        {
             RACE_MirrorPlayerLeft( client );
+            // report their uncounted race starts before the slot is reused
+            RACE_FlushAttempts( client );
+        }
     }
     else if ( score_event == "userinfochanged" )
     {
@@ -369,6 +373,12 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
 
         return;
     }
+
+    // Mirror bots (fake clients representing remote players) are driven entirely
+    // by the mesh layer — skip the normal race spawn setup so it doesn't fight
+    // their frozen, streamed position/view.
+    if ( RS_MirrorBotIs( ent.client.playerNum ) )
+        return;
 
     Player@ player = RACE_GetPlayer( ent.client );
     player.cancelRace();
@@ -463,6 +473,10 @@ void GT_ThinkRules()
     {
         @client = G_GetClient( i );
         if ( client.state() < CS_SPAWNED )
+            continue;
+
+        // mirror bots are driven by the mesh layer, not the race rules
+        if ( RS_MirrorBotIs( i ) )
             continue;
 
         //delayed rules
@@ -584,6 +598,8 @@ bool GT_MatchStateFinished( int incomingMatchState )
         // ch : also send rest of results
         RACE_WriteTopScores();
         RACE_UpdatePosValues();
+        // script globals reset on map change: report uncounted race starts now
+        RACE_FlushAllAttempts();
 
         G_CmdExecute("set g_inactivity_maxtime 90\n");
         G_CmdExecute("set g_disable_vote_remove 1\n");
@@ -665,6 +681,12 @@ void GT_MatchStateStarted()
 // the gametype is shutting down cause of a match restart or map change
 void GT_Shutdown()
 {
+    // Report uncounted race starts before the module unloads (clean server
+    // shutdown / restart mid-map — the WAITEXIT flush only covers map
+    // changes). The native's worker drains the queued POST during library
+    // shutdown, one delivery attempt per report.
+    RACE_FlushAllAttempts();
+
     RACE_MirrorShutdown();
 }
 

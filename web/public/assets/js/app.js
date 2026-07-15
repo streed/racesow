@@ -432,6 +432,7 @@ async function viewPlayer(id, params) {
   );
   const s = d.standing;
   const rec = d.records;
+  const hasAttempts = d.attempts != null; // legacy DBs have no attempts column
 
   const aliasHtml =
     d.aliases && d.aliases.length
@@ -453,6 +454,7 @@ async function viewPlayer(id, params) {
       <div class="s"><div class="n">${fmtNum(s.podium)}</div><div class="l">Podiums</div></div>
       <div class="s"><div class="n">${fmtNum(s.maps)}</div><div class="l">Maps Raced</div></div>
       ${d.finishes != null ? `<div class="s"><div class="n">${fmtNum(d.finishes)}</div><div class="l">Finishes</div></div>` : ""}
+      ${d.attempts != null ? `<div class="s"><div class="n">${fmtNum(d.attempts)}</div><div class="l">Attempts</div></div>` : ""}
     </div>
 
     <div class="page-title" style="font-size:20px">RECORDS <span class="accent">·</span> ${fmtNum(rec.total)}</div>
@@ -462,6 +464,7 @@ async function viewPlayer(id, params) {
           ${th("Map", "map", state)}
           ${th("Time", "time", state, "num")}
           ${th("Global Rank", "rank", state, "num")}
+          ${hasAttempts ? th("Attempts", "attempts", state, "num") : ""}
         </tr></thead>
         <tbody>
           ${rec.rows.map((r) => `
@@ -469,12 +472,13 @@ async function viewPlayer(id, params) {
               <td class="mapname">${esc(r.map_name)}</td>
               <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
               <td class="num ${rankClass(r.rank)}">${r.rank === 1 ? '<span class="pill wr">WR</span> ' : ""}#${fmtNum(r.rank)}</td>
-            </tr>`).join("") || `<tr><td colspan="3" class="empty">No records.</td></tr>`}
+              ${hasAttempts ? `<td class="num"><span class="muted">${fmtNum(r.attempts)}</span></td>` : ""}
+            </tr>`).join("") || `<tr><td colspan="${hasAttempts ? 4 : 3}" class="empty">No records.</td></tr>`}
         </tbody>
       </table>
     </div>${pager(state, rec, `#/player/${id}`)}</div>`;
 
-  wireSort(`#/player/${id}`, state, ["map", "time", "rank"]);
+  wireSort(`#/player/${id}`, state, ["map", "time", "rank", "attempts"]);
 
   // Show the shareable path-form URL (server-rendered OG tags for Discord/
   // social unfurls live at /player/<id>, not at the hash route). Only the
@@ -695,9 +699,11 @@ async function router() {
   let { path, params } = parseHash();
   // Path-form URLs (/player/5 — the shareable form whose OG tags unfurl in
   // Discord/social) route like their hash equivalents; hash navigation away
-  // from one normalizes the address bar back to hash form.
+  // from one normalizes the address bar back to hash form. Query params live
+  // in location.search for path-form URLs (parseHash only sees the fragment).
   if (!location.hash && location.pathname !== "/") {
     path = location.pathname;
+    new URLSearchParams(location.search).forEach((v, k) => (params[k] = v));
   } else if (location.hash && location.pathname !== "/") {
     history.replaceState(null, "", "/" + location.hash);
   }

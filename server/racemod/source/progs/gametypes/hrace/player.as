@@ -534,6 +534,7 @@ class Player
 
         this.currentCheckpoint = 0;
         this.inRace = true;
+        RACE_AttemptStarted( this ); // every genuine start counts (racelog.as)
         this.startTime = this.timeStamp();
         this.runPositionCount = 0;
         this.positionCycle = 0;

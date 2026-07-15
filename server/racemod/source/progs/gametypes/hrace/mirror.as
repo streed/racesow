@@ -28,9 +28,13 @@ Cvar rsMirrorMaxGhosts( "rs_mirror_maxghosts", "32", 0 );
 // verification that the mesh broadcast is flowing
 Cvar rsMirrorDebug( "rs_mirror_debug", "0", 0 );
 
-const uint MIRROR_PUBLISH_INTERVAL = 100; // ms between state publishes (~10Hz)
-const uint MIRROR_EXTRAPOLATE_MAX = 200;  // ms of dead-reckoning before a ghost freezes
-const float MIRROR_SNAP_DISTANCE = 512.0f; // corrections beyond this teleport instead of lerping
+const uint MIRROR_PUBLISH_INTERVAL = 16; // ms between state publishes/syncs (~60Hz)
+const uint MIRROR_EXTRAPOLATE_MAX = 150;  // ms of dead-reckoning before a ghost freezes
+const float MIRROR_SNAP_DISTANCE = 512.0f; // corrections beyond this teleport instead of smoothing
+// Per-frame easing of the rendered position/view toward the (extrapolated)
+// target. Higher = snappier/more responsive, lower = smoother/laggier. This is
+// what turns the ~60Hz stepwise updates into continuous, jitter-free motion.
+const float MIRROR_SMOOTH = 0.35f;
 const int MIRROR_EVENTS_PER_FRAME = 16;
 const int MIRROR_ENTITY_HEADROOM = 64;    // never spawn ghosts into the last edict slots
 
@@ -50,19 +54,25 @@ class MirrorPlayer
     String name;
     String map;    // origin server's current map
     Vec3 origin;   // last received position
-    Vec3 angles;   // pitch yaw roll
+    Vec3 angles;   // pitch yaw roll (the remote player's VIEW angles)
     Vec3 velocity;
     int flags;     // 1 = racing
     uint receivedAt; // realTime when the last state row arrived
     bool seen;     // mark/sweep flag for roster sync
-    Entity@ ghost;
+    int botSlot;   // fake-client playerNum representing this player, or -1
+    int cr, cg, cb; // random display colour, assigned once
+    Vec3 renderPos; // smoothed position actually pushed to the bot
+    Vec3 renderAng; // smoothed view angles
+    bool hasRender; // renderPos/Ang seeded yet?
 
     MirrorPlayer()
     {
         this.flags = 0;
         this.receivedAt = 0;
         this.seen = false;
-        @this.ghost = null;
+        this.botSlot = -1;
+        this.cr = 255; this.cg = 255; this.cb = 255;
+        this.hasRender = false;
     }
 }
 
@@ -73,6 +83,19 @@ uint mirrorNextSync = 0;
 uint mirrorNextDebugSummary = 0;
 int mirrorModelIndex = 0;
 int mirrorSkinIndex = 0;
+uint mirrorColorSeed = 0x9e3779b9; // LCG state for random bot colours
+
+// Give a remote player a bright, random-ish colour (assigned once, so it is
+// stable for the player's session). Avoids AngelScript string indexing.
+void RACE_MirrorAssignColour( MirrorPlayer@ rp )
+{
+    mirrorColorSeed = mirrorColorSeed * 1103515245 + 12345;
+    rp.cr = int( 70 + ( ( mirrorColorSeed >> 16 ) % 186 ) );
+    mirrorColorSeed = mirrorColorSeed * 1103515245 + 12345;
+    rp.cg = int( 70 + ( ( mirrorColorSeed >> 16 ) % 186 ) );
+    mirrorColorSeed = mirrorColorSeed * 1103515245 + 12345;
+    rp.cb = int( 70 + ( ( mirrorColorSeed >> 16 ) % 186 ) );
+}
 
 // /watch state per client slot; empty server string = not watching
 String[] mirrorWatchServer( maxClients );
@@ -105,9 +128,10 @@ void RACE_MirrorInit()
 
 void RACE_MirrorSpawnGametype()
 {
-    // the level reload freed every entity: forget stale ghost handles
+    // A level reload drops all clients, so any fake-client bot slots we held
+    // are gone — forget them; RACE_MirrorUpdateBots re-adds lazily.
     for ( uint i = 0; i < mirrorPlayers.length(); i++ )
-        @mirrorPlayers[i].ghost = null;
+        mirrorPlayers[i].botSlot = -1;
     for ( int i = 0; i < maxClients; i++ )
     {
         mirrorWatchServer[i] = "";
@@ -119,6 +143,8 @@ void RACE_MirrorSpawnGametype()
 
     Cvar mapNameVar( "mapname", "", 0 );
     mirrorLocalMap = mapNameVar.string.tolower();
+    if ( mirrorColorSeed == 0x9e3779b9 )
+        mirrorColorSeed ^= levelTime; // vary colours across restarts
 
     mirrorModelIndex = G_ModelIndex( "$models/players/" + MIRROR_GHOST_MODEL );
     mirrorSkinIndex = G_SkinIndex( "models/players/" + MIRROR_GHOST_MODEL + "/default" );
@@ -132,7 +158,7 @@ void RACE_MirrorSpawnGametype()
 void RACE_MirrorShutdown()
 {
     for ( uint i = 0; i < mirrorPlayers.length(); i++ )
-        RACE_MirrorDespawnGhost( mirrorPlayers[i] );
+        RACE_MirrorRemoveBot( mirrorPlayers[i] );
 }
 
 void RACE_MirrorThink()
@@ -151,7 +177,7 @@ void RACE_MirrorThink()
         mirrorNextSync = realTime + MIRROR_PUBLISH_INTERVAL;
         RACE_MirrorSyncRoster();
     }
-    RACE_MirrorUpdateGhosts();
+    RACE_MirrorUpdateBots();
     RACE_MirrorUpdateWatchers();
 
     if ( realTime >= mirrorNextPublish )
@@ -186,17 +212,17 @@ void RACE_MirrorDebugSummary()
         listed.insertLast( server );
 
         int count = 0;
-        int ghosts = 0;
+        int bots = 0;
         for ( uint j = 0; j < mirrorPlayers.length(); j++ )
         {
             if ( mirrorPlayers[j].server != server )
                 continue;
             count++;
-            if ( @mirrorPlayers[j].ghost != null )
-                ghosts++;
+            if ( mirrorPlayers[j].botSlot >= 0 )
+                bots++;
         }
         G_Print( "rs_mirror(as): roster [" + server + "] map=" + mirrorPlayers[i].map
-                + " players=" + count + " ghosts=" + ghosts + "\n" );
+                + " players=" + count + " bots=" + bots + "\n" );
     }
     if ( listed.length() == 0 )
         G_Print( "rs_mirror(as): roster empty (no remote players streamed)\n" );
@@ -225,6 +251,12 @@ void RACE_MirrorPublish()
     RS_MirrorBegin();
     for ( int i = 0; i < maxClients; i++ )
     {
+        // NEVER publish our own mirror bots: they represent OTHER servers'
+        // players, so re-broadcasting them would loop them around the mesh
+        // (hop limit 1 — a server publishes only its genuine local players).
+        if ( RS_MirrorBotIs( i ) )
+            continue;
+
         Client@ client = G_GetClient( i );
         if ( client.state() < CS_SPAWNED || client.team == TEAM_SPECTATOR )
             continue;
@@ -285,7 +317,7 @@ void RACE_MirrorSyncRoster()
     {
         if ( !mirrorPlayers[i].seen )
         {
-            RACE_MirrorDespawnGhost( mirrorPlayers[i] );
+            RACE_MirrorRemoveBot( mirrorPlayers[i] );
             mirrorPlayers.removeAt( i );
         }
         else
@@ -330,82 +362,92 @@ Vec3 RACE_MirrorPredict( MirrorPlayer@ rp )
     return rp.origin + rp.velocity * ( age / 1000.0f );
 }
 
-Entity@ RACE_MirrorSpawnGhost( MirrorPlayer@ rp )
+// Free the fake-client slot that represents this remote player, if any.
+// A bot is removed when its source player leaves, goes to spectator, or goes
+// idle (their server drops them from the broadcast). Any local player who was
+// spectating that bot would be left staring at a dropped slot, so bump them
+// back to free-fly spectate first.
+void RACE_MirrorRemoveBot( MirrorPlayer@ rp )
 {
-    Entity@ ghost = G_SpawnEntity( "mirror_ghost" );
-    if ( @ghost == null )
-        return null;
-
-    ghost.type = ET_PLAYER;
-    // must be non-zero: modelindex 0 + SOLID_NOT reads as "ghosting" to the
-    // engine (G_ISGHOSTING) and the entity stops being networked
-    ghost.modelindex = mirrorModelIndex;
-    ghost.skinNum = mirrorSkinIndex;
-    ghost.team = TEAM_PLAYERS;
-    ghost.solid = SOLID_NOT;
-    ghost.moveType = MOVETYPE_NONE;
-    ghost.svflags = ghost.svflags & ~uint( SVF_NOCLIENT );
-    ghost.effects = EF_RACEGHOST_FLAG;
-    ghost.setSize( Vec3( -16, -16, -24 ), Vec3( 16, 16, 40 ) );
-    ghost.origin = rp.origin;
-    ghost.angles = rp.angles;
-    ghost.teleported = true;
-    ghost.linkEntity();
-    return ghost;
-}
-
-void RACE_MirrorDespawnGhost( MirrorPlayer@ rp )
-{
-    if ( @rp.ghost != null )
+    if ( rp.botSlot >= 0 )
     {
-        rp.ghost.freeEntity();
-        @rp.ghost = null;
+        int botEntNum = rp.botSlot + 1;
+        for ( int i = 0; i < maxClients; i++ )
+        {
+            Client@ c = G_GetClient( i );
+            if ( c.state() >= CS_SPAWNED && c.chaseActive && c.chaseTarget == botEntNum )
+            {
+                c.chaseActive = false; // drop to free spectate
+                c.printMessage( "[" + rp.server + S_COLOR_WHITE + "] " + rp.name
+                        + S_COLOR_YELLOW + " left the race - spectating freely.\n" );
+            }
+        }
+        RS_MirrorBotRemove( rp.botSlot );
+        rp.botSlot = -1;
     }
 }
 
-void RACE_MirrorUpdateGhosts()
+// Each frame: keep a real fake-client ("mirror bot") in sync for every remote
+// player on OUR map. The bot occupies a client slot, so it appears on the
+// scoreboard, is chaseable with the normal spectator controls, and its view
+// angles drive a first-person POV when chased "in eyes". Remote players on a
+// different map (or that vanished) get their bot dropped.
+void RACE_MirrorUpdateBots()
 {
-    int ghostCount = 0;
-    int maxGhosts = rsMirrorMaxGhosts.integer;
+    int botCount = 0;
+    int maxBots = rsMirrorMaxGhosts.integer;
 
     for ( uint i = 0; i < mirrorPlayers.length(); i++ )
     {
         MirrorPlayer@ rp = mirrorPlayers[i];
 
-        // ghosts only make sense on the same map; chat/roster still flow
+        // bots only make sense on the same map; chat/roster still flow
         if ( rp.map != mirrorLocalMap )
         {
-            RACE_MirrorDespawnGhost( rp );
+            RACE_MirrorRemoveBot( rp );
             continue;
         }
 
-        if ( @rp.ghost == null )
+        if ( rp.botSlot < 0 )
         {
-            if ( ghostCount >= maxGhosts || numEntities > maxEntities - MIRROR_ENTITY_HEADROOM )
+            if ( botCount >= maxBots )
                 continue;
-            @rp.ghost = RACE_MirrorSpawnGhost( rp );
-            if ( @rp.ghost == null )
-                continue;
+            RACE_MirrorAssignColour( rp );
+            rp.botSlot = RS_MirrorBotAdd( rp.name, rp.server, rp.cr, rp.cg, rp.cb );
+            if ( rp.botSlot < 0 )
+                continue; // no free client slot right now; retry next frame
+            rp.hasRender = false; // (re)seed smoothing on a fresh bot
         }
-        ghostCount++;
+        botCount++;
 
-        Entity@ ghost = rp.ghost;
-        Vec3 predicted = RACE_MirrorPredict( rp );
+        // Target = the extrapolated position (dead-reckon a little past the last
+        // sample so we track fast racers), then EASE the rendered pose toward it
+        // each frame. Easing removes the stepwise snap when a new sample lands,
+        // turning ~60Hz updates into continuous motion; velocity still drives the
+        // client's run/jump animation. Large corrections (respawn/teleport) snap.
+        Vec3 target = RACE_MirrorPredict( rp );
+        if ( !rp.hasRender )
+        {
+            rp.renderPos = target;
+            rp.renderAng = rp.angles;
+            rp.hasRender = true;
+        }
+        else
+        {
+            Vec3 d = target - rp.renderPos;
+            if ( d * d > MIRROR_SNAP_DISTANCE * MIRROR_SNAP_DISTANCE )
+            {
+                rp.renderPos = target;
+                rp.renderAng = rp.angles;
+            }
+            else
+            {
+                rp.renderPos = Lerp( rp.renderPos, MIRROR_SMOOTH, target );
+                rp.renderAng = LerpAngles( rp.renderAng, MIRROR_SMOOTH, rp.angles );
+            }
+        }
 
-        // respawns/teleports on the origin server arrive as a huge correction;
-        // flag it so clients snap instead of drawing a lerp streak across the map
-        float dx = predicted.x - ghost.origin.x;
-        float dy = predicted.y - ghost.origin.y;
-        float dz = predicted.z - ghost.origin.z;
-        if ( dx * dx + dy * dy + dz * dz > MIRROR_SNAP_DISTANCE * MIRROR_SNAP_DISTANCE )
-            ghost.teleported = true;
-
-        ghost.origin = predicted;
-        ghost.angles = rp.angles;
-        // the engine transmits ET_PLAYER velocity to clients (origin2), which
-        // drives both their extrapolation and the procedural run/jump anims
-        ghost.velocity = rp.velocity;
-        ghost.linkEntity();
+        RS_MirrorBotUpdate( rp.botSlot, rp.renderPos, rp.renderAng, rp.velocity, rp.flags );
     }
 }
 
@@ -469,6 +511,10 @@ void RACE_MirrorUpdateWatchers()
     }
 }
 
+// watch <#|name|off> — because remote players are real fake-client bots here,
+// this just points the NATIVE chasecam at the chosen bot, so the normal
+// spectator controls (chasenext/chaseprev, in-eyes POV) all work on it. The
+// number is the row index shown by /who (position in mirrorPlayers).
 bool Cmd_MirrorWatch( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
     if ( !RACE_MirrorEnabled() )
@@ -477,96 +523,62 @@ bool Cmd_MirrorWatch( Client@ client, const String &cmdString, const String &arg
         return true;
     }
 
-    int slot = client.playerNum;
     String first = argsString.getToken( 0 );
-
-    if ( first == "" || first == "off" )
+    if ( first == "" )
     {
-        if ( mirrorWatchServer[slot] != "" )
-        {
-            RACE_MirrorStopWatching( slot, "" );
-            client.printMessage( "Watch stopped.\n" );
-        }
-        else
-        {
-            client.printMessage( "Usage: watch <player>  |  watch <server> <player>  |  watch off\n" );
-            client.printMessage( "Follows a player on a peered server (spectators only); see /who.\n" );
-        }
+        client.printMessage( "Usage: watch <#>  |  watch <name>  |  watch off   (numbers from /who)\n" );
+        client.printMessage( "Remote players are real bots here, so spec + chasenext/chaseprev work too.\n" );
         return true;
     }
-
+    if ( first == "off" )
+    {
+        client.chaseActive = false;
+        client.printMessage( "Watch stopped.\n" );
+        return true;
+    }
     if ( client.team != TEAM_SPECTATOR )
     {
-        client.printMessage( "You must be spectating to watch remote players (use /spec first).\n" );
+        client.printMessage( "You must be spectating first (use spec), then watch <#>.\n" );
         return true;
     }
 
-    // "watch <server> <player>" when the first token names a known peer,
-    // otherwise the whole argument string is the player pattern
-    String wantServer = "";
-    String pattern = argsString.trim();
-    if ( argc >= 2 )
+    MirrorPlayer@ found = null;
+
+    if ( first.isNumeric() )
     {
-        String maybeTag = first.tolower();
+        int n = first.toInt();
+        if ( n >= 1 && n <= int( mirrorPlayers.length() ) )
+            @found = mirrorPlayers[n - 1];
+    }
+    if ( @found == null )
+    {
+        String pattern = argsString.trim().removeColorTokens().tolower();
         for ( uint i = 0; i < mirrorPlayers.length(); i++ )
         {
-            if ( mirrorPlayers[i].server.tolower() == maybeTag )
-            {
-                wantServer = mirrorPlayers[i].server;
-                pattern = pattern.substr( first.length() ).trim();
-                break;
-            }
-        }
-    }
-    pattern = pattern.removeColorTokens().tolower();
-
-    MirrorPlayer@ found = null;
-    bool ambiguous = false;
-    for ( uint i = 0; i < mirrorPlayers.length(); i++ )
-    {
-        MirrorPlayer@ rp = mirrorPlayers[i];
-        if ( wantServer != "" && rp.server != wantServer )
-            continue;
-        String clean = rp.name.removeColorTokens().tolower();
-        if ( clean == pattern )
-        {
-            @found = rp;
-            ambiguous = false;
-            break; // exact match wins outright
-        }
-        if ( PatternMatch( clean, pattern ) )
-        {
-            if ( @found != null )
-                ambiguous = true;
-            else
-                @found = rp;
+            String clean = mirrorPlayers[i].name.removeColorTokens().tolower();
+            if ( clean == pattern ) { @found = mirrorPlayers[i]; break; }
+            if ( @found == null && PatternMatch( clean, pattern ) ) @found = mirrorPlayers[i];
         }
     }
 
     if ( @found == null )
     {
-        client.printMessage( "No remote player matches '" + pattern + "'. Try /who.\n" );
+        client.printMessage( "No remote player matches '" + first + "'. Try /who.\n" );
         return true;
     }
-    if ( ambiguous )
-    {
-        client.printMessage( "Several remote players match '" + pattern + "' - be more specific or give the server tag.\n" );
-        return true;
-    }
-    if ( found.map != mirrorLocalMap )
+    if ( found.map != mirrorLocalMap || found.botSlot < 0 )
     {
         client.printMessage( "[" + found.server + S_COLOR_WHITE + "] " + found.name
-                + S_COLOR_WHITE + " is playing " + S_COLOR_GREEN + found.map
-                + S_COLOR_WHITE + ", but this server is on " + S_COLOR_GREEN + mirrorLocalMap
-                + S_COLOR_WHITE + ".\n" );
+                + S_COLOR_WHITE + " is on " + S_COLOR_GREEN + found.map
+                + S_COLOR_WHITE + " - not spectatable here right now.\n" );
         return true;
     }
 
-    client.chaseActive = false; // we drive the camera, not the chasecam
-    mirrorWatchServer[slot] = found.server;
-    mirrorWatchName[slot] = found.name;
-    client.printMessage( "Watching [" + found.server + S_COLOR_WHITE + "] " + found.name
-            + S_COLOR_WHITE + " - /watch off to stop.\n" );
+    // native chasecam onto the mirror bot (entnum = playerNum + 1)
+    client.chaseActive = true;
+    client.chaseTarget = found.botSlot + 1;
+    client.printMessage( "Spectating [" + found.server + S_COLOR_WHITE + "] " + found.name
+            + S_COLOR_WHITE + " - chasenext/chaseprev to cycle, watch off to stop.\n" );
     return true;
 }
 
@@ -592,48 +604,28 @@ bool Cmd_MirrorWho( Client@ client, const String &cmdString, const String &argsS
     client.printMessage( "[" + rsMirrorTag.string + S_COLOR_WHITE + "] " + S_COLOR_GREEN + mirrorLocalMap
             + S_COLOR_WHITE + " - " + localCount + " playing (this server)\n" );
 
-    String[] listed;
-    for ( uint i = 0; i < mirrorPlayers.length(); i++ )
+    if ( mirrorPlayers.length() == 0 )
     {
-        String server = mirrorPlayers[i].server;
-
-        bool done = false;
-        for ( uint j = 0; j < listed.length(); j++ )
-        {
-            if ( listed[j] == server )
-                done = true;
-        }
-        if ( done )
-            continue;
-        listed.insertLast( server );
-
-        int count = 0;
-        for ( uint j = 0; j < mirrorPlayers.length(); j++ )
-        {
-            if ( mirrorPlayers[j].server == server )
-                count++;
-        }
-
-        client.printMessage( "[" + server + S_COLOR_WHITE + "] " + S_COLOR_GREEN + mirrorPlayers[i].map
-                + S_COLOR_WHITE + " - " + count + " playing"
-                + ( mirrorPlayers[i].map == mirrorLocalMap ? " (visible as ghosts)" : "" ) + "\n" );
-
-        Table table( "l l" );
-        for ( uint j = 0; j < mirrorPlayers.length(); j++ )
-        {
-            MirrorPlayer@ rp = mirrorPlayers[j];
-            if ( rp.server != server )
-                continue;
-            table.addCell( "  " + rp.name );
-            table.addCell( ( rp.flags & 1 ) != 0 ? S_COLOR_GREEN + "racing" : S_COLOR_WHITE + "idle" );
-        }
-        uint rows = table.numRows();
-        for ( uint j = 0; j < rows; j++ )
-            client.printMessage( table.getRow( j ) + "\n" );
+        client.printMessage( "No peered players online.\n" );
+        return true;
     }
 
-    if ( listed.length() == 0 )
-        client.printMessage( "No peered servers online.\n" );
+    // Numbered rows; the number is what /watch <#> takes (index in mirrorPlayers).
+    for ( uint i = 0; i < mirrorPlayers.length(); i++ )
+    {
+        MirrorPlayer@ rp = mirrorPlayers[i];
+        String status;
+        if ( rp.map != mirrorLocalMap )
+            status = S_COLOR_WHITE + "on " + rp.map;
+        else if ( ( rp.flags & 1 ) != 0 )
+            status = S_COLOR_GREEN + "racing";
+        else
+            status = S_COLOR_WHITE + "idle";
+        client.printMessage( "  " + S_COLOR_YELLOW + ( i + 1 ) + "." + S_COLOR_WHITE
+                + " [" + rp.server + S_COLOR_WHITE + "] " + rp.name + "  " + status + "\n" );
+    }
+    client.printMessage( S_COLOR_WHITE + "spec, then " + S_COLOR_YELLOW + "watch <#>"
+            + S_COLOR_WHITE + " (or chasenext) to spectate a remote player.\n" );
 
     return true;
 }

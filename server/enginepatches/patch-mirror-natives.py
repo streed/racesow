@@ -55,6 +55,12 @@ wrapper = (
     "void RS_MirrorEvent( const char *kind, const char *name, const char *text );\n"
     "int RS_MirrorRefresh( void );\n"
     "int RS_MirrorNextEvent( void );\n"
+    "// mirror bots (real fake-client slots; implementation in g_rs_mirrorbots.cpp)\n"
+    "int RS_MirrorBotAdd( const char *name, const char *clan, int r, int g, int b );\n"
+    "void RS_MirrorBotUpdate( int playerNum, float ox, float oy, float oz,"
+    " float pitch, float yaw, float roll, float vx, float vy, float vz, int flags );\n"
+    "void RS_MirrorBotRemove( int playerNum );\n"
+    "bool RS_MirrorBotIs( int playerNum );\n"
 )
 for g in STRING_GETTERS:
     wrapper += "const char *RS_Mirror%s( int i );\n" % g
@@ -107,6 +113,31 @@ wrapper += (
     "\treturn RS_MirrorNextEvent();\n"
     "}\n"
     "\n"
+    "static int asFunc_RS_MirrorBotAdd( asstring_t *name, asstring_t *clan, int r, int g, int b )\n"
+    "{\n"
+    "\treturn RS_MirrorBotAdd( name && name->buffer ? name->buffer : \"\",\n"
+    "\t\tclan && clan->buffer ? clan->buffer : \"\", r, g, b );\n"
+    "}\n"
+    "\n"
+    "static void asFunc_RS_MirrorBotUpdate( int playerNum, asvec3_t *origin, asvec3_t *angles, asvec3_t *velocity, int flags )\n"
+    "{\n"
+    "\tif( !origin || !angles || !velocity )\n"
+    "\t\treturn;\n"
+    "\tRS_MirrorBotUpdate( playerNum, origin->v[0], origin->v[1], origin->v[2],\n"
+    "\t\tangles->v[0], angles->v[1], angles->v[2],\n"
+    "\t\tvelocity->v[0], velocity->v[1], velocity->v[2], flags );\n"
+    "}\n"
+    "\n"
+    "static void asFunc_RS_MirrorBotRemove( int playerNum )\n"
+    "{\n"
+    "\tRS_MirrorBotRemove( playerNum );\n"
+    "}\n"
+    "\n"
+    "static bool asFunc_RS_MirrorBotIs( int playerNum )\n"
+    "{\n"
+    "\treturn RS_MirrorBotIs( playerNum );\n"
+    "}\n"
+    "\n"
 )
 for g in STRING_GETTERS:
     wrapper += (
@@ -149,6 +180,11 @@ for decl, func in [
     ("const String @RS_MirrorEventServer()", "EventServer"),
     ("const String @RS_MirrorEventName()", "EventName"),
     ("const String @RS_MirrorEventText()", "EventText"),
+    ("int RS_MirrorBotAdd( const String &in name, const String &in clan, int r, int g, int b )", "BotAdd"),
+    ("void RS_MirrorBotUpdate( int playerNum, const Vec3 &in origin, const Vec3 &in angles, "
+     "const Vec3 &in velocity, int flags )", "BotUpdate"),
+    ("void RS_MirrorBotRemove( int playerNum )", "BotRemove"),
+    ("bool RS_MirrorBotIs( int playerNum )", "BotIs"),
 ]:
     entries += "\t{ \"%s\", asFUNCTION(asFunc_RS_Mirror%s), NULL },\n" % (decl, func)
 

@@ -1,7 +1,9 @@
 # Racesow Discord Announcer
 
-A tiny Node.js service that watches the race database and posts a rich embed to
-a **Discord webhook** whenever a new record is set.
+A tiny Node.js service that polls the stats API and posts a rich embed to a
+**Discord webhook** whenever a new record is set. It has **no database access
+of its own** — it reads `GET /api/records` from the web service (which computes
+the margin-to-#2 and version name for it).
 
 New records are detected by race `id` (every new run gets a higher id), so the
 service just remembers the highest id it has already handled. **On first run it
@@ -22,21 +24,22 @@ For each new qualifying record it sends an embed with:
 | Variable               | Default              | Meaning                                                        |
 |------------------------|----------------------|----------------------------------------------------------------|
 | `DISCORD_WEBHOOK_URL`  | *(empty)*            | Discord webhook URL. **If unset, runs in dry-run (log-only).** |
-| `DB_PATH`              | `/data/db.sqlite`   | Path to the race database.                                      |
+| `API_URL`              | `http://web:8080`   | Base URL of the stats API (polls `<API_URL>/api/records`).     |
 | `STATE_PATH`           | `/state/announcer.json` | Where the last-seen id is persisted (use a volume).        |
 | `POLL_INTERVAL`        | `300`               | Seconds between checks (min 15).                                |
 | `ANNOUNCE_MAX_RANK`    | `1`                 | Announce records with global rank ≤ this (`1`=WRs, `3`=podiums).|
 | `MAX_PER_POLL`         | `10`                | Max embeds posted per poll (flood guard).                      |
-| `REMOTE_DB_URL`        | *(empty)*           | If set, download a fresh DB from here before each poll.        |
 | `SITE_URL`             | *(empty)*           | Base URL of the stats site, for map links in embeds.           |
 | `WEBHOOK_USERNAME`     | `Racesow`           | Display name for the webhook messages.                         |
 
 ## Run locally (dry run)
 
+Point it at a running web service (see `web/README.md`):
+
 ```bash
 cd discord
 npm install
-DB_PATH=../data/db.sqlite STATE_PATH=./announcer.json node announcer.js
+API_URL=http://127.0.0.1:8080 STATE_PATH=./announcer.json node announcer.js
 # no webhook set -> it logs the embeds it *would* post
 ```
 
@@ -47,13 +50,5 @@ docker compose up -d --build discord
 ```
 
 Set `DISCORD_WEBHOOK_URL` in `docker-compose.yml` (or an `.env` file) first.
-
-## How "new records" appear in a static snapshot
-
-The bundled `data/db.sqlite` is a point-in-time snapshot, so on its own it never
-gains new rows. Two ways to get a live feed:
-
-1. Set `REMOTE_DB_URL=http://livesow.net/race/api/db.sqlite` so the announcer
-   pulls a fresh snapshot before each poll and diffs it against the last one.
-2. Have your own race server / import pipeline update `data/db.sqlite`; the
-   announcer (and the website) pick up the changes automatically.
+The compose service already points `API_URL` at the co-located `web` service,
+so new records appear as soon as the game servers report them.

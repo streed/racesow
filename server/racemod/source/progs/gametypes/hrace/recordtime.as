@@ -249,7 +249,13 @@ void RACE_WriteTopScores()
 
 uint RACE_AddTopScore( RecordTime record, bool take_priority = true )
 {
-    uint id;
+    // UINT_MAX = "no slot": if the board is full and the record is slower
+    // than every entry, the scan below never breaks and id keeps this value.
+    // (It used to be declared uninitialized — indexing levelRecords with the
+    // garbage value threw "Index out of bounds" whenever a slower-than-#50
+    // record arrived on a full board, which the periodic API top-scores
+    // reload made a routine event instead of a rarity.)
+    uint id = UINT_MAX;
     for ( uint top = 0; top < MAX_RECORDS; top++ )
     {
         // add at the end of list
@@ -278,6 +284,10 @@ uint RACE_AddTopScore( RecordTime record, bool take_priority = true )
             break;
         }
     }
+
+    // Full board and slower than every entry: nothing to insert.
+    if ( id == UINT_MAX )
+        return UINT_MAX;
 
     bool found = false;
     uint end = MAX_RECORDS - 1;
