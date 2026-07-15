@@ -186,6 +186,12 @@ fetch_one() {
         return 0
     fi
 
+    # mktemp creates the temp file 0600; the game container reads the maps dir
+    # as its own non-root user (uid 999), so an unreadable pack silently drops
+    # out of map discovery AND fails the engine's pk3 load. Make it world-
+    # readable before it lands.
+    chmod 644 "${part}"
+
     # Flush to disk before the rename: otherwise a hard reboot in the writeback
     # window can persist the directory entry ahead of the data, stranding a
     # short nonempty file at the final name that the -s skip then trusts forever.

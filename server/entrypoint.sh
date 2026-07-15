@@ -23,6 +23,13 @@ SV_UPLOADS_BASEURL="${SV_UPLOADS_BASEURL:-}"  # client-reachable HTTP pak mirror
 INGEST_URL="${INGEST_URL:-}"                # central stats /api/ingest; empty = no direct reporting
 INGEST_TOKEN="${INGEST_TOKEN:-}"            # per-server bearer token for the ingest endpoint
 VERSION_NAME="${VERSION_NAME:-wsw 2.1}"     # game version records file under on the stats site
+# Cross-server player mirroring (UDP mesh between peered race servers).
+MIRROR_PEERS="${MIRROR_PEERS:-}"            # "hostB:44450 hostC:44450"; empty = mirroring off
+MIRROR_SECRET="${MIRROR_SECRET:-}"          # shared HMAC key (hex recommended: openssl rand -hex 24);
+                                            # empty = source-IP allowlist mode, LAN/testing only.
+                                            # Must not contain '"' or ';' (it is emitted into a cfg line).
+MIRROR_PORT="${MIRROR_PORT:-44450}"         # local mirror UDP bind port
+MIRROR_TAG="${MIRROR_TAG:-}"                # short server id shown as [TAG] in mirrored chat
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 cd "${WARSOW_DIR}"
@@ -71,8 +78,10 @@ fi
 export_pakshare() {
     [ -d /pakshare ] || return 0
     mkdir -p /pakshare/racemod 2>/dev/null || true
+    # -u: with a full map mirror this is ~12 GB of pk3s; only copy what
+    # changed so restarts don't redo the whole export every time.
     for pk in "${MOD_DIR}"/*.pk3; do
-        [ -e "${pk}" ] && cp -Lf "${pk}" /pakshare/racemod/ 2>/dev/null || true
+        [ -e "${pk}" ] && cp -uLf "${pk}" /pakshare/racemod/ 2>/dev/null || true
     done
 }
 export_pakshare
@@ -138,6 +147,75 @@ fi
 FIRST_MAP="${MAPLIST%% *}"
 : "${FIRST_MAP:=race}"
 
+# --- Mirror mesh sanity checks ------------------------------------------------
+# The peers list rides in a single generated cfg line, so it shares the
+# engine's 1024-char command buffer hazard with g_maplist above: a chopped
+# line corrupts the list and executes the tail as garbage commands. Truncate
+# at a host:port boundary long before that.
+if [ -n "${MIRROR_PEERS}" ] && [ -z "${MIRROR_TAG}" ]; then
+    echo ">> WARNING: MIRROR_PEERS is set but MIRROR_TAG is empty; player mirroring stays OFF."
+    MIRROR_PEERS=""
+fi
+
+# Each MIRROR_* value is emitted as `set rs_mirror_X "..."` and exec'd by the
+# engine. A '"', ';' or newline in a value closes the quoted token early, so
+# the tail runs as its own console command (e.g. a stray `quit` bootloops the
+# server). Reject those characters outright rather than silently corrupting
+# config — a secret in particular must survive verbatim or auth fails on every
+# packet with no obvious cause.
+if [ -n "${MIRROR_PEERS}" ]; then
+    for _mv in TAG PORT PEERS SECRET; do
+        eval "_val=\${MIRROR_${_mv}}"
+        case "${_val}" in
+            *'"'* | *';'* | *'
+'*)
+                echo ">> ERROR: MIRROR_${_mv} contains a quote, semicolon or newline, which would"
+                echo ">>        break the generated env.cfg line. Refusing to start. Use a value"
+                echo ">>        without those characters (secrets: openssl rand -hex 24)."
+                exit 1
+                ;;
+        esac
+    done
+    # A secret/tag longer than the engine's ~1000-char cfg-line budget would be
+    # silently chopped — a truncated secret then mismatches every peer with no
+    # error. Fail fast (no safe truncate-at-boundary exists for a key).
+    if [ "${#MIRROR_SECRET}" -gt 900 ]; then
+        echo ">> ERROR: MIRROR_SECRET exceeds the engine's 1024-char cfg-line buffer."
+        echo ">>        Use a short key, e.g. openssl rand -hex 24."
+        exit 1
+    fi
+    if [ "${#MIRROR_TAG}" -gt 16 ]; then
+        echo ">> ERROR: MIRROR_TAG '${MIRROR_TAG}' is too long (max 16 chars)."
+        exit 1
+    fi
+    # Source-IP allowlist mode (no shared secret) trusts any packet from a
+    # peer's IP; UDP sources are spoofable, so this is LAN/testing only. Warn
+    # loudly so it can't silently ship to internet-facing peers.
+    if [ -z "${MIRROR_SECRET}" ]; then
+        echo ">> WARNING: MIRROR_PEERS is set but MIRROR_SECRET is empty."
+        echo ">>          Mirroring will run in source-IP allowlist mode (no authentication)."
+        echo ">>          This is safe only on a trusted/LAN network. Set MIRROR_SECRET"
+        echo ">>          (shared across all peers) for any internet-facing deployment."
+    fi
+fi
+
+MIRROR_PEERS_MAX=950
+if [ "${#MIRROR_PEERS}" -gt "${MIRROR_PEERS_MAX}" ]; then
+    full_count=$(echo "${MIRROR_PEERS}" | wc -w)
+    MIRROR_PEERS="$(echo "${MIRROR_PEERS}" | awk -v max="${MIRROR_PEERS_MAX}" '{
+        out = ""
+        for (i = 1; i <= NF; i++) {
+            cand = (out == "" ? $i : out " " $i)
+            if (length(cand) > max) break
+            out = cand
+        }
+        print out
+    }')"
+    kept_count=$(echo "${MIRROR_PEERS}" | wc -w)
+    echo ">> WARNING: MIRROR_PEERS lists ${full_count} peers but only ${kept_count} fit the"
+    echo ">>          engine's 1024-char cfg-line buffer; the rest are dropped."
+fi
+
 echo "=============================================================="
 echo " Warsow 2.1.2 dedicated race server"
 echo "   hostname   : ${SV_HOSTNAME}"
@@ -145,6 +223,9 @@ echo "   gametype   : ${G_GAMETYPE}   (fs_game=${FS_GAME})"
 echo "   maxclients : ${SV_MAXCLIENTS}   public=${SV_PUBLIC}   port=${SV_PORT}"
 echo "   first map  : ${FIRST_MAP}"
 echo "   map pool   : ${MAPLIST:-<none found>}"
+if [ -n "${MIRROR_PEERS}" ]; then
+    echo "   mirror     : tag=${MIRROR_TAG} port=${MIRROR_PORT} peers=${MIRROR_PEERS}"
+fi
 echo "=============================================================="
 
 # --- Environment-derived cvars ------------------------------------------------
@@ -175,6 +256,18 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         echo "set rs_api_url \"${INGEST_URL}\""
         echo "set rs_api_version \"${VERSION_NAME}\""
         [ -n "${INGEST_TOKEN}" ] && echo "set rs_api_token \"${INGEST_TOKEN}\""
+        # Live top-scores queries hit the same API host (hrace/apitop.as):
+        # in-game `top`, HUD record lines and record announcements then track
+        # the central database, not just this server's local files.
+        echo "set rs_api_top_url \"${INGEST_URL%/api/ingest}/api/game/topscores\""
+    fi
+    # Cross-server player mirroring: the gametype reads these and drives the
+    # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.
+    if [ -n "${MIRROR_PEERS}" ]; then
+        echo "set rs_mirror_tag \"${MIRROR_TAG}\""
+        echo "set rs_mirror_port \"${MIRROR_PORT}\""
+        echo "set rs_mirror_peers \"${MIRROR_PEERS}\""
+        [ -n "${MIRROR_SECRET}" ] && echo "set rs_mirror_secret \"${MIRROR_SECRET}\""
     fi
 } > "${ENV_CFG}"
 
@@ -193,14 +286,31 @@ set -- \
 set -- "$@" +map "${FIRST_MAP}"
 
 # --- Restart loop -----------------------------------------------------------
-trap 'echo "Shutting down."; exit 0' INT TERM
+# The engine runs as a background child with its PID recorded so the TERM
+# trap can FORWARD the signal: this script is PID 1, and without forwarding,
+# `docker stop` would TERM only the shell — the engine never shuts down
+# cleanly (no final topscores write, no rs_api queue drain) and gets
+# SIGKILLed when the grace period expires.
+server_pid=""
+shutdown() {
+    echo "Shutting down."
+    if [ -n "${server_pid}" ]; then
+        kill -TERM "${server_pid}" 2>/dev/null || true
+        wait "${server_pid}" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap shutdown INT TERM
 while true; do
     export_pakshare
     echo ">> launching wsw_server.x86_64 $*"
     # Force line-buffered stdout/stderr. In a detached container the engine's
     # stdout is a pipe, so glibc block-buffers it and `docker logs` looks frozen
     # mid-startup. stdbuf keeps output flowing even if no TTY is allocated.
-    stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" || true
+    stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" &
+    server_pid=$!
+    wait "${server_pid}" || true
+    server_pid=""
     echo ">> server exited, restarting in 5s..."
     sleep 5
 done

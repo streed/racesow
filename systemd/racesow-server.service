@@ -1,0 +1,26 @@
+# Racesow Warsow race game server (server/ docker compose).
+#
+# Template: __RACESOW_DIR__ / __RACESOW_USER__ are substituted by
+# systemd/install.sh. Ordered after racesow-web because the game server
+# joins the web stack's compose network (racesow_default) to reach
+# http://web:8080/api/ingest.
+#
+# To also run the HTTP pak mirror, set COMPOSE_PROFILES=httpdl in
+# server/.env — compose picks it up without changing this unit.
+[Unit]
+Description=Racesow Warsow race game server (docker compose)
+Requires=docker.service racesow-web.service
+After=docker.service network-online.target racesow-web.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=__RACESOW_USER__
+WorkingDirectory=__RACESOW_DIR__/server
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose stop
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

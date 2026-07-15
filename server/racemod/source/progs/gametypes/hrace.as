@@ -179,6 +179,10 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_Help( client, cmdString, argsString, argc );
     else if ( cmdString == "rules")
         return Cmd_Rules( client, cmdString, argsString, argc );
+    else if ( cmdString == "who" )
+        return Cmd_MirrorWho( client, cmdString, argsString, argc );
+    else if ( cmdString == "watch" )
+        return Cmd_MirrorWatch( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -301,6 +305,22 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
         // ch : begin fetching records over interweb
         // MM_FetchRaceRecords( client.getEnt() );
     }
+    else if ( score_event == "connect" )
+    {
+        // fired by p_client.cpp ClientConnect on GENUINE connects only (not the
+        // soft reconnect every client does on a map change), so the mirror
+        // "connected" notice is announced once per real join. netname is set
+        // just before this event, so client.name is valid here.
+        if ( @client != null )
+            RACE_MirrorPlayerJoined( client );
+    }
+    else if ( score_event == "disconnect" )
+    {
+        // fired by p_client.cpp ClientDisconnect; announce the leave to the
+        // mirror mesh so peers drop the ghost instantly instead of aging it out
+        if ( @client != null )
+            RACE_MirrorPlayerLeft( client );
+    }
     else if ( score_event == "userinfochanged" )
     {
         if ( @client != null )
@@ -406,6 +426,14 @@ void GT_ThinkRules()
 {
     if ( match.scoreLimitHit() || match.timeLimitHit() || match.suddenDeathFinished() )
         match.launchState( match.getState() + 1 );
+
+    // before the postmatch early-return, so cross-server chat/ghosts keep
+    // flowing while the scoreboard is up
+    RACE_MirrorThink();
+
+    // live top scores from the central API (no-op when rs_api_top_url is
+    // empty); also before the early-return so records stay current postmatch
+    RACE_ApiTopThink();
 
     if ( match.getState() >= MATCH_STATE_POSTMATCH )
         return;
@@ -637,6 +665,7 @@ void GT_MatchStateStarted()
 // the gametype is shutting down cause of a match restart or map change
 void GT_Shutdown()
 {
+    RACE_MirrorShutdown();
 }
 
 // The map entities have just been spawned. The level is initialized for
@@ -672,6 +701,8 @@ void GT_SpawnGametype()
         levelRecords[i].setupArrays( numCheckpoints + 1 );
 
     RACE_LoadTopScores();
+
+    RACE_MirrorSpawnGametype();
 }
 
 float GT_VotePower( Client@ client, String& votename, bool voted, bool yes )
@@ -697,7 +728,7 @@ void GT_InitGametype()
     gametype.author = "Warsow Development Team";
 
     // Pure-index a (silent) sound that lives inside the client UI pak
-    // (racemod_ui_v4_local.pk3, built from server/clientdata). This puts the
+    // (racemod_ui_v5_local.pk3, built from server/clientdata). This puts the
     // pak on the sv_pure list as a *referenced* file, so connecting clients
     // download it from this server over the game connection. The pak must NOT
     // be *pure-named: clients only fetch explicit-pure paks from the official
@@ -797,6 +828,8 @@ void GT_InitGametype()
     G_RegisterCommand( "help" );
     G_RegisterCommand( "rules" );
 
+    RACE_MirrorInit(); // registers "who" and "watch"
+
     // add votes
     G_RegisterCallvote( "randmap", "<* | pattern>", "string", "Changes to a random map" );
 
@@ -804,8 +837,9 @@ void GT_InitGametype()
     practiceModeMsg = G_RegisterHelpMessage(S_COLOR_CYAN + "Practicing");
     defaultMsg = G_RegisterHelpMessage(" ");
 
-    // msc: force pk3 download
-    G_SoundIndex( "racemod_ui_v3.txt", true );
+    // msc: force pk3 download — the marker version MUST match the pak built
+    // in server/Dockerfile (asserted there at build time)
+    G_SoundIndex( "racemod_ui_v5.txt", true );
     G_SoundIndex( "missing_tex.txt", true );
 
     demoRecording = false;

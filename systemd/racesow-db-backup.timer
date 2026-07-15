@@ -1,0 +1,12 @@
+# Nightly Racesow database backup (see scripts/backup-db.sh).
+# Persistent=true catches up a run missed while the box was off.
+[Unit]
+Description=Nightly Racesow race-database backup
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

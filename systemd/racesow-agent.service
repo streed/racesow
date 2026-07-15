@@ -1,0 +1,25 @@
+# Racesow game-server AGENT (docker-compose.agent.yml): game server only,
+# pushing records to a remote central stats site. Alternative to the
+# racesow-web + racesow-server pair — do not enable both (same container
+# name); Conflicts= makes systemd enforce that.
+#
+# Template: __RACESOW_DIR__ / __RACESOW_USER__ are substituted by
+# systemd/install.sh.
+[Unit]
+Description=Racesow game-server agent (docker compose, no website)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+Conflicts=racesow-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=__RACESOW_USER__
+WorkingDirectory=__RACESOW_DIR__
+ExecStart=/usr/bin/docker compose -f docker-compose.agent.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f docker-compose.agent.yml stop
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

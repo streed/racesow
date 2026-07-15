@@ -93,5 +93,67 @@ wait "${HARNESS_PID}"
 step "phase B: asserting the retried finish landed (new WR, updated perfect run)"
 node "${HERE}/assert.mjs" "${BASE}" phaseB
 
+# --- Phase C: live top scores back into the game -----------------------------
+# The reverse direction: RS_ApiFetchTop pulls /api/game/topscores and swaps it
+# into the map's topscores file, byte-format identical to what the gametype's
+# RACE_LoadTopScores parses — records reported by ANY server come back to ALL.
+step "phase C: compiling top-fetch harness (real g_rs_api.cpp)"
+g++ -std=c++11 -Wall -Wextra -o "${TMP}/topfetch" \
+    "${HERE}/topfetch_harness.cpp" \
+    "${ROOT}/server/enginepatches/g_rs_api.cpp" \
+    -lcurl -lpthread
+
+step "phase C: fetching live top scores for 'testrace' through the native"
+mkdir -p "${TMP}/wsw/racemod/topscores/race"
+WARSOW_DIR="${TMP}/wsw" FS_GAME="racemod" \
+    "${TMP}/topfetch" "${BASE}/api/game/topscores" "" testrace 10
+
+TOPFILE="${TMP}/wsw/racemod/topscores/race/testrace.txt"
+[ -s "${TOPFILE}" ] || { echo "FAIL: ${TOPFILE} not written" >&2; exit 1; }
+head -1 "${TOPFILE}" | grep -qx "//testrace top scores" \
+    || { echo "FAIL: bad header" >&2; cat "${TOPFILE}"; exit 1; }
+# Exact loader format ("time" "name" "numSectors" "cp..." with absolute sector
+# times): Wave's phase-B 47.0 WR first, then Nova's 48.0 PR.
+grep -qF '"47000" "^4Wa^5ve" "2" "9500" "27000" ' "${TOPFILE}" \
+    || { echo "FAIL: WR line missing or misformatted" >&2; cat "${TOPFILE}"; exit 1; }
+grep -qF '"48000" "^1No^7va" "2" "10000" "28000" ' "${TOPFILE}" \
+    || { echo "FAIL: PR line missing or misformatted" >&2; cat "${TOPFILE}"; exit 1; }
+# best-per-player only: Nova's slower 52.0 / 50.0 attempts must not appear
+[ "$(grep -cF '"^1No^7va"' "${TOPFILE}")" = "1" ] \
+    || { echo "FAIL: duplicate rows for one player" >&2; cat "${TOPFILE}"; exit 1; }
+sed 's/^/   /' "${TOPFILE}"
+
+step "phase C: unknown map must fail the poll and write nothing"
+if WARSOW_DIR="${TMP}/wsw" FS_GAME="racemod" \
+    "${TMP}/topfetch" "${BASE}/api/game/topscores" "" nosuchmap 10; then
+    echo "FAIL: fetch for an unknown map reported success" >&2; exit 1
+fi
+[ ! -e "${TMP}/wsw/racemod/topscores/race/nosuchmap.txt" ] \
+    || { echo "FAIL: file written for an unknown map" >&2; exit 1; }
+
+step "phase C: GET retry — fetch starts against a DOWN server, must recover"
+kill "${SERVER_PID}"
+wait "${SERVER_PID}" 2>/dev/null || true
+SERVER_PID=""
+rm -f "${TOPFILE}"
+WARSOW_DIR="${TMP}/wsw" FS_GAME="racemod" \
+    "${TMP}/topfetch" "${BASE}/api/game/topscores" "" testrace 15 &
+TOPFETCH_PID=$!
+sleep 0.5
+start_server
+wait "${TOPFETCH_PID}" \
+    || { echo "FAIL: fetch did not recover once the server came back" >&2; exit 1; }
+grep -qF '"47000" "^4Wa^5ve" "2" "9500" "27000" ' "${TOPFILE}" \
+    || { echo "FAIL: recovered fetch wrote wrong content" >&2; cat "${TOPFILE}"; exit 1; }
+
+step "phase C: retry exhaustion — unreachable API must signal -1, write nothing"
+rc=0
+WARSOW_DIR="${TMP}/wsw" FS_GAME="racemod" \
+    "${TMP}/topfetch" "http://127.0.0.1:1/api/game/topscores" "" ghostmap 20 || rc=$?
+[ "${rc}" = "2" ] \
+    || { echo "FAIL: expected exhaustion (exit 2), got rc=${rc}" >&2; exit 1; }
+[ ! -e "${TMP}/wsw/racemod/topscores/race/ghostmap.txt" ] \
+    || { echo "FAIL: file written despite unreachable API" >&2; exit 1; }
+
 echo ""
 echo "OK: end-to-end pipeline test passed"

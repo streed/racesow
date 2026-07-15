@@ -262,8 +262,13 @@ uint RACE_AddTopScore( RecordTime record, bool take_priority = true )
         // check for same ident
         if ( record.ident.equals( levelRecords[ top ].ident, !take_priority ) )
         {
-            // check if old time was better
-            if ( record.getFinishTime() > levelRecords[ top ].getFinishTime() )
+            // check if old time was better OR EQUAL: an equal-time re-add of
+            // the same ident must be a no-op, or reloading the topscores file
+            // over a populated list (the live API refresh in apitop.as does
+            // this every interval) duplicates every record — the insert scan
+            // below is strictly-less so the copy lands after this row, where
+            // the forward-only duplicate sweep never sees it.
+            if ( record.getFinishTime() >= levelRecords[ top ].getFinishTime() )
                 return UINT_MAX;
         }
         // insert into correct spot

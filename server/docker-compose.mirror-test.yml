@@ -1,0 +1,86 @@
+# Local 3-node mirror mesh for developing/verifying cross-server player
+# mirroring before any regional deployment. Standalone on purpose (the base
+# compose file's fixed container_name/ports don't override cleanly):
+#
+#   docker compose -f docker-compose.mirror-test.yml up --build
+#
+# Connect one Warsow client to localhost:44403 (A) and another to
+# localhost:44401 (B): chat relays with [A]/[B] prefixes, /who lists all
+# rosters, players on the other server show up as translucent ghosts (all
+# three nodes boot into the same map), and spectators can /watch them.
+# (A publishes 44403 because the main compose's warsow-race usually holds
+# 44400 on a dev box.)
+#
+# The mirror ports are container-to-container over the compose network via
+# service DNS — nothing published except warsow-a's, which lets a host-side
+# harness/script poke the wire protocol (see e2e/mirror_harness.cpp).
+#
+# Throwaway by design: no state volumes, no stats ingest, test-only secret.
+#
+# Explicit project name so this stack does NOT collide with the main
+# server/docker-compose.yml (both live in server/, which would otherwise
+# derive the same project name "server" — then `up/down --remove-orphans` on
+# either file would delete the other stack's containers, including production
+# warsow-race).
+name: racesow-mirror-test
+
+x-mirror-common: &mirror-common
+  image: warsow-race:2.1.2
+  tty: true
+  restart: "no"
+  # one shared race map (mirror-test-maps/, see below) so every node boots
+  # into the same map and ghosts are visible; without it the only installed
+  # map is the menu-background "ui"
+  volumes:
+    - ./mirror-test-maps:/warsow/maps_extra:ro
+  environment: &mirror-env
+    SV_PUBLIC: "0"
+    SV_MAXCLIENTS: "8"
+    MAP_ROTATION: "0"
+    MIRROR_PORT: "44450"
+    MIRROR_SECRET: "mirror-test-local-only"
+    # test-only; lets scripts drive a node's console (e.g. addbot on B)
+    RCON_PASSWORD: "mirrortest"
+    # log received events + roster summaries to the console (rs_mirror(as):
+    # lines) so broadcast can be verified from docker logs without clients
+    EXTRA_ARGS: "+set rs_mirror_debug 1"
+
+services:
+  warsow-a:
+    <<: *mirror-common
+    build: .
+    container_name: warsow-mirror-a
+    ports:
+      - "44403:44400/udp"
+      - "44450:44450/udp" # host-side protocol tests only
+    # lets MIRROR_PEERS_A include a listener on the docker host, so headless
+    # wire checks can receive real keepalives (host.docker.internal:PORT)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      <<: *mirror-env
+      SV_HOSTNAME: "Mirror Test A"
+      MIRROR_TAG: "A"
+      MIRROR_PEERS: "${MIRROR_PEERS_A:-warsow-b:44450 warsow-c:44450}"
+
+  warsow-b:
+    <<: *mirror-common
+    container_name: warsow-mirror-b
+    ports:
+      - "44401:44400/udp"
+    environment:
+      <<: *mirror-env
+      SV_HOSTNAME: "Mirror Test B"
+      MIRROR_TAG: "B"
+      MIRROR_PEERS: "warsow-a:44450 warsow-c:44450"
+
+  warsow-c:
+    <<: *mirror-common
+    container_name: warsow-mirror-c
+    ports:
+      - "44402:44400/udp"
+    environment:
+      <<: *mirror-env
+      SV_HOSTNAME: "Mirror Test C"
+      MIRROR_TAG: "C"
+      MIRROR_PEERS: "warsow-a:44450 warsow-b:44450"

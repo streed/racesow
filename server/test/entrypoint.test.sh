@@ -82,5 +82,38 @@ run_entrypoint "${BOX2}"
 CFG2="${BOX2}/racemod/configs/server/env.cfg"
 [ -f "${CFG2}" ] || fail "env.cfg was not generated (plain case)"
 grep -q 'rs_api' "${CFG2}" && fail "rs_api_* must be absent when INGEST_URL is unset"
+grep -q 'rs_mirror' "${CFG2}" && fail "rs_mirror_* must be absent when MIRROR_PEERS is unset"
+
+# --- Case 3: mesh configuration -> rs_mirror_* cvars in env.cfg ---------------
+BOX3="$(sandbox mesh)"
+run_entrypoint "${BOX3}" \
+    MIRROR_TAG="EU" \
+    MIRROR_PORT="44450" \
+    MIRROR_PEERS="us.example.com:44450 au.example.com:44450" \
+    MIRROR_SECRET="deadbeefcafe"
+
+CFG3="${BOX3}/racemod/configs/server/env.cfg"
+grep -qx 'set rs_mirror_tag "EU"'                                        "${CFG3}" || fail "rs_mirror_tag missing"
+grep -qx 'set rs_mirror_port "44450"'                                    "${CFG3}" || fail "rs_mirror_port missing"
+grep -qx 'set rs_mirror_peers "us.example.com:44450 au.example.com:44450"' "${CFG3}" || fail "rs_mirror_peers missing"
+grep -qx 'set rs_mirror_secret "deadbeefcafe"'                           "${CFG3}" || fail "rs_mirror_secret missing"
+# Secret must not leak onto the command line (visible in `ps`).
+grep -q 'deadbeefcafe' "${BOX3}/launch-args.txt" && fail "mirror secret leaked onto the command line"
+
+# --- Case 4: MIRROR_PEERS but no MIRROR_TAG -> mirroring stays off ------------
+BOX4="$(sandbox mesh-notag)"
+run_entrypoint "${BOX4}" MIRROR_PEERS="peer:44450"
+grep -q 'rs_mirror' "${BOX4}/racemod/configs/server/env.cfg" && fail "mirroring must stay off without MIRROR_TAG"
+
+# --- Case 5: injection char in a MIRROR_* value -> refuse to start ------------
+# A '"'/';'/newline would escape the generated `set rs_mirror_* "..."` line, so
+# the entrypoint must abort (the fake server must never launch).
+BOX5="$(sandbox mesh-inject)"
+box5="${BOX5}"
+env -i PATH="${PATH}" HOME="${HOME}" WARSOW_DIR="${box5}" \
+    MIRROR_TAG="EU" MIRROR_PEERS="peer:44450" MIRROR_SECRET='pw;quit' \
+    timeout 3 sh "${ENTRYPOINT}" > "${box5}/entrypoint.log" 2>&1 || true
+[ -f "${box5}/launch-args.txt" ] && fail "entrypoint launched despite an injection char in MIRROR_SECRET"
+grep -qi 'ERROR' "${box5}/entrypoint.log" || fail "expected an error message for the injection char"
 
 echo "OK: entrypoint contract tests passed"

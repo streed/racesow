@@ -60,6 +60,11 @@ function rankClass(r) {
   return r === 1 ? "rank-1" : r === 2 ? "rank-2" : r === 3 ? "rank-3" : "";
 }
 
+/* External link to a map's page on padpork.org (map downloads/info). */
+function padporkUrl(mapName) {
+  return "https://padpork.org/maps/" + encodeURIComponent(mapName);
+}
+
 function setActiveNav(path) {
   document.querySelectorAll("nav.main a").forEach((a) => {
     const target = a.getAttribute("data-nav");
@@ -115,7 +120,7 @@ async function viewOverview() {
     </div>
 
     <div class="grid-2">
-      <div class="panel">
+      <div class="panel hof">
         <h3><span class="dot"></span> Hall of Fame</h3>
         <div class="tscroll"><table class="data">
           <thead><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num">WRs</th><th class="num">Maps</th></tr></thead>
@@ -163,10 +168,10 @@ async function viewOverview() {
         </div>
         <div class="panel">
           <h3><span class="dot"></span> Most-Raced Maps</h3>
-          <div class="tscroll"><table class="data">
+          <div class="tscroll"><table class="data most-raced">
             <thead><tr><th>Map</th><th class="num">Records</th><th class="num">Finishes</th></tr></thead>
             <tbody>
-              ${d.topMaps.slice(0, 10).map((m) => `
+              ${d.topMaps.map((m) => `
                 <tr class="clickable" data-nav="#/map/${m.id}">
                   <td class="mapname">${esc(m.name)}</td>
                   <td class="num">${fmtNum(m.records != null ? m.records : m.races)}</td>
@@ -193,6 +198,30 @@ async function viewOverview() {
         </div>` : ""}
       </div>
     </div>`;
+
+  // Fill the Hall of Fame to exactly the right column's height: the API
+  // sends more rows than ever fit and the excess is trimmed against the
+  // measured layout, so the panel ends flush — no scrollbar, no dead gap —
+  // whatever the recent/servers panels happen to contain. (In the stacked
+  // single-column layout the right column sits below, so nothing trims.)
+  // The top-20 Hall of Fame is the fixed reference; the right column trims
+  // trailing Most-Raced Maps rows (served with spares) until it ends flush
+  // with it. Two-column layout only — stacked columns need no matching.
+  // NB: measure the right column's last PANEL, not the column div — the grid
+  // stretches the column container to the row height, so the container's own
+  // bottom never moves as rows are removed.
+  if (window.matchMedia("(min-width: 821px)").matches) {
+    const hof = app.querySelector(".panel.hof");
+    const rightEnd = hof && hof.nextElementSibling && hof.nextElementSibling.lastElementChild;
+    const mostRaced = app.querySelector("table.most-raced tbody");
+    if (hof && rightEnd && mostRaced) {
+      const hofBottom = hof.getBoundingClientRect().bottom;
+      const rows = [...mostRaced.querySelectorAll("tr")];
+      while (rows.length > 3 && rightEnd.getBoundingClientRect().bottom > hofBottom + 2) {
+        rows.pop().remove();
+      }
+    }
+  }
 }
 
 /* unix seconds -> "3m ago" / "2h ago" / "5d ago" */
@@ -248,7 +277,9 @@ async function viewMaps(params) {
         <tbody>
           ${data.rows.map((m) => `
             <tr class="clickable" data-nav="#/map/${m.id}">
-              <td class="mapname">${esc(m.name)}</td>
+              <td class="mapname">${esc(m.name)}
+                <a class="extlink" href="${padporkUrl(m.name)}" target="_blank" rel="noopener external" title="${esc(m.name)} on padpork.org">↗</a>
+              </td>
               <td class="num">${fmtNum(m.records != null ? m.records : m.races)}</td>
               <td class="num">${fmtNum(m.finishes != null ? m.finishes : m.races)}</td>
               <td class="num"><span class="time">${m.wr_time != null ? fmtTime(m.wr_time) : "—"}</span></td>
@@ -368,20 +399,22 @@ async function viewMap(id) {
     ${perfectHtml}
 
     <div class="page-title">${esc(d.name)}</div>
-    <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board</p>
+    <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board
+      · <a class="extlink" href="${padporkUrl(d.name)}" target="_blank" rel="noopener external">padpork.org ↗</a></p>
 
     <div class="table-wrap"><div class="tscroll">
       <table class="data">
-        <thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">Behind</th><th>Version</th></tr></thead>
+        <thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">Behind</th><th class="num">Gap</th><th>Version</th></tr></thead>
         <tbody>
-          ${d.leaderboard.map((r) => `
+          ${d.leaderboard.map((r, i) => `
             <tr class="clickable" data-nav="#/player/${r.playerId}">
               <td class="rankcell ${rankClass(r.pos)}">${r.pos}</td>
               <td>${wname(r.name)}</td>
               <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
               <td class="num"><span class="time">${r.pos === 1 ? "—" : "+" + fmtTime(r.time - d.leaderboard[0].time)}</span></td>
+              <td class="num"><span class="time muted">${i === 0 ? "—" : "+" + fmtTime(r.time - d.leaderboard[i - 1].time)}</span></td>
               <td><span class="pill ${r.version === 1 ? "v1" : ""}">${esc(r.versionName || "")}</span></td>
-            </tr>`).join("") || `<tr><td colspan="5" class="empty">No runs recorded.</td></tr>`}
+            </tr>`).join("") || `<tr><td colspan="6" class="empty">No runs recorded.</td></tr>`}
         </tbody>
       </table>
     </div></div>`;
@@ -442,6 +475,91 @@ async function viewPlayer(id, params) {
     </div>${pager(state, rec, `#/player/${id}`)}</div>`;
 
   wireSort(`#/player/${id}`, state, ["map", "time", "rank"]);
+
+  // Show the shareable path-form URL (server-rendered OG tags for Discord/
+  // social unfurls live at /player/<id>, not at the hash route). Only the
+  // plain view rewrites — sorted/paged views keep their hash permalinks.
+  if (!location.hash || location.hash === `#/player/${id}`) {
+    history.replaceState(null, "", `/player/${d.id}`);
+  }
+}
+
+/* ------------------------------- live view ------------------------------- */
+/* Auto-refreshing "who's in the servers right now" page. The backend polls
+   the game servers over UDP on its own cadence; we just re-fetch its cached
+   snapshot while the tab is visible. */
+const LIVE_REFRESH_MS = 5000;
+let liveTimer = null;
+
+function stopLiveRefresh() {
+  clearInterval(liveTimer);
+  liveTimer = null;
+}
+
+function liveServerCard(s) {
+  const head = `
+    <h3>
+      <span class="dot ${s.online ? "teal" : ""}"></span>
+      ${esc(s.name)}
+      <span class="pill ${s.online ? "ok" : ""}">${s.online ? "online" : "offline"}</span>
+      ${s.online && s.maxclients ? `<span class="live-count">${s.players.length}/${s.maxclients}</span>` : ""}
+    </h3>`;
+  if (!s.online) {
+    return `<div class="panel live-srv off">${head}
+      <div class="muted">Not responding to queries right now.</div></div>`;
+  }
+  const meta = `
+    <div class="live-meta">
+      ${s.hostname ? wname(s.hostname) : ""}
+      ${s.map ? `<span class="live-map ${s.mapId ? "clickable" : ""}" ${s.mapId ? `data-nav="#/map/${s.mapId}"` : ""}>▸ ${esc(s.map)}</span>` : ""}
+      ${s.address ? `<span class="live-addr mono">connect ${esc(s.address)}</span>` : ""}
+    </div>`;
+  const players = s.players.length
+    ? `<table class="data">
+        <thead><tr><th>Player</th><th class="num">Ping</th></tr></thead>
+        <tbody>
+          ${s.players.map((p) => `
+            <tr class="clickable" data-nav="#/players?q=${encodeURIComponent(p.simplified)}">
+              <td>${wname(p.name)}</td>
+              <td class="num">${fmtNum(p.ping)}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>`
+    : `<div class="muted live-empty">Server is empty — hop in and set a record.</div>`;
+  return `<div class="panel live-srv">${head}${meta}${players}</div>`;
+}
+
+async function renderLive() {
+  const d = await api("/live");
+  const online = d.servers.filter((s) => s.online);
+  const total = online.reduce((n, s) => n + s.players.length, 0);
+  const html = `
+    <div class="page-title">LIVE <span class="livedot big"></span></div>
+    <p class="page-sub">
+      ${d.servers.length
+        ? `${total} player${total === 1 ? "" : "s"} in game across ${online.length} of ${d.servers.length} server${d.servers.length === 1 ? "" : "s"}`
+        : "Who's racing right now, on this server and every server feeding records here."}
+      ${d.updatedAt ? ` · updated ${fmtAgo(d.updatedAt)}` : ""}
+    </p>
+    ${d.servers.length
+      ? `<div class="live-grid">${d.servers.map(liveServerCard).join("")}</div>`
+      : `<div class="empty">No live-enabled servers yet.<br><small>The site admin can add one with <span class="mono">node admin.js address &lt;serverId&gt; &lt;host:port&gt;</span>.</small></div>`}`;
+  // Only touch the DOM when something changed — no 5s flicker.
+  if (app.dataset.liveHtml !== html) {
+    app.dataset.liveHtml = html;
+    app.innerHTML = html;
+  }
+}
+
+async function viewLive() {
+  loading();
+  delete app.dataset.liveHtml;
+  await renderLive();
+  stopLiveRefresh();
+  liveTimer = setInterval(() => {
+    if (document.hidden || parseHash().path !== "/live") return;
+    renderLive().catch(() => {}); // transient fetch errors: keep last snapshot
+  }, LIVE_REFRESH_MS);
 }
 
 /* --------------------------- shared widgets ------------------------------ */
@@ -491,8 +609,10 @@ function wireFilter(inputId, base, state) {
   el.addEventListener("input", () => {
     clearTimeout(timer);
     timer = setTimeout(() => {
-      go(base + buildQuery({ q: el.value.trim(), sort: state.sort, order: state.order, offset: 0 }));
-    }, 250);
+      const q = el.value.trim();
+      if (q === (state.q || "")) return; // unchanged -> no refetch/re-render
+      go(base + buildQuery({ q, sort: state.sort, order: state.order, offset: 0 }));
+    }, 350);
   });
   // keep focus + caret after re-render
   const v = el.value;
@@ -504,14 +624,23 @@ function wireFilter(inputId, base, state) {
 function initGlobalSearch() {
   const input = document.getElementById("gsearch");
   const box = document.getElementById("gresults");
+  // Debounced + cancellable: one in-flight request at a time (typing aborts
+  // the previous fetch, so fast typing can't stack requests or render a
+  // stale result over a newer one), and single characters never query — a
+  // 1-char LIKE scan is the most expensive search the API can run.
   let timer;
+  let inflight = null;
   input.addEventListener("input", () => {
     clearTimeout(timer);
     const q = input.value.trim();
-    if (!q) { box.classList.remove("show"); box.innerHTML = ""; return; }
+    if (q.length < 2) { box.classList.remove("show"); box.innerHTML = ""; inflight?.abort(); return; }
     timer = setTimeout(async () => {
       try {
-        const d = await api("/search?q=" + encodeURIComponent(q));
+        inflight?.abort();
+        inflight = new AbortController();
+        const res = await fetch("/api/search?q=" + encodeURIComponent(q), { signal: inflight.signal });
+        if (!res.ok) return;
+        const d = await res.json();
         let html = "";
         if (d.players.length) {
           html += `<div class="rgroup-title">Players</div>`;
@@ -529,8 +658,8 @@ function initGlobalSearch() {
         }
         box.innerHTML = html || `<div class="ritem"><small>No matches.</small></div>`;
         box.classList.add("show");
-      } catch (e) { /* ignore */ }
-    }, 200);
+      } catch (e) { /* aborted or network error — ignore */ }
+    }, 300);
   });
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && input.value.trim()) {
@@ -547,6 +676,10 @@ function initGlobalSearch() {
 /* ------------------------------ dispatch --------------------------------- */
 // Delegated navigation for any [data-nav] element.
 document.addEventListener("click", (e) => {
+  // Real links (e.g. the padpork ↗ chips) inside clickable rows keep their
+  // native behaviour instead of being hijacked by the row's data-nav.
+  const link = e.target.closest("a[href]");
+  if (link && !link.hasAttribute("data-nav")) return;
   const el = e.target.closest("[data-nav]");
   if (el) {
     e.preventDefault();
@@ -558,13 +691,23 @@ document.addEventListener("click", (e) => {
 });
 
 async function router() {
-  const { path, params } = parseHash();
+  stopLiveRefresh();
+  let { path, params } = parseHash();
+  // Path-form URLs (/player/5 — the shareable form whose OG tags unfurl in
+  // Discord/social) route like their hash equivalents; hash navigation away
+  // from one normalizes the address bar back to hash form.
+  if (!location.hash && location.pathname !== "/") {
+    path = location.pathname;
+  } else if (location.hash && location.pathname !== "/") {
+    history.replaceState(null, "", "/" + location.hash);
+  }
   setActiveNav(path);
   window.scrollTo(0, 0);
   try {
     if (path === "/") await viewOverview();
     else if (path === "/maps") await viewMaps(params);
     else if (path === "/players") await viewPlayers(params);
+    else if (path === "/live") await viewLive();
     else if (path.startsWith("/map/")) await viewMap(parseInt(path.split("/")[2], 10));
     else if (path.startsWith("/player/")) await viewPlayer(parseInt(path.split("/")[2], 10), params);
     else app.innerHTML = `<div class="empty">Page not found.</div>`;

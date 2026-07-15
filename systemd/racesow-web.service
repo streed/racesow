@@ -1,0 +1,26 @@
+# Racesow stats website + Discord announcer (repo-root docker compose).
+#
+# Template: __RACESOW_DIR__ / __RACESOW_USER__ are substituted by
+# systemd/install.sh. The containers keep restart: unless-stopped, so Docker
+# handles crashes; this unit makes boot-time bring-up explicit, orders the
+# game server after the web stack (it joins this project's network), and
+# gives you `systemctl status racesow-web`.
+[Unit]
+Description=Racesow stats site + Discord announcer (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=__RACESOW_USER__
+WorkingDirectory=__RACESOW_DIR__
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+# stop, not down: down would remove the compose network the game server is
+# attached to.
+ExecStop=/usr/bin/docker compose stop
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

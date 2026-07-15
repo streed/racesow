@@ -47,6 +47,11 @@ Git-LFS pull, no collector needed on your side. A local
 To run a real competitive map pool, drop `.pk3` map packs into `server/maps/`
 and list them in `server/configs/mappool.txt` (see `server/README.md`).
 
+Running **several regional servers**? They can also form a peer-to-peer
+**mesh** so players on one see and chat with players on the others (ghosts on
+the same map, cross-server chat, `/who`, `/watch`). This is independent of the
+stats feed above — see **Cross-server player mirroring** in `server/README.md`.
+
 ## 3. Basic tier — a stock, unmodified racemod server (no fork)
 
 Already running a normal Warsow race server (DenMSC or hettoo `hrace`)? You can
@@ -92,6 +97,7 @@ Three layers, all runnable on a dev box (node ≥ 18, g++, libcurl headers):
 cd web && npm test                    # DB semantics + HTTP API (fresh SQLite per test)
 sh server/test/entrypoint.test.sh     # env vars -> env.cfg -> launch-args contract
 sh e2e/run.sh                         # the REAL g_rs_api.cpp -> live server.js -> API
+sh e2e/mirror_fuzz_run.sh             # mesh parser vs ~300k hostile datagrams (ASan+UBSan)
 ```
 
 The e2e compiles `server/enginepatches/g_rs_api.cpp` into a harness that calls

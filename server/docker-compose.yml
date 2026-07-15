@@ -17,14 +17,29 @@ services:
     # appears frozen mid-startup until ~4 KB accumulates. See entrypoint.sh,
     # which also wraps the launch in stdbuf as a belt-and-suspenders fallback.
     tty: true
+    # The engine holds every loaded pk3 open; a full livesow map mirror is
+    # 4000+ packs, which blows through the default 2048-fd soft limit and the
+    # tail of the packs fails to load ("Error opening PK3 file").
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
     ports:
       # Warsow uses a single UDP port; pk3 downloads also flow over it (the
       # engine's HTTP server is disabled via sv_http 0 in entrypoint.sh).
       - "44400:44400/udp"
+      # Uncomment for cross-HOST player mirroring (peers on other machines
+      # need to reach the mirror port). Same-host/compose-network peers and
+      # the local mesh test do NOT need it published.
+      # - "44450:44450/udp"
     environment:
       SV_HOSTNAME: "${SV_HOSTNAME:-Dockerized Warsow Race - go fast!}"
       SV_MAXCLIENTS: "${SV_MAXCLIENTS:-16}"
-      SV_PUBLIC: "${SV_PUBLIC:-0}"   # set to 1 to advertise on the master server list
+      # 1 = advertise on the master list AND answer queries from the internet.
+      # 0 makes the engine silently IGNORE getinfo/getstatus from non-LAN
+      # addresses — the server looks dead from outside even though the port
+      # is open. Use 1 for any internet-facing server; 0 is LAN/dev only.
+      SV_PUBLIC: "${SV_PUBLIC:-0}"
       SV_PORT: "44400"
       G_GAMETYPE: "hrace"
       MAP_ROTATION: "2"        # 0 none, 1 sequential, 2 random
@@ -43,6 +58,15 @@ services:
       INGEST_URL: "${INGEST_URL:-}"
       INGEST_TOKEN: "${INGEST_TOKEN:-}"
       VERSION_NAME: "${VERSION_NAME:-wsw 2.1}"
+      # Cross-server player mirroring (UDP mesh): peered servers exchange
+      # live player positions, chat and join/leave events, so players on one
+      # server see the others as ghosts and can chat across servers. Set all
+      # of these in server/.env; empty MIRROR_PEERS = feature off. See
+      # docker-compose.mirror-test.yml for a 3-node local mesh.
+      MIRROR_PEERS: "${MIRROR_PEERS:-}"     # "peer-host:44450 other-host:44450"
+      MIRROR_SECRET: "${MIRROR_SECRET:-}"   # shared: openssl rand -hex 24
+      MIRROR_PORT: "${MIRROR_PORT:-44450}"
+      MIRROR_TAG: "${MIRROR_TAG:-}"         # short id shown as [TAG] in chat
       # EXTRA_ARGS: "+set sv_maxrate 0"
     networks:
       - default

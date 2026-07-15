@@ -14,16 +14,157 @@
 # directory is mounted read-only at /warsow/maps_extra and entrypoint.sh
 # symlinks the packs into the mod dir at container start (see
 # docker-compose.yml and server/maps/README.md).
-# Then uncomment the maps you want below. These are the most-played maps in
-# the livesow race database:
-#
-# aurora-speed1
-# aurora-sunday
-# pornstar-slopin
-# coldrun
-# bull-highway
-# pornstar-redemption-long
-# scratchystrafe1
-# pornstar-lamba-slick
-# killua-pornstar
-# zeel-recapture
+# Generated from data/db.sqlite: the most-raced maps (top 150 by finish
+# count). entrypoint.sh keeps only the installed ones and caps the list
+# at the engine's 1024-char command budget (~80 maps), most-raced first.
+
+aurora-speed1
+aurora-sunday
+pornstar-slopin
+coldrun
+bull-highway
+pornstar-redemption-long
+pornstar-lamba-slick
+killua-pornstar
+scratchystrafe1
+aurora-friday
+aurora-speed2
+czsk2007-bardok
+gpl-strangeland-strafe
+zeel-recapture
+bardok-avp
+lovet-ghost2
+stammer-strafecave
+scratchystrafe2
+pornstar-dangerzone
+pornstar-diebaso
+dinirun4
+fun_strafe02
+0ups-straferun1
+pornstar-old1
+4and
+pornstar-wtf
+pornstar-quickie3
+bardok-strafe1
+gpl-arcaon
+the-strafe
+leoorun13
+pornstar-thickwoman
+aurora-speed4
+eline_phatoma
+wsrc09-03
+pornstar-dravid
+inder-strafe3
+bliss-strafe-run
+aurora-saturday
+pornstar-kurkure
+pornstar-simplicity2
+pornstar-novaa
+bardok-egypt
+r7-xyligan
+pornstar-4percent
+pornstar-fuckjingles
+pink_tutorial
+strafelokki-wjfix
+zeel-ponpon
+rs_mandarin
+pornstar-minibagel
+lovet-cld-slick
+ghost-strafe7
+zeel-rivesud
+rusher_run2a
+st1
+123-slipknot
+r7-destroy2
+hunter-fire
+nxo-lavarun
+stonestrafe3
+pornstar-goethe
+kool_quickgrass1-wjfix
+zpox-hyvaa-puuta
+dinirun1
+p3nt4-rz1
+line
+ghost-arcaon
+rr1k
+pornstar-8percent
+effect-strafe
+wespitmaps-hello_copac
+runistrafe1
+char4n-caja
+somuchfun
+regrelue03-wjfix
+greenstrafe
+killua-akuma
+ghost-simple4
+wsrc09-01
+dfwc2017-6-wjfix
+ebniy
+pornstar-caveman
+0ups-rocketrun1
+pneumo-speed13-slick
+bardok-cpm
+platstrafe
+sdf-strafes1
+bardok-vail
+r7-nina2
+pornstar-cpmrun
+pornstar-gaand
+tandoori
+r7-brigi
+aurora-speed3
+40funslickandgreenballs
+sylvan-strafehero
+pornstar-junglepubes
+yungstrafe18-slick
+bardok-strafe3
+pornstar-thickerwoman
+frcup42
+n3ur0_toxicshock
+sleepystrafe1
+dray2k_stairjump_p1
+r7-omega
+nood-adr_slick-wjfix
+inder-strafe2
+pornstar-15percent
+bardok-da
+straferoni
+r7-smally1
+pornstar-apple
+robon-strafe3
+pornstar-shorty2
+pornstar-nochoice
+wespitmaps-hello_freeman
+funkyboost
+urp
+pornstar-quickie9
+bardok-undead
+borestrafe2
+enz-05
+dinirun5
+pento
+pornstar-shitbagz2
+bdfcomp032
+r7-bazz
+littlestrafe-rl
+rdk-25-wjfix
+powerslide10
+strafeblocks
+pornstar-kaine
+pornstar-nuclear
+tatmt-s10
+krug-strafe-wjfix
+pornstar-retro
+annh_hall
+ghost-simple4_2
+ghost-egypt2
+pornstar-raven
+stonestrafe2
+pornstar-red
+awumpus-strafe-wjfix
+mntstrafe07
+bardok-diztar
+avp-voltair
+nicefunslick
+fe-dome_2-wjfix
+r7-amplitude

@@ -1,0 +1,25 @@
+# The three test layers documented in AGENT.md, run on every push/PR:
+#   web unit + HTTP API tests (fresh SQLite per test — no LFS needed),
+#   the entrypoint env->cfg contract, and the e2e pipeline that compiles the
+#   REAL g_rs_api.cpp natives against the REAL web server.
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: build deps for the e2e harnesses
+        run: sudo apt-get update && sudo apt-get install -y g++ libcurl4-openssl-dev
+      - name: web unit + API tests
+        run: cd web && npm install && npm test
+      - name: entrypoint contract test
+        run: sh server/test/entrypoint.test.sh
+      - name: end-to-end pipeline (real natives -> real API)
+        run: sh e2e/run.sh

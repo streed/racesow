@@ -1,0 +1,13 @@
+# One-shot Racesow database backup — run nightly by racesow-db-backup.timer.
+# Template: __RACESOW_DIR__ / __RACESOW_USER__ are substituted by
+# systemd/install.sh.
+[Unit]
+Description=Racesow race-database backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=__RACESOW_USER__
+WorkingDirectory=__RACESOW_DIR__
+ExecStart=__RACESOW_DIR__/scripts/backup-db.sh

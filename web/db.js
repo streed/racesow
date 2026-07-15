@@ -30,7 +30,7 @@ const POINTS_CASE = `CASE rank
   WHEN 11 THEN 40 WHEN 12 THEN 38 WHEN 13 THEN 36 WHEN 14 THEN 34 WHEN 15 THEN 32
   ELSE 0 END`;
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export function sha256(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex");
@@ -104,6 +104,7 @@ export function openDatabase(dbPath) {
     runTally: hasTable(db, "run_tally"),
     server: hasTable(db, "server"),
     serverId: hasColumn(db, "race", "server_id"),
+    serverAddress: hasColumn(db, "server", "address"),
   };
   buildAggregates(db, caps);
   console.log(`Database ready in ${Date.now() - t0}ms (schema v${userVersion(db)})`);
@@ -241,6 +242,13 @@ const MIGRATIONS = {
   // namespace, "(N)" suffix stripping, last-known-nick as the representative).
   2(db) {
     populateCanonical(db);
+  },
+  // Game-server query address ("host:port") for the Live page. Optional per
+  // server; set with `node admin.js address <id> <host:port>`. The web
+  // process polls it over UDP (getstatus) — the remote server must run
+  // sv_public 1 or the engine ignores non-LAN queries.
+  3(db) {
+    if (!hasColumn(db, "server", "address")) db.exec("ALTER TABLE server ADD COLUMN address TEXT");
   },
 };
 
@@ -443,7 +451,7 @@ class RaceDB {
       .prepare(
         `SELECT s.rank, s.player_id id, p.name, p.simplified, s.points, s.wr, s.podium, s.maps
          FROM standings s JOIN player p ON p.id = s.player_id
-         ORDER BY s.rank LIMIT 15`
+         ORDER BY s.rank LIMIT 20`
       )
       .all();
     const recent = this.recentRecords(8);
@@ -484,12 +492,81 @@ class RaceDB {
 
   servers() {
     if (!this.caps.server) return [];
+    const address = this.caps.serverAddress ? ", address" : "";
     return this.db
       .prepare(
-        `SELECT id, name, status, created_at, last_seen_at, records
+        `SELECT id, name, status, created_at, last_seen_at, records${address}
          FROM server ORDER BY last_seen_at DESC NULLS LAST, id`
       )
       .all();
+  }
+
+  setServerAddress(id, address) {
+    if (!this.caps.serverAddress) return false;
+    return this.db.prepare("UPDATE server SET address = ? WHERE id = ?").run(address || null, id).changes > 0;
+  }
+
+  // Map an engine map name (e.g. from a live getstatus reply) to its DB id,
+  // so the Live page can deep-link to the map's leaderboard.
+  mapIdByName(name) {
+    const row = this.db.prepare("SELECT id FROM map WHERE name = ?").get(String(name).toLowerCase());
+    return row ? row.id : null;
+  }
+
+  // --------------------------------------------------------------------------
+  // Live topscores for game servers (GET /api/game/topscores?map=) ------------
+  // Returns the map's top-50 in the EXACT topscores file format the hrace
+  // gametype reads and writes (RACE_LoadTopScores / RACE_WriteTopScores in
+  // server/racemod/.../hrace/recordtime.as, mirrored by web/seed-topscores.js):
+  //
+  //   //<map> top scores
+  //
+  //   "<finishMs>" "<playerName>" "<numSectors>" "<cp1Ms>" ... "<cpNMs>"
+  //
+  // The RS_ApiFetchTop native swaps this straight into the server's local
+  // topscores/race/<map>.txt, and the gametype re-reads it through its normal
+  // loader — so the payload MUST stay byte-format identical to that file.
+  // Logins are deliberately omitted (see seed-topscores.js for why).
+  // Returns null for unknown or path-unsafe map names.
+  gameTopscoresText(mapName) {
+    const name = String(mapName || "").toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
+    const map = this.db.prepare("SELECT id FROM map WHERE name = ?").get(name);
+    if (!map) return null;
+
+    // Best race per (canonical) player, fastest first — same query as
+    // seed-topscores.js.
+    const cid = this.caps.canonical ? "pl.canonical_id" : "r.player_id";
+    const top = this.db
+      .prepare(`
+        WITH k AS (
+          SELECT ${cid} cid, r.id rid, r.time,
+                 ROW_NUMBER() OVER (PARTITION BY ${cid} ORDER BY r.time, r.id) rn
+          FROM race r ${this.caps.canonical ? "JOIN player pl ON pl.id = r.player_id" : ""}
+          WHERE r.map_id = ?
+        )
+        SELECT k.rid, k.time, rep.name
+        FROM k JOIN player rep ON rep.id = k.cid
+        WHERE k.rn = 1 ORDER BY k.time, k.rid LIMIT 50
+      `)
+      .all(map.id);
+    const cpStmt = this.db.prepare("SELECT time FROM checkpoint WHERE race_id = ? ORDER BY number");
+    // A name goes inside a quoted engine token it cannot escape.
+    const sanitize = (n) => String(n).replace(/["\r\n\t]/g, "").slice(0, 64);
+
+    let body = `//${name} top scores\n\n`;
+    for (const r of top) {
+      // A name that sanitizes to nothing would emit an empty quoted token,
+      // which the gametype loader treats as end-of-input — truncating every
+      // record after it. Skip the row instead.
+      const cleanName = sanitize(r.name);
+      if (!cleanName) continue;
+      const sectors = cpStmt.all(r.rid).map((c) => c.time | 0);
+      let line = `"${r.time}" "${cleanName}" "${sectors.length}" `;
+      for (const s of sectors) line += `"${s}" `;
+      body += line + "\n";
+    }
+    return body;
   }
 
   maps({ q = "", sort = "records", order, limit, offset } = {}) {

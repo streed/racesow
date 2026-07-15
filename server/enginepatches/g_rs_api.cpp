@@ -37,6 +37,11 @@
 
 namespace {
 
+enum RequestType {
+	REQ_POST_REPORT,  // fire-and-forget race finish -> /api/ingest
+	REQ_GET_TOPSCORES // live top scores -> swapped into the local topscores file
+};
+
 // note: no default member initializers — the game module builds as C++11,
 // where they would make this a non-aggregate and break brace-initialization
 struct ApiRequest {
@@ -44,6 +49,9 @@ struct ApiRequest {
 	std::string token;
 	std::string body;
 	int attempts;
+	int type;             // RequestType
+	std::string filePath; // REQ_GET_TOPSCORES: where the payload lands
+	unsigned gen;         // REQ_GET_TOPSCORES: fetch generation (stale = discard)
 };
 
 constexpr size_t QUEUE_MAX = 256;
@@ -64,7 +72,15 @@ struct ApiState {
 	std::thread worker;
 	std::atomic<bool> stop;
 
-	ApiState() : stop( false ) {}
+	// Top-scores fetch handshake with the script thread. fetchGen is bumped
+	// by every RS_ApiFetchTop; a completing request whose gen no longer
+	// matches is discarded (the map changed / a newer fetch superseded it).
+	// fetchResult is read-and-cleared by RS_ApiPollTop: 0 = nothing new,
+	// 1 = fresh payload swapped into the file, -1 = fetch failed for good.
+	std::atomic<unsigned> fetchGen;
+	std::atomic<int> fetchResult;
+
+	ApiState() : stop( false ), fetchGen( 0 ), fetchResult( 0 ) {}
 };
 
 ApiState *g_state = nullptr;
@@ -73,6 +89,100 @@ ApiState *g_state = nullptr;
 size_t discardBody( void *, size_t size, size_t nmemb, void * )
 {
 	return size * nmemb;
+}
+
+// Collect a (bounded) response body into a std::string.
+constexpr size_t BODY_MAX = 1u << 20; // a top-50 payload is a few KB
+size_t collectBody( void *data, size_t size, size_t nmemb, void *userp )
+{
+	std::string *out = (std::string *)userp;
+	size_t n = size * nmemb;
+	if( out->size() + n > BODY_MAX )
+		return 0; // absurd payload; abort the transfer
+	out->append( (const char *)data, n );
+	return n;
+}
+
+// -1 = transport error (retryable), otherwise the HTTP status.
+long doGet( const ApiRequest &req, std::string &out )
+{
+	CURL *curl = curl_easy_init();
+	if( !curl )
+		return -1;
+
+	struct curl_slist *headers = nullptr;
+	if( !req.token.empty() ) {
+		std::string auth = "Authorization: Bearer " + req.token;
+		headers = curl_slist_append( headers, auth.c_str() );
+	}
+
+	curl_easy_setopt( curl, CURLOPT_URL, req.url.c_str() );
+	if( headers )
+		curl_easy_setopt( curl, CURLOPT_HTTPHEADER, headers );
+	curl_easy_setopt( curl, CURLOPT_HTTPGET, 1L );
+	curl_easy_setopt( curl, CURLOPT_CONNECTTIMEOUT, 5L );
+	curl_easy_setopt( curl, CURLOPT_TIMEOUT, 10L );
+	curl_easy_setopt( curl, CURLOPT_NOSIGNAL, 1L );
+	curl_easy_setopt( curl, CURLOPT_FOLLOWLOCATION, 1L );
+	curl_easy_setopt( curl, CURLOPT_MAXREDIRS, 3L );
+	// http(s) only on redirects: never follow into file:// etc., and keep the
+	// Authorization header from wandering to arbitrary protocols. NB: the
+	// non-_STR option is deprecated in modern curl but is the ONLY spelling
+	// libcurl 7.58 (the Ubuntu 18.04 build target) has — do not "modernize".
+	curl_easy_setopt( curl, CURLOPT_REDIR_PROTOCOLS, (long)( CURLPROTO_HTTP | CURLPROTO_HTTPS ) );
+	curl_easy_setopt( curl, CURLOPT_WRITEFUNCTION, collectBody );
+	curl_easy_setopt( curl, CURLOPT_WRITEDATA, &out );
+
+	CURLcode rc = curl_easy_perform( curl );
+	long status = -1;
+	if( rc == CURLE_OK )
+		curl_easy_getinfo( curl, CURLINFO_RESPONSE_CODE, &status );
+	else
+		fprintf( stderr, "rs_api: %s: %s\n", req.url.c_str(), curl_easy_strerror( rc ) );
+
+	if( headers )
+		curl_slist_free_all( headers );
+	curl_easy_cleanup( curl );
+	return status;
+}
+
+// Read a file fully (worker thread; plain libc). Empty string when absent.
+std::string readFileAll( const std::string &path )
+{
+	std::string out;
+	FILE *f = fopen( path.c_str(), "rb" );
+	if( !f )
+		return out;
+	char buf[8192];
+	size_t n;
+	while( ( n = fread( buf, 1, sizeof( buf ), f ) ) > 0 ) {
+		out.append( buf, n );
+		if( out.size() > BODY_MAX )
+			break;
+	}
+	fclose( f );
+	return out;
+}
+
+// tmp + rename so the engine (or a reader like the collector) never sees a
+// half-written topscores file. Runs on the worker thread — plain libc only.
+bool writeFileAtomic( const std::string &path, const std::string &data )
+{
+	std::string tmp = path + ".apitmp";
+	FILE *f = fopen( tmp.c_str(), "wb" );
+	if( !f )
+		return false;
+	size_t w = fwrite( data.data(), 1, data.size(), f );
+	int rc = fclose( f );
+	if( w != data.size() || rc != 0 ) {
+		remove( tmp.c_str() );
+		return false;
+	}
+	if( rename( tmp.c_str(), path.c_str() ) != 0 ) {
+		remove( tmp.c_str() );
+		return false;
+	}
+	return true;
 }
 
 // -1 = transport error (retryable), otherwise the HTTP status.
@@ -125,23 +235,78 @@ void workerMain( ApiState *s )
 			s->queue.pop_front();
 		}
 
-		long status = doPost( req );
-		if( status >= 200 && status < 300 )
-			continue;
+		long status;
+		if( req.type == REQ_GET_TOPSCORES ) {
+			// A fetch queued when shutdown is already under way is worthless:
+			// nobody will ever poll the result.
+			if( s->stop.load() )
+				continue;
 
-		bool permanent = status >= 400 && status < 500;
-		req.attempts++;
-		if( permanent || req.attempts >= MAX_ATTEMPTS ) {
-			fprintf( stderr, "rs_api: dropping report after %d attempt(s), status %ld: %s\n",
-				req.attempts, status, req.body.c_str() );
-			continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchGen.load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded while in flight — drop silently
+				// A topscores payload always starts with its "//<map> top
+				// scores" header. Anything else (captive portal, proxy error
+				// page answering 200) must never reach the records file —
+				// the loader would tokenize garbage into 0ms "records".
+				if( payload.compare( 0, 2, "//" ) != 0 ) {
+					fprintf( stderr, "rs_api: rejecting non-topscores payload from %s\n",
+						req.url.c_str() );
+					s->fetchResult.store( -1 );
+					continue;
+				}
+				// Unchanged since the last swap: skip the write AND the
+				// poll signal — reloading an identical payload is pure
+				// churn for the gametype's merge every interval.
+				if( payload == readFileAll( req.filePath ) )
+					continue;
+				if( writeFileAtomic( req.filePath, payload ) ) {
+					s->fetchResult.store( 1 );
+				} else {
+					fprintf( stderr, "rs_api: cannot write %s\n", req.filePath.c_str() );
+					s->fetchResult.store( -1 );
+				}
+				continue;
+			}
+			if( !current )
+				continue; // superseded — do not burn retries on a stale fetch
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				// 404 is the expected "no central records for this map yet" —
+				// not worth a log line per refresh interval.
+				if( status != 404 )
+					fprintf( stderr, "rs_api: top-scores fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchResult.store( -1 );
+				continue;
+			}
+		} else {
+			status = doPost( req );
+			if( status >= 200 && status < 300 )
+				continue;
+
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			// During shutdown a report gets exactly the attempt it just had:
+			// endless retry rounds against a dead API would stall the drain
+			// far past any container stop grace, losing the reports anyway.
+			if( permanent || req.attempts >= MAX_ATTEMPTS || s->stop.load() ) {
+				fprintf( stderr, "rs_api: dropping report after %d attempt(s), status %ld: %s\n",
+					req.attempts, status, req.body.c_str() );
+				continue;
+			}
 		}
 
-		// brief pause, then requeue at the back
-		if( !s->stop.load() )
-			std::this_thread::sleep_for( std::chrono::seconds( 2 ) );
+		// Brief pause, then requeue at the back. The pause is a cv wait so
+		// rsApiShutdown's notify_all cuts it short instead of the join eating
+		// the sleep remainder.
 		{
-			std::lock_guard<std::mutex> lock( s->mutex );
+			std::unique_lock<std::mutex> lock( s->mutex );
+			s->cv.wait_for( lock, std::chrono::seconds( 2 ), [s] { return s->stop.load(); } );
 			s->queue.push_back( std::move( req ) );
 		}
 	}
@@ -258,7 +423,92 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
 			fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
 			s->queue.pop_front();
 		}
-		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0 } );
+		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
+			REQ_POST_REPORT, "", 0 } );
 	}
 	s->cv.notify_one();
+}
+
+/*
+ * RS_ApiFetchTop
+ *
+ * Fetch the map's live top scores from <url> (the central
+ * /api/game/topscores endpoint; ?map=<mapname> is appended) and swap the
+ * payload — which is byte-format identical to a topscores file — into
+ * topscores/race/<mapname>.txt under the mod's write directory. The gametype
+ * polls RS_ApiPollTop() and re-runs its normal topscores loader when a fresh
+ * payload has landed, so every in-game record display matches the central
+ * database. Fire-and-forget; a newer fetch supersedes an in-flight one.
+ *
+ * The write directory comes from WARSOW_DIR/FS_GAME (set by the Docker
+ * image; falls back to /warsow and racemod) because the engine's filesystem
+ * API is not callable off the main thread.
+ */
+void RS_ApiFetchTop( const char *url, const char *token, const char *mapname )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] )
+		return;
+
+	// The map name becomes a file name — accept the same character set the
+	// stats API allows and refuse anything else outright.
+	for( const char *p = mapname; *p; p++ ) {
+		char c = *p;
+		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
+			c == '_' || c == '.' || c == '-';
+		if( !ok ) {
+			fprintf( stderr, "rs_api: refusing top-scores fetch for unsafe map name\n" );
+			return;
+		}
+	}
+
+	const char *base = getenv( "WARSOW_DIR" );
+	if( !base || !base[0] )
+		base = "/warsow";
+	const char *fsgame = getenv( "FS_GAME" );
+	if( !fsgame || !fsgame[0] )
+		fsgame = "racemod";
+
+	std::string full = std::string( url ) + "?map=" + mapname;
+	std::string path = std::string( base ) + "/" + fsgame + "/topscores/race/" + mapname + ".txt";
+
+	ApiState *s = ensureStarted();
+	unsigned gen = s->fetchGen.fetch_add( 1 ) + 1;
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			// Prefer evicting another fetch (fully reproducible next interval)
+			// over a race report (a finish is reported exactly once).
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
+			REQ_GET_TOPSCORES, std::move( path ), gen } );
+	}
+	s->cv.notify_one();
+}
+
+/*
+ * RS_ApiPollTop
+ *
+ * Read-and-clear the fetch outcome: 1 = a fresh top-scores payload was
+ * swapped into the map's topscores file (reload it now), -1 = the last fetch
+ * failed for good (keep the local file), 0 = nothing new. Called from the
+ * gametype's think loop.
+ */
+int RS_ApiPollTop( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	return s->fetchResult.exchange( 0 );
 }

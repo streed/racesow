@@ -42,6 +42,10 @@ Everything is driven by environment variables (see `docker-compose.yml`):
 | `MAP_ROTATION`  | `2`                           | `0` none, `1` sequential, `2` random            |
 | `RCON_PASSWORD` | *(empty)*                     | Enables remote console when set                 |
 | `SV_UPLOADS_BASEURL` | *(empty)*                | HTTP pak mirror for client downloads (see below)|
+| `MIRROR_PEERS`  | *(empty)*                     | Space-separated `host:port` mesh peers (see below); empty = mirroring off |
+| `MIRROR_TAG`    | *(empty)*                     | Short id (≤16 chars) shown as `[TAG]` in mirrored chat |
+| `MIRROR_SECRET` | *(empty)*                     | Shared HMAC key across all peers; empty = source-IP allowlist (LAN only) |
+| `MIRROR_PORT`   | `44450`                       | UDP port this server binds for mesh traffic     |
 | `EXTRA_ARGS`    | *(empty)*                     | Extra `+set ...` args appended verbatim         |
 
 Race gameplay tuning (no fall/self damage, bunnyhop, voting, flood protection)
@@ -88,6 +92,158 @@ by default the server rotates through those. To run the real competitive pool:
    are not installed are skipped automatically; an empty pool means "rotate
    through everything installed".
 
+## Cross-server player mirroring (the mesh)
+
+Run several regional servers (so players pick the one with the best ping) that
+still feel like one community: players on any server see the others as
+translucent **ghosts** running the same map, **chat** relays across all of
+them, and spectators can **`/watch`** a racer on another server to study their
+route. Servers form a **bidirectional UDP mesh** — every server broadcasts its
+*own* live players and chat to every peer, and never re-forwards what it
+receives (hop limit 1: a player on A shows as `[A]` on B and C, but B and C
+never propagate it further).
+
+```
+        ┌──────────┐   players + chat (UDP, ~10Hz)   ┌──────────┐
+        │ Server A │◀───────────────────────────────▶│ Server B │
+        │  [A] EU  │◀──┐                          ┌──▶│  [B] US  │
+        └──────────┘   │                          │   └──────────┘
+              ▲        └──────┐          ┌─────────┘        ▲
+              │               ▼          ▼                  │
+              └──────────▶┌──────────┐◀──────────────────────┘
+                          │ Server C │
+                          │  [C] AU  │
+                          └──────────┘
+```
+
+The mesh is **fire-and-forget and low priority**: lost packets are never
+retransmitted (positions self-correct on the next tick), and if a peer is down
+its ghosts/roster simply age out in ~3 s. All socket I/O runs on a background
+thread, so mesh traffic never affects the game frame. It is entirely
+independent of the stats pipeline (`INGEST_URL`) — you can run either, both, or
+neither.
+
+### Setup
+
+On **every** server in the mesh, set four env vars in `server/.env`:
+
+```sh
+MIRROR_TAG=EU                              # this server's short id, unique per peer
+MIRROR_PORT=44450                          # UDP port to bind (default 44450)
+MIRROR_PEERS="us.example.com:44450 au.example.com:44450"   # every OTHER peer
+MIRROR_SECRET=<shared key>                 # SAME value on all peers
+```
+
+- **`MIRROR_PEERS`** lists the *other* peers only (don't list yourself). Each
+  entry is `host:port`; use each peer's public host/IP and its `MIRROR_PORT`.
+  Because it's a full mesh, server EU lists `[US, AU]`, US lists `[EU, AU]`,
+  AU lists `[EU, US]`.
+- **`MIRROR_SECRET`** must be **identical on every peer** and kept secret. It
+  authenticates every datagram (HMAC-SHA256). Generate one and share it out of
+  band: `openssl rand -hex 24`. A value with `"`, `;` or a newline is rejected
+  at startup (it would corrupt the generated config line).
+- **`MIRROR_TAG`** is what players see (`[EU] name: hi`) and how peers are
+  keyed, so make each one distinct (≤16 chars, `A-Za-z0-9_-`).
+
+Then open the mesh port so peers can reach each other and (re)deploy:
+
+```bash
+# docker-compose.yml: uncomment the mirror port publish
+#   ports:
+#     - "44450:44450/udp"
+docker compose up -d --build          # on each server
+```
+
+If you run behind a firewall/security group, allow **inbound UDP 44450** from
+each peer's IP. Same-host containers on a shared Docker network don't need the
+port published (they reach each other by service name) — that's how the local
+test mesh works.
+
+### Verify
+
+Each server logs its mesh health to the container log:
+
+```bash
+docker compose logs -f warsow-race | grep rs_mirror
+# rs_mirror: configured tag=EU port=44450 peers=2 (secret: yes)
+# rs_mirror: stats tx=580 rx=1150 drop=0 heard=[US(coldrun 0.1s) AU(coldrun 0.0s)]
+```
+
+`heard=[...]` lists every peer you're receiving from, its current map, and how
+long since its last packet; `tx`/`rx` are datagrams sent/received and `drop`
+counts rejected (unauthenticated/malformed) datagrams — a healthy mesh shows
+all peers with sub-second freshness and `drop=0`. Set `EXTRA_ARGS="+set
+rs_mirror_debug 1"` (or `rcon <pw> set rs_mirror_debug 1`) to also log each
+received chat/join/leave event and a per-server roster summary.
+
+In-game, players use **`/who`** to list every peer's roster and
+**`/watch <player>`** (as a spectator) to follow a remote racer's route.
+
+### Behavior notes
+
+- **Ghosts only render when two servers are on the same map**; chat, join/leave
+  notices, and `/who` work regardless of map. When maps differ you still see
+  `[US] name: msg` chat and the roster, just no in-world ghost.
+- **Tuning cvars** (rarely needed, set via `EXTRA_ARGS`): `rs_mirror_maxghosts`
+  (default 32) caps ghost entities; `rs_mirror_debug` toggles verbose logging.
+
+### Security posture
+
+The mesh binds an internet-facing UDP port, so its parser and auth were built
+and audited to withstand hostile input:
+
+- **Authentication.** Every datagram carries an HMAC-SHA256 (truncated to 128
+  bits) over its contents, verified with a constant-time compare before any of
+  its fields are trusted. Wrong-length/forged MACs are rejected for free (no
+  hashing). Empty-secret mode falls back to a source-IP allowlist and is
+  **LAN/testing only** — never expose it to the internet (the server warns).
+- **Bounded by construction.** Datagrams over ~1400 bytes are dropped; remote
+  state is hard-capped (≤16 peers, ≤32 players each, ≤64 queued events), and
+  the receive path never emits a datagram in response to one — so the port
+  can't be used as a reflector/amplifier. Worst case under a flood is a
+  generic line-rate UDP flood with bounded per-packet CPU, not an asymmetric
+  one-packet kill.
+- **Audited + fuzzed.** The parser was reviewed adversarially (no confirmed
+  overflow/DoS) and fuzzed with ~1M malformed/boundary/hostile datagrams under
+  AddressSanitizer + UBSan with zero memory-safety violations. Re-run it any
+  time: `sh e2e/mirror_fuzz_run.sh`.
+- **Defense in depth — firewall the port to your peers.** The HMAC already
+  gates content, but you should still restrict inbound UDP on `MIRROR_PORT` to
+  the known peer IPs at the OS/security-group level, e.g.
+
+  ```bash
+  # allow only the two peers, drop everything else on the mesh port
+  ufw allow from <peer-B-ip> to any port 44450 proto udp
+  ufw allow from <peer-C-ip> to any port 44450 proto udp
+  ufw deny 44450/udp
+  ```
+
+  This shrinks the attack surface to your mesh and blunts any UDP flood before
+  it reaches the process.
+- **Trust model / known limits.** The shared secret is trusted mesh-wide: any
+  holder can speak as any tag, so treat it like an admin credential and only
+  mesh servers you control. There is no datagram-level replay protection within
+  the ±60 s timestamp window (impact is display-only under hop-limit-1).
+  Per-peer keys and replay protection are documented as future hardening.
+
+### Test the mesh locally first
+
+`docker-compose.mirror-test.yml` runs a 3-node mesh (tags A/B/C) on one host
+for development — see the header of that file. It pins a shared map so ghosts
+are visible and enables `rs_mirror_debug`:
+
+```bash
+# put one race map in server/mirror-test-maps/, then:
+docker compose -f docker-compose.mirror-test.yml up --build
+# clients: localhost:44403 (A), :44401 (B), :44402 (C)
+```
+
+`e2e/mirror_wire_check.py` speaks the wire protocol for headless checks —
+`fakeplayer` streams a synthetic racer into the mesh, `garbage` fires an
+unauthenticated datagram (must bump `drop`), and `listen` prints received
+datagram headers. `e2e/mirror_harness.cpp` drives the real `g_rs_mirror.cpp`
+so two harness processes form a genuine two-node mesh off-engine.
+
 ## How it works
 
 - **`Dockerfile`** — two stages. Stage 1 compiles, from DenMSC's `racemod_2.1`
@@ -128,6 +284,13 @@ by default the server rotates through those. To run the real competitive pool:
   finished (non-practice) race to `racelog/events.log`, which the stats
   collector (`../collector`) ships to the central database. Edit the source
   and `docker compose up -d --build` to deploy mod changes.
+- **Cross-server mirroring** — `enginepatches/g_rs_mirror.cpp` adds the
+  `RS_Mirror*` AngelScript natives (a UDP mesh on a background thread; wired in
+  by `enginepatches/patch-mirror-natives.py`, which also hooks `Cmd_Say_f` to
+  relay chat), and `racemod/source/progs/gametypes/hrace/mirror.as` drives them
+  (publish local players at 10 Hz, render remote ghosts, `/who`, `/watch`).
+  `entrypoint.sh` turns the `MIRROR_*` env vars into `rs_mirror_*` cvars. See
+  the mirroring section above.
 - **`entrypoint.sh`** — resolves the map pool against the maps that are
   actually installed, assembles the `+set` launch arguments from the
   environment, and runs `wsw_server.x86_64` in a restart loop (mirroring the

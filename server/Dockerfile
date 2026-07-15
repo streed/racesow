@@ -64,11 +64,27 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "RS_ApiReportRace" game/g_ascript.cpp \
     && grep -q "curl pthread" game/CMakeLists.txt
 
+# 7. Cross-server player mirroring: the RS_Mirror* natives (UDP mesh on a
+#    worker thread, see g_rs_mirror.cpp) let peered servers exchange live
+#    player positions and chat. The patch also hooks Cmd_Say_f so public chat
+#    reaches the mesh. Runs after patch-api-natives.py (anchor order).
+COPY enginepatches/g_rs_mirror.cpp /build/repo/source/game/g_rs_mirror.cpp
+COPY enginepatches/patch-mirror-natives.py /tmp/patch-mirror-natives.py
+RUN python3 /tmp/patch-mirror-natives.py \
+    && grep -q "asFunc_RS_MirrorRefresh" game/g_ascript.cpp \
+    && grep -q "RS_MirrorLocalChat" game/g_cmds.cpp
+
 RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Release . \
     && make game -j"$(nproc)" \
     && cp build/basewsw/libgame_x86_64.so /libgame_x86_64.so \
-    # the module must carry the native and require libcurl at runtime
-    && strings /libgame_x86_64.so | grep -q "RS_ApiReportRace" \
+    # the module must carry the natives and require libcurl at runtime.
+    # nm --defined-only (not strings): the registration string in g_ascript
+    # would pass a strings grep even if g_rs_api.cpp never compiled in — the
+    # unresolved symbol would then only abort at runtime, 60s into a map.
+    && nm -D --defined-only /libgame_x86_64.so | grep -q "RS_ApiReportRace" \
+    && nm -D --defined-only /libgame_x86_64.so | grep -q "RS_ApiFetchTop" \
+    && nm -D --defined-only /libgame_x86_64.so | grep -q "RS_ApiPollTop" \
+    && strings /libgame_x86_64.so | grep -q "rs_mirror: configured" \
     && objdump -p /libgame_x86_64.so | grep -q "NEEDED.*libcurl"
 
 # --- Patched dedicated server binary ----------------------------------------
@@ -197,7 +213,17 @@ COPY --from=gamemod /wsw_server.x86_64 ${WARSOW_DIR}/wsw_server.x86_64
 COPY clientdata /tmp/clientdata
 RUN set -eux; \
     cd /tmp/clientdata; \
-    zip -r -X "${WARSOW_DIR}/${FS_GAME}/racemod_ui_v4_local.pk3" ui huds gfx scripts sounds racemod_ui_v4.txt -x '.*'; \
+    # Deterministic pak: fixed mtimes, sorted entries, UTC DOS times — every
+    # rebuild of the same clientdata tree is byte-identical, so all servers
+    # reference the same checksum. A drifted checksum under the same pak name
+    # means "Pure check failed" for every client holding the other copy.
+    find ui huds gfx scripts sounds racemod_ui_v5.txt -exec touch -t 200901010000.00 {} +; \
+    find ui huds gfx scripts sounds racemod_ui_v5.txt -type f ! -name '.*' | sort \
+        | TZ=UTC zip -X -D "${WARSOW_DIR}/${FS_GAME}/racemod_ui_v5_local.pk3" -@; \
+    # the gametype must pure-index the marker this pak actually ships, else
+    # clients are never told to download it (the recurring v3/v4 drift bug)
+    unzip -p "${WARSOW_DIR}/${FS_GAME}/hrace.pk3" progs/gametypes/hrace.as | grep -q 'racemod_ui_v5.txt'; \
+    unzip -Z1 "${WARSOW_DIR}/${FS_GAME}/racemod_ui_v5_local.pk3" | grep -qx 'racemod_ui_v5.txt'; \
     rm -rf /tmp/clientdata
 
 # --- Server configuration + entrypoint --------------------------------------

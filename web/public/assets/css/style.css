@@ -279,3 +279,43 @@ footer.site { border-top: 1px solid var(--line); color: var(--muted); font-size:
 footer.site .fi { max-width: 1180px; margin: 0 auto; padding: 20px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
 footer.site a { color: var(--cyan); }
 .hide { display: none !important; }
+
+/* ---------- Live page ---------- */
+.livedot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--green); margin-left: 6px; vertical-align: 2px;
+  animation: livepulse 1.6s ease-in-out infinite;
+}
+.livedot.big { width: 11px; height: 11px; vertical-align: 3px; }
+@keyframes livepulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(169,242,106,.55); opacity: 1; }
+  60%      { box-shadow: 0 0 0 7px rgba(169,242,106,0);  opacity: .75; }
+}
+.live-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(340px,1fr)); gap: 20px; }
+.live-srv.off { opacity: .55; }
+.live-srv h3 .pill { margin-left: 8px; }
+.live-count {
+  float: right; font-family: var(--mono); font-size: 13px; color: var(--muted);
+}
+/* .panel has no padding of its own (tables run edge-to-edge), so the card's
+   text rows carry the same 18px inset as the panel header. */
+.live-meta {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px;
+  padding: 12px 18px 0; margin: 0 0 12px; font-size: 14px;
+}
+.live-map { color: var(--cyan); font-family: var(--mono); font-size: 13px; }
+.live-map.clickable:hover { text-decoration: underline; cursor: pointer; }
+.live-addr { color: var(--faint); font-family: var(--mono); font-size: 12px; }
+.live-empty { padding: 10px 18px 16px; }
+.live-srv > .muted { display: block; padding: 12px 18px 16px; }
+.mono { font-family: var(--mono); }
+
+/* External link chips (padpork.org map pages) */
+.extlink { color: var(--cyan); opacity: .8; }
+.extlink:hover { opacity: 1; text-decoration: underline; }
+td.mapname .extlink { color: var(--faint); margin-left: 6px; font-size: 12px; opacity: 1; }
+tr:hover td.mapname .extlink { color: var(--cyan); }
+
+/* Hall of Fame panel hugs its rows (no grid stretch) so the client-side
+   height-matching trim in viewOverview can measure and fill it precisely. */
+.grid-2 > .panel.hof { align-self: start; }

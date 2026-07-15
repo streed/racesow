@@ -153,6 +153,64 @@ test("re-sending the same finish is idempotent for records", async () => {
   assert.deepEqual(second.json, { inserted: 0, improved: 0, unchanged: 1 });
 });
 
+test("/api/game/topscores serves the EXACT topscores file format the gametype parses", async () => {
+  const r = await fetch(`${base}/api/game/topscores?map=testmap1`);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type"), /text\/plain/);
+  const lines = (await r.text()).split("\n");
+  // Contract with RACE_LoadTopScores/RACE_WriteTopScores (hrace gametype):
+  // header comment, blank line, then '"time" "name" "numSectors" "cp..." '
+  // per player — best time per player, fastest first, trailing space intact.
+  assert.equal(lines[0], "//testmap1 top scores");
+  assert.equal(lines[1], "");
+  assert.equal(lines[2], '"48000" "^1No^7va" "2" "10000" "28000" ');
+  assert.equal(lines[3], '"49000" "^4Wa^5ve" "2" "9800" "27500" ');
+  // path-unsafe and unknown map names must 404, never touch the filesystem
+  assert.equal((await fetch(`${base}/api/game/topscores?map=..%2F..%2Fetc%2Fpasswd`)).status, 404);
+  assert.equal((await fetch(`${base}/api/game/topscores?map=doesnotexist`)).status, 404);
+  assert.equal((await fetch(`${base}/api/game/topscores`)).status, 404);
+});
+
+test("/api/live returns the (empty) presence snapshot shape", async () => {
+  const live = await get("/live");
+  assert.ok(Array.isArray(live.servers));
+  assert.equal(live.servers.length, 0); // no enrolled servers with an address
+});
+
+test("/player/:id serves the SPA shell with player-specific OG tags", async () => {
+  // "Nova" (raw name ^1No^7va) was ingested and aggregate-refreshed by the
+  // earlier finish test — the colour codes must be stripped in the tags.
+  const found = await get("/players?q=Nova");
+  assert.equal(found.rows.length, 1);
+  const id = found.rows[0].id;
+
+  const r = await fetch(`${base}/player/${id}`);
+  assert.equal(r.status, 200);
+  const html = await r.text();
+  assert.match(html, /<meta property="og:title" content="Nova — Racesow player stats">/);
+  assert.match(html, /<meta property="og:type" content="profile">/);
+  assert.match(html, /world record/); // stats line in og:description
+  assert.match(html, new RegExp(`<meta property="og:url" content="http://[^"]+/player/${id}">`));
+  assert.match(html, new RegExp(`<meta property="og:image" content="http://[^"]+/og/player/${id}.png">`));
+  assert.match(html, /<meta name="twitter:card" content="summary_large_image">/);
+  assert.doesNotMatch(html, /\^1/); // colour codes never leak into tags
+
+  // The per-player card renders as a real PNG.
+  const img = await fetch(`${base}/og/player/${id}.png`);
+  assert.equal(img.status, 200);
+  assert.equal(img.headers.get("content-type"), "image/png");
+  const bytes = Buffer.from(await img.arrayBuffer());
+  assert.deepEqual([...bytes.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]); // PNG magic
+  assert.ok(bytes.length > 10000, `card suspiciously small: ${bytes.length}`);
+  assert.equal((await fetch(`${base}/og/player/99999999.png`)).status, 404);
+
+  // Unknown player id falls through to the plain shell with the default tags
+  // (absolute og:image — crawlers ignore relative URLs).
+  const fallback = await (await fetch(`${base}/player/99999999`)).text();
+  assert.match(fallback, /<meta property="og:type" content="website">/);
+  assert.match(fallback, /<meta property="og:image" content="http:\/\/[^"]+\/assets\/img\/warsow-logo.png">/);
+});
+
 test("names are truncated and checkpoint garbage is normalised, not fatal", async () => {
   const longName = "N".repeat(200);
   const { status } = await ingest(

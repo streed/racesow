@@ -42,12 +42,22 @@ try {
         console.log("No servers enrolled.");
         break;
       }
-      console.log("id  status      records   last seen              name");
+      console.log("id  status      records   last seen              address                name");
       for (const s of rows) {
         console.log(
-          `${String(s.id).padEnd(3)} ${s.status.padEnd(11)} ${String(s.records).padEnd(9)} ${fmtTime(s.last_seen_at).padEnd(22)} ${s.name}`
+          `${String(s.id).padEnd(3)} ${s.status.padEnd(11)} ${String(s.records).padEnd(9)} ${fmtTime(s.last_seen_at).padEnd(22)} ${String(s.address || "—").padEnd(22)} ${s.name}`
         );
       }
+      break;
+    }
+    case "address": {
+      // Query address for the Live page (UDP getstatus). "-" clears it.
+      // The game server must run sv_public 1, or it ignores non-LAN queries.
+      const id = parseInt(args[0], 10);
+      const addr = (args[1] || "").trim();
+      if (Number.isNaN(id) || !addr) throw new Error('usage: node admin.js address <serverId> <host:port | ->');
+      const ok = race.setServerAddress(id, addr === "-" ? null : addr);
+      console.log(ok ? `Server #${id} address -> ${addr === "-" ? "(cleared)" : addr}` : `No server #${id}`);
       break;
     }
     case "revoke":
@@ -75,7 +85,7 @@ try {
       break;
     }
     default:
-      console.log("commands: enroll <name> | list | revoke <id> | trust <id> | delete-map <id>");
+      console.log("commands: enroll <name> | list | address <id> <host:port|-> | revoke <id> | trust <id> | delete-map <id>");
   }
 } finally {
   db.close();

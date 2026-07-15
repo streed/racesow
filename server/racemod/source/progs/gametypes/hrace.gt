@@ -27,6 +27,8 @@ hrace/position.as;
 hrace/quickmenu.as;
 hrace/recordtime.as;
 hrace/racelog.as;
+hrace/apitop.as;
+hrace/mirror.as;
 hrace/checkpoint.as;
 hrace/table.as;
 

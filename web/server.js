@@ -3,8 +3,11 @@
 import express from "express";
 import path from "node:path";
 import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { openDatabase, sha256 } from "./db.js";
+import { openDatabase, sha256, simplifyName } from "./db.js";
+import { createLivePoller } from "./live.js";
+import { playerCardCached } from "./og-image.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -36,6 +39,10 @@ const MAX_RECORDS_PER_REQUEST = 1000;
 
 console.log(`Opening database at ${DB_PATH} ...`);
 const race = openDatabase(DB_PATH);
+
+// Live "who's playing" poller: UDP getstatus against each enrolled server
+// that has a query address (admin.js address). /api/live serves the cache.
+const live = createLivePoller(race);
 
 const app = express();
 app.disable("x-powered-by");
@@ -76,6 +83,27 @@ api.get("/players/:id", (req, res) => {
 });
 
 api.get("/search", (req, res) => res.json(race.search(req.query.q || "", { limit: 8 })));
+
+api.get("/live", (_req, res) => {
+  const snap = live.getLive();
+  res.json({
+    ...snap,
+    servers: snap.servers.map((s) => ({ ...s, mapId: s.map ? race.mapIdByName(s.map) : null })),
+  });
+});
+
+// Live topscores for game servers: the hrace gametype's RS_ApiFetchTop
+// native GETs this on map load and on a refresh interval, and swaps the
+// response into the map's local topscores file — the payload is byte-format
+// identical to that file, so the gametype's normal loader consumes it and
+// every server connected to this API serves the same in-game `top` lists,
+// HUD record lines and record announcements. Public read — it exposes
+// nothing the map leaderboard pages don't already show.
+api.get("/game/topscores", (req, res) => {
+  const body = race.gameTopscoresText(req.query.map);
+  if (body == null) return res.status(404).type("text/plain").send("// unknown map\n");
+  res.type("text/plain").send(body);
+});
 
 api.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -211,13 +239,118 @@ app.use("/api", (err, _req, res, _next) => {
   res.status(500).json({ error: "internal error" });
 });
 
+// --- Server-rendered Open Graph tags -----------------------------------------
+// The SPA is hash-routed, but URL fragments are never sent to servers, so
+// Discord/social crawlers can't unfurl #/player/N links. Path-form URLs
+// (/player/N) get the SPA shell with player-specific OG tags injected; the
+// frontend routes those paths client-side (and rewrites the address bar to
+// this shareable form on player pages).
+const INDEX_HTML = readFileSync(path.join(__dirname, "public", "index.html"), "utf8");
+const escAttr = (s) =>
+  String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+
+function siteOrigin(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const host = req.headers["x-forwarded-host"] || req.headers.host || `localhost:${PORT}`;
+  return `${proto}://${host}`;
+}
+
+function withOgTags(tags) {
+  const block = tags
+    .map(([prop, content]) => {
+      const attr = prop.startsWith("twitter:") ? "name" : "property";
+      return `<meta ${attr}="${escAttr(prop)}" content="${escAttr(content)}">`;
+    })
+    .join("\n  ");
+  // The static shell carries default OG tags between the markers; swap them
+  // for the page-specific set.
+  return INDEX_HTML.replace(/<!-- og -->[\s\S]*?<!-- \/og -->/, `<!-- og -->\n  ${block}\n  <!-- /og -->`);
+}
+
+app.get("/player/:id", (req, res, next) => {
+  const id = parseInt(req.params.id, 10);
+  const d = Number.isNaN(id) ? null : race.playerDetail(id, { limit: 1 });
+  if (!d) return next(); // unknown player -> plain SPA shell (default tags)
+  const origin = siteOrigin(req);
+  const name = simplifyName(d.name);
+  const s = d.standing;
+  const bits = [
+    s.rank != null ? `Rank #${s.rank}` : null,
+    `${(s.points || 0).toLocaleString("en-US")} points`,
+    `${s.wr || 0} world record${s.wr === 1 ? "" : "s"}`,
+    `${s.maps || 0} maps ranked`,
+    d.finishes != null ? `${d.finishes.toLocaleString("en-US")} finishes` : null,
+  ].filter(Boolean);
+  const image = `${origin}/og/player/${d.id}.png`;
+  res.send(
+    withOgTags([
+      ["og:site_name", "Racesow"],
+      ["og:type", "profile"],
+      ["og:title", `${name} — Racesow player stats`],
+      ["og:description", bits.join(" · ")],
+      ["og:url", `${origin}/player/${d.id}`],
+      ["og:image", image],
+      ["og:image:width", "1200"],
+      ["og:image:height", "630"],
+      ["og:image:type", "image/png"],
+      ["profile:username", name],
+      ["twitter:card", "summary_large_image"],
+      ["twitter:title", `${name} — Racesow player stats`],
+      ["twitter:description", bits.join(" · ")],
+      ["twitter:image", image],
+    ])
+  );
+});
+
+// The stats card behind og:image — rendered per player, cached a few minutes.
+app.get("/og/player/:id.png", (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const d = Number.isNaN(id) ? null : race.playerDetail(id, { limit: 1 });
+  if (!d) return res.status(404).end();
+  try {
+    const png = playerCardCached(d.id, () => ({
+      name: d.name,
+      rank: d.standing.rank,
+      points: d.standing.points,
+      wr: d.standing.wr,
+      maps: d.standing.maps,
+      finishes: d.finishes,
+      host: req.headers["x-forwarded-host"] || req.headers.host || "",
+    }));
+    res.set("Content-Type", "image/png");
+    res.set("Cache-Control", "public, max-age=3600");
+    res.send(png);
+  } catch (e) {
+    console.error("og card render failed:", e.message);
+    res.status(500).end();
+  }
+});
+
+// Default tags with an absolute og:image (crawlers ignore relative URLs).
+function defaultShell(req) {
+  const origin = siteOrigin(req);
+  return withOgTags([
+    ["og:site_name", "Racesow"],
+    ["og:type", "website"],
+    ["og:title", "Racesow · Warsow Race Records"],
+    ["og:description", "Live world records, maps and player rankings from Warsow race servers."],
+    ["og:url", origin + "/"],
+    ["og:image", `${origin}/assets/img/warsow-logo.png`],
+    ["twitter:card", "summary"],
+  ]);
+}
+
+app.get("/", (req, res) => res.send(defaultShell(req)));
+
 // Static frontend.
 app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
 
 // SPA fallback for client-side routes (non-API, non-asset).
 app.get("*", (req, res, next) => {
   if (req.path.startsWith("/api/") || req.path.includes(".")) return next();
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+  res.send(defaultShell(req));
 });
 
 app.listen(PORT, () => {
@@ -226,4 +359,7 @@ app.listen(PORT, () => {
   if (INGEST_TOKEN_HASH) modes.push("shared-token");
   if (race.caps.server) modes.push(`${race.servers().length} enrolled server(s)`);
   console.log(`Ingest: ${modes.length ? modes.join(" + ") : "DISABLED"}`);
+  live.start();
+  const liveTargets = race.servers().filter((s) => s.address).length;
+  console.log(`Live poller: ${liveTargets} server(s) with a query address`);
 });

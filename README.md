@@ -11,7 +11,11 @@ Everything you need to run a **Warsow 2.1 race community** in Docker:
 3. **`web/`** — a **Node.js + SQLite** web server that hosts the race database
    behind a REST API (including the authenticated `/api/ingest` endpoint) and
    a retro-modern stats website (world records, maps, player rankings — all
-   live-queried, searchable and sortable).
+   live-queried, searchable and sortable). A **Live tab** shows who is playing
+   right now on every enrolled server with a query address (UDP `getstatus`,
+   polled server-side; enable per server with `node admin.js address`), and
+   player pages are shareable as `/player/<id>` with server-rendered Open
+   Graph stats for Discord/social unfurls.
 4. **`discord/`** — a small service that posts **new race records to a Discord
    webhook**.
 5. **`data/db.sqlite`** — the race records database (seeded from the livesow
@@ -68,6 +72,23 @@ DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/…" docker compose up -d
 ```
 
 (Without a webhook the announcer runs in harmless dry-run/log mode.)
+
+### Guided install
+
+`scripts/setup.sh` walks through either deployment shape — it checks/installs
+Docker, asks the right questions, and wires everything up:
+
+```bash
+scripts/setup.sh agent   # game server only, pushing records to a remote
+                         # stats site (asks for the ingest URL + token)
+scripts/setup.sh full    # website + Discord announcer + game server on one
+                         # box, enrolled against each other automatically
+```
+
+For production boxes, `systemd/install.sh [full|agent]` then installs systemd
+units on top: explicit boot ordering (web stack before game server),
+`systemctl status racesow-*`, and a nightly gzip'd database backup into
+`backups/db/` (`racesow-db-backup.timer`, 14-day retention).
 
 ### Game server
 
