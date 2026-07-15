@@ -379,26 +379,29 @@ function buildAggregates(db, caps) {
 }
 
 // Whitelisted sort columns keep user-supplied `sort` params injection-safe.
-const MAP_SORTS = {
+// Null-prototype so a query param like ?sort=constructor or ?sort=toString
+// (inherited Object.prototype keys) can't return a truthy non-column value and
+// slip past the `SORTS[sort] || fallback` guard into `ORDER BY ${col}`.
+const MAP_SORTS = Object.assign(Object.create(null), {
   name: "mi.name COLLATE NOCASE",
   records: "mi.records",
   races: "mi.records", // legacy alias
   finishes: "mi.finishes",
   wr_time: "mi.wr_time",
-};
-const PLAYER_SORTS = {
+});
+const PLAYER_SORTS = Object.assign(Object.create(null), {
   points: "points",
   wr: "wr",
   podium: "podium",
   maps: "maps",
   rank: "rank",
   name: "p.simplified COLLATE NOCASE",
-};
-const RECORD_SORTS = {
+});
+const RECORD_SORTS = Object.assign(Object.create(null), {
   map: "map_name COLLATE NOCASE",
   time: "time",
   rank: "rank",
-};
+});
 
 function dir(order, fallback = "ASC") {
   return String(order).toLowerCase() === "desc" ? "DESC" : String(order).toLowerCase() === "asc" ? "ASC" : fallback;
@@ -421,6 +424,11 @@ class RaceDB {
     for (const v of db.prepare("SELECT id, name FROM version").all()) {
       this.versions[v.id] = v.name;
     }
+    // Memoized perfect-run per map. perfectRun() is an O(races×checkpoints)
+    // synchronous scan, and /api/maps/:id is public+unauthenticated, so on a
+    // busy or (ingest-)bloated map it could block the single event loop on
+    // every hit. Compute once per map, reuse until an ingest touches that map.
+    this._perfectRunCache = new Map();
   }
 
   overview() {
@@ -663,9 +671,22 @@ class RaceDB {
   // stitched together with per-segment attribution. This is the classic
   // speedrun "sum of best splits". Bounded to one map's checkpoint rows.
   perfectRun(mapId, wr) {
-    // finish time per race on this map
+    const cached = this._perfectRunCache.get(mapId);
+    if (cached !== undefined) return cached;
+    const result = this._computePerfectRun(mapId, wr);
+    // Bound the memo so a distinct-map sweep can't grow it without limit.
+    if (this._perfectRunCache.size >= 2048) this._perfectRunCache.clear();
+    this._perfectRunCache.set(mapId, result);
+    return result;
+  }
+
+  _computePerfectRun(mapId, wr) {
+    // finish time per race on this map. Defensive ceiling: the best per-segment
+    // splits come from the fastest runs, so bounding to the fastest N races
+    // caps the scan a hostile ingest could otherwise inflate without changing
+    // the result for any realistic map.
     const races = this.db
-      .prepare("SELECT id, player_id, time FROM race WHERE map_id = ?")
+      .prepare("SELECT id, player_id, time FROM race WHERE map_id = ? ORDER BY time ASC LIMIT 20000")
       .all(mapId);
     if (!races.length) return null;
     const finishById = new Map(races.map((r) => [r.id, r]));
@@ -673,7 +694,8 @@ class RaceDB {
     const cps = this.db
       .prepare(
         `SELECT race_id, number, time FROM checkpoint
-         WHERE race_id IN (SELECT id FROM race WHERE map_id = ?) AND time > 0
+         WHERE race_id IN (SELECT id FROM race WHERE map_id = ? ORDER BY time ASC LIMIT 20000)
+           AND time > 0
          ORDER BY race_id, number`
       )
       .all(mapId);
@@ -876,6 +898,7 @@ class RaceDB {
       DROP TABLE IF EXISTS temp.map_index;
     `);
     buildAggregates(this.db, this.caps);
+    this._perfectRunCache.clear();
   }
 
   // ------------------------------------------------------------------------
@@ -929,7 +952,7 @@ class RaceDB {
 
       const counts = { inserted: 0, improved: 0, unchanged: 0 };
       for (const rec of records) {
-        const playerId = this._resolvePlayer(rec, S, source);
+        const playerId = this._resolvePlayer(rec, S);
 
         if (tally) {
           S.bumpTally.run(playerId, mapRow.id, versionRow.id, now, now);
@@ -955,6 +978,7 @@ class RaceDB {
       if (counts.inserted || counts.improved) {
         S.rerankMap.run(mapRow.id);
         S.touchLastUpdate.run(String(now));
+        this._perfectRunCache.delete(mapRow.id); // stale after new/improved times
       }
       return counts;
     });
@@ -969,11 +993,18 @@ class RaceDB {
   }
 
   // Resolve (and, if new, create) the player row, keeping canonical grouping
-  // current. A live finish (source=racelog) means we just saw this person use
-  // this nick, so it becomes the group's representative ("last nick we know
-  // of"). Topscores is a periodic backfill of historical bests, so it joins the
-  // group without disturbing the representative.
-  _resolvePlayer(rec, S, source) {
+  // current. New identities JOIN the existing group; they never seize it.
+  //
+  // Both `name` and `login` in an ingest are attacker-chosen and unverified
+  // (the login/auth servers are gone), so we must NOT let a submission promote
+  // its chosen nick to a pre-existing group's representative — that let a
+  // malicious enrolled server repoint another player's entire canonical group
+  // (points, WRs, standings) onto a row it just created, simply by knowing the
+  // victim's public login or a colour-variant of their nick. So racelog and
+  // topscores are treated identically here: a new row joins the group under the
+  // group's established representative; the representative is only ever set when
+  // the group is first created (or by the offline rebuildCanonical pass).
+  _resolvePlayer(rec, S) {
     const simplified = simplifyName(rec.name);
     const row = S.playerByIdent.get(rec.name, rec.login);
     const id = row ? row.id : S.insertPlayer.run(rec.name, simplified, trimName(simplified), rec.login).lastInsertRowid;
@@ -988,16 +1019,8 @@ class RaceDB {
       return id;
     }
     if (rep.player_id === id) return id; // already the representative
-
-    if (source === "racelog") {
-      // Promote this nick to the group's display and move the group onto it.
-      S.repointCanon.run(id, rep.player_id);
-      S.setCanonical.run(id, id);
-      S.insertCanon.run(key, id);
-    } else {
-      // Backfill: just join the existing group.
-      S.setCanonical.run(rep.player_id, id);
-    }
+    // Join the existing group without disturbing its representative.
+    S.setCanonical.run(rep.player_id, id);
     return id;
   }
 
@@ -1049,7 +1072,6 @@ class RaceDB {
       canonByKey: db.prepare("SELECT player_id FROM canonical WHERE key = ?"),
       insertCanon: db.prepare("INSERT OR REPLACE INTO canonical (key, player_id) VALUES (?, ?)"),
       setCanonical: db.prepare("UPDATE player SET canonical_id = ? WHERE id = ?"),
-      repointCanon: db.prepare("UPDATE player SET canonical_id = ? WHERE canonical_id = ?"),
     };
     return this._prep;
   }

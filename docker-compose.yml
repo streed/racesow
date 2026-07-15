@@ -16,6 +16,11 @@ services:
     environment:
       PORT: "8080"
       DB_PATH: /data/db.sqlite
+      # Canonical public origin for server-rendered share URLs + OG cards. Set
+      # this in production (e.g. https://eu.frankfurt.racesow.org) so og:url/
+      # og:image and the OG image footer never derive from the request Host
+      # header (prevents host-header cache poisoning). Empty → per-request (dev).
+      PUBLIC_ORIGIN: "${PUBLIC_ORIGIN:-}"
       # Optional shared secret for POST /api/ingest. Empty by default → ingest
       # stays disabled until you either set a real secret here (openssl rand
       # -hex 32) or enroll per-server tokens (recommended for multiple servers):

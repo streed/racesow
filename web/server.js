@@ -14,6 +14,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "data", "db.sqlite");
 
+// Canonical public origin for server-rendered share URLs (og:url/og:image) and
+// the OG card footer. Pinning it here means those never depend on the
+// attacker-controllable Host / X-Forwarded-Host header (which would otherwise
+// let a request point another viewer's share tags at an arbitrary host and
+// poison the id-keyed OG image cache). Unset -> derive per request (dev).
+const PUBLIC_ORIGIN = (process.env.PUBLIC_ORIGIN || "").replace(/\/+$/, "");
+const PUBLIC_HOST = PUBLIC_ORIGIN ? new URL(PUBLIC_ORIGIN).host : "";
+
 // Legacy single-server token (optional). Per-server tokens live in the DB
 // `server` table and are the recommended path for multi-server deploys.
 const PLACEHOLDER_TOKEN = "change-me-ingest-token";
@@ -33,6 +41,8 @@ const REFRESH_MAX_WAIT_MS = 30000;
 // Defensive caps on a single ingested record (a buggy/hostile authorized
 // collector could otherwise bloat the DB). Real data maxes ~2730 checkpoints.
 const MAX_NAME_LEN = 64;
+const MAX_MAP_LEN = 128;
+const MAX_VERSION_LEN = 64;
 const MAX_CHECKPOINTS = 4096;
 const MAX_TIME_MS = 24 * 60 * 60 * 1000;
 const MAX_RECORDS_PER_REQUEST = 1000;
@@ -46,6 +56,52 @@ const live = createLivePoller(race);
 
 const app = express();
 app.disable("x-powered-by");
+// One trusted proxy (the production nginx) so req.ip is the real client for
+// rate limiting; harmless when hit directly (no X-Forwarded-For -> socket IP).
+app.set("trust proxy", 1);
+
+// Minimal dependency-free fixed-window rate limiter. The production nginx also
+// rate-limits, but the game-server render routes (/player, /og) and ingest
+// warrant an in-app cap too: those routes do synchronous DB work + PNG
+// rasterization that blocks the single event loop, so an unthrottled flood of
+// distinct ids can stall the whole site. Keyed per client (IP) or per ingest
+// server; an unref'd sweeper bounds the map so distinct-key floods can't grow
+// it without limit.
+function rateLimiter({ windowMs, max, key = (req) => req.ip || "?" }) {
+  const hits = new Map(); // key -> { count, resetAt }
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [k, e] of hits) if (e.resetAt <= now) hits.delete(k);
+  }, windowMs);
+  sweep.unref();
+  return (req, res, next) => {
+    const now = Date.now();
+    const k = key(req);
+    let e = hits.get(k);
+    if (!e || e.resetAt <= now) {
+      e = { count: 0, resetAt: now + windowMs };
+      hits.set(k, e);
+    }
+    if (++e.count > max) {
+      res.set("Retry-After", String(Math.ceil((e.resetAt - now) / 1000)));
+      return res.status(429).json({ error: "rate limited" });
+    }
+    next();
+  };
+}
+
+// Server-rendered player/OG routes: expensive (DB + resvg PNG), so keep this
+// tighter than the API. ~1/s average per IP absorbs crawlers and real users.
+const renderLimiter = rateLimiter({ windowMs: 60_000, max: 60 });
+// Public read API backstop (nginx does the primary 20r/s); generous so page
+// fan-out isn't affected, but bounds a direct-to-:8080 flood.
+const apiLimiter = rateLimiter({ windowMs: 60_000, max: 600 });
+// Ingest: keyed by the authenticated server so one server can't starve others.
+const ingestLimiter = rateLimiter({
+  windowMs: 60_000,
+  max: 120,
+  key: (req) => "ingest:" + (req.ingest ? req.ingest.serverId ?? req.ingest.serverName : req.ip),
+});
 
 app.use((req, _res, next) => {
   if (req.path.startsWith("/api/")) console.log(`${req.method} ${req.originalUrl}`);
@@ -53,6 +109,7 @@ app.use((req, _res, next) => {
 });
 
 const api = express.Router();
+api.use(apiLimiter);
 
 function asInt(v) {
   const n = parseInt(v, 10);
@@ -193,13 +250,19 @@ api.post(
     req.ingest = ident;
     next();
   },
+  ingestLimiter, // per-server cap (after auth so req.ingest is set)
   express.json({ limit: "2mb" }),
   (req, res) => {
-    const { version, map, records } = req.body || {};
-    const source = req.body && req.body.source === "racelog" ? "racelog" : "topscores";
-    if (typeof version !== "string" || !version || typeof map !== "string" || !map) {
+    const body = req.body || {};
+    const source = body.source === "racelog" ? "racelog" : "topscores";
+    if (typeof body.version !== "string" || !body.version || typeof body.map !== "string" || !body.map) {
       return res.status(400).json({ error: "version and map are required" });
     }
+    // Cap the top-level strings for parity with record name/login, so an
+    // enrolled server can't persist multi-KB map/version rows (DB bloat).
+    const version = body.version.slice(0, MAX_VERSION_LEN);
+    const map = body.map.slice(0, MAX_MAP_LEN);
+    const records = body.records;
     if (!Array.isArray(records) || records.length === 0 || records.length > MAX_RECORDS_PER_REQUEST) {
       return res.status(400).json({ error: `records must be a non-empty array (max ${MAX_RECORDS_PER_REQUEST})` });
     }
@@ -252,6 +315,7 @@ const escAttr = (s) =>
   );
 
 function siteOrigin(req) {
+  if (PUBLIC_ORIGIN) return PUBLIC_ORIGIN; // pinned: never trust request headers
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
   const host = req.headers["x-forwarded-host"] || req.headers.host || `localhost:${PORT}`;
   return `${proto}://${host}`;
@@ -269,7 +333,7 @@ function withOgTags(tags) {
   return INDEX_HTML.replace(/<!-- og -->[\s\S]*?<!-- \/og -->/, `<!-- og -->\n  ${block}\n  <!-- /og -->`);
 }
 
-app.get("/player/:id", (req, res, next) => {
+app.get("/player/:id", renderLimiter, (req, res, next) => {
   const id = parseInt(req.params.id, 10);
   const d = Number.isNaN(id) ? null : race.playerDetail(id, { limit: 1 });
   if (!d) return next(); // unknown player -> plain SPA shell (default tags)
@@ -305,7 +369,7 @@ app.get("/player/:id", (req, res, next) => {
 });
 
 // The stats card behind og:image — rendered per player, cached a few minutes.
-app.get("/og/player/:id.png", (req, res) => {
+app.get("/og/player/:id.png", renderLimiter, (req, res) => {
   const id = parseInt(req.params.id, 10);
   const d = Number.isNaN(id) ? null : race.playerDetail(id, { limit: 1 });
   if (!d) return res.status(404).end();
@@ -317,7 +381,9 @@ app.get("/og/player/:id.png", (req, res) => {
       wr: d.standing.wr,
       maps: d.standing.maps,
       finishes: d.finishes,
-      host: req.headers["x-forwarded-host"] || req.headers.host || "",
+      // Fixed, config-derived host so the id-keyed cache render is
+      // deterministic and can't be poisoned via the request's Host header.
+      host: PUBLIC_HOST,
     }));
     res.set("Content-Type", "image/png");
     res.set("Cache-Control", "public, max-age=3600");

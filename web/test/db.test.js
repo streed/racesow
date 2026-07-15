@@ -41,6 +41,38 @@ test("openDatabase bootstraps a usable schema on an empty file", (t) => {
   assert.deepEqual(race.maps().rows, []);
 });
 
+test("a later racelog nick cannot seize an existing canonical group (identity hijack)", (t) => {
+  const race = freshDb(t);
+  // Victim establishes the group under login 'vic'.
+  race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Victim", 50000, [], "vic")] });
+  const victimId = race.db.prepare("SELECT id FROM player WHERE name = 'Victim'").get().id;
+  const key = canonKey(simplifyName("Victim"), "vic");
+  assert.equal(race.db.prepare("SELECT player_id FROM canonical WHERE key = ?").get(key).player_id, victimId);
+
+  // Attacker submits a NEW nick under the victim's login with a faster time.
+  race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("PWNED_BY_ATTACKER", 40000, [], "vic")] });
+  race.refreshAggregates();
+
+  // The group representative (display identity) must NOT move to the attacker's
+  // freshly-created row: the whole leaderboard footprint stays "Victim".
+  assert.equal(race.db.prepare("SELECT player_id FROM canonical WHERE key = ?").get(key).player_id, victimId);
+  const mapId = race.db.prepare("SELECT id FROM map WHERE name = ?").get(MAP).id;
+  assert.equal(race.mapDetail(mapId).leaderboard[0].name, "Victim");
+});
+
+test("inherited Object.prototype sort keys fall back to default, never error", (t) => {
+  const race = freshDb(t);
+  race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova", 50000)] });
+  race.refreshAggregates();
+  for (const sort of ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"]) {
+    assert.doesNotThrow(() => race.maps({ sort }), `maps sort=${sort}`);
+    assert.doesNotThrow(() => race.players({ sort }), `players sort=${sort}`);
+    assert.doesNotThrow(() => race.playerDetail(1, { sort }), `playerDetail sort=${sort}`);
+  }
+  // A valid default result still comes back.
+  assert.equal(race.maps({ sort: "constructor" }).rows.length, 1);
+});
+
 test("every finish counts as an attempt; only the best is kept as the PR", (t) => {
   const race = freshDb(t);
 
