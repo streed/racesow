@@ -108,7 +108,16 @@ void RS_MirrorBotUpdate( int playerNum, float ox, float oy, float oz,
 	ent->movetype = MOVETYPE_NONE;
 	ent->s.effects |= EF_RACEGHOST;
 	ent->s.type = ET_PLAYER;
-	(void)flags;
+	// flags bit 1 (value 2) = a WR "ghost racer" (hrace/ghostbot.as): make it
+	// non-solid so real racers run straight through it, and re-assert
+	// visibility each frame in case the engine tries to hide it. bit 0 (value
+	// 1) is the mesh "racing" animation hint and is ignored here (velocity
+	// alone drives the animation).
+	if( flags & 2 )
+	{
+		ent->r.solid = SOLID_NOT;
+		ent->r.svflags &= ~SVF_NOCLIENT;
+	}
 	GClip_LinkEntity( ent );
 }
 

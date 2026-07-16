@@ -308,6 +308,26 @@ footer.site a { color: var(--cyan); }
 .live-addr { color: var(--faint); font-family: var(--mono); font-size: 12px; }
 .live-empty { padding: 10px 18px 16px; }
 .live-srv > .muted { display: block; padding: 12px 18px 16px; }
+/* cross-server mesh chips (live server card) */
+.live-mesh {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px;
+  padding: 0 18px 12px; margin-top: -4px;
+}
+.mesh-label {
+  font-family: var(--cond); font-style: italic; text-transform: uppercase;
+  letter-spacing: 1px; font-size: 11px; color: var(--muted);
+}
+.mesh-peer {
+  display: inline-flex; align-items: baseline; gap: 5px;
+  padding: 2px 9px; border: 1px solid var(--line); border-radius: 999px;
+  background: var(--bg-2);
+}
+.mesh-tag {
+  font-family: var(--cond); font-style: italic; text-transform: uppercase;
+  letter-spacing: .5px; font-size: 12px; color: var(--teal);
+}
+.mesh-map { font-family: var(--mono); font-size: 11px; color: var(--cyan); }
+.mesh-num { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .mono { font-family: var(--mono); }
 
 /* External link chips (padpork.org map pages) */
@@ -319,3 +339,102 @@ tr:hover td.mapname .extlink { color: var(--cyan); }
 /* Hall of Fame panel hugs its rows (no grid stretch) so the client-side
    height-matching trim in viewOverview can measure and fill it precisely. */
 .grid-2 > .panel.hof { align-self: start; }
+
+/* Clickable server name in the Live cards + offline live-dot state */
+.srvname.clickable { cursor: pointer; }
+.srvname.clickable:hover { text-decoration: underline; }
+.livedot.off { background: #5c637d; animation: none; box-shadow: none; }
+
+/* ==========================================================================
+   Mobile / narrow-viewport layout
+   ========================================================================== */
+
+/* Header: at phone/tablet widths the brand + nav + search no longer fit on one
+   row. Wrap to brand+search on row 1, nav full-width on row 2. */
+@media (max-width: 720px) {
+  .header-inner { flex-wrap: wrap; gap: 10px 12px; padding: 10px 14px; }
+  .brand { gap: 10px; }
+  .brand img { width: 30px; height: 30px; }
+  .brand .wordmark { font-size: 21px; }
+  .brand .tag { display: none; }              /* reclaim space */
+  .gsearch { order: 2; width: auto; flex: 1 1 130px; min-width: 120px; margin-left: 8px; }
+  nav.main { order: 3; width: 100%; margin-left: 0; gap: 6px; }
+  nav.main a { flex: 1; text-align: center; padding: 9px 6px; font-size: 13px; letter-spacing: .5px; }
+  .gsearch .results { top: 44px; }
+}
+
+/* Content: tighter gutters, smaller headings, denser tables. */
+@media (max-width: 560px) {
+  main { padding: 18px 12px 64px; }
+  .page-title { font-size: 24px; }
+  .page-sub { font-size: 13px; margin-bottom: 16px; }
+  .tiles { gap: 10px; margin-bottom: 20px; }
+  .tile { padding: 13px 14px; }
+  .tile .num { font-size: 25px; }
+  .grid-2 { gap: 16px; }
+  table.data thead th, table.data tbody td { padding: 9px 10px; font-size: 13px; }
+  .panel > h3 { font-size: 15px; padding: 12px 14px; }
+  .statrow { gap: 8px; }
+  .statrow .s { padding: 11px 12px; }
+  .statrow .s .n { font-size: 22px; }
+  /* Live/server cards: single column, tighter. */
+  .live-grid { grid-template-columns: 1fr; gap: 14px; }
+  .live-meta { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .feeditem { padding: 10px 14px; }
+  /* Let long connect strings / addresses wrap instead of overflowing. */
+  .live-addr, .live-meta { overflow-wrap: anywhere; }
+}
+
+/* Header wordmark/nav further tightening on very small phones. */
+@media (max-width: 380px) {
+  .brand .wordmark { font-size: 19px; }
+  nav.main a { font-size: 12px; padding: 8px 4px; }
+  .gsearch input { font-size: 13px; }
+}
+
+/* ---------------------------- WR replay ---------------------------------- */
+.replay-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.replay-actions .btn { text-decoration: none; }
+.replay-watch { color: var(--gold); border-color: rgba(255,210,74,.4); }
+.replay-watch:hover { border-color: var(--gold); }
+.demo-help { margin-top: 10px; font-size: 13px; color: var(--muted); }
+.demo-help summary { cursor: pointer; color: var(--cyan); }
+.demo-help code { font-family: var(--mono); background: rgba(255,255,255,.05);
+  border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; color: var(--text); }
+
+.replay-head { margin-bottom: 12px; }
+.replay-sub { color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.replay-root { border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+  background: #0a0b0f; box-shadow: var(--shadow); }
+.rv-stage { width: 100%; height: min(64vh, 640px); min-height: 320px; }
+.rv-stage canvas { display: block; width: 100%; height: 100%; }
+.rv-bar { display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  border-top: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+.rv-btn { font-family: var(--cond); text-transform: uppercase; letter-spacing: .5px;
+  font-size: 13px; color: var(--text); background: transparent; border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+.rv-btn:hover { border-color: var(--orange); color: #fff; }
+.rv-play { min-width: 42px; font-size: 15px; }
+.rv-seek { flex: 1 1 180px; accent-color: var(--orange); cursor: pointer; }
+.rv-clock, .rv-total { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--text); }
+.rv-sep { color: var(--faint); }
+.rv-hud { color: var(--cyan); margin-left: 6px; }
+.rv-speed-sel { background: var(--bg); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 6px; font-family: var(--cond); }
+.rv-note { color: var(--muted); font-size: 12px; padding: 6px 12px; }
+.rv-note:empty { display: none; }
+
+/* ---- replay key-press overlay (in-game "show keys" style) ---- */
+.rv-stage { position: relative; }
+.rv-keys { position: absolute; left: 14px; bottom: 14px; z-index: 3;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  pointer-events: none; user-select: none; font-family: var(--cond); }
+.rv-keys.rv-hidden { display: none; }
+.rv-krow { display: flex; gap: 4px; justify-content: center; }
+.rv-key { display: inline-flex; align-items: center; justify-content: center;
+  min-width: 30px; height: 30px; padding: 0 8px; font-size: 12px; font-weight: 600;
+  letter-spacing: .5px; color: var(--faint); background: rgba(10,11,15,.55);
+  border: 1px solid var(--line); border-radius: 6px; transition: all .06s ease; }
+.rv-key.rv-wide { min-width: 60px; }
+.rv-key.on { color: #0a0b0f; background: var(--orange);
+  border-color: var(--orange); box-shadow: 0 0 12px rgba(255,106,26,.55); }

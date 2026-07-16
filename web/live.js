@@ -89,6 +89,28 @@ export function queryServer(host, port, timeoutMs = QUERY_TIMEOUT_MS) {
   });
 }
 
+// Parse the game server's rs_mesh_status serverinfo field — a compact list of
+// the peer servers it currently hears, "TAG:map:players,TAG:map:players,...".
+// (Published by the hrace mirror module; see mirror.as RACE_MirrorPublishStatus.)
+// Absent/empty => null (mesh disabled or no peers heard). Defensive: skip
+// malformed records so a stray value can never throw.
+export function parseMeshStatus(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const peers = [];
+  for (const rec of raw.split(",")) {
+    const f = rec.split(":");
+    if (f.length < 3 || !f[0]) continue;
+    const players = parseInt(f[2], 10);
+    peers.push({
+      tag: f[0].slice(0, 8),
+      map: f[1] || null,
+      players: Number.isFinite(players) ? players : 0,
+    });
+    if (peers.length >= 16) break;
+  }
+  return peers.length ? peers : null;
+}
+
 // Shape one server's poll result for the API/frontend.
 function presentResult(server, result) {
   const base = {
@@ -107,6 +129,7 @@ function presentResult(server, result) {
     map: info.mapname || null,
     gametype: info.gametype || info.g_gametype || null,
     maxclients: info.sv_maxclients ? parseInt(info.sv_maxclients, 10) : null,
+    mesh: parseMeshStatus(info.rs_mesh_status),
     players: players.map((p) => ({
       name: p.name,
       simplified: simplifyName(p.name),

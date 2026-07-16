@@ -27,6 +27,13 @@ Cvar rsMirrorMaxGhosts( "rs_mirror_maxghosts", "32", 0 );
 // console; pairs with the C side's "rs_mirror: stats" line for headless
 // verification that the mesh broadcast is flowing
 Cvar rsMirrorDebug( "rs_mirror_debug", "0", 0 );
+// Published into serverinfo (CVAR_SERVERINFO) so the web dashboard can read the
+// live mesh state via the getstatus query: a compact, delimiter-safe list of
+// the peer servers this node currently hears, each as "TAG:map:players". Must
+// stay under MAX_INFO_VALUE (64 chars) and free of \ " ; or the engine's
+// Info_Validate rejects the whole value (keeping the previous one). See
+// RACE_MirrorPublishStatus.
+Cvar rsMeshStatus( "rs_mesh_status", "", CVAR_SERVERINFO );
 
 const uint MIRROR_PUBLISH_INTERVAL = 16; // ms between state publishes/syncs (~60Hz)
 const uint MIRROR_EXTRAPOLATE_MAX = 150;  // ms of dead-reckoning before a ghost freezes
@@ -124,6 +131,7 @@ void RACE_MirrorInit()
 {
     G_RegisterCommand( "who" );
     G_RegisterCommand( "watch" );
+    RACE_MeshVoteInit();
 }
 
 void RACE_MirrorSpawnGametype()
@@ -153,6 +161,11 @@ void RACE_MirrorSpawnGametype()
     // always picks up the current map for the packet headers
     RS_MirrorConfigure( rsMirrorTag.string, rsMirrorSecret.string,
             rsMirrorPort.string.toInt(), rsMirrorPeers.string, mirrorLocalMap );
+
+    // Announce our (new) map to the mesh so peers print "[TAG] now playing X"
+    // and update immediately — fired on every map load, whatever the cause
+    // (mesh vote, native callvote, rotation, admin).
+    RS_MirrorEvent( "M", mirrorLocalMap, "" );
 }
 
 void RACE_MirrorShutdown()
@@ -179,11 +192,20 @@ void RACE_MirrorThink()
     }
     RACE_MirrorUpdateBots();
     RACE_MirrorUpdateWatchers();
+    RACE_MeshVoteThink();
 
     if ( realTime >= mirrorNextPublish )
     {
         mirrorNextPublish = realTime + MIRROR_PUBLISH_INTERVAL;
         RACE_MirrorPublish();
+    }
+
+    // Refresh the serverinfo mesh_status a couple of times a minute is plenty
+    // for a dashboard the web polls every ~10s; keep it off the hot path.
+    if ( realTime >= mirrorNextStatus )
+    {
+        mirrorNextStatus = realTime + 2000;
+        RACE_MirrorPublishStatus();
     }
 
     if ( rsMirrorDebug.integer > 0 && realTime >= mirrorNextDebugSummary )
@@ -228,9 +250,90 @@ void RACE_MirrorDebugSummary()
         G_Print( "rs_mirror(as): roster empty (no remote players streamed)\n" );
 }
 
+// --- serverinfo mesh_status (read by the web live page) --------------------
+
+uint mirrorNextStatus = 0;
+const uint MESH_STATUS_MAX = 63; // MAX_INFO_VALUE (64) - 1
+
+// Strip anything illegal in a serverinfo value (\ " ; or control/non-ASCII) or
+// that we use as a field/record delimiter ( : , ), and cap the length, so a
+// stray map or tag name can neither corrupt the encoding nor get the whole
+// cvar rejected by the engine's Info_Validate.
+String RACE_MeshStatusClean( const String &in raw, uint maxLen )
+{
+    String s = raw.removeColorTokens();
+    String clean = "";
+    for ( uint i = 0; i < s.length() && clean.length() < maxLen; i++ )
+    {
+        uint8 c = s[i];
+        if ( c < uint8(0x20) || c > uint8(0x7E) )       // control / non-ASCII
+            continue;
+        if ( c == uint8(0x5C) || c == uint8(0x22) || c == uint8(0x3B)   // \ " ;
+                || c == uint8(0x3A) || c == uint8(0x2C) )                // : ,
+            continue;
+        clean += s.substr( i, 1 );
+    }
+    return clean;
+}
+
+// Build "TAG:map:players,TAG:map:players,..." for every peer we currently hear
+// (peers time out of the snapshot when silent, so the list is exactly the live
+// mesh) and publish it into serverinfo. Greedily truncated to stay under
+// MAX_INFO_VALUE — the web renders whatever it receives.
+void RACE_MirrorPublishStatus()
+{
+    String status = "";
+    int pc = RS_MirrorPeerCount();
+    for ( int i = 0; i < pc; i++ )
+    {
+        String rawTag = RS_MirrorPeerTag( i );
+        String tag = RACE_MeshStatusClean( rawTag, 6 );
+        if ( tag.length() == 0 )
+            continue;
+        String map = RACE_MeshStatusClean( RS_MirrorPeerMap( i ), 16 );
+
+        int players = 0;
+        for ( uint j = 0; j < mirrorPlayers.length(); j++ )
+        {
+            if ( mirrorPlayers[j].server == rawTag )
+                players++;
+        }
+
+        String rec = tag + ":" + map + ":" + players;
+        String next = ( status.length() == 0 ) ? rec : ( status + "," + rec );
+        if ( next.length() > MESH_STATUS_MAX )
+            break; // keep the value valid rather than lose it all to Info_Validate
+        status = next;
+    }
+
+    // Only write on change: trap_Cvar_Set flags serverinfo dirty every call.
+    if ( status != rsMeshStatus.string )
+        rsMeshStatus.set( status );
+}
+
+// True for our mirror bots (and any fake client). We test SVF_FAKECLIENT on the
+// entity rather than only RS_MirrorBotIs because the "connect"/"disconnect"
+// score events fire from INSIDE trap_FakeClientConnect / trap_DropClient — i.e.
+// before RS_MirrorBotAdd marks the slot (and after RS_MirrorBotRemove clears
+// it) — but the engine keeps SVF_FAKECLIENT set for the bot's whole lifetime.
+bool RACE_MirrorIsFakeClient( Client@ client )
+{
+    if ( @client == null )
+        return false;
+    if ( RS_MirrorBotIs( client.playerNum ) )
+        return true;
+    Entity@ ent = client.getEnt();
+    return @ent != null && ( ent.svflags & SVF_FAKECLIENT ) != 0;
+}
+
 void RACE_MirrorPlayerJoined( Client@ client )
 {
     if ( !RACE_MirrorEnabled() || @client == null )
+        return;
+    // Never announce our own mirror bots: they represent players already on a
+    // PEER server, so echoing their connect back into the mesh (hop limit 1)
+    // would report a remote player as a new local join on their origin server.
+    if ( RACE_MirrorIsFakeClient( client ) )
         return;
     RS_MirrorEvent( "J", client.name, "" );
 }
@@ -239,6 +342,8 @@ void RACE_MirrorPlayerLeft( Client@ client )
 {
     if ( !RACE_MirrorEnabled() || @client == null )
         return;
+    if ( RACE_MirrorIsFakeClient( client ) )
+        return; // mirror bots are peer players, not local ones (see Joined)
     RS_MirrorEvent( "L", client.name, "" );
 }
 
@@ -351,6 +456,11 @@ void RACE_MirrorDrainEvents()
         else if ( type == 3 )
             G_PrintMsg( null, "[" + tag + S_COLOR_WHITE + "] " + name
                     + S_COLOR_YELLOW + " disconnected\n" );
+        else if ( type == 7 ) // M: a peer changed map
+            G_PrintMsg( null, "[" + tag + S_COLOR_WHITE + "] "
+                    + S_COLOR_YELLOW + "now playing " + S_COLOR_GREEN + name + "\n" );
+        else if ( type >= 4 && type <= 6 ) // O/T/R mesh-vote events
+            RACE_MeshVoteOnEvent( type, tag, name, RS_MirrorEventText() );
     }
 }
 

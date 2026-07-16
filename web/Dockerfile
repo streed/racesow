@@ -16,7 +16,8 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY server.js db.js live.js og-image.js admin.js seed-topscores.js migrate-sqlite-to-pg.js ./
+COPY server.js db.js live.js og-image.js cache.js admin.js seed-topscores.js migrate-sqlite-to-pg.js ./
+COPY migrations ./migrations
 COPY og-assets ./og-assets
 COPY public ./public
 

@@ -25,7 +25,8 @@ import sys
 # insertion (silently doubling the chat hook, and only failing later in the
 # cmake step on redefined statics). Fail fast if the patch is already present.
 for _p, _marker in [("game/g_ascript.cpp", "asFunc_RS_MirrorConfigure"),
-                    ("game/g_cmds.cpp", "RS_MirrorLocalChat")]:
+                    ("game/g_cmds.cpp", "RS_MirrorLocalChat"),
+                    ("game/g_gameteams.cpp", "RS_MirrorLocalChat")]:
     if _marker in open(_p, encoding="utf-8").read():
         sys.exit("FATAL: mirror natives patch already applied (%s in %s)" % (_marker, _p))
 
@@ -41,7 +42,7 @@ def patch(path, old, new, what):
 # --- 1a. wrapper functions, inserted just before the global function table --
 ANCHOR_TABLE = "static const asglobfuncs_t asGlobFuncs[] =\n"
 
-STRING_GETTERS = ["PlayerName", "PlayerServer", "PlayerMap", "PlayerState"]
+STRING_GETTERS = ["PlayerName", "PlayerServer", "PlayerMap", "PlayerState", "PeerTag", "PeerMap"]
 EVENT_GETTERS = ["EventServer", "EventName", "EventText"]
 
 wrapper = (
@@ -61,6 +62,9 @@ wrapper = (
     " float pitch, float yaw, float roll, float vx, float vy, float vz, int flags );\n"
     "void RS_MirrorBotRemove( int playerNum );\n"
     "bool RS_MirrorBotIs( int playerNum );\n"
+    "// mirror peer liveness (heard peers with their advertised map + silence age)\n"
+    "int RS_MirrorPeerCount( void );\n"
+    "int RS_MirrorPeerAge( int i );\n"
 )
 for g in STRING_GETTERS:
     wrapper += "const char *RS_Mirror%s( int i );\n" % g
@@ -138,6 +142,16 @@ wrapper += (
     "\treturn RS_MirrorBotIs( playerNum );\n"
     "}\n"
     "\n"
+    "static int asFunc_RS_MirrorPeerCount( void )\n"
+    "{\n"
+    "\treturn RS_MirrorPeerCount();\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_MirrorPeerAge( int i )\n"
+    "{\n"
+    "\treturn RS_MirrorPeerAge( i );\n"
+    "}\n"
+    "\n"
 )
 for g in STRING_GETTERS:
     wrapper += (
@@ -185,6 +199,10 @@ for decl, func in [
      "const Vec3 &in velocity, int flags )", "BotUpdate"),
     ("void RS_MirrorBotRemove( int playerNum )", "BotRemove"),
     ("bool RS_MirrorBotIs( int playerNum )", "BotIs"),
+    ("int RS_MirrorPeerCount()", "PeerCount"),
+    ("const String @RS_MirrorPeerTag( int index )", "PeerTag"),
+    ("const String @RS_MirrorPeerMap( int index )", "PeerMap"),
+    ("int RS_MirrorPeerAge( int index )", "PeerAge"),
 ]:
     entries += "\t{ \"%s\", asFUNCTION(asFunc_RS_Mirror%s), NULL },\n" % (decl, func)
 
@@ -211,5 +229,37 @@ HOOK = (
 ) + ANCHOR_CHAT
 
 patch("game/g_cmds.cpp", ANCHOR_CHAT, HOOK, "Cmd_Say_f mirror hook")
+
+# --- 3. mirror say_team as well (g_gameteams.cpp / G_Say_Team) ----------------
+# On an individual gametype (race), an active player's say_team is redirected to
+# Cmd_Say_f above and is already mirrored. The two remaining delivery paths in
+# G_Say_Team - spectator team chat, and real team chat on a team-based gametype -
+# are not, so hook both so say_team crosses the mesh like say. (No double-mirror:
+# the redirect returns before reaching these.)
+ANCHOR_TEAM_FN = "void G_Say_Team( edict_t *who, char *msg, bool checkflood )\n{"
+DECL_TEAM = (
+    "// racesow-docker: mirror team / spectator chat to peer servers too (see\n"
+    "// patch-mirror-natives.py). Active players' say_team on an individual\n"
+    "// gametype is redirected to Cmd_Say_f above and already mirrored.\n"
+    "void RS_MirrorLocalChat( const char *name, const char *text );\n"
+    "\n"
+) + ANCHOR_TEAM_FN
+patch("game/g_gameteams.cpp", ANCHOR_TEAM_FN, DECL_TEAM, "G_Say_Team forward decl")
+
+# spectator team chat funnel
+ANCHOR_SPEC = "\t\tG_ChatMsg( NULL, who, true, \"%s\", msg );\n"
+HOOK_SPEC = (
+    "\t\tif( who->r.client )\n"
+    "\t\t\tRS_MirrorLocalChat( who->r.client->netname, msg );\n"
+) + ANCHOR_SPEC
+patch("game/g_gameteams.cpp", ANCHOR_SPEC, HOOK_SPEC, "G_Say_Team spectator hook")
+
+# team-based delivery funnel (dead code on race; future-proof for team gametypes)
+ANCHOR_TEAM = "\tG_ChatMsg( NULL, who, true, \"%s\", outmsg );\n"
+HOOK_TEAM = (
+    "\tif( who->r.client )\n"
+    "\t\tRS_MirrorLocalChat( who->r.client->netname, outmsg );\n"
+) + ANCHOR_TEAM
+patch("game/g_gameteams.cpp", ANCHOR_TEAM, HOOK_TEAM, "G_Say_Team team hook")
 
 print("mirror natives patch applied")

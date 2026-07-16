@@ -62,6 +62,8 @@ COPY enginepatches/patch-api-natives.py /tmp/patch-api-natives.py
 WORKDIR /build/repo/source
 RUN python3 /tmp/patch-api-natives.py \
     && grep -q "RS_ApiReportRace" game/g_ascript.cpp \
+    && grep -q "RS_ApiReportWrDemo" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchGhost" game/g_ascript.cpp \
     && grep -q "curl pthread" game/CMakeLists.txt
 
 # 7. Cross-server player mirroring: the RS_Mirror* natives (UDP mesh on a
@@ -74,7 +76,9 @@ COPY enginepatches/patch-mirror-natives.py /tmp/patch-mirror-natives.py
 RUN python3 /tmp/patch-mirror-natives.py \
     && grep -q "asFunc_RS_MirrorRefresh" game/g_ascript.cpp \
     && grep -q "asFunc_RS_MirrorBotAdd" game/g_ascript.cpp \
-    && grep -q "RS_MirrorLocalChat" game/g_cmds.cpp
+    && grep -q "asFunc_RS_MirrorPeerCount" game/g_ascript.cpp \
+    && grep -q "RS_MirrorLocalChat" game/g_cmds.cpp \
+    && grep -q "RS_MirrorLocalChat" game/g_gameteams.cpp
 
 RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Release . \
     && make game -j"$(nproc)" \
@@ -88,6 +92,12 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
     && strings /libgame_x86_64.so | grep -q "RS_ApiReportRace" \
     && strings /libgame_x86_64.so | grep -q "rs_api: dropping report" \
     && strings /libgame_x86_64.so | grep -q "rs_api: top-scores fetch failed" \
+    # replay feature: WR demo pointer + ghost upload/fetch natives, and the
+    # per-client race-demo binding (racerecord) the demo capture calls.
+    && strings /libgame_x86_64.so | grep -q "RS_ApiReportWrDemo" \
+    && strings /libgame_x86_64.so | grep -q "RS_ApiFetchGhost" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: ghost fetch failed" \
+    && strings /libgame_x86_64.so | grep -q "racerecord" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: configured" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: bot slot" \
     && objdump -p /libgame_x86_64.so | grep -q "NEEDED.*libcurl"
@@ -107,6 +117,11 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
 COPY enginepatches/patch-udp-download.py /tmp/patch-udp-download.py
 RUN python3 /tmp/patch-udp-download.py \
     && grep -q "racesow-docker" server/sv_client.c
+# Hide cross-server mirror-bot ghosts from getstatus/heartbeats so the web live
+# page and server browser don't double-count a mirrored player on both servers.
+COPY enginepatches/patch-status-hide-bots.py /tmp/patch-status-hide-bots.py
+RUN python3 /tmp/patch-status-hide-bots.py \
+    && grep -q "racesow-docker: mirror-bot ghosts" server/sv_oob.c
 RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=OFF -DCMAKE_BUILD_TYPE=Release . \
     && make wsw_server -j"$(nproc)" \
     && cp build/wsw_server.x86_64 /wsw_server.x86_64 \

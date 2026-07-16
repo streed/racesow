@@ -28,7 +28,10 @@ hrace/quickmenu.as;
 hrace/recordtime.as;
 hrace/racelog.as;
 hrace/apitop.as;
+hrace/demos.as;
+hrace/ghostbot.as;
 hrace/mirror.as;
+hrace/meshvote.as;
 hrace/checkpoint.as;
 hrace/table.as;
 

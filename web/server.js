@@ -7,7 +7,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { openDatabase, sha256, simplifyName } from "./db.js";
 import { createLivePoller } from "./live.js";
-import { playerCardCached } from "./og-image.js";
+import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
+import { cache } from "./cache.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -49,6 +50,16 @@ const MAX_VERSION_LEN = 64;
 const MAX_CHECKPOINTS = 4096;
 const MAX_TIME_MS = 24 * 60 * 60 * 1000;
 const MAX_RECORDS_PER_REQUEST = 1000;
+
+// Signals are handled from the very first tick: node may run as container
+// PID 1, where SIGTERM with no handler installed is silently ignored (docker
+// then waits 10s and SIGKILLs). During boot (DB probe + migrations below) the
+// handler just exits; once the server is up it is swapped for the graceful
+// drain defined at the bottom of this file.
+let shuttingDown = false;
+let onSignal = () => process.exit(0);
+process.on("SIGTERM", () => onSignal("SIGTERM"));
+process.on("SIGINT", () => onSignal("SIGINT"));
 
 console.log(`Connecting to database ...`);
 const race = await openDatabase(DATABASE_URL);
@@ -123,12 +134,32 @@ function asInt(v) {
 // DB error becomes a 500 via the error middleware instead of a hung request.
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-api.get("/overview", wrap(async (_req, res) => res.json(await race.overview())));
+// Hot read endpoints are Redis-cached (short TTL). /overview is the heaviest
+// aggregate and the most-hit page-load call, so it gets the longest window.
+api.get("/overview", cache(120), wrap(async (_req, res) => res.json(await race.overview())));
 api.get("/servers", wrap(async (_req, res) => res.json({ servers: await race.servers() })));
 
-api.get("/maps", wrap(async (req, res) => res.json(await race.maps(req.query))));
+// One enrolled server: its DB record (name, status, records, last-seen,
+// address) merged with the live poller's current snapshot (online, hostname,
+// map, current players). Powers the /server/:id page.
+api.get("/servers/:id", wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).json({ error: "invalid server id" });
+  const s = (await race.servers()).find((x) => x.id === id);
+  if (!s) return res.status(404).json({ error: "server not found" });
+  const snap = live.getLive();
+  const li = (snap.servers || []).find((x) => x.id === id) || null;
+  const mapId = li && li.map ? await race.mapIdByName(li.map) : null;
+  res.json({
+    ...s,
+    updatedAt: snap.updatedAt,
+    live: li ? { ...li, mapId } : { online: false, players: [] },
+  });
+}));
 
-api.get("/maps/:id", wrap(async (req, res) => {
+api.get("/maps", cache(60), wrap(async (req, res) => res.json(await race.maps(req.query))));
+
+api.get("/maps/:id", cache(60), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid map id" });
   const detail = await race.mapDetail(id, req.query);
@@ -136,9 +167,22 @@ api.get("/maps/:id", wrap(async (req, res) => {
   res.json(detail);
 }));
 
-api.get("/players", wrap(async (req, res) => res.json(await race.players(req.query))));
+// WR ghost trajectory for the in-browser replay viewer (gzipped JSON). Served
+// with Content-Encoding: gzip so the stored bytes go straight to the client.
+api.get("/maps/:id/ghost", wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).json({ error: "invalid map id" });
+  const buf = await race.ghostGzip(id);
+  if (!buf) return res.status(404).json({ error: "no ghost for this map" });
+  res.set("Content-Type", "application/json; charset=utf-8");
+  res.set("Content-Encoding", "gzip");
+  res.set("Cache-Control", "public, max-age=300");
+  res.send(buf);
+}));
 
-api.get("/players/:id", wrap(async (req, res) => {
+api.get("/players", cache(60), wrap(async (req, res) => res.json(await race.players(req.query))));
+
+api.get("/players/:id", cache(60), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid player id" });
   const detail = await race.playerDetail(id, req.query);
@@ -146,12 +190,12 @@ api.get("/players/:id", wrap(async (req, res) => {
   res.json(detail);
 }));
 
-api.get("/search", wrap(async (req, res) => res.json(await race.search(req.query.q || "", { limit: 8 }))));
+api.get("/search", cache(60), wrap(async (req, res) => res.json(await race.search(req.query.q || "", { limit: 8 }))));
 
 // New records after a race id — the Discord announcer polls this (it has no
 // database access; margin-to-#2 and version names are computed here). Public
 // read: nothing the site's recent-records feed doesn't already show.
-api.get("/records", wrap(async (req, res) => {
+api.get("/records", cache(60), wrap(async (req, res) => {
   res.json(
     await race.recordsAfter({
       afterId: asInt(req.query.after_id) ?? 0,
@@ -176,9 +220,18 @@ api.get("/live", wrap(async (_req, res) => {
 // every server connected to this API serves the same in-game `top` lists,
 // HUD record lines and record announcements. Public read — it exposes
 // nothing the map leaderboard pages don't already show.
-api.get("/game/topscores", wrap(async (req, res) => {
+api.get("/game/topscores", cache(120), wrap(async (req, res) => {
   const body = await race.gameTopscoresText(req.query.map);
   if (body == null) return res.status(404).type("text/plain").send("// unknown map\n");
+  res.type("text/plain").send(body);
+}));
+
+// Flat-text WR ghost for game servers: the hrace gametype's RS_ApiFetchGhost
+// native GETs this on map load and drives an in-game "ghost racer" along it.
+// Text (not the gzipped JSON) because AngelScript can't decompress/parse JSON.
+api.get("/game/ghost", cache(120), wrap(async (req, res) => {
+  const body = await race.gameGhostText(req.query.map);
+  if (body == null) return res.status(404).type("text/plain").send("// no ghost\n");
   res.type("text/plain").send(body);
 }));
 
@@ -194,6 +247,10 @@ async function doRefresh() {
   clearTimeout(refreshTimer);
   refreshTimer = null;
   firstDirtyAt = 0;
+  // A rebuild started mid-drain would hold a pool client past server.close()
+  // and push the shutdown into its force-exit backstop; the replacement
+  // container recomputes aggregates at boot anyway.
+  if (shuttingDown) return;
   // The rebuild is async now: never run two at once (they'd deadlock on the
   // table swap); a request arriving mid-rebuild queues exactly one more pass.
   if (refreshRunning) {
@@ -282,6 +339,65 @@ function sanitizeRecord(r) {
   };
 }
 
+// A WR demo path is a relative "<map>/<file>.wdz20" the game host serves. It
+// becomes part of a download URL, so validate hard against path traversal:
+// no "..", no backslash, no leading slash, exactly one segment separator, a
+// .wdz20 extension, and only a URL-safe charset. The mod already restricts the
+// player-name fragment to [A-Za-z0-9_-] (hrace/demos.as RACE_DemoCleanName),
+// so this stays a tight allowlist rather than mirroring the engine's looser set.
+const DEMO_SEG = /^[A-Za-z0-9_.-]+$/;
+function validDemoPath(p) {
+  if (typeof p !== "string" || p.length === 0 || p.length > 256) return false;
+  if (p.includes("..") || p.includes("\\") || p.startsWith("/")) return false;
+  if (!/\.wdz20$/.test(p)) return false;
+  const parts = p.split("/");
+  return parts.length === 2 && parts.every((s) => DEMO_SEG.test(s));
+}
+
+// A ghost is a fixed-rate trajectory: N frames of 9 finite numbers
+// [x,y,z,pitch,yaw,roll,vx,vy,vz], implicit time = frameIndex / hz. Caps bound
+// a hostile/buggy server (30000 frames = 20 min at 25 Hz).
+const MAX_GHOST_FRAMES = 30000;
+const MAX_GHOST_HZ = 250;
+function sanitizeGhost(body) {
+  const time = Number(body.time);
+  const hz = Number(body.hz);
+  if (typeof body.name !== "string" || !body.name) return null;
+  if (!Number.isInteger(time) || time <= 0 || time > MAX_TIME_MS) return null;
+  if (!Number.isInteger(hz) || hz <= 0 || hz > MAX_GHOST_HZ) return null;
+  if (!Array.isArray(body.frames) || body.frames.length === 0 || body.frames.length > MAX_GHOST_FRAMES)
+    return null;
+  const frames = [];
+  for (const f of body.frames) {
+    // 9 numbers [x,y,z,pitch,yaw,roll,vx,vy,vz], optionally a 10th = the pressed-
+    // keys bitmask (Warsow Key_*, 0-255) for the in-viewer key-press overlay.
+    if (!Array.isArray(f) || (f.length !== 9 && f.length !== 10)) return null;
+    const row = [];
+    for (let k = 0; k < 9; k++) {
+      const n = Number(f[k]);
+      if (!Number.isFinite(n)) return null;
+      row.push(Math.round(n * 1000) / 1000);
+    }
+    if (f.length === 10) {
+      const keys = Number(f[9]);
+      row.push(Number.isFinite(keys) ? keys & 255 : 0);
+    }
+    frames.push(row);
+  }
+  const cps = (Array.isArray(body.cps) ? body.cps : [])
+    .map((n) => Number(n))
+    .filter((n) => Number.isInteger(n) && n >= 0 && n < frames.length)
+    .slice(0, MAX_CHECKPOINTS);
+  return {
+    name: body.name.slice(0, MAX_NAME_LEN),
+    login: typeof body.login === "string" ? body.login.slice(0, MAX_NAME_LEN) : "",
+    time,
+    hz,
+    frames,
+    cps,
+  };
+}
+
 // Standalone attempt flush entries (body.attempts[]): starts with no finish
 // to ride on — the player disconnected or the map ended mid-run.
 function sanitizeAttempt(a) {
@@ -310,10 +426,38 @@ api.post(
   express.json({ limit: "2mb" }),
   async (req, res) => {
     const body = req.body || {};
-    const source = body.source === "racelog" ? "racelog" : "topscores";
     if (typeof body.version !== "string" || !body.version || typeof body.map !== "string" || !body.map) {
       return res.status(400).json({ error: "version and map are required" });
     }
+
+    // WR demo metadata (Phase 1): a pointer to a .wd file the game host serves.
+    // Does not touch the leaderboard — just records where the record's demo is.
+    if (body.source === "wr_demo" || body.wr_demo) {
+      const d = body.wr_demo || {};
+      const time = Number(d.time);
+      if (typeof d.name !== "string" || !d.name || !Number.isInteger(time) || time <= 0 || time > MAX_TIME_MS)
+        return res.status(400).json({ error: "invalid wr_demo record" });
+      if (!validDemoPath(d.demo)) return res.status(400).json({ error: "invalid demo path" });
+      try {
+        await race.upsertWrDemo({
+          version: body.version.slice(0, MAX_VERSION_LEN),
+          map: body.map.slice(0, MAX_MAP_LEN).toLowerCase(),
+          name: d.name.slice(0, MAX_NAME_LEN),
+          login: typeof d.login === "string" ? d.login.slice(0, MAX_NAME_LEN) : "",
+          time,
+          demoPath: d.demo,
+          bytes: Number.isInteger(Number(d.bytes)) && Number(d.bytes) >= 0 ? Number(d.bytes) : null,
+          serverId: req.ingest.serverId,
+        });
+        console.log(`wr_demo ${body.map} from ${req.ingest.serverName}: ${d.demo}`);
+        return res.json({ ok: true });
+      } catch (e) {
+        console.error("wr_demo ingest failed:", e);
+        return res.status(500).json({ error: "ingest failed" });
+      }
+    }
+
+    const source = body.source === "racelog" ? "racelog" : "topscores";
     // Cap the top-level strings for parity with record name/login, so an
     // enrolled server can't persist multi-KB map/version rows (DB bloat).
     const version = body.version.slice(0, MAX_VERSION_LEN);
@@ -356,6 +500,49 @@ api.post(
   }
 );
 
+// WR ghost trajectory upload (Phase 2): a separate route from /ingest because
+// the frames are the payload (bigger body limit) and it writes a file, not a
+// leaderboard row. Same per-server auth + rate limiter.
+api.post(
+  "/ingest/ghost",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  express.json({ limit: "8mb" }),
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    if (typeof body.version !== "string" || !body.version || typeof body.map !== "string" || !body.map)
+      return res.status(400).json({ error: "version and map are required" });
+    const g = sanitizeGhost(body);
+    if (!g) return res.status(400).json({ error: "invalid ghost" });
+    try {
+      const stored = await race.upsertGhost({
+        version: body.version.slice(0, MAX_VERSION_LEN),
+        map: body.map.slice(0, MAX_MAP_LEN).toLowerCase(),
+        name: g.name,
+        login: g.login,
+        time: g.time,
+        hz: g.hz,
+        frames: g.frames,
+        cps: g.cps,
+        serverId: req.ingest.serverId,
+      });
+      console.log(
+        `ghost ${body.map} from ${req.ingest.serverName}: ${g.frames.length} frames${stored ? "" : " (kept faster)"}`
+      );
+      res.json({ ok: true, stored });
+    } catch (e) {
+      console.error("ghost ingest failed:", e);
+      res.status(500).json({ error: "ingest failed" });
+    }
+  })
+);
+
 app.use("/api", api);
 
 // JSON body-parse errors (and any other error surfaced by middleware) return
@@ -372,7 +559,30 @@ app.use("/api", (err, _req, res, _next) => {
 // (/player/N) get the SPA shell with player-specific OG tags injected; the
 // frontend routes those paths client-side (and rewrites the address bar to
 // this shareable form on player pages).
-const INDEX_HTML = readFileSync(path.join(__dirname, "public", "index.html"), "utf8");
+// Cache-bust the SPA's JS/CSS: fingerprint each asset by content hash and
+// rewrite its URL in the shell to /assets/…?v=<hash>. When app.js or style.css
+// changes, its hash (and URL) changes, so browsers and Cloudflare fetch the
+// new file instead of a stale cached one — the fix for old-JS-after-deploy
+// (which is what left "#" URLs and broken back/forward on already-open tabs).
+function assetVersion(rel) {
+  try {
+    return crypto.createHash("sha1").update(readFileSync(path.join(__dirname, "public", rel))).digest("hex").slice(0, 10);
+  } catch {
+    return "";
+  }
+}
+const INDEX_HTML = readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
+  .replace("/assets/js/app.js", `/assets/js/app.js?v=${assetVersion("assets/js/app.js")}`)
+  .replace("/assets/css/style.css", `/assets/css/style.css?v=${assetVersion("assets/css/style.css")}`);
+
+// Send the SPA shell HTML with no-cache so browsers ALWAYS revalidate it (and
+// thus always see the current asset ?v= URLs). The fingerprinted assets
+// themselves stay long-cacheable — their URL changes on content change.
+function sendShell(res, html) {
+  res.set("Cache-Control", "no-cache");
+  res.type("html").send(html);
+}
+
 const escAttr = (s) =>
   String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
@@ -413,7 +623,8 @@ app.get("/player/:id", renderLimiter, wrap(async (req, res, next) => {
     d.attempts != null ? `${d.attempts.toLocaleString("en-US")} attempts` : null,
   ].filter(Boolean);
   const image = `${origin}/og/player/${d.id}.png`;
-  res.send(
+  sendShell(
+    res,
     withOgTags([
       ["og:site_name", "Racesow"],
       ["og:type", "profile"],
@@ -460,6 +671,137 @@ app.get("/og/player/:id.png", renderLimiter, wrap(async (req, res) => {
   }
 }));
 
+// Shape the live poller's cached snapshot into OG-card data.
+function liveCardData() {
+  const snap = live.getLive();
+  const servers = (snap.servers || []).map((s) => ({
+    name: s.name,
+    online: !!s.online,
+    hostname: s.hostname,
+    map: s.map,
+    maxclients: s.maxclients,
+    players: (s.players || []).length,
+  }));
+  const online = servers.filter((s) => s.online);
+  return {
+    servers,
+    totalPlayers: online.reduce((n, s) => n + s.players, 0),
+    onlineCount: online.length,
+    host: PUBLIC_HOST,
+  };
+}
+
+// Shareable /live page: SPA shell with live-status OG tags (og:image is the
+// generated server-status card). The frontend routes the /live path to the
+// Live view client-side.
+app.get("/live", renderLimiter, (req, res) => {
+  const origin = siteOrigin(req);
+  const d = liveCardData();
+  const desc = d.servers.length
+    ? `${d.totalPlayers} player${d.totalPlayers === 1 ? "" : "s"} in game · ${d.onlineCount} of ${d.servers.length} server${d.servers.length === 1 ? "" : "s"} online right now.`
+    : "Who's racing right now across the Racesow servers.";
+  const image = `${origin}/og/live.png`;
+  sendShell(
+    res,
+    withOgTags([
+      ["og:site_name", "Racesow"],
+      ["og:type", "website"],
+      ["og:title", "Racesow — Live Servers"],
+      ["og:description", desc],
+      ["og:url", `${origin}/live`],
+      ["og:image", image],
+      ["og:image:width", "1200"],
+      ["og:image:height", "630"],
+      ["og:image:type", "image/png"],
+      ["twitter:card", "summary_large_image"],
+      ["twitter:title", "Racesow — Live Servers"],
+      ["twitter:description", desc],
+      ["twitter:image", image],
+    ])
+  );
+});
+
+// The live server-status card behind og:image. Short cache: it reflects the
+// current snapshot, which the poller refreshes on its own cadence.
+app.get("/og/live.png", renderLimiter, (req, res) => {
+  try {
+    const png = liveCardCached(liveCardData);
+    res.set("Content-Type", "image/png");
+    res.set("Cache-Control", "public, max-age=60");
+    res.send(png);
+  } catch (e) {
+    console.error("live og card render failed:", e.message);
+    res.status(500).end();
+  }
+});
+
+// Look up one enrolled server + its live snapshot (shared by the /server page
+// and its OG card). Returns null for an unknown id.
+async function serverForOg(id) {
+  const s = (await race.servers()).find((x) => x.id === id);
+  if (!s) return null;
+  const li = (live.getLive().servers || []).find((x) => x.id === id) || null;
+  return { db: s, live: li };
+}
+
+// Shareable /server/:id page: SPA shell with server-specific OG tags.
+app.get("/server/:id", renderLimiter, wrap(async (req, res, next) => {
+  const id = parseInt(req.params.id, 10);
+  const info = Number.isNaN(id) ? null : await serverForOg(id);
+  if (!info) return next(); // unknown -> plain SPA shell
+  const origin = siteOrigin(req);
+  const name = simplifyName(info.db.name);
+  const li = info.live;
+  const desc = li && li.online
+    ? `${li.players.length}${li.maxclients ? " / " + li.maxclients : ""} playing${li.map ? " on " + li.map : ""} · ${info.db.records.toLocaleString("en-US")} records contributed`
+    : `Offline · ${info.db.records.toLocaleString("en-US")} records contributed`;
+  const image = `${origin}/og/server/${id}.png`;
+  sendShell(
+    res,
+    withOgTags([
+      ["og:site_name", "Racesow"],
+      ["og:type", "website"],
+      ["og:title", `${name} — Racesow`],
+      ["og:description", desc],
+      ["og:url", `${origin}/server/${id}`],
+      ["og:image", image],
+      ["og:image:width", "1200"],
+      ["og:image:height", "630"],
+      ["og:image:type", "image/png"],
+      ["twitter:card", "summary_large_image"],
+      ["twitter:title", `${name} — Racesow`],
+      ["twitter:description", desc],
+      ["twitter:image", image],
+    ])
+  );
+}));
+
+// The per-server status card behind og:image.
+app.get("/og/server/:id.png", renderLimiter, wrap(async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const info = Number.isNaN(id) ? null : await serverForOg(id);
+  if (!info) return res.status(404).end();
+  try {
+    const png = serverCardCached(id, () => {
+      const li = info.live;
+      return {
+        name: (li && li.online && li.hostname) || info.db.name,
+        online: !!(li && li.online),
+        map: li && li.map,
+        maxclients: li && li.maxclients,
+        players: (li && li.players) || [],
+        host: PUBLIC_HOST,
+      };
+    });
+    res.set("Content-Type", "image/png");
+    res.set("Cache-Control", "public, max-age=60");
+    res.send(png);
+  } catch (e) {
+    console.error("server og card render failed:", e.message);
+    res.status(500).end();
+  }
+}));
+
 // Default tags with an absolute og:image (crawlers ignore relative URLs).
 function defaultShell(req) {
   const origin = siteOrigin(req);
@@ -474,7 +816,7 @@ function defaultShell(req) {
   ]);
 }
 
-app.get("/", (req, res) => res.send(defaultShell(req)));
+app.get("/", (req, res) => sendShell(res, defaultShell(req)));
 
 // Static frontend.
 app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
@@ -482,17 +824,44 @@ app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] })
 // SPA fallback for client-side routes (non-API, non-asset).
 app.get("*", (req, res, next) => {
   if (req.path.startsWith("/api/") || req.path.includes(".")) return next();
-  res.send(defaultShell(req));
+  sendShell(res, defaultShell(req));
 });
 
-app.listen(PORT, async () => {
+const server = app.listen(PORT, async () => {
   console.log(`Race stats server listening on http://0.0.0.0:${PORT}`);
   const servers = await race.servers();
   const modes = [];
   if (INGEST_TOKEN_HASH) modes.push("shared-token");
   modes.push(`${servers.length} enrolled server(s)`);
   console.log(`Ingest: ${modes.join(" + ")}`);
-  live.start();
+  if (!shuttingDown) live.start(); // a signal may land during the await above
   const liveTargets = servers.filter((s) => s.address).length;
   console.log(`Live poller: ${liveTargets} server(s) with a query address`);
 });
+
+// Graceful shutdown, swapped in over the boot-time handler installed at the
+// top of this file. The handler itself is what prevents the 10s
+// SIGTERM-then-SIGKILL deploy hang: an installed handler runs even when node
+// is container PID 1 (init:true in compose only adds zombie reaping on top).
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received, draining connections`);
+  // Backstop just under docker's 10s stop grace, in case a connection or the
+  // pool refuses to drain.
+  setTimeout(() => process.exit(1), 8000).unref();
+  live.stop();
+  clearTimeout(refreshTimer);
+  await new Promise((resolve) => {
+    server.close(resolve); // stop accepting; resolves once all sockets close
+    // Sweep repeatedly: a socket serving a request at signal time only turns
+    // idle when its response finishes, which a one-shot sweep would miss.
+    server.closeIdleConnections();
+    setInterval(() => server.closeIdleConnections(), 500).unref();
+    // Cut lingering keep-alive/streaming sockets so close() can complete.
+    setTimeout(() => server.closeAllConnections(), 4000).unref();
+  });
+  await race.close().catch(() => {});
+  process.exit(0);
+}
+onSignal = shutdown;

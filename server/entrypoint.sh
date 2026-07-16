@@ -83,6 +83,14 @@ export_pakshare() {
     for pk in "${MOD_DIR}"/*.pk3; do
         [ -e "${pk}" ] && cp -uLf "${pk}" /pakshare/racemod/ 2>/dev/null || true
     done
+    # Replay demos: the engine writes per-run WR demos under demos/server/<map>/;
+    # mirror them (dropping the "server/" layer) into /pakshare/demos so nginx
+    # serves them at <base>/demos/<map>/<file>.wdz20 — the two-segment path the
+    # web stores/validates and hrace/demos.as reconstructs.
+    if [ -d "${MOD_DIR}/demos/server" ]; then
+        mkdir -p /pakshare/demos 2>/dev/null || true
+        cp -uLrf "${MOD_DIR}/demos/server/." /pakshare/demos/ 2>/dev/null || true
+    fi
 }
 export_pakshare
 
@@ -250,6 +258,10 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     # HTTP pak mirror: when set, the engine redirects pak downloads there
     # instead of the (patched) UDP transfer. Must be reachable by game clients.
     [ -n "${SV_UPLOADS_BASEURL}" ] && echo "set sv_uploads_baseurl \"${SV_UPLOADS_BASEURL}\""
+    # Pin the demo output dir so the WR-demo path the mod reconstructs
+    # (hrace/demos.as RACE_DemoRelPath) matches what the engine writes:
+    # SV_DEMO_DIR resolves to "demos/server" when sv_demodir is empty.
+    echo "set sv_demodir \"\""
     # Direct-to-API race reporting: the gametype POSTs every finish to the
     # central stats ingest endpoint (racelog.as -> RS_ApiReportRace native).
     if [ -n "${INGEST_URL}" ]; then
@@ -260,6 +272,10 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # in-game `top`, HUD record lines and record announcements then track
         # the central database, not just this server's local files.
         echo "set rs_api_top_url \"${INGEST_URL%/api/ingest}/api/game/topscores\""
+        # Replay feature: WR ghost upload (browser viewer) + the in-game WR
+        # ghost racer's fetch (hrace/demos.as + hrace/ghostbot.as). Same host.
+        echo "set rs_api_ghost_url \"${INGEST_URL%/api/ingest}/api/ingest/ghost\""
+        echo "set rs_wr_ghost_url \"${INGEST_URL%/api/ingest}/api/game/ghost\""
     fi
     # Cross-server player mirroring: the gametype reads these and drives the
     # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.

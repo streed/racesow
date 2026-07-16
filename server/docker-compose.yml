@@ -83,6 +83,11 @@ services:
       # them. The host dirs must be writable by the container user (uid 999).
       - ./topscores:/warsow/racemod/topscores
       - ./racelog:/warsow/racemod/racelog
+      # WR replay demos (per-run .wd files the engine's race-demos subsystem
+      # writes under demos/server/<map>/); bind-mounted so they survive restarts
+      # and can be exported to the pak mirror for download (entrypoint.sh
+      # export_pakshare). Host dir must be writable by the container user.
+      - ./demos:/warsow/racemod/demos
       # Persist server-written state (bans, logs) across restarts (optional).
       - warsow-state:/home/warsow/.local/share/warsow-2.1
       # Downloadable pk3s are exported here at startup for the pakserver below.
@@ -107,7 +112,7 @@ services:
       - pakshare:/usr/share/nginx/html
     # Chown the share to the game-server user (uid 999) before serving, so the
     # export works even if this container initialized the volume first.
-    command: ["/bin/sh", "-c", "chown -R 999:999 /usr/share/nginx/html 2>/dev/null || true; exec nginx -g 'daemon off;'"]
+    command: ["/bin/sh", "-c", "printf 'server_tokens off;\\n' > /etc/nginx/conf.d/security.conf; chown -R 999:999 /usr/share/nginx/html 2>/dev/null || true; exec nginx -g 'daemon off;'"]
 
 volumes:
   warsow-state:

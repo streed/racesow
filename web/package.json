@@ -6,16 +6,20 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test 'test/*.test.js'"
+    "test": "node --test 'test/*.test.js'",
+    "migrate": "node-pg-migrate -m migrations -j sql --migration-filename-format utc -t pgmigrations",
+    "migrate:create": "node-pg-migrate create -m migrations -j sql --migration-filename-format utc -t pgmigrations"
   },
   "engines": {
     "node": ">=18"
   },
-  "//": "better-sqlite3 is used ONLY by the one-time migrate-sqlite-to-pg.js, but stays a runtime dependency because that tool runs inside the production image (which installs with --omit=dev). pg is the live driver.",
+  "//": "better-sqlite3 is used ONLY by the one-time migrate-sqlite-to-pg.js, but stays a runtime dependency because that tool runs inside the production image (which installs with --omit=dev). pg is the live driver. node-pg-migrate runs the schema migrations at startup (see web/db.js openDatabase and web/migrations/).",
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",
     "better-sqlite3": "^11.8.1",
     "express": "^4.21.2",
-    "pg": "^8.22.0"
+    "node-pg-migrate": "^8.0.4",
+    "pg": "^8.22.0",
+    "redis": "^6.1.0"
   }
 }

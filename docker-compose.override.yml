@@ -1,0 +1,48 @@
+# Deployment-specific overrides for the eu.frankfurt.racesow.org box.
+# Host nginx terminates TLS and load-balances the TWO web replicas (see the
+# racesow_web upstream in the nginx site); nothing here listens publicly.
+#
+# This file is the live production override (previously only on the box, now
+# version-controlled). docker compose auto-merges it over docker-compose.yml.
+services:
+  web:
+    environment:
+      PUBLIC_ORIGIN: "https://racesow.org"
+      REDIS_URL: "redis://redis:6379"
+    ports: !override
+      - "127.0.0.1:8080:8080"
+
+  # Second web replica for zero-downtime rolling deploys (scripts/rolling-deploy.sh
+  # recreates web and web2 one at a time behind the nginx upstream). Stateless —
+  # same image/env as web, all state is in Postgres. Distinct name + port.
+  web2:
+    image: racesow-web:latest
+    container_name: racesow-web-2
+    # tini for zombie reaping; graceful stop still comes from the SIGTERM
+    # handler in web/server.js (mirrors the base `web` service).
+    init: true
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      DATABASE_URL: "postgres://racesow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/racesow"
+      PUBLIC_ORIGIN: "https://racesow.org"
+      # Shares the same Redis as the base web replica (see docker-compose.yml).
+      REDIS_URL: "redis://redis:6379"
+      INGEST_TOKEN: "${INGEST_TOKEN:-}"
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8081:8080"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 4s
+      retries: 3
+      start_period: 20s
+
+  discord:
+    environment:
+      SITE_URL: "https://eu.frankfurt.racesow.org"

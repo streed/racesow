@@ -1,0 +1,13 @@
+# The image never COPYs these — they are large runtime bind-mounts (see
+# docker-compose*.yml volumes). Excluding them keeps the build context tiny;
+# without this, ./maps alone (12+ GB of community pk3s) is sent to the daemon
+# on every build, dominating build time. None of these paths are referenced by
+# any Dockerfile COPY, so excluding them changes no layer cache key.
+maps/
+mirror-test-maps/
+topscores/
+racelog/
+*.log
+# local env / secrets never belong in the image
+.env
+.env.*

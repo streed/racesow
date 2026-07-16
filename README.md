@@ -99,6 +99,16 @@ units on top: explicit boot ordering (web stack before game server),
 `systemctl status racesow-*`, and a nightly `pg_dump` backup into
 `backups/db/` (`racesow-db-backup.timer`, 14-day retention).
 
+> **Public production deployment (Cloudflare-fronted):** the live stats box
+> (`racesow.org`) runs behind Cloudflare and **only accepts traffic through it**
+> — the origin enforces Cloudflare's client certificate (mTLS / Authenticated
+> Origin Pulls), so a direct hit returns HTTP 400. The full setup — Cloudflare
+> dashboard settings, the origin nginx (real-IP, rate limits, mTLS, the
+> origin-pull CA file), TLS certs, the tuned Postgres/Redis services, the
+> rolling-deploy procedure, and the secrets that must never be committed — is
+> documented in **[`deploy/README.md`](deploy/README.md)**. Read it before
+> standing up or redeploying the public origin.
+
 ### Game server
 
 The Warsow server is a separate, heavier image (it downloads the ~465 MB

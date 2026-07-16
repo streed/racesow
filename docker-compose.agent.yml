@@ -79,9 +79,11 @@ services:
       - "${PAK_HTTP_PORT:-44445}:80"
     volumes:
       - pakshare:/usr/share/nginx/html
-    # Chown the share to the game-server user (uid 999) so the export works
-    # even if this container initialised the volume first.
-    command: ["/bin/sh", "-c", "chown -R 999:999 /usr/share/nginx/html 2>/dev/null || true; exec nginx -g 'daemon off;'"]
+    # On start: (1) hide the nginx version in the Server header — this port is
+    # internet-facing (server_tokens off, dropped into the http-context
+    # conf.d include); (2) chown the share to the game-server user (uid 999)
+    # so the export works even if this container initialised the volume first.
+    command: ["/bin/sh", "-c", "printf 'server_tokens off;\\n' > /etc/nginx/conf.d/security.conf; chown -R 999:999 /usr/share/nginx/html 2>/dev/null || true; exec nginx -g 'daemon off;'"]
 
   # No collector service: the gametype POSTs finishes to the central API
   # directly (RS_ApiReportRace). If you instead run a stock, unmodified race

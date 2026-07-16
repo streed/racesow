@@ -32,3 +32,9 @@ data/*.sqlite-shm
 *.sqlite-shm
 .env
 backups/
+
+# Generated WR-ghost viewer meshes (converted on the box, mounted into web)
+web/public/maps/*.glb
+
+# Local scratch (screenshots, large paks deployed out-of-band)
+temp/

@@ -183,6 +183,8 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_MirrorWho( client, cmdString, argsString, argc );
     else if ( cmdString == "watch" )
         return Cmd_MirrorWatch( client, cmdString, argsString, argc );
+    else if ( cmdString == "meshvote" || cmdString == "mv" )
+        return Cmd_MeshVote( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -255,6 +257,10 @@ String@ GT_ScoreboardMessage( uint maxlen )
     // add players without time
     for ( i = 0; @team.ent( i ) != null; i++ )
     {
+        // the WR ghost racer is a fake client with no time — hide it here
+        if ( team.ent( i ).client.playerNum == raceGhostBotSlot )
+            continue;
+
         @player = RACE_GetPlayer( team.ent( i ).client );
 
         if ( !player.best_recordTime.isFinished() )
@@ -445,6 +451,11 @@ void GT_ThinkRules()
     // empty); also before the early-return so records stay current postmatch
     RACE_ApiTopThink();
 
+    // in-game WR ghost racer (no-op unless rs_wr_ghost + its URL are set); also
+    // before the early-return so the ghost keeps looping while the scoreboard
+    // is up
+    RACE_GhostThink();
+
     if ( match.getState() >= MATCH_STATE_POSTMATCH )
         return;
 
@@ -452,13 +463,16 @@ void GT_ThinkRules()
 
     if ( match.getState() == MATCH_STATE_PLAYTIME )
     {
-        // if there is no player in TEAM_PLAYERS finish the match and restart
-        if ( G_GetTeam( TEAM_PLAYERS ).numPlayers == 0 && demoRecording )
+        // Count only real players — the WR ghost racer and mesh bots are fake
+        // clients on TEAM_PLAYERS, so numPlayers would otherwise keep autorecord
+        // running forever on an otherwise-empty server.
+        int realPlayers = RACE_RealPlayerCount();
+        if ( realPlayers == 0 && demoRecording )
         {
             match.stopAutorecord();
             demoRecording = false;
         }
-        else if ( !demoRecording && G_GetTeam( TEAM_PLAYERS ).numPlayers > 0 )
+        else if ( !demoRecording && realPlayers > 0 )
         {
             match.startAutorecord();
             demoRecording = true;
@@ -527,6 +541,7 @@ void GT_ThinkRules()
             client.setHUDStat( STAT_MESSAGE_BETA, CS_GENERAL + 2 );
 
         player.saveRunPosition();
+        player.saveGhostFrame();
         player.checkNoclipAction();
         player.updateMaxSpeed();
 
@@ -688,6 +703,7 @@ void GT_Shutdown()
     RACE_FlushAllAttempts();
 
     RACE_MirrorShutdown();
+    RACE_GhostShutdown();
 }
 
 // The map entities have just been spawned. The level is initialized for
@@ -725,6 +741,7 @@ void GT_SpawnGametype()
     RACE_LoadTopScores();
 
     RACE_MirrorSpawnGametype();
+    RACE_GhostSpawnGametype();
 }
 
 float GT_VotePower( Client@ client, String& votename, bool voted, bool yes )
@@ -851,6 +868,7 @@ void GT_InitGametype()
     G_RegisterCommand( "rules" );
 
     RACE_MirrorInit(); // registers "who" and "watch"
+    RACE_GhostInit();
 
     // add votes
     G_RegisterCallvote( "randmap", "<* | pattern>", "string", "Changes to a random map" );

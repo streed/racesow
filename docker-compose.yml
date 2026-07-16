@@ -15,6 +15,49 @@ services:
     image: postgres:16-alpine
     container_name: racesow-postgres
     restart: unless-stopped
+    # Parallel-query workers pass data through POSIX shared memory (/dev/shm),
+    # which Docker defaults to a cramped 64MB — too small once shared_buffers is
+    # large and parallel plans kick in ("could not resize shared memory"). Give
+    # them real room.
+    shm_size: "1gb"
+    # Tuned for this box (32GB RAM, 12 cores, NVMe SSD) and workload (small
+    # ~210MB read-heavy DB fronted by Redis, plus periodic single-connection
+    # aggregate rebuilds and light ingest writes). The stock alpine defaults
+    # (shared_buffers=128MB, work_mem=4MB, effective_cache_size=4GB) badly
+    # undersize the hardware. These -c flags override postgresql.conf at boot;
+    # applied with a one-time container recreate (pgdata volume persists).
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=8GB"              # 25% RAM; caches the whole DB many times over
+      - "-c"
+      - "effective_cache_size=24GB"       # planner hint: OS caches the rest (favors index scans)
+      - "-c"
+      - "maintenance_work_mem=2GB"        # speeds the aggregate-rebuild index builds + VACUUM
+      - "-c"
+      - "work_mem=32MB"                   # per-op; safe at max_connections=100, real pool ~20
+      - "-c"
+      - "max_connections=100"             # ~20 real (10/replica x2) + headroom
+      - "-c"
+      - "random_page_cost=1.1"            # NVMe SSD: random ~= sequential
+      - "-c"
+      - "effective_io_concurrency=200"    # SSD can service many concurrent reads
+      - "-c"
+      - "max_worker_processes=12"         # = cores
+      - "-c"
+      - "max_parallel_workers=12"
+      - "-c"
+      - "max_parallel_workers_per_gather=4"
+      - "-c"
+      - "max_parallel_maintenance_workers=4"
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "min_wal_size=1GB"
+      - "-c"
+      - "max_wal_size=4GB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"  # spread checkpoint I/O to avoid write spikes
     environment:
       POSTGRES_USER: racesow
       POSTGRES_DB: racesow
@@ -29,19 +72,41 @@ services:
       retries: 5
       start_period: 10s
 
+  # Short-TTL response cache for the hot read endpoints (web/cache.js). Pure
+  # cache — no persistence — so it is safe to lose on restart; capped memory
+  # with LRU eviction so it can never grow unbounded.
+  redis:
+    image: redis:7-alpine
+    container_name: racesow-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
   web:
     build: ./web
     image: racesow-web:latest
     container_name: racesow-web
+    # Graceful stops come from the SIGTERM handler in web/server.js (it runs
+    # even with node as PID 1 — do NOT remove it in favor of this). init just
+    # adds tini for zombie reaping; a web2 override replica works without it.
+    init: true
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     ports:
       - "8080:8080"
     environment:
       PORT: "8080"
       DATABASE_URL: "postgres://racesow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/racesow"
+      # Response cache (web/cache.js). Empty/unset disables caching gracefully.
+      REDIS_URL: "redis://redis:6379"
       # Canonical public origin for server-rendered share URLs + OG cards. Set
       # this in production (e.g. https://eu.frankfurt.racesow.org) so og:url/
       # og:image and the OG image footer never derive from the request Host
@@ -50,9 +115,22 @@ services:
       # Optional shared secret for POST /api/ingest. Empty by default → prefer
       # per-server tokens: docker compose exec web node admin.js enroll "Name"
       INGEST_TOKEN: "${INGEST_TOKEN:-}"
+      # Public base the game host serves WR .wd demos from (nginx /demos/ →
+      # pakserver, plain HTTP). Empty → the "Download demo" button is omitted.
+      DEMO_BASE_URL: "${DEMO_BASE_URL:-}"
+      # WR ghost trajectory files (browser replay). On /data so they persist
+      # across web image rebuilds and are shared by both replicas (the row is in
+      # Postgres; the gzipped bytes live here).
+      GHOST_DIR: "/data/ghosts"
     volumes:
-      # Legacy SQLite location — only read by migrate-sqlite-to-pg.js now.
+      # Legacy SQLite location — only read by migrate-sqlite-to-pg.js now; also
+      # holds the WR ghost files (GHOST_DIR=/data/ghosts above), shared by both
+      # replicas and persisted across rebuilds.
       - ./data:/data
+      # WR ghost viewer meshes: converted on the box (node tools/bsp2gltf ...
+      # --dir server/maps web/public/maps) and mounted READ-ONLY, so adding maps
+      # needs no image rebuild and the multi-hundred-MB glbs are never baked in.
+      - ./web/public/maps:/app/public/maps:ro
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s

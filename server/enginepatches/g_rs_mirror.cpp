@@ -360,6 +360,12 @@ struct SnapRow {
 	std::string state; // "x y z pitch yaw roll vx vy vz flags ageMs"
 };
 
+struct PeerSnap {
+	std::string tag;
+	std::string map;
+	int ageMs;         // ms since this peer was last heard from
+};
+
 // All mutable state on the heap behind a raw pointer — same rationale as
 // ApiState in g_rs_api.cpp: a static object's destructor would run before
 // rsMirrorShutdown and std::terminate on the still-joinable worker.
@@ -390,6 +396,7 @@ struct MirrorState {
 	std::string buildRows;
 	size_t buildCount;
 	std::vector<SnapRow> snapshot;
+	std::vector<PeerSnap> peerSnapshot; // heard peers, rebuilt each RS_MirrorRefresh
 	InEvent cur;
 
 	// -- worker thread only --
@@ -723,8 +730,10 @@ void processStateLine( MirrorState *s, const std::string &tag, uint32_t seq, con
 
 void processEventLine( MirrorState *s, PeerRt &rt, const std::string &tag, const char *line )
 {
+	// C chat, J join, L leave; O vote-open, T vote-tally, R vote-result,
+	// M map-changed — all ride the same event channel (dedup + re-send-once).
 	char kind = line[0];
-	if( ( kind != 'C' && kind != 'J' && kind != 'L' ) || line[1] != ' ' )
+	if( kind == 0 || strchr( "CJLOTRM", kind ) == nullptr || line[1] != ' ' )
 		return;
 	char *end = nullptr;
 	unsigned long eseq = strtoul( line + 2, &end, 10 );
@@ -743,7 +752,16 @@ void processEventLine( MirrorState *s, PeerRt &rt, const std::string &tag, const
 		rt.seenEvents.pop_front();
 
 	InEvent ev;
-	ev.type = kind == 'C' ? 1 : ( kind == 'J' ? 2 : 3 );
+	switch( kind ) {
+		case 'C': ev.type = 1; break;
+		case 'J': ev.type = 2; break;
+		case 'L': ev.type = 3; break;
+		case 'O': ev.type = 4; break; // vote open
+		case 'T': ev.type = 5; break; // vote tally (a server's subtotal)
+		case 'R': ev.type = 6; break; // vote result
+		case 'M': ev.type = 7; break; // map changed
+		default: return;
+	}
 	ev.tag = tag;
 	ev.name = sanitizeField( std::string( nameStart, tab2 - nameStart ).c_str(), NAME_MAX );
 	ev.text = sanitizeField( tab2 + 1, TEXT_MAX );
@@ -1065,7 +1083,7 @@ void RS_MirrorEvent( const char *kind, const char *name, const char *text )
 	if( !s || !kind || !kind[0] )
 		return;
 	char k = kind[0];
-	if( k != 'C' && k != 'J' && k != 'L' )
+	if( strchr( "CJLOTRM", k ) == nullptr )
 		return;
 	OutEvent ev;
 	ev.kind = k;
@@ -1114,6 +1132,19 @@ int RS_MirrorRefresh( void )
 			s->peersRt.erase( rt++ );
 		else
 			++rt;
+	}
+
+	// Peer-liveness snapshot for the RS_MirrorPeer* natives (game thread only,
+	// same discipline as the player snapshot below). Includes EMPTY peers —
+	// keepalive state carries the map — so the gametype can publish mesh status
+	// that shows the mesh as connected even when no players are streaming.
+	s->peerSnapshot.clear();
+	for( std::map<std::string, PeerRt>::iterator pit = s->peersRt.begin(); pit != s->peersRt.end(); ++pit ) {
+		PeerSnap ps;
+		ps.tag = pit->first;
+		ps.map = pit->second.map;
+		ps.ageMs = (int)( now - pit->second.lastMs );
+		s->peerSnapshot.push_back( ps );
 	}
 
 	s->snapshot.clear();
@@ -1177,6 +1208,43 @@ const char *RS_MirrorPlayerState( int i )
 	if( !s || i < 0 || (size_t)i >= s->snapshot.size() )
 		return "";
 	return s->snapshot[i].state.c_str();
+}
+
+/*
+ * RS_MirrorPeer{Count,Tag,Map,Age} — the heard-peer snapshot rebuilt by
+ * RS_MirrorRefresh (game thread only, like the player snapshot). Lets the
+ * gametype publish mesh status — which peers this server currently hears and
+ * their maps — even when those peers have no players streaming. Age is ms
+ * since the peer was last heard (its keepalive interval, ~100ms when healthy).
+ */
+int RS_MirrorPeerCount( void )
+{
+	MirrorState *s = g_mirror;
+	return s ? (int)s->peerSnapshot.size() : 0;
+}
+
+const char *RS_MirrorPeerTag( int i )
+{
+	MirrorState *s = g_mirror;
+	if( !s || i < 0 || (size_t)i >= s->peerSnapshot.size() )
+		return "";
+	return s->peerSnapshot[i].tag.c_str();
+}
+
+const char *RS_MirrorPeerMap( int i )
+{
+	MirrorState *s = g_mirror;
+	if( !s || i < 0 || (size_t)i >= s->peerSnapshot.size() )
+		return "";
+	return s->peerSnapshot[i].map.c_str();
+}
+
+int RS_MirrorPeerAge( int i )
+{
+	MirrorState *s = g_mirror;
+	if( !s || i < 0 || (size_t)i >= s->peerSnapshot.size() )
+		return -1;
+	return s->peerSnapshot[i].ageMs;
 }
 
 /*

@@ -2,6 +2,14 @@ const int MAX_POSITIONS = 400;
 const int POSITION_INTERVAL = 500;
 const float POSITION_HEIGHT = 24;
 
+// Replay ghost capture: a high-rate trajectory recorded for the whole run and,
+// on a new world record, uploaded to the web (hrace/demos.as) for the browser
+// viewer + the in-game WR ghost racer (hrace/ghostbot.as). Separate from the
+// 2 Hz recall buffer above, which skips airborne/solid-ground samples and is
+// far too coarse for smooth playback.
+const int MAX_GHOST_FRAMES = 3000; // ~2 min at 25 Hz
+const int GHOST_INTERVAL = 40;     // ms of RACE time between samples (~25 Hz)
+
 const int RECALL_ACTION_TIME = 200;
 const int RECALL_ACTION_JUMP = 5;
 
@@ -51,6 +59,22 @@ class Player
     Position[] bestRunPositions;
     int bestRunPositionCount;
 
+    // 25 Hz replay ghost buffers (current run + the best/WR run).
+    Vec3[] ghostOrigin;
+    Vec3[] ghostAngle;
+    Vec3[] ghostVel;
+    int[] ghostKeys;      // Warsow pressedKeys bitmask per frame (for the viewer)
+    int ghostCount;
+    int[] ghostCp;        // ghost-frame index at each checkpoint crossing
+    int ghostCpCount;
+    Vec3[] bestGhostOrigin;
+    Vec3[] bestGhostAngle;
+    Vec3[] bestGhostVel;
+    int[] bestGhostKeys;
+    int bestGhostCount;
+    int[] bestGhostCp;
+    int bestGhostCpCount;
+
     void setupArrays( int size )
     {
         this.messageTimes.resize( MAX_FLOOD_MESSAGES );
@@ -58,6 +82,16 @@ class Player
         this.best_recordTime.setupArrays( size );
         this.runPositions.resize( MAX_POSITIONS );
         this.bestRunPositions.resize( MAX_POSITIONS );
+        this.ghostOrigin.resize( MAX_GHOST_FRAMES );
+        this.ghostAngle.resize( MAX_GHOST_FRAMES );
+        this.ghostVel.resize( MAX_GHOST_FRAMES );
+        this.ghostKeys.resize( MAX_GHOST_FRAMES );
+        this.bestGhostOrigin.resize( MAX_GHOST_FRAMES );
+        this.bestGhostAngle.resize( MAX_GHOST_FRAMES );
+        this.bestGhostVel.resize( MAX_GHOST_FRAMES );
+        this.bestGhostKeys.resize( MAX_GHOST_FRAMES );
+        this.ghostCp.resize( size );
+        this.bestGhostCp.resize( size );
         this.arraysSetUp = true;
         this.clear();
     }
@@ -80,6 +114,10 @@ class Player
         this.nextRunPositionTime = 0;
         this.bestRunPositionCount = 0;
         this.positionCycle = 0;
+        this.ghostCount = 0;
+        this.ghostCpCount = 0;
+        this.bestGhostCount = 0;
+        this.bestGhostCpCount = 0;
         this.pos = -1;
         this.noclipSpawn = false;
 
@@ -529,6 +567,12 @@ class Player
 
     bool startRace()
     {
+        // Mirror bots (and any fake client) are puppets driven by the mesh
+        // stream, not real input — they must never enter a race, so they can
+        // never count an attempt or set a record on this server.
+        if ( RACE_MirrorIsFakeClient( this.client ) )
+            return false;
+
         if ( !this.preRace() )
             return false;
 
@@ -539,6 +583,8 @@ class Player
         this.runPositionCount = 0;
         this.positionCycle = 0;
         this.nextRunPositionTime = this.timeStamp() + POSITION_INTERVAL;
+        this.ghostCount = 0;
+        this.ghostCpCount = 0;
 
         if ( RS_QueryPjState( this.client.playerNum )  )
         {
@@ -557,6 +603,13 @@ class Player
         this.current_recordTime.clearCheckpoints();
 
         // this.report.reset();
+
+        // Begin a per-client server demo of this run (engine race-demos
+        // subsystem; skips bots internally and no-ops when disabled). demoStop
+        // on the finish renames it with the time; demoCancel on an abort
+        // discards it. Never reached by fake clients (guarded at the top).
+        if ( rsRecordDemos.boolean )
+            this.client.demoStart( RACE_DemoName( this.client ) );
 
         this.client.newRaceRun( numCheckpoints );
 
@@ -581,6 +634,25 @@ class Player
 
         this.runPositions[ this.runPositionCount++ ] = this.currentPosition();
         this.nextRunPositionTime = this.timeStamp() + POSITION_INTERVAL;
+    }
+
+    // Record one replay-ghost frame at a fixed ~25 Hz cadence in RACE time, so
+    // frame i lands at ~i*GHOST_INTERVAL ms (the web/viewer treat timing as
+    // implicit from the index). Unlike saveRunPosition this samples every
+    // frame including airborne — that is exactly what a smooth strafe path
+    // needs. Called from GT_ThinkRules for every racing client.
+    void saveGhostFrame()
+    {
+        if ( !this.inRace || this.ghostCount >= MAX_GHOST_FRAMES )
+            return;
+        if ( this.raceTime() < uint( this.ghostCount ) * uint( GHOST_INTERVAL ) )
+            return;
+        Entity@ ent = this.client.getEnt();
+        this.ghostOrigin[ this.ghostCount ] = ent.origin;
+        this.ghostAngle[ this.ghostCount ] = ent.angles;
+        this.ghostVel[ this.ghostCount ] = ent.get_velocity();
+        this.ghostKeys[ this.ghostCount ] = int( this.client.pressedKeys );
+        this.ghostCount++;
     }
 
     uint getSpeed()
@@ -727,6 +799,11 @@ class Player
     {
         Entity@ ent = this.client.getEnt();
 
+        // Discard this run's per-client demo (no-op if none / disabled). Guard
+        // on inRace so ordinary respawns don't spam racerecordcancel.
+        if ( rsRecordDemos.boolean && this.inRace )
+            this.client.demoCancel();
+
         if ( this.inRace && this.currentCheckpoint > 0 )
         {
             this.current_recordTime.report( this );
@@ -759,6 +836,12 @@ class Player
 
     void completeRace()
     {
+        // Belt-and-suspenders: a fake client should never be inRace (startRace
+        // refuses them), but never log a finish, report to the API, or write a
+        // top score for one even if some other path gets here.
+        if ( RACE_MirrorIsFakeClient( this.client ) )
+            return;
+
         if ( this.practicing && !this.recalled )
         {
             if ( this.practiceFinish == 0 || this.timeStamp() > this.practiceFinish + 5000 )
@@ -813,18 +896,44 @@ class Player
                 for ( int i = 0; i < this.runPositionCount; i++ )
                     this.bestRunPositions[ i ] = this.runPositions[ i ];
 
+                // Snapshot the 25 Hz ghost of this personal-best run too.
+                this.bestGhostCount = this.ghostCount;
+                for ( int i = 0; i < this.ghostCount; i++ )
+                {
+                    this.bestGhostOrigin[ i ] = this.ghostOrigin[ i ];
+                    this.bestGhostAngle[ i ] = this.ghostAngle[ i ];
+                    this.bestGhostVel[ i ] = this.ghostVel[ i ];
+                    this.bestGhostKeys[ i ] = this.ghostKeys[ i ];
+                }
+                this.bestGhostCpCount = this.ghostCpCount;
+                for ( int i = 0; i < this.ghostCpCount; i++ )
+                    this.bestGhostCp[ i ] = this.ghostCp[ i ];
+
                 this.best_recordTime = this.current_recordTime;
             }
 
             uint pos = RACE_AddTopScore( this.best_recordTime );
+
+            // Close this run's per-client demo: the engine renames it with the
+            // finish time and keeps the fastest few per map (no-op if disabled
+            // or if none was started).
+            if ( rsRecordDemos.boolean )
+                this.client.demoStop( RACE_DemoName( this.client ), finishTime );
+
             if ( pos == 0 )
             {
                 String str = this.client.name + S_COLOR_YELLOW + " set a new " + SERVER_NAME + S_COLOR_YELLOW + " record: " + S_COLOR_GREEN + RACE_TimeToString( finishTime );
                 if ( levelRecords[ 1 ].isFinished() )
                     str += " " + S_COLOR_YELLOW + "[-" + RACE_TimeToString( levelRecords[ 1 ].getFinishTime() - finishTime ) + "]";
                 G_PrintMsg( null, str + "\n" );
+
+                // New world record: point the web at the downloadable demo and
+                // upload the ghost trajectory (browser viewer + in-game racer).
+                if ( rsRecordDemos.boolean )
+                    RACE_ReportWrDemo( this, finishTime );
+                RACE_UploadWrGhost( this, finishTime );
             }
-            
+
 
             RACE_WriteTopScores();
             RACE_UpdateHUDTopScores();
@@ -857,6 +966,10 @@ class Player
         uint time = this.raceTime();
         this.current_recordTime.checkpoints[ id ] = Checkpoint( time, this.getSpeed(), this.maxSpeed, CheckpointType_Normal );
         this.current_recordTime.checkpoint_order[ this.currentCheckpoint++ ] = id;
+
+        // mark which ghost frame this checkpoint fell on (viewer cp markers)
+        if ( this.inRace && this.ghostCpCount < int( numCheckpoints ) )
+            this.ghostCp[ this.ghostCpCount++ ] = this.ghostCount;
 
         // print some output and give awards if earned
         this.current_recordTime.checkpoints[ id ].print( this, id );

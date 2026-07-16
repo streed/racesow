@@ -34,12 +34,14 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
 enum RequestType {
-	REQ_POST_REPORT,  // fire-and-forget race finish -> /api/ingest
-	REQ_GET_TOPSCORES // live top scores -> swapped into the local topscores file
+	REQ_POST_REPORT,   // fire-and-forget race finish -> /api/ingest
+	REQ_GET_TOPSCORES, // live top scores -> swapped into the local topscores file
+	REQ_GET_GHOST      // WR ghost trajectory -> parsed into memory (RS_ApiPollGhost)
 };
 
 // note: no default member initializers — the game module builds as C++11,
@@ -80,8 +82,29 @@ struct ApiState {
 	std::atomic<unsigned> fetchGen;
 	std::atomic<int> fetchResult;
 
-	ApiState() : stop( false ), fetchGen( 0 ), fetchResult( 0 ) {}
+	// WR-ghost fetch handshake (same shape as the top-scores one, separate so a
+	// ghost fetch and a top-scores fetch never clobber each other's result).
+	// The parsed trajectory lives here behind ghostMutex; the script thread
+	// copies it out after RS_ApiPollGhost reports 1.
+	std::atomic<unsigned> fetchGhostGen;
+	std::atomic<int> fetchGhostResult;
+	std::mutex ghostMutex;
+	std::vector<int> ghostFrames; // flat: 9 ints per frame (x y z p yaw r vx vy vz)
+	int ghostFrameCount;
+	int ghostHz;
+	int ghostTime;
+	std::string ghostName; // record holder (raw, may carry ^ colour codes)
+	std::string ghostCps;  // checkpoint frame indices, space-separated
+
+	ApiState()
+		: stop( false ), fetchGen( 0 ), fetchResult( 0 ), fetchGhostGen( 0 ), fetchGhostResult( 0 ),
+		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ) {}
 };
+
+// Script-thread-only accumulator for building a ghost upload body incrementally
+// (RS_GhostBegin/Frame/End) — avoids an O(n^2) string concat in AngelScript.
+std::string g_ghostBuild;
+bool g_ghostBuildFirst = true;
 
 ApiState *g_state = nullptr;
 
@@ -222,6 +245,66 @@ long doPost( const ApiRequest &req )
 	return status;
 }
 
+// Parse the flat-text WR ghost payload the web serves at /api/game/ghost:
+//   line 1: RSGHOST <v> <hz> <time> <frameCount>
+//   line 2: <holder name>
+//   line 3: <cp frame indices, space separated, maybe empty>
+//   then <frameCount> lines of: x y z pitch yaw roll vx vy vz
+// Positions are truncated to ints (a ghost path needs no sub-unit precision).
+// Returns false on anything that is not a well-formed ghost (proxy error page,
+// truncated body, etc.) so it can never drive a bot from garbage.
+bool parseGhostPayload( const std::string &payload, std::vector<int> &frames,
+	int &frameCount, int &hz, int &timeMs, std::string &name, std::string &cps )
+{
+	if( payload.compare( 0, 8, "RSGHOST " ) != 0 )
+		return false;
+
+	size_t pos = 0;
+	std::string line;
+	auto nextLine = [&]( std::string &out ) -> bool {
+		if( pos > payload.size() )
+			return false;
+		size_t nl = payload.find( '\n', pos );
+		if( nl == std::string::npos ) {
+			out = payload.substr( pos );
+			pos = payload.size() + 1;
+		} else {
+			out = payload.substr( pos, nl - pos );
+			pos = nl + 1;
+		}
+		return true;
+	};
+
+	std::string header;
+	if( !nextLine( header ) )
+		return false;
+	int v = 0;
+	if( sscanf( header.c_str(), "RSGHOST %d %d %d %d", &v, &hz, &timeMs, &frameCount ) != 4 )
+		return false;
+	if( frameCount < 0 || frameCount > 200000 || hz <= 0 || hz > 1000 )
+		return false;
+
+	if( !nextLine( name ) )
+		return false;
+	if( !nextLine( cps ) )
+		return false; // may be empty, but the line must exist
+
+	frames.clear();
+	frames.reserve( (size_t)frameCount * 9 );
+	int got = 0;
+	while( got < frameCount && nextLine( line ) ) {
+		float f[9];
+		if( sscanf( line.c_str(), "%f %f %f %f %f %f %f %f %f",
+				&f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7], &f[8] ) != 9 )
+			break;
+		for( int k = 0; k < 9; k++ )
+			frames.push_back( (int)f[k] );
+		got++;
+	}
+	frameCount = got;
+	return got >= 2;
+}
+
 void workerMain( ApiState *s )
 {
 	for( ;; ) {
@@ -236,7 +319,47 @@ void workerMain( ApiState *s )
 		}
 
 		long status;
-		if( req.type == REQ_GET_TOPSCORES ) {
+		if( req.type == REQ_GET_GHOST ) {
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchGhostGen.load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded (map changed / newer fetch) — drop
+				std::vector<int> frames;
+				int fc = 0, hz = 0, tm = 0;
+				std::string nm, cps;
+				if( parseGhostPayload( payload, frames, fc, hz, tm, nm, cps ) ) {
+					std::lock_guard<std::mutex> lock( s->ghostMutex );
+					s->ghostFrames.swap( frames );
+					s->ghostFrameCount = fc;
+					s->ghostHz = hz;
+					s->ghostTime = tm;
+					s->ghostName = nm;
+					s->ghostCps = cps;
+					s->fetchGhostResult.store( 1 );
+				} else {
+					fprintf( stderr, "rs_api: rejecting non-ghost payload from %s\n", req.url.c_str() );
+					s->fetchGhostResult.store( -1 );
+				}
+				continue;
+			}
+			if( !current )
+				continue;
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				// 404 = no WR ghost for this map yet — expected, not logged.
+				if( status != 404 )
+					fprintf( stderr, "rs_api: ghost fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchGhostResult.store( -1 );
+				continue;
+			}
+			// transient: fall through to the requeue below
+		} else if( req.type == REQ_GET_TOPSCORES ) {
 			// A fetch queued when shutdown is already under way is worthless:
 			// nobody will ever poll the result.
 			if( s->stop.load() )
@@ -559,4 +682,259 @@ int RS_ApiPollTop( void )
 	if( !s )
 		return 0;
 	return s->fetchResult.exchange( 0 );
+}
+
+// Enqueue any fire-and-forget POST (shared by the report natives below).
+static void rsQueuePost( const char *url, const char *token, std::string &&body )
+{
+	ApiState *s = ensureStarted();
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+			s->queue.pop_front();
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
+			REQ_POST_REPORT, "", 0 } );
+	}
+	s->cv.notify_one();
+}
+
+/*
+ * RS_ApiReportWrDemo
+ *
+ * Tell the stats API that a new world record on <mapname> has a downloadable
+ * .wd demo at <demoPath> (relative to the game host's demos/ dir; the web
+ * builds a download URL from it). Posted to the same /api/ingest endpoint with
+ * source "wr_demo"; does not touch the leaderboard. No-op when url is empty.
+ */
+void RS_ApiReportWrDemo( const char *url, const char *token, const char *version,
+	const char *mapname, const char *player, const char *login, int timeMs, const char *demoPath )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] ||
+		timeMs <= 0 || !demoPath || !demoPath[0] )
+		return;
+
+	std::string body;
+	body.reserve( 256 );
+	body += "{\"version\":\"";
+	jsonEscapeInto( body, version && version[0] ? version : "wsw 2.1" );
+	body += "\",\"map\":\"";
+	jsonEscapeInto( body, mapname );
+	body += "\",\"source\":\"wr_demo\",\"wr_demo\":{\"name\":\"";
+	jsonEscapeInto( body, player );
+	body += "\",\"login\":\"";
+	jsonEscapeInto( body, login ? login : "" );
+	body += "\",\"time\":";
+	body += std::to_string( timeMs );
+	body += ",\"demo\":\"";
+	jsonEscapeInto( body, demoPath );
+	body += "\"}}";
+
+	rsQueuePost( url, token, std::move( body ) );
+}
+
+/*
+ * RS_GhostBegin / RS_GhostFrame / RS_GhostEnd
+ *
+ * Build a WR ghost upload body incrementally on the script thread (one native
+ * call per captured frame) so AngelScript never does an O(n^2) string concat
+ * over thousands of frames. Begin resets the accumulator, Frame appends one
+ * "[x,y,z,pitch,yaw,roll,vx,vy,vz]", End wraps it into the ingest body and
+ * queues the POST to <url> (the central /api/ingest/ghost).
+ */
+void RS_GhostBegin( void )
+{
+	g_ghostBuild.clear();
+	g_ghostBuild.reserve( 1u << 16 );
+	g_ghostBuildFirst = true;
+}
+
+void RS_GhostFrame( int x, int y, int z, int pitch, int yaw, int roll, int vx, int vy, int vz, int keys )
+{
+	if( !g_ghostBuildFirst )
+		g_ghostBuild += ',';
+	g_ghostBuildFirst = false;
+	char buf[112];
+	snprintf( buf, sizeof( buf ), "[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]",
+		x, y, z, pitch, yaw, roll, vx, vy, vz, keys );
+	g_ghostBuild += buf;
+}
+
+void RS_GhostEnd( const char *url, const char *token, const char *version,
+	const char *mapname, const char *player, const char *login,
+	int timeMs, int hz, const char *cpsCsv )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] ||
+		timeMs <= 0 || g_ghostBuild.empty() ) {
+		g_ghostBuild.clear();
+		return;
+	}
+
+	std::string body;
+	body.reserve( g_ghostBuild.size() + 256 );
+	body += "{\"version\":\"";
+	jsonEscapeInto( body, version && version[0] ? version : "wsw 2.1" );
+	body += "\",\"map\":\"";
+	jsonEscapeInto( body, mapname );
+	body += "\",\"name\":\"";
+	jsonEscapeInto( body, player );
+	body += "\",\"login\":\"";
+	jsonEscapeInto( body, login ? login : "" );
+	body += "\",\"time\":";
+	body += std::to_string( timeMs );
+	body += ",\"hz\":";
+	body += std::to_string( hz > 0 ? hz : 25 );
+	body += ",\"cps\":[";
+	bool first = true;
+	const char *p = cpsCsv ? cpsCsv : "";
+	while( *p ) {
+		char *end = nullptr;
+		long v = strtol( p, &end, 10 );
+		if( end == p )
+			break;
+		if( !first )
+			body += ',';
+		body += std::to_string( v );
+		first = false;
+		p = ( *end == ',' ) ? end + 1 : end;
+		if( *end != ',' )
+			break;
+	}
+	body += "],\"frames\":[";
+	body += g_ghostBuild;
+	body += "]}";
+	g_ghostBuild.clear();
+
+	rsQueuePost( url, token, std::move( body ) );
+}
+
+/*
+ * RS_ApiFetchGhost / RS_ApiPollGhost
+ *
+ * Fetch the current WR ghost for <mapname> from <url> (the central
+ * /api/game/ghost endpoint; ?map= appended), parse it in the worker, and make
+ * it available to the gametype's in-game WR ghost racer. RS_ApiPollGhost()
+ * returns 1 when a fresh ghost is loaded (copy it out via the getters below),
+ * -1 when the last fetch failed for good (404 = no WR ghost yet), 0 otherwise.
+ */
+void RS_ApiFetchGhost( const char *url, const char *token, const char *mapname )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] )
+		return;
+	for( const char *p = mapname; *p; p++ ) {
+		char c = *p;
+		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
+			c == '_' || c == '.' || c == '-';
+		if( !ok ) {
+			fprintf( stderr, "rs_api: refusing ghost fetch for unsafe map name\n" );
+			return;
+		}
+	}
+
+	std::string full = std::string( url ) + "?map=" + mapname;
+	ApiState *s = ensureStarted();
+	unsigned gen = s->fetchGhostGen.fetch_add( 1 ) + 1;
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			// evict another fetch (reproducible) before a one-shot race report
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
+			REQ_GET_GHOST, "", gen } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollGhost( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	return s->fetchGhostResult.exchange( 0 );
+}
+
+// Getters for the loaded WR ghost. Called from the script thread after a poll
+// of 1; each briefly locks ghostMutex and copies out. The string getters use a
+// static buffer the AngelScript wrapper copies immediately (no reentrancy on
+// the single script thread).
+int RS_GhostLoadedFrames( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	std::lock_guard<std::mutex> lock( s->ghostMutex );
+	return s->ghostFrameCount;
+}
+
+int RS_GhostLoadedHz( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	std::lock_guard<std::mutex> lock( s->ghostMutex );
+	return s->ghostHz;
+}
+
+int RS_GhostLoadedTime( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	std::lock_guard<std::mutex> lock( s->ghostMutex );
+	return s->ghostTime;
+}
+
+const char *RS_GhostLoadedName( void )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->ghostMutex );
+	buf = s->ghostName;
+	return buf.c_str();
+}
+
+const char *RS_GhostLoadedCps( void )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->ghostMutex );
+	buf = s->ghostCps;
+	return buf.c_str();
+}
+
+const char *RS_GhostFrameAt( int i )
+{
+	static char buf[128];
+	buf[0] = '\0';
+	ApiState *s = g_state;
+	if( !s )
+		return buf;
+	std::lock_guard<std::mutex> lock( s->ghostMutex );
+	if( i < 0 || i >= s->ghostFrameCount || (size_t)( i * 9 + 8 ) >= s->ghostFrames.size() )
+		return buf;
+	const int *f = &s->ghostFrames[(size_t)i * 9];
+	snprintf( buf, sizeof( buf ), "%d %d %d %d %d %d %d %d %d",
+		f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8] );
+	return buf;
 }

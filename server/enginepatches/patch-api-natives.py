@@ -104,6 +104,117 @@ ENTRY = ANCHOR_ENTRY + (
 
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, ENTRY, "asGlobFuncs entry")
 
+# --- 1c. replay feature: WR demo pointer + ghost upload/fetch/replay ----------
+# Added for the in-browser + in-game replay feature. Wrappers/entries inserted
+# the same way as above; anchors are re-emitted so they stay unique for the
+# mirror patcher that runs after. C uses spaces (indentation is irrelevant to
+# the compiler); the AngelScript decls survive stripping as string literals, so
+# the Dockerfile asserts on "RS_ApiReportWrDemo" / "RS_ApiFetchGhost".
+GHOST_WRAPPERS = r'''// racesow-docker: WR demo pointer + ghost trajectory upload/fetch/replay
+// (implementation in g_rs_api.cpp; queued + sent/parsed on the worker thread)
+void RS_ApiReportWrDemo( const char *url, const char *token, const char *version,
+    const char *mapname, const char *player, const char *login, int timeMs, const char *demoPath );
+void RS_GhostBegin( void );
+void RS_GhostFrame( int x, int y, int z, int pitch, int yaw, int roll, int vx, int vy, int vz, int keys );
+void RS_GhostEnd( const char *url, const char *token, const char *version,
+    const char *mapname, const char *player, const char *login, int timeMs, int hz, const char *cpsCsv );
+void RS_ApiFetchGhost( const char *url, const char *token, const char *mapname );
+int RS_ApiPollGhost( void );
+int RS_GhostLoadedFrames( void );
+int RS_GhostLoadedHz( void );
+int RS_GhostLoadedTime( void );
+const char *RS_GhostLoadedName( void );
+const char *RS_GhostLoadedCps( void );
+const char *RS_GhostFrameAt( int i );
+
+static void asFunc_RS_ApiReportWrDemo( asstring_t *url, asstring_t *token, asstring_t *version,
+    asstring_t *mapname, asstring_t *player, asstring_t *login, int timeMs, asstring_t *demo )
+{
+    if( !url || !url->buffer || !mapname || !mapname->buffer || !player || !player->buffer || !demo || !demo->buffer )
+        return;
+    RS_ApiReportWrDemo( url->buffer,
+        token && token->buffer ? token->buffer : "",
+        version && version->buffer ? version->buffer : "",
+        mapname->buffer, player->buffer,
+        login && login->buffer ? login->buffer : "",
+        timeMs, demo->buffer );
+}
+
+static void asFunc_RS_GhostBegin( void ) { RS_GhostBegin(); }
+
+static void asFunc_RS_GhostFrame( int x, int y, int z, int pitch, int yaw, int roll, int vx, int vy, int vz, int keys )
+{
+    RS_GhostFrame( x, y, z, pitch, yaw, roll, vx, vy, vz, keys );
+}
+
+static void asFunc_RS_GhostEnd( asstring_t *url, asstring_t *token, asstring_t *version,
+    asstring_t *mapname, asstring_t *player, asstring_t *login, int timeMs, int hz, asstring_t *cps )
+{
+    if( !url || !url->buffer || !mapname || !mapname->buffer || !player || !player->buffer )
+        return;
+    RS_GhostEnd( url->buffer,
+        token && token->buffer ? token->buffer : "",
+        version && version->buffer ? version->buffer : "",
+        mapname->buffer, player->buffer,
+        login && login->buffer ? login->buffer : "",
+        timeMs, hz, cps && cps->buffer ? cps->buffer : "" );
+}
+
+static void asFunc_RS_ApiFetchGhost( asstring_t *url, asstring_t *token, asstring_t *mapname )
+{
+    if( !url || !url->buffer || !mapname || !mapname->buffer )
+        return;
+    RS_ApiFetchGhost( url->buffer, token && token->buffer ? token->buffer : "", mapname->buffer );
+}
+
+static int asFunc_RS_ApiPollGhost( void ) { return RS_ApiPollGhost(); }
+static int asFunc_RS_GhostLoadedFrames( void ) { return RS_GhostLoadedFrames(); }
+static int asFunc_RS_GhostLoadedHz( void ) { return RS_GhostLoadedHz(); }
+static int asFunc_RS_GhostLoadedTime( void ) { return RS_GhostLoadedTime(); }
+
+static asstring_t *asFunc_RS_GhostLoadedName( void )
+{
+    const char *s = RS_GhostLoadedName();
+    return angelExport->asStringFactoryBuffer( s, strlen( s ) );
+}
+static asstring_t *asFunc_RS_GhostLoadedCps( void )
+{
+    const char *s = RS_GhostLoadedCps();
+    return angelExport->asStringFactoryBuffer( s, strlen( s ) );
+}
+static asstring_t *asFunc_RS_GhostFrameAt( int i )
+{
+    const char *s = RS_GhostFrameAt( i );
+    return angelExport->asStringFactoryBuffer( s, strlen( s ) );
+}
+
+'''
+patch("game/g_ascript.cpp", ANCHOR_TABLE, GHOST_WRAPPERS + ANCHOR_TABLE, "asFunc ghost wrappers")
+
+GHOST_ENTRIES = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiReportWrDemo( const String &in url, const String &in token, "
+    "const String &in version, const String &in map, const String &in player, "
+    "const String &in login, int timeMs, const String &in demo )\", "
+    "asFUNCTION(asFunc_RS_ApiReportWrDemo), NULL },\n"
+    "\t{ \"void RS_GhostBegin()\", asFUNCTION(asFunc_RS_GhostBegin), NULL },\n"
+    "\t{ \"void RS_GhostFrame( int x, int y, int z, int pitch, int yaw, int roll, "
+    "int vx, int vy, int vz, int keys )\", asFUNCTION(asFunc_RS_GhostFrame), NULL },\n"
+    "\t{ \"void RS_GhostEnd( const String &in url, const String &in token, "
+    "const String &in version, const String &in map, const String &in player, "
+    "const String &in login, int timeMs, int hz, const String &in cps )\", "
+    "asFUNCTION(asFunc_RS_GhostEnd), NULL },\n"
+    "\t{ \"void RS_ApiFetchGhost( const String &in url, const String &in token, "
+    "const String &in map )\", asFUNCTION(asFunc_RS_ApiFetchGhost), NULL },\n"
+    "\t{ \"int RS_ApiPollGhost()\", asFUNCTION(asFunc_RS_ApiPollGhost), NULL },\n"
+    "\t{ \"int RS_GhostLoadedFrames()\", asFUNCTION(asFunc_RS_GhostLoadedFrames), NULL },\n"
+    "\t{ \"int RS_GhostLoadedHz()\", asFUNCTION(asFunc_RS_GhostLoadedHz), NULL },\n"
+    "\t{ \"int RS_GhostLoadedTime()\", asFUNCTION(asFunc_RS_GhostLoadedTime), NULL },\n"
+    "\t{ \"const String @RS_GhostLoadedName()\", asFUNCTION(asFunc_RS_GhostLoadedName), NULL },\n"
+    "\t{ \"const String @RS_GhostLoadedCps()\", asFUNCTION(asFunc_RS_GhostLoadedCps), NULL },\n"
+    "\t{ \"const String @RS_GhostFrameAt( int i )\", asFUNCTION(asFunc_RS_GhostFrameAt), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, GHOST_ENTRIES, "asGlobFuncs ghost entries")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

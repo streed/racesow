@@ -25,9 +25,9 @@ DATABASE_URL=postgres://racesow:racesow@127.0.0.1:5432/racesow \
   node migrate-sqlite-to-pg.js ../data/db.sqlite
 ```
 
-On startup the server bootstraps/migrates the schema and builds `UNLOGGED`
-aggregate tables (standings, per-map world records) — ~1s for the full
-~237k-row database.
+On startup the server applies any pending schema migrations (see
+[Schema migrations](#schema-migrations)) and builds `UNLOGGED` aggregate tables
+(standings, per-map world records) — ~1s for the full ~237k-row database.
 
 ## Run with Docker
 
@@ -47,11 +47,39 @@ docker compose up -d --build
 | `DATABASE_URL`  | `postgres://racesow:racesow@127.0.0.1:5432/racesow` | PostgreSQL connection    |
 | `PG_POOL_SIZE`  | `10`                                             | pg connection pool size     |
 
+## Schema migrations
+
+The schema is managed by [node-pg-migrate](https://github.com/salsita/node-pg-migrate).
+Versioned SQL files live in [`migrations/`](migrations); the runner records what
+it has applied in a `pgmigrations` table.
+
+Migrations run **automatically at startup** (`db.js` → `runSchemaMigrations`),
+so a normal `npm start` / `docker compose up` needs no extra step. The runner
+takes a Postgres advisory lock, so the two production web replicas booting
+together can't race the schema. The baseline migration is idempotent
+(`CREATE ... IF NOT EXISTS`), which is how it adopted the existing production
+database without recreating anything.
+
+Author a new change (never edit an applied migration — add a new one):
+
+```bash
+cd web
+npm run migrate:create -- add_some_column     # writes migrations/<utc>_add-some-column.sql
+# edit the file: fill in the -- Up Migration and -- Down Migration sections
+```
+
+Manual runs (the app does this for you at boot) use `DATABASE_URL`:
+
+```bash
+DATABASE_URL=postgres://racesow:racesow@127.0.0.1:5432/racesow npm run migrate -- up
+DATABASE_URL=postgres://racesow:racesow@127.0.0.1:5432/racesow npm run migrate -- down    # roll back one
+```
+
 ## Testing
 
-`npm test` spins up an ephemeral throwaway database per test, so point
-`TEST_PG_URL` at any Postgres owner connection (default
-`postgres://racesow:racesow@127.0.0.1:5433/racesow`).
+`npm test` spins up an ephemeral throwaway database per test (each one is
+migrated from scratch by `openDatabase`), so point `TEST_PG_URL` at any Postgres
+owner connection (default `postgres://racesow:racesow@127.0.0.1:5433/racesow`).
 
 ## REST API
 
@@ -96,8 +124,9 @@ curl 'http://localhost:8080/api/players/47'
 ## Files
 
 - `server.js` — Express app: API routes + static hosting + SPA fallback + OG cards.
-- `db.js` — PostgreSQL data layer: schema bootstrap/migrations, aggregate
+- `db.js` — PostgreSQL data layer: runs migrations at startup, builds aggregate
   tables, trigram search, ingest, all query logic.
+- `migrations/` — versioned node-pg-migrate schema files (`<utc>_<name>.sql`).
 - `migrate-sqlite-to-pg.js` — one-time SQLite → PostgreSQL data copy.
 - `admin.js` — enroll/list/revoke servers, set Live addresses, rebuild
   canonical player groups.

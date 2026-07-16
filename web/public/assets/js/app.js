@@ -80,17 +80,30 @@ function errorView(e) {
   app.innerHTML = `<div class="empty">Something went wrong<br><small>${esc(e.message || e)}</small></div>`;
 }
 
-/* --------------------------- hash routing -------------------------------- */
-function parseHash() {
-  let h = location.hash.slice(1) || "/";
-  const [path, qs] = h.split("?");
+/* ----------------------- routing (History API paths) --------------------- */
+// The app uses clean path URLs (/live, /map/5, /player/5?sort=map) via
+// pushState — no "#" in the address bar. `data-nav` values keep the "#/…"
+// shorthand (it just means "an in-app route"); navHref() maps them to real
+// paths. Legacy "#/…" URLs (old shared links, bookmarks) are normalized to
+// the path form on load.
+function navHref(target) {
+  let t = String(target == null ? "/" : target);
+  if (t.startsWith("#")) t = t.slice(1); // "#/live" -> "/live"
+  if (!t.startsWith("/")) t = "/" + t; // "live" -> "/live"
+  return t || "/";
+}
+
+function parseRoute() {
+  const path = location.pathname || "/";
   const params = {};
-  if (qs) new URLSearchParams(qs).forEach((v, k) => (params[k] = v));
+  new URLSearchParams(location.search).forEach((v, k) => (params[k] = v));
   return { path: path || "/", params };
 }
 
-function go(hash) {
-  location.hash = hash;
+function go(target) {
+  const url = navHref(target);
+  if (url !== location.pathname + location.search) history.pushState(null, "", url);
+  router();
 }
 
 function buildQuery(params) {
@@ -187,7 +200,7 @@ async function viewOverview() {
             <thead><tr><th>Server</th><th>Status</th><th class="num">Records</th><th class="num">Last Seen</th></tr></thead>
             <tbody>
               ${d.servers.map((s) => `
-                <tr>
+                <tr class="clickable" data-nav="#/server/${s.id}">
                   <td class="mapname">${esc(s.name)}</td>
                   <td><span class="pill ${s.status === "trusted" ? "ok" : ""}">${esc(s.status)}</span></td>
                   <td class="num">${fmtNum(s.records)}</td>
@@ -395,6 +408,15 @@ async function viewMap(id) {
         <div class="wr-time time">${fmtTime(wr.time)}</div>
         <div class="holder">by ${wname(wr.name)} <span class="pill v1">${esc(wr.versionName || "")}</span></div>
         ${splitsHtml}
+        ${wr.ghost || (wr.demo && wr.demo.url) ? `
+        <div class="replay-actions">
+          ${wr.ghost ? `<button class="btn replay-watch" data-nav="#/replay/${id}">▶ Watch in browser</button>` : ""}
+          ${wr.demo && wr.demo.url ? `<a class="btn replay-demo" href="${esc(wr.demo.url)}" download rel="noopener">⬇ Download demo</a>` : ""}
+        </div>
+        ${wr.demo && wr.demo.url ? `<details class="demo-help"><summary>How to watch the demo in Warsow</summary>
+          <p>Download the file into your Warsow <code>racemod/demos</code> folder, then in the console run
+          <code>demo &lt;filename&gt;</code> — or launch <code>warsow +demo &lt;filename&gt;</code>. It plays the record run start&#8209;to&#8209;finish.</p></details>` : ""}
+        ` : ""}
       </div>` : ""}
     ${perfectHtml}
 
@@ -418,6 +440,45 @@ async function viewMap(id) {
         </tbody>
       </table>
     </div></div>`;
+}
+
+/* ------------------------------ replay view ------------------------------ */
+// The 3D viewer is a lazily-imported ES module (three.js). It returns a
+// cleanup function we must call when leaving the route to free the WebGL
+// context and animation loop.
+let disposeReplay = null;
+function stopReplay() {
+  if (disposeReplay) {
+    try { disposeReplay(); } catch (e) { /* ignore */ }
+    disposeReplay = null;
+  }
+}
+
+async function viewReplay(id) {
+  loading();
+  const d = await api(`/maps/${id}?limit=1`);
+  const wr = d.wr;
+  if (!wr || !wr.ghost) {
+    app.innerHTML = `<div class="crumbs"><a data-nav="#/map/${id}">${esc(d.name)}</a> / Replay</div>
+      <div class="empty">No in-browser replay for this map yet.<br><small>A ghost is captured the next time a world record is set here.</small></div>`;
+    return;
+  }
+  app.innerHTML = `
+    <div class="crumbs"><a data-nav="#/maps">Maps</a> / <a data-nav="#/map/${id}">${esc(d.name)}</a> / Replay</div>
+    <div class="replay-head">
+      <div class="page-title" style="font-size:24px">${esc(d.name)} <span class="accent">·</span> WR Replay</div>
+      <div class="replay-sub">by ${wname(wr.name)} <span class="pill wr">WR</span> <span class="time">${fmtTime(wr.time)}</span>
+        ${wr.demo && wr.demo.url ? `<a class="btn replay-demo" href="${esc(wr.demo.url)}" download rel="noopener">⬇ Download demo</a>` : ""}
+      </div>
+    </div>
+    <div id="replay-root" class="replay-root"></div>`;
+  const root = document.getElementById("replay-root");
+  try {
+    const mod = await import("/assets/js/replay.js");
+    disposeReplay = await mod.mountReplay(root, { mapId: id, mapName: d.name, wr });
+  } catch (e) {
+    root.innerHTML = `<div class="empty">Replay failed to load<br><small>${esc(e.message || e)}</small></div>`;
+  }
 }
 
 async function viewPlayer(id, params) {
@@ -479,13 +540,8 @@ async function viewPlayer(id, params) {
     </div>${pager(state, rec, `#/player/${id}`)}</div>`;
 
   wireSort(`#/player/${id}`, state, ["map", "time", "rank", "attempts"]);
-
-  // Show the shareable path-form URL (server-rendered OG tags for Discord/
-  // social unfurls live at /player/<id>, not at the hash route). Only the
-  // plain view rewrites — sorted/paged views keep their hash permalinks.
-  if (!location.hash || location.hash === `#/player/${id}`) {
-    history.replaceState(null, "", `/player/${d.id}`);
-  }
+  // (The address bar is already the clean /player/<id> path from pushState —
+  // where the server-rendered OG tags for Discord/social unfurls live.)
 }
 
 /* ------------------------------- live view ------------------------------- */
@@ -504,7 +560,7 @@ function liveServerCard(s) {
   const head = `
     <h3>
       <span class="dot ${s.online ? "teal" : ""}"></span>
-      ${esc(s.name)}
+      <span class="srvname clickable" data-nav="#/server/${s.id}">${esc(s.name)}</span>
       <span class="pill ${s.online ? "ok" : ""}">${s.online ? "online" : "offline"}</span>
       ${s.online && s.maxclients ? `<span class="live-count">${s.players.length}/${s.maxclients}</span>` : ""}
     </h3>`;
@@ -518,6 +574,20 @@ function liveServerCard(s) {
       ${s.map ? `<span class="live-map ${s.mapId ? "clickable" : ""}" ${s.mapId ? `data-nav="#/map/${s.mapId}"` : ""}>▸ ${esc(s.map)}</span>` : ""}
       ${s.address ? `<span class="live-addr mono">connect ${esc(s.address)}</span>` : ""}
     </div>`;
+  // Cross-server mesh: the peer servers this node currently hears (from its
+  // rs_mesh_status serverinfo). Renders nothing when mirroring is off or no
+  // peers are up, so non-meshed servers are unaffected.
+  const mesh = s.mesh && s.mesh.length
+    ? `<div class="live-mesh" title="Cross-server mesh — peers this server is currently linked with">
+        <span class="mesh-label">⇄ mesh</span>
+        ${s.mesh.map((p) => `
+          <span class="mesh-peer" title="${esc(p.tag)}${p.map ? ` on ${esc(p.map)}` : ""} · ${p.players} player${p.players === 1 ? "" : "s"}">
+            <span class="mesh-tag">${esc(p.tag)}</span>
+            ${p.map ? `<span class="mesh-map">▸ ${esc(p.map)}</span>` : ""}
+            <span class="mesh-num">${fmtNum(p.players)}</span>
+          </span>`).join("")}
+      </div>`
+    : "";
   const players = s.players.length
     ? `<table class="data">
         <thead><tr><th>Player</th><th class="num">Ping</th></tr></thead>
@@ -530,7 +600,7 @@ function liveServerCard(s) {
         </tbody>
       </table>`
     : `<div class="muted live-empty">Server is empty — hop in and set a record.</div>`;
-  return `<div class="panel live-srv">${head}${meta}${players}</div>`;
+  return `<div class="panel live-srv">${head}${meta}${mesh}${players}</div>`;
 }
 
 async function renderLive() {
@@ -561,8 +631,65 @@ async function viewLive() {
   await renderLive();
   stopLiveRefresh();
   liveTimer = setInterval(() => {
-    if (document.hidden || parseHash().path !== "/live") return;
+    if (document.hidden || parseRoute().path !== "/live") return;
     renderLive().catch(() => {}); // transient fetch errors: keep last snapshot
+  }, LIVE_REFRESH_MS);
+}
+
+/* ---------------------------- single server ------------------------------ */
+async function renderServer(id) {
+  const s = await api(`/servers/${id}`);
+  const li = s.live || { online: false, players: [] };
+  const statusPill = `<span class="pill ${li.online ? "ok" : ""}">${li.online ? "online" : "offline"}</span>`;
+  const meta = li.online
+    ? `<div class="live-meta">
+        ${li.hostname ? wname(li.hostname) : ""}
+        ${li.map ? `<span class="live-map ${li.mapId ? "clickable" : ""}" ${li.mapId ? `data-nav="#/map/${li.mapId}"` : ""}>▸ ${esc(li.map)}</span>` : ""}
+        ${s.address ? `<span class="live-addr mono">connect ${esc(s.address)}</span>` : ""}
+      </div>`
+    : `<div class="live-meta"><span class="muted">Not responding to queries right now.</span></div>`;
+  const players = li.online
+    ? (li.players.length
+        ? `<div class="tscroll"><table class="data">
+            <thead><tr><th>Player</th><th class="num">Ping</th></tr></thead>
+            <tbody>
+              ${li.players.map((p) => `
+                <tr class="clickable" data-nav="#/players?q=${encodeURIComponent(p.simplified)}">
+                  <td>${wname(p.name)}</td><td class="num">${fmtNum(p.ping)}</td>
+                </tr>`).join("")}
+            </tbody></table></div>`
+        : `<div class="muted live-empty">Server is empty — hop in and set a record.</div>`)
+    : "";
+
+  const html = `
+    <div class="crumbs"><a data-nav="#/live">Live</a> / ${esc(s.name)}</div>
+    <div class="page-title" style="font-size:32px">
+      <span class="livedot ${li.online ? "" : "off"}"></span> ${esc(s.name)} ${statusPill}
+    </div>
+    <p class="page-sub">${li.online && li.maxclients ? `${li.players.length} / ${li.maxclients} playing · ` : ""}${s.updatedAt ? `updated ${fmtAgo(s.updatedAt)}` : ""}</p>
+
+    <div class="panel live-srv">${meta}${players}</div>
+
+    <div class="statrow" style="margin-top:20px">
+      <div class="s hl"><div class="n">${fmtNum(s.records)}</div><div class="l">Records Contributed</div></div>
+      <div class="s"><div class="n">${s.last_seen_at ? fmtAgo(s.last_seen_at) : "—"}</div><div class="l">Last Record</div></div>
+      <div class="s"><div class="n">${s.status}</div><div class="l">Status</div></div>
+      ${s.created_at ? `<div class="s"><div class="n">${new Date(s.created_at * 1000).toISOString().slice(0, 10)}</div><div class="l">Enrolled</div></div>` : ""}
+    </div>`;
+  if (app.dataset.srvHtml !== html) {
+    app.dataset.srvHtml = html;
+    app.innerHTML = html;
+  }
+}
+
+async function viewServer(id) {
+  loading();
+  delete app.dataset.srvHtml;
+  await renderServer(id);
+  stopLiveRefresh();
+  liveTimer = setInterval(() => {
+    if (document.hidden || parseRoute().path !== `/server/${id}`) return;
+    renderServer(id).catch(() => {});
   }, LIVE_REFRESH_MS);
 }
 
@@ -680,6 +807,9 @@ function initGlobalSearch() {
 /* ------------------------------ dispatch --------------------------------- */
 // Delegated navigation for any [data-nav] element.
 document.addEventListener("click", (e) => {
+  // Let the browser handle modified clicks natively (open-in-new-tab etc.) so
+  // the anchors' real path hrefs work; only hijack a plain left click.
+  if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
   // Real links (e.g. the padpork ↗ chips) inside clickable rows keep their
   // native behaviour instead of being hijacked by the row's data-nav.
   const link = e.target.closest("a[href]");
@@ -696,17 +826,13 @@ document.addEventListener("click", (e) => {
 
 async function router() {
   stopLiveRefresh();
-  let { path, params } = parseHash();
-  // Path-form URLs (/player/5 — the shareable form whose OG tags unfurl in
-  // Discord/social) route like their hash equivalents; hash navigation away
-  // from one normalizes the address bar back to hash form. Query params live
-  // in location.search for path-form URLs (parseHash only sees the fragment).
-  if (!location.hash && location.pathname !== "/") {
-    path = location.pathname;
-    new URLSearchParams(location.search).forEach((v, k) => (params[k] = v));
-  } else if (location.hash && location.pathname !== "/") {
-    history.replaceState(null, "", "/" + location.hash);
+  stopReplay();
+  // Legacy "#/…" URL (old shared link / bookmark): rewrite to the clean path
+  // once, so the address bar never keeps a "#".
+  if (location.hash) {
+    history.replaceState(null, "", navHref(location.hash));
   }
+  const { path, params } = parseRoute();
   setActiveNav(path);
   window.scrollTo(0, 0);
   try {
@@ -714,6 +840,8 @@ async function router() {
     else if (path === "/maps") await viewMaps(params);
     else if (path === "/players") await viewPlayers(params);
     else if (path === "/live") await viewLive();
+    else if (path.startsWith("/server/")) await viewServer(parseInt(path.split("/")[2], 10));
+    else if (path.startsWith("/replay/")) await viewReplay(parseInt(path.split("/")[2], 10));
     else if (path.startsWith("/map/")) await viewMap(parseInt(path.split("/")[2], 10));
     else if (path.startsWith("/player/")) await viewPlayer(parseInt(path.split("/")[2], 10), params);
     else app.innerHTML = `<div class="empty">Page not found.</div>`;
@@ -722,7 +850,7 @@ async function router() {
   }
 }
 
-window.addEventListener("hashchange", router);
+window.addEventListener("popstate", router);
 window.addEventListener("DOMContentLoaded", async () => {
   initGlobalSearch();
   router();

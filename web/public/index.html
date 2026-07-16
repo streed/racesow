@@ -15,6 +15,17 @@
   <!-- /og -->
   <link rel="icon" href="/assets/img/warsow-logo.png">
   <link rel="stylesheet" href="/assets/css/style.css">
+  <!-- Vendored three.js (no build step; CSP blocks CDNs). The replay viewer
+       (assets/js/replay.js) is dynamically imported and resolves "three"
+       through this map; OrbitControls imports "three" internally. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/assets/vendor/three/three.module.js",
+      "three/addons/controls/OrbitControls.js": "/assets/vendor/three/OrbitControls.js"
+    }
+  }
+  </script>
 </head>
 <body>
   <header class="site">
@@ -27,10 +38,10 @@
         </div>
       </div>
       <nav class="main">
-        <a data-nav="#/" href="#/">Overview</a>
-        <a data-nav="#/maps" href="#/maps">Maps</a>
-        <a data-nav="#/players" href="#/players">Players</a>
-        <a data-nav="#/live" href="#/live">Live<span class="livedot" aria-hidden="true"></span></a>
+        <a data-nav="#/" href="/">Overview</a>
+        <a data-nav="#/maps" href="/maps">Maps</a>
+        <a data-nav="#/players" href="/players">Players</a>
+        <a data-nav="#/live" href="/live">Live<span class="livedot" aria-hidden="true"></span></a>
       </nav>
       <div class="gsearch">
         <span class="ico">⌕</span>

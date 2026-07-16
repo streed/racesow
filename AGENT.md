@@ -44,8 +44,43 @@ forked `hrace` mod and the patched engine/game module. No database, no
 Git-LFS pull, no collector needed on your side. A local
 `racelog/events.log` audit trail is still written alongside the API reports.
 
-To run a real competitive map pool, drop `.pk3` map packs into `server/maps/`
-and list them in `server/configs/mappool.txt` (see `server/README.md`).
+### Maps
+
+Out of the box the server rotates only the handful of maps that ship with
+Warsow. To run the community map pool — **and so every server in a network
+rotates the same maps** — mirror the full livesow pack collection into
+`server/maps/`:
+
+```bash
+scripts/fetch-maps.sh --jobs 8      # ~4300 packs / ~12.5 GB from livesow.net
+```
+
+It is safe to re-run (idempotent, resumable), makes each `.pk3`
+world-readable so the container's non-root user can load it, and restarts the
+game server when new packs land. The rotation itself is
+`server/configs/mappool.txt` (curated, most-raced maps) intersected with what
+is installed — so with the full mirror in place, `mappool.txt` alone
+determines the cycle, identically on every box that shares it. `docker logs
+warsow-race | grep "map pool"` shows the resulting rotation.
+
+> Running multiple servers that should feel like one network? Give them the
+> **same `server/configs/mappool.txt` and the same fetched maps** so their
+> `map pool` lines match exactly.
+
+**Fast local map downloads.** By default clients pull unknown `.pk3`s from the
+game server over UDP, which is slow for big packs — and painfully slow across
+regions. Run the bundled plain-HTTP pak mirror so clients download from *your*
+box instead:
+
+```bash
+# in .env: point clients at a URL THEY can reach (open the port to everyone)
+SV_UPLOADS_BASEURL=http://your-host:44445
+PAK_HTTP_PORT=44445
+docker compose -f docker-compose.agent.yml --profile httpdl up -d --build
+```
+
+Only set `SV_UPLOADS_BASEURL` if the port is reachable by every player — the
+engine does not fall back to UDP after a failed web download.
 
 Running **several regional servers**? They can also form a peer-to-peer
 **mesh** so players on one see and chat with players on the others (ghosts on
