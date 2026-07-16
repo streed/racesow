@@ -39,6 +39,22 @@ cp .env.example .env         # set INGEST_URL, INGEST_TOKEN, SERVER_NAME
 docker compose -f docker-compose.agent.yml up -d --build
 ```
 
+Or let `scripts/setup.sh` do it interactively (it installs Docker if needed,
+asks for the ingest URL + token and the optional server mesh, fetches the map
+mirror, and brings the stack up):
+
+```bash
+scripts/setup.sh agent
+```
+
+**Fresh cloud VM, hands-off.** To provision a new box entirely from its
+provider's *user-data*, use the cloud-init path: paste
+[`systemd/cloud-config.yaml`](systemd/cloud-config.yaml) (fill in your token,
+and the mesh settings if you're networking servers) and first boot installs
+Docker, creates the `racesow` service user, clones the repo, builds the server,
+and enables the systemd units — no SSH-in required. See *Zero-touch install
+(cloud-init)* in the main [`README.md`](README.md#zero-touch-install-cloud-init).
+
 This builds the game server (downloads Warsow 2.1.2 once, ~465 MB) with the
 forked `hrace` mod and the patched engine/game module. No database, no
 Git-LFS pull, no collector needed on your side. A local

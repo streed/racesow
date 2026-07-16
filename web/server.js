@@ -136,7 +136,7 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 
 // Hot read endpoints are Redis-cached (short TTL). /overview is the heaviest
 // aggregate and the most-hit page-load call, so it gets the longest window.
-api.get("/overview", cache(120), wrap(async (_req, res) => res.json(await race.overview())));
+api.get("/overview", cache(120, { edge: true }), wrap(async (_req, res) => res.json(await race.overview())));
 api.get("/servers", wrap(async (_req, res) => res.json({ servers: await race.servers() })));
 
 // One enrolled server: its DB record (name, status, records, last-seen,
@@ -157,9 +157,9 @@ api.get("/servers/:id", wrap(async (req, res) => {
   });
 }));
 
-api.get("/maps", cache(60), wrap(async (req, res) => res.json(await race.maps(req.query))));
+api.get("/maps", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.maps(req.query))));
 
-api.get("/maps/:id", cache(60), wrap(async (req, res) => {
+api.get("/maps/:id", cache(60, { edge: true }), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid map id" });
   const detail = await race.mapDetail(id, req.query);
@@ -184,9 +184,9 @@ api.get("/maps/:id/ghost", wrap(async (req, res) => {
   res.send(buf);
 }));
 
-api.get("/players", cache(60), wrap(async (req, res) => res.json(await race.players(req.query))));
+api.get("/players", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.players(req.query))));
 
-api.get("/players/:id", cache(60), wrap(async (req, res) => {
+api.get("/players/:id", cache(60, { edge: true }), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid player id" });
   const detail = await race.playerDetail(id, req.query);
@@ -662,7 +662,7 @@ app.get("/og/player/:id.png", renderLimiter, wrap(async (req, res) => {
   const d = Number.isNaN(id) ? null : await race.playerDetail(id, { limit: 1 });
   if (!d) return res.status(404).end();
   try {
-    const png = playerCardCached(d.id, () => ({
+    const png = await playerCardCached(d.id, () => ({
       name: d.name,
       rank: d.standing.rank,
       points: d.standing.points,
@@ -735,9 +735,9 @@ app.get("/live", renderLimiter, (req, res) => {
 
 // The live server-status card behind og:image. Short cache: it reflects the
 // current snapshot, which the poller refreshes on its own cadence.
-app.get("/og/live.png", renderLimiter, (req, res) => {
+app.get("/og/live.png", renderLimiter, wrap(async (req, res) => {
   try {
-    const png = liveCardCached(liveCardData);
+    const png = await liveCardCached(liveCardData);
     res.set("Content-Type", "image/png");
     res.set("Cache-Control", "public, max-age=60");
     res.send(png);
@@ -745,7 +745,7 @@ app.get("/og/live.png", renderLimiter, (req, res) => {
     console.error("live og card render failed:", e.message);
     res.status(500).end();
   }
-});
+}));
 
 // Look up one enrolled server + its live snapshot (shared by the /server page
 // and its OG card). Returns null for an unknown id.
@@ -794,7 +794,7 @@ app.get("/og/server/:id.png", renderLimiter, wrap(async (req, res) => {
   const info = Number.isNaN(id) ? null : await serverForOg(id);
   if (!info) return res.status(404).end();
   try {
-    const png = serverCardCached(id, () => {
+    const png = await serverCardCached(id, () => {
       const li = info.live;
       return {
         name: (li && li.online && li.hostname) || info.db.name,

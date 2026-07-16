@@ -1,0 +1,19 @@
+# One-shot ClamAV scan of the game pk3 map packs — run weekly by
+# racesow-pakscan.timer (or on demand: `systemctl start racesow-pakscan`).
+# Template: __RACESOW_DIR__ / __RACESOW_USER__ are substituted by
+# systemd/install.sh. Needs clamav (apt install clamav clamav-freshclam).
+[Unit]
+Description=Racesow pk3 antivirus scan (ClamAV)
+# Let freshclam pull the signature DB first if both fire near boot.
+After=clamav-freshclam.service network-online.target
+
+[Service]
+Type=oneshot
+User=__RACESOW_USER__
+WorkingDirectory=__RACESOW_DIR__
+ExecStart=__RACESOW_DIR__/scripts/scan-paks.sh
+# clamscan loads the full signature DB (~1-2GB); give it room and don't let a
+# long scan trip a watchdog.
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=idle

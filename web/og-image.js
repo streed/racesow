@@ -5,7 +5,7 @@
 // so rendering is deterministic — no system fonts involved.
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Resvg } from "@resvg/resvg-js";
+import { renderAsync } from "@resvg/resvg-js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FONT_DIR = path.join(__dirname, "og-assets", "fonts");
@@ -124,13 +124,15 @@ export function playerCardSvg({ name, rank, points, wr, maps, finishes, attempts
 </svg>`;
 }
 
-export function renderPlayerCardPng(data) {
-  const svg = playerCardSvg(data);
-  const resvg = new Resvg(svg, {
+// renderAsync (not the sync Resvg().render()) so CPU rasterization runs on the
+// libuv threadpool instead of blocking the single Node event loop — a burst of
+// cold-card renders must not head-of-line-block concurrent API/page requests.
+export async function renderPlayerCardPng(data) {
+  const img = await renderAsync(playerCardSvg(data), {
     fitTo: { mode: "width", value: W },
     font: { fontFiles: FONT_FILES, loadSystemFonts: false, defaultFontFamily: "Fira Sans Condensed" },
   });
-  return resvg.render().asPng();
+  return img.asPng();
 }
 
 // Live server-status card: one row per enrolled server (online/offline dot,
@@ -222,12 +224,12 @@ export function liveCardSvg({ servers = [], totalPlayers = 0, onlineCount = 0, h
 </svg>`;
 }
 
-export function renderLiveCardPng(data) {
-  const resvg = new Resvg(liveCardSvg(data), {
+export async function renderLiveCardPng(data) {
+  const img = await renderAsync(liveCardSvg(data), {
     fitTo: { mode: "width", value: W },
     font: { fontFiles: FONT_FILES, loadSystemFonts: false, defaultFontFamily: "Fira Sans Condensed" },
   });
-  return resvg.render().asPng();
+  return img.asPng();
 }
 
 // Single-server card: the server name, live status line, and its current
@@ -309,22 +311,22 @@ export function serverCardSvg({ name, online, map, maxclients, players = [], hos
 </svg>`;
 }
 
-export function renderServerCardPng(data) {
-  const resvg = new Resvg(serverCardSvg(data), {
+export async function renderServerCardPng(data) {
+  const img = await renderAsync(serverCardSvg(data), {
     fitTo: { mode: "width", value: W },
     font: { fontFiles: FONT_FILES, loadSystemFonts: false, defaultFontFamily: "Fira Sans Condensed" },
   });
-  return resvg.render().asPng();
+  return img.asPng();
 }
 
 // Per-server cards change with the roster; brief cache keyed by server id.
 const serverCache = new Map(); // id -> { buf, exp }
-export function serverCardCached(id, makeData) {
+export async function serverCardCached(id, makeData) {
   const hit = serverCache.get(id);
   if (hit && hit.exp > Date.now()) return hit.buf;
   const data = makeData();
   if (!data) return null;
-  const buf = renderServerCardPng(data);
+  const buf = await renderServerCardPng(data);
   if (serverCache.size >= 100) serverCache.delete(serverCache.keys().next().value);
   serverCache.set(id, { buf, exp: Date.now() + 30_000 });
   return buf;
@@ -333,9 +335,9 @@ export function serverCardCached(id, makeData) {
 // The live card changes as players join/leave, so cache it only briefly
 // (roughly the live-poll cadence) — enough to absorb a crawler burst.
 let liveCache = { buf: null, exp: 0 };
-export function liveCardCached(makeData) {
+export async function liveCardCached(makeData) {
   if (liveCache.buf && liveCache.exp > Date.now()) return liveCache.buf;
-  const buf = renderLiveCardPng(makeData());
+  const buf = await renderLiveCardPng(makeData());
   liveCache = { buf, exp: Date.now() + 30_000 };
   return buf;
 }
@@ -346,12 +348,12 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX = 300;
 const cache = new Map(); // id -> { buf, exp }
 
-export function playerCardCached(id, makeData) {
+export async function playerCardCached(id, makeData) {
   const hit = cache.get(id);
   if (hit && hit.exp > Date.now()) return hit.buf;
   const data = makeData();
   if (!data) return null;
-  const buf = renderPlayerCardPng(data);
+  const buf = await renderPlayerCardPng(data);
   if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value); // drop oldest
   cache.set(id, { buf, exp: Date.now() + CACHE_TTL_MS });
   return buf;

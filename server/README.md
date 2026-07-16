@@ -92,6 +92,33 @@ by default the server rotates through those. To run the real competitive pool:
    are not installed are skipped automatically; an empty pool means "rotate
    through everything installed".
 
+`scripts/fetch-maps.sh` mirrors the packs from livesow into `server/maps/` and
+restarts the game server to load them.
+
+### Antivirus scanning of pk3 packs
+
+pk3 packs are untrusted, community-redistributed ZIP archives that the pakserver
+hands to every connecting client, so we scan them with **ClamAV**. A `.pk3` is a
+ZIP; ClamAV unpacks it and scans the contents.
+
+- **Install** (per game box): `sudo apt install clamav clamav-freshclam`. The
+  `clamav-freshclam` service keeps the signature database current automatically.
+- **On-demand / full scan:** `scripts/scan-paks.sh [dir ...]` (default:
+  `server/maps`). It scans with the size caps raised well above the biggest pack
+  (~140 MB) so nothing is skipped, **moves any infected pack to a quarantine dir**
+  (`./quarantine`, out of the served set), logs to `pak-scan.log`, and exits
+  non-zero on a detection.
+- **Weekly scheduled scan:** `systemd/racesow-pakscan.{service,timer}` (installed
+  + enabled by `systemd/install.sh` for both tiers) runs the scan every Sunday
+  off-peak. Trigger manually with `sudo systemctl start racesow-pakscan`.
+- **On fetch:** `scripts/fetch-maps.sh` scans just the newly-downloaded packs
+  with ClamAV **before** the server loads them (skip with `--no-scan`; it also
+  runs without clamav installed, just without the scan).
+- **If a pack is flagged:** it is moved to `./quarantine` and dropped from
+  `server/maps/`. Also delete it from the pakserver volume
+  (`server_pakshare/.../racemod/<pack>.pk3`) and restart the game server so the
+  infected copy is no longer served.
+
 ## Cross-server player mirroring (the mesh)
 
 Run several regional servers (so players pick the one with the best ping) that

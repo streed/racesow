@@ -23,6 +23,23 @@ async function api(path) {
   return res.json();
 }
 
+// The home page fetches /overview twice on load — once for the stat tiles
+// (viewOverview) and once for the footer "Updated" date (DOMContentLoaded).
+// Share a single in-flight request (and its result for a short window) so a
+// cold load drives the origin's ~11 count queries once instead of twice. A
+// rejected fetch is not memoized, so the next call retries.
+let _overview = null;
+let _overviewAt = 0;
+function overview() {
+  if (_overview && Date.now() - _overviewAt < 15000) return _overview;
+  _overviewAt = Date.now();
+  _overview = api("/overview").catch((e) => {
+    _overview = null;
+    throw e;
+  });
+  return _overview;
+}
+
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
@@ -131,7 +148,7 @@ function buildQuery(params) {
 /* ------------------------------ views ------------------------------------ */
 async function viewOverview() {
   loading();
-  const d = await api("/overview");
+  const d = await overview();
   const t = d.totals;
   const maxV = Math.max(...d.versions.map((v) => v.records || v.races), 1);
   const players = t.canonicalPlayers != null ? t.canonicalPlayers : t.rankedPlayers;
@@ -1046,7 +1063,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   initGlobalSearch();
   router();
   try {
-    const d = await api("/overview");
+    const d = await overview();
     if (d.lastUpdate) {
       const dt = new Date(d.lastUpdate * 1000).toISOString().slice(0, 10);
       document.getElementById("foot-updated").textContent = "Updated: " + dt;

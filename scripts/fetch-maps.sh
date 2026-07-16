@@ -39,6 +39,7 @@ LIMIT=0
 FORCE=0
 DRY_RUN=0
 RESTART=1
+SCAN=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -48,6 +49,7 @@ while [ $# -gt 0 ]; do
         --force)      FORCE=1 ;;
         --dry-run)    DRY_RUN=1 ;;
         --no-restart) RESTART=0 ;;
+        --no-scan)    SCAN=0 ;;
         -h|--help)    sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
@@ -228,6 +230,37 @@ if [ "${failed}" -gt 0 ]; then
     sed 's/^/   /' "${STATE}/failed"
 else
     rm -f "${FAILED_LIST}"
+fi
+
+# --- Antivirus scan of the freshly-fetched packs ------------------------------
+# pk3s are untrusted community ZIPs served to every client, so scan new arrivals
+# with ClamAV (if installed) BEFORE the server loads them. Only the just-fetched
+# packs are scanned here (fast); the weekly racesow-pakscan.timer covers the full
+# set. An infected pack is moved to the quarantine dir and dropped from the maps
+# dir, so it is never loaded or served. Skip with --no-scan.
+if [ "${ok}" -gt 0 ] && [ "${SCAN}" = "1" ]; then
+    if command -v clamscan >/dev/null 2>&1; then
+        QDIR="${QUARANTINE:-${REPO_ROOT}/quarantine}"; mkdir -p "${QDIR}"
+        : > "${STATE}/scanlist"
+        while IFS= read -r u; do
+            f="${DEST}/${u##*/}"; [ -f "${f}" ] && printf '%s\n' "${f}" >> "${STATE}/scanlist"
+        done < "${STATE}/ok"
+        if [ -s "${STATE}/scanlist" ]; then
+            say "antivirus-scanning ${ok} new pack(s) with ClamAV"
+            scanrc=0
+            clamscan --infected --no-summary \
+                --max-filesize=2000M --max-scansize=2000M --max-files=500000 \
+                --max-recursion=32 --max-scantime=0 \
+                --move="${QDIR}" --file-list="${STATE}/scanlist" || scanrc=$?
+            case "${scanrc}" in
+                0) say "antivirus: all new packs clean" ;;
+                1) say "!! ANTIVIRUS FLAGGED new pack(s) — moved to ${QDIR}, NOT served. Review before re-fetching." ;;
+                *) say "antivirus scan error (rc=${scanrc}) — check the clamav signature DB; new packs were NOT verified" ;;
+            esac
+        fi
+    else
+        say "note: clamscan not installed — new packs were NOT scanned (see scripts/scan-paks.sh + systemd/racesow-pakscan.timer)"
+    fi
 fi
 
 # --- Load the new packs -------------------------------------------------------

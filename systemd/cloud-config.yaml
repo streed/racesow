@@ -1,0 +1,59 @@
+#cloud-config
+# Racesow game-server AGENT — drop-in cloud-init user-data for a fresh
+# Ubuntu/Debian VM. Paste this into your provider's "user data" field when
+# creating the instance (DigitalOcean, Hetzner, AWS, GCP, ...). On first boot it
+# installs Docker, creates the `racesow` service user, clones the repo, builds
+# the game server, and enables the systemd units — hands-off.
+#
+# You fill in only TWO things below:
+#   1. the API token  (INGEST_URL + INGEST_TOKEN) from the central stats admin
+#   2. the mesh        (MIRROR_*) IF this box should join a server network
+# Everything else has a sane default.
+#
+# For a FULL box (website + Discord + game server) set RACESOW_MODE=full and
+# leave the INGEST_* lines blank (the site enrolls the local game server itself).
+
+package_update: true
+packages:
+  - git            # cloud-init.sh installs the rest (Docker, git-lfs, clamav)
+
+write_files:
+  # KEY=VALUE, docker-.env style: values are literal (no quoting needed for
+  # spaces), and a whitespace-preceded "# comment" is stripped. Nothing here is
+  # ever run as code.
+  - path: /etc/racesow/deploy.env
+    permissions: '0600'
+    content: |
+      # agent (game server only) | full (website + Discord + game server)
+      RACESOW_MODE=agent
+
+      # ---- API token (REQUIRED for agent — from the central stats admin) ----
+      INGEST_URL=https://stats.example.com/api/ingest
+      # 64 hex chars; leave blank and the first boot will refuse to start.
+      INGEST_TOKEN=
+
+      # ---- Cross-server mesh (optional; identical values on every peer) ------
+      # Leave MIRROR_PEERS empty for a standalone server. MIRROR_SECRET must be
+      # the SAME on every peer — generate once with: openssl rand -hex 24
+      MIRROR_PEERS=
+      MIRROR_SECRET=
+      MIRROR_TAG=
+
+      # ---- Optional (defaults shown) ----------------------------------------
+      SV_HOSTNAME=Racesow Community Server
+      SV_MAXCLIENTS=16
+      SV_PUBLIC=1
+      # RCON_PASSWORD is auto-generated if omitted (empty = rcon disabled).
+
+      # Mirror the ~12.5 GB community map pool on first boot so meshed servers
+      # share the same rotation. Needs ~20 GB free disk and adds time to the
+      # first boot — set to 0 to skip and run scripts/fetch-maps.sh later.
+      DOWNLOAD_MAPS=1
+
+runcmd:
+  # For a PRIVATE fork, change the clone URL/branch below (and give the VM a
+  # deploy key). cloud-init.sh reuses whatever is cloned here.
+  - [ bash, -c, "git clone https://github.com/streed/racesow.git /opt/racesow 2>/dev/null || git -C /opt/racesow pull --ff-only" ]
+  - [ bash, /opt/racesow/scripts/cloud-init.sh ]
+
+# Progress + errors land in /var/log/cloud-init-output.log on the instance.

@@ -99,6 +99,36 @@ units on top: explicit boot ordering (web stack before game server),
 `systemctl status racesow-*`, and a nightly `pg_dump` backup into
 `backups/db/` (`racesow-db-backup.timer`, 14-day retention).
 
+### Zero-touch install (cloud-init)
+
+To stand up a **brand-new VM** (typically a regional game-server agent) with no
+SSH-in required, use the cloud-init path. `scripts/cloud-init.sh` runs as root on
+first boot and does the whole job — installs Docker + deps, creates the
+unprivileged `racesow` service user, clones the repo, provisions the deployment
+(`setup.sh --non-interactive`), and enables the systemd units.
+
+It reads its configuration from `/etc/racesow/deploy.env` (docker-`.env` style —
+no quoting, nothing evaluated as code). The **only** values you must supply are
+the **API token** (`INGEST_URL` + `INGEST_TOKEN`, from the central stats admin)
+and, if the box joins a server network, the **mesh** (`MIRROR_PEERS` /
+`MIRROR_SECRET` / `MIRROR_TAG`). Everything else — hostname, rcon password
+(auto-generated), ports, the map mirror — is defaulted or generated.
+
+Paste [`systemd/cloud-config.yaml`](systemd/cloud-config.yaml) into your
+provider's *user-data* field (edit the two values first), or run it by hand on
+any fresh Ubuntu/Debian box:
+
+```bash
+sudo RACESOW_MODE=agent \
+     INGEST_URL=https://stats.example.com/api/ingest \
+     INGEST_TOKEN=<your-64-hex-token> \
+     bash scripts/cloud-init.sh          # or set them in /etc/racesow/deploy.env
+```
+
+`RACESOW_MODE=full` provisions the website + Discord + game server instead. The
+script is idempotent — re-running updates the checkout and re-provisions in
+place. (For a private fork, set `RACESOW_REPO` to an authenticated clone URL.)
+
 > **Public production deployment (Cloudflare-fronted):** the live stats box
 > (`racesow.org`) runs behind Cloudflare and **only accepts traffic through it**
 > — the origin enforces Cloudflare's client certificate (mTLS / Authenticated
