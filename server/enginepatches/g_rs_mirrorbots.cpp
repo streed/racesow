@@ -38,10 +38,14 @@ static void rsSetColor( char *userinfo, size_t size, int r, int g, int b )
 /*
  * RS_MirrorBotAdd — connect a fake client for a remote player.
  * name is shown on the scoreboard / over nothing (client limitation) and in
- * chase; (r,g,b) is the random Warsow player colour. Returns the playerNum
- * (0..maxclients-1) or -1 on failure.
+ * chase; (r,g,b) is the random Warsow player colour. When spectator is true the
+ * remote player is spectating on their origin server: the bot joins the
+ * SPECTATOR team (so it appears in the peer scoreboard's spectator list) and is
+ * kept invisible in-world (SVF_NOCLIENT), since a spectator has no body — its
+ * transform is never driven. Returns the playerNum (0..maxclients-1) or -1 on
+ * failure.
  */
-int RS_MirrorBotAdd( const char *name, const char *clan, int r, int g, int b )
+int RS_MirrorBotAdd( const char *name, const char *clan, int r, int g, int b, bool spectator )
 {
 	char userinfo[MAX_INFO_STRING];
 	memset( userinfo, 0, sizeof( userinfo ) );
@@ -67,14 +71,19 @@ int RS_MirrorBotAdd( const char *name, const char *clan, int r, int g, int b )
 
 	if( ent->r.client )
 	{
-		// Join the players team so it shows on the scoreboard and the chasecam
-		// includes it, then freeze it — we drive its transform every frame.
-		G_Teams_SetTeam( ent, TEAM_PLAYERS );
+		// Racers join the players team so they show on the scoreboard and the
+		// chasecam includes them; spectators join the spectator team so they are
+		// listed as spectators. Either way freeze pmove — we own the transform.
+		G_Teams_SetTeam( ent, spectator ? TEAM_SPECTATOR : TEAM_PLAYERS );
 		ent->r.client->ps.pmove.pm_type = PM_FREEZE;
 	}
 	ent->movetype = MOVETYPE_NONE;
-	ent->r.svflags &= ~SVF_NOCLIENT;
-	fprintf( stderr, "rs_mirror: bot slot %d connected as '%s'\n", playerNum, name ? name : "" );
+	if( spectator )
+		ent->r.svflags |= SVF_NOCLIENT;  // in the spectator list, but no world entity
+	else
+		ent->r.svflags &= ~SVF_NOCLIENT;
+	fprintf( stderr, "rs_mirror: bot slot %d connected as '%s'%s\n", playerNum, name ? name : "",
+		spectator ? " (spectator)" : "" );
 	return playerNum;
 }
 
@@ -90,6 +99,10 @@ void RS_MirrorBotUpdate( int playerNum, float ox, float oy, float oz,
 		return;
 	edict_t *ent = &game.edicts[playerNum + 1];
 	if( !ent->r.inuse || !ent->r.client )
+		return;
+	// Spectator mirror bots have no world transform to drive; never un-hide or
+	// move them (the gametype already skips this call for them — belt & braces).
+	if( ent->s.team == TEAM_SPECTATOR )
 		return;
 
 	vec3_t origin = { ox, oy, oz };

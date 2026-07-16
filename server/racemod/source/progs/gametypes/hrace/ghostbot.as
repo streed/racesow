@@ -153,7 +153,7 @@ void RACE_GhostThink()
     if ( raceGhostBotSlot < 0 )
     {
         String label = "WR " + raceGhostHolder.removeColorTokens() + " (" + RACE_TimeToString( raceGhostTimeMs ) + ")";
-        raceGhostBotSlot = RS_MirrorBotAdd( label, "WR", 255, 210, 63 );
+        raceGhostBotSlot = RS_MirrorBotAdd( label, "WR", 255, 210, 63, false ); // racer-kind bot
         if ( raceGhostBotSlot < 0 )
             return; // no free client slot right now; retry next frame
         raceGhostClock = 0;

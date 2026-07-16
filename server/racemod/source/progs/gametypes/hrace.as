@@ -672,6 +672,12 @@ bool Pending_AnyRacing(bool respawn = false)
         if ( client.state() < CS_SPAWNED )
             continue;
 
+        // Mesh bots are remote players, not local match participants: never let
+        // a mirrored racer keep the local match in overtime, and never yank a
+        // bot to spectator here (consistent with GT_ThinkRules / GT_PlayerRespawn).
+        if ( RS_MirrorBotIs( i ) )
+            continue;
+
         Player@ player = RACE_GetPlayer( client );
         if ( player.inRace && !player.postRace && client.team != TEAM_SPECTATOR )
         {

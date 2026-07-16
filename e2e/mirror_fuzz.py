@@ -100,6 +100,14 @@ def gen_state_body(rows=None):
             out.append(b"P ")
         elif shape < 0.45:
             out.append(b"P " + b" ".join(_num() for _ in range(random.randint(0, 9))))
+        elif shape < 0.6:
+            # new "PS <flags> <score> <9 floats> <name>" rows (score field)
+            fields = [_num(), _num()] + [_float() for _ in range(9)]
+            name = random.choice([_token(120), b"", b" " * 40, rnd_bytes(120)])
+            out.append(b"PS " + b" ".join(fields) + b" " + name)
+        elif shape < 0.68:
+            # short/garbled PS headers
+            out.append(random.choice([b"PS", b"PS ", b"PS " + b" ".join(_num() for _ in range(random.randint(0, 10)))]))
         else:
             fields = [_num()] + [_float() for _ in range(9)]
             name = random.choice([_token(120), b"", b" " * 40, rnd_bytes(120)])

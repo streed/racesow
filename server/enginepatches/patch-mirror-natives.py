@@ -51,13 +51,13 @@ wrapper = (
     "// thread - these wrappers only swap queues/snapshots under a brief mutex)\n"
     "void RS_MirrorConfigure( const char *tag, const char *secret, int port, const char *peers, const char *map );\n"
     "void RS_MirrorBegin( void );\n"
-    "void RS_MirrorPlayer( const char *name, const float *origin, const float *angles, const float *velocity, int flags );\n"
+    "void RS_MirrorPlayer( const char *name, const float *origin, const float *angles, const float *velocity, int flags, int score );\n"
     "void RS_MirrorEnd( void );\n"
     "void RS_MirrorEvent( const char *kind, const char *name, const char *text );\n"
     "int RS_MirrorRefresh( void );\n"
     "int RS_MirrorNextEvent( void );\n"
     "// mirror bots (real fake-client slots; implementation in g_rs_mirrorbots.cpp)\n"
-    "int RS_MirrorBotAdd( const char *name, const char *clan, int r, int g, int b );\n"
+    "int RS_MirrorBotAdd( const char *name, const char *clan, int r, int g, int b, bool spectator );\n"
     "void RS_MirrorBotUpdate( int playerNum, float ox, float oy, float oz,"
     " float pitch, float yaw, float roll, float vx, float vy, float vz, int flags );\n"
     "void RS_MirrorBotRemove( int playerNum );\n"
@@ -88,11 +88,11 @@ wrapper += (
     "\tRS_MirrorBegin();\n"
     "}\n"
     "\n"
-    "static void asFunc_RS_MirrorPlayer( asstring_t *name, asvec3_t *origin, asvec3_t *angles, asvec3_t *velocity, int flags )\n"
+    "static void asFunc_RS_MirrorPlayer( asstring_t *name, asvec3_t *origin, asvec3_t *angles, asvec3_t *velocity, int flags, int score )\n"
     "{\n"
     "\tif( !name || !name->buffer || !origin || !angles || !velocity )\n"
     "\t\treturn;\n"
-    "\tRS_MirrorPlayer( name->buffer, origin->v, angles->v, velocity->v, flags );\n"
+    "\tRS_MirrorPlayer( name->buffer, origin->v, angles->v, velocity->v, flags, score );\n"
     "}\n"
     "\n"
     "static void asFunc_RS_MirrorEnd( void )\n"
@@ -117,10 +117,10 @@ wrapper += (
     "\treturn RS_MirrorNextEvent();\n"
     "}\n"
     "\n"
-    "static int asFunc_RS_MirrorBotAdd( asstring_t *name, asstring_t *clan, int r, int g, int b )\n"
+    "static int asFunc_RS_MirrorBotAdd( asstring_t *name, asstring_t *clan, int r, int g, int b, bool spectator )\n"
     "{\n"
     "\treturn RS_MirrorBotAdd( name && name->buffer ? name->buffer : \"\",\n"
-    "\t\tclan && clan->buffer ? clan->buffer : \"\", r, g, b );\n"
+    "\t\tclan && clan->buffer ? clan->buffer : \"\", r, g, b, spectator );\n"
     "}\n"
     "\n"
     "static void asFunc_RS_MirrorBotUpdate( int playerNum, asvec3_t *origin, asvec3_t *angles, asvec3_t *velocity, int flags )\n"
@@ -182,7 +182,7 @@ for decl, func in [
      "const String &in peers, const String &in map )", "Configure"),
     ("void RS_MirrorBegin()", "Begin"),
     ("void RS_MirrorPlayer( const String &in name, const Vec3 &in origin, const Vec3 &in angles, "
-     "const Vec3 &in velocity, int flags )", "Player"),
+     "const Vec3 &in velocity, int flags, int score )", "Player"),
     ("void RS_MirrorEnd()", "End"),
     ("void RS_MirrorEvent( const String &in kind, const String &in name, const String &in text )", "Event"),
     ("int RS_MirrorRefresh()", "Refresh"),
@@ -194,7 +194,7 @@ for decl, func in [
     ("const String @RS_MirrorEventServer()", "EventServer"),
     ("const String @RS_MirrorEventName()", "EventName"),
     ("const String @RS_MirrorEventText()", "EventText"),
-    ("int RS_MirrorBotAdd( const String &in name, const String &in clan, int r, int g, int b )", "BotAdd"),
+    ("int RS_MirrorBotAdd( const String &in name, const String &in clan, int r, int g, int b, bool spectator )", "BotAdd"),
     ("void RS_MirrorBotUpdate( int playerNum, const Vec3 &in origin, const Vec3 &in angles, "
      "const Vec3 &in velocity, int flags )", "BotUpdate"),
     ("void RS_MirrorBotRemove( int playerNum )", "BotRemove"),

@@ -336,6 +336,7 @@ struct RemoteRow {
 	float ang[3]; // pitch yaw roll
 	float vel[3];
 	int flags;
+	int score;    // origin player's best finish time on their map (ms), 0 = none
 	long long lastMs;
 	uint32_t lastSeq;
 };
@@ -686,11 +687,25 @@ void noteDrop( MirrorState *s )
 
 void processStateLine( MirrorState *s, const std::string &tag, uint32_t seq, const char *line )
 {
-	int flags = 0, off = 0;
+	int flags = 0, score = 0, off = 0;
 	float f[9];
-	if( sscanf( line, "P %d %f %f %f %f %f %f %f %f %f %n", &flags,
-			&f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7], &f[8], &off ) < 10 || off <= 0 )
+	// Current wire: "PS <flags> <score> <9 floats> <name>". A peer that has not
+	// upgraded yet still sends the legacy "P <flags> <9 floats> <name>" (no
+	// score) — accept that too so rolling deploys don't drop mirrored players.
+	// The two formats deliberately use DISTINCT leading tokens (PS vs P): a bare
+	// %d greedily consumes the integer part of the first %.1f coordinate, so a
+	// field-count test alone could NOT tell "PS f s <9 floats>" from "P f <9
+	// floats>". The tokens make it unambiguous ("P ..." never matches "PS %d..."
+	// because the 'S' literal fails against the space, and vice-versa).
+	if( sscanf( line, "PS %d %d %f %f %f %f %f %f %f %f %f %n", &flags, &score,
+			&f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7], &f[8], &off ) == 11 && off > 0 ) {
+		// new format: flags + score parsed above
+	} else if( sscanf( line, "P %d %f %f %f %f %f %f %f %f %f %n", &flags,
+			&f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7], &f[8], &off ) == 10 && off > 0 ) {
+		score = 0; // legacy peer: no score field
+	} else {
 		return;
+	}
 	// %f parses "nan"/"inf"; reject non-finite coords so they never reach the
 	// ghost origin/velocity, the snapshot formatter, or the /watch trace math.
 	for( int i = 0; i < 9; i++ )
@@ -724,6 +739,7 @@ void processStateLine( MirrorState *s, const std::string &tag, uint32_t seq, con
 	row.ang[0] = f[3]; row.ang[1] = f[4]; row.ang[2] = f[5];
 	row.vel[0] = f[6]; row.vel[1] = f[7]; row.vel[2] = f[8];
 	row.flags = flags;
+	row.score = score;
 	row.lastMs = steadyMs();
 	row.lastSeq = seq;
 }
@@ -1044,7 +1060,7 @@ void RS_MirrorBegin( void )
 	g_mirror->buildCount = 0;
 }
 
-void RS_MirrorPlayer( const char *name, const float *origin, const float *angles, const float *velocity, int flags )
+void RS_MirrorPlayer( const char *name, const float *origin, const float *angles, const float *velocity, int flags, int score )
 {
 	MirrorState *s = g_mirror;
 	if( !s || s->buildCount >= MAX_PLAYERS_PER_TAG )
@@ -1052,9 +1068,11 @@ void RS_MirrorPlayer( const char *name, const float *origin, const float *angles
 	std::string cleanName = sanitizeField( name, NAME_MAX );
 	if( cleanName.empty() )
 		return;
+	if( score < 0 )
+		score = 0;
 	char line[NAME_MAX + 160];
-	int n = snprintf( line, sizeof( line ), "P %d %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %s\n",
-		flags, origin[0], origin[1], origin[2], angles[0], angles[1], angles[2],
+	int n = snprintf( line, sizeof( line ), "PS %d %d %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %s\n",
+		flags, score, origin[0], origin[1], origin[2], angles[0], angles[1], angles[2],
 		velocity[0], velocity[1], velocity[2], cleanName.c_str() );
 	if( n <= 0 || (size_t)n >= sizeof( line ) )
 		return;
@@ -1160,10 +1178,12 @@ int RS_MirrorRefresh( void )
 		snap.name = row.name;
 		snap.tag = row.tag;
 		snap.map = prt->second.map;
-		char state[224];
-		int n = snprintf( state, sizeof( state ), "%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %d %d",
+		// "x y z pitch yaw roll vx vy vz flags score ageMs" (token order the
+		// gametype's RACE_MirrorSyncRoster parses).
+		char state[240];
+		int n = snprintf( state, sizeof( state ), "%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %d %d %d",
 			row.pos[0], row.pos[1], row.pos[2], row.ang[0], row.ang[1], row.ang[2],
-			row.vel[0], row.vel[1], row.vel[2], row.flags, (int)( now - row.lastMs ) );
+			row.vel[0], row.vel[1], row.vel[2], row.flags, row.score, (int)( now - row.lastMs ) );
 		// snprintf returns the UNTRUNCATED length; clamp before assign() so a
 		// pathological row can never make assign() read past the stack buffer
 		// (coords are finite-checked upstream, so this is belt-and-suspenders).

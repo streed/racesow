@@ -50,6 +50,13 @@ const int MIRROR_ENTITY_HEADROOM = 64;    // never spawn ghosts into the last ed
 // the viewer's cg_raceGhosts setting. Not in the script enums, so hardcoded.
 const uint EF_RACEGHOST_FLAG = 131072;
 
+// Wire "flags" bits carried by RS_MirrorPlayer / RS_MirrorPlayerState. bit0 =
+// racing, bit2 = the player is spectating on their origin server. bit1 (value
+// 2) is reserved for the LOCAL WR-ghost convention consumed by RS_MirrorBotUpdate
+// (see ghostbot.as) and is never set on the wire, so remote spectators use bit2.
+const int MIRROR_FLAG_RACING = 1;
+const int MIRROR_FLAG_SPECTATOR = 4;
+
 // The model every ghost wears; precached in RACE_MirrorSpawnGametype the same
 // way p_client.cpp precaches real player models, so stock clients resolve it
 // (and fall back to their base model if not, which is safe).
@@ -63,10 +70,14 @@ class MirrorPlayer
     Vec3 origin;   // last received position
     Vec3 angles;   // pitch yaw roll (the remote player's VIEW angles)
     Vec3 velocity;
-    int flags;     // 1 = racing
+    int flags;     // bit0 = racing, bit2 = spectating (see MIRROR_FLAG_*)
+    int score;     // origin player's best finish time on their map (ms), 0 = none
+    bool spectator; // true = spectating on their origin server (no world ghost)
     uint receivedAt; // realTime when the last state row arrived
     bool seen;     // mark/sweep flag for roster sync
     int botSlot;   // fake-client playerNum representing this player, or -1
+    bool botIsSpectator; // kind of the fake client currently held in botSlot
+    int appliedScore;   // last score pushed onto the bot's scoreboard time (-1 = none yet)
     int cr, cg, cb; // random display colour, assigned once
     Vec3 renderPos; // smoothed position actually pushed to the bot
     Vec3 renderAng; // smoothed view angles
@@ -75,9 +86,13 @@ class MirrorPlayer
     MirrorPlayer()
     {
         this.flags = 0;
+        this.score = 0;
+        this.spectator = false;
         this.receivedAt = 0;
         this.seen = false;
         this.botSlot = -1;
+        this.botIsSpectator = false;
+        this.appliedScore = -1;
         this.cr = 255; this.cg = 255; this.cb = 255;
         this.hasRender = false;
     }
@@ -295,7 +310,9 @@ void RACE_MirrorPublishStatus()
         int players = 0;
         for ( uint j = 0; j < mirrorPlayers.length(); j++ )
         {
-            if ( mirrorPlayers[j].server == rawTag )
+            // count active players only (spectators show in /who + the spectator
+            // list, but the web "players" tally keeps its prior meaning)
+            if ( mirrorPlayers[j].server == rawTag && !mirrorPlayers[j].spectator )
                 players++;
         }
 
@@ -363,19 +380,34 @@ void RACE_MirrorPublish()
             continue;
 
         Client@ client = G_GetClient( i );
-        if ( client.state() < CS_SPAWNED || client.team == TEAM_SPECTATOR )
+        if ( client.state() < CS_SPAWNED )
             continue;
 
+        Player@ player = RACE_GetPlayer( client );
         Entity@ ent = client.getEnt();
+
+        // Everyone carries their best finish time on this map so peers can show
+        // it on the scoreboard (0 = no time yet).
+        int score = player.best_recordTime.isFinished() ? int( player.best_recordTime.getFinishTime() ) : 0;
+
+        if ( client.team == TEAM_SPECTATOR )
+        {
+            // Publish spectators too, tagged, so peers can list them ("see all
+            // players"). A spectator has no meaningful body — the position is
+            // ignored by the receiver, which renders them as a spectator entry.
+            RS_MirrorPlayer( client.name, ent.origin, ent.angles, ent.velocity, MIRROR_FLAG_SPECTATOR, score );
+            continue;
+        }
+
+        // Active players: skip transient no-body states (dead / between runs /
+        // noclip) and private practice runs — unchanged from before.
         if ( ent.isGhosting() || ent.moveType == MOVETYPE_NOCLIP )
             continue;
-
-        // practice runs are private; don't stream them
-        if ( RACE_GetPlayer( client ).practicing )
+        if ( player.practicing )
             continue;
 
-        int flags = RACE_GetPlayer( client ).inRace ? 1 : 0;
-        RS_MirrorPlayer( client.name, ent.origin, ent.angles, ent.velocity, flags );
+        int flags = player.inRace ? MIRROR_FLAG_RACING : 0;
+        RS_MirrorPlayer( client.name, ent.origin, ent.angles, ent.velocity, flags, score );
     }
     RS_MirrorEnd();
 }
@@ -409,13 +441,15 @@ void RACE_MirrorSyncRoster()
         rp.seen = true;
         rp.map = RS_MirrorPlayerMap( i );
 
-        // "x y z pitch yaw roll vx vy vz flags ageMs"
+        // "x y z pitch yaw roll vx vy vz flags score ageMs"
         String state = RS_MirrorPlayerState( i );
         rp.origin = Vec3( state.getToken( 0 ).toFloat(), state.getToken( 1 ).toFloat(), state.getToken( 2 ).toFloat() );
         rp.angles = Vec3( state.getToken( 3 ).toFloat(), state.getToken( 4 ).toFloat(), state.getToken( 5 ).toFloat() );
         rp.velocity = Vec3( state.getToken( 6 ).toFloat(), state.getToken( 7 ).toFloat(), state.getToken( 8 ).toFloat() );
         rp.flags = state.getToken( 9 ).toInt();
-        rp.receivedAt = realTime - uint( state.getToken( 10 ).toInt() );
+        rp.score = state.getToken( 10 ).toInt();
+        rp.spectator = ( rp.flags & MIRROR_FLAG_SPECTATOR ) != 0;
+        rp.receivedAt = realTime - uint( state.getToken( 11 ).toInt() );
     }
 
     for ( uint i = 0; i < mirrorPlayers.length(); )
@@ -530,10 +564,27 @@ void RACE_MirrorUpdateBots()
     {
         MirrorPlayer@ rp = mirrorPlayers[i];
 
-        // bots only make sense on the same map; chat/roster still flow
-        if ( rp.map != mirrorLocalMap )
+        // Bots only make sense for players on OUR map (chat/roster still flow for
+        // off-map peers). Racers get a driven in-world ghost on the players team;
+        // spectators get a hidden fake client on the spectator team so they show
+        // in the peer's spectator list. wantKind: -1 none, 0 racer, 1 spectator.
+        int wantKind = -1;
+        if ( rp.map == mirrorLocalMap )
+            wantKind = rp.spectator ? 1 : 0;
+
+        // A racer<->spectator transition (or the player leaving our map) leaves
+        // the held bot as the wrong kind: drop it and re-create it below on the
+        // correct team. RACE_MirrorRemoveBot releases anyone chasing it.
+        if ( rp.botSlot >= 0 )
         {
-            RACE_MirrorRemoveBot( rp );
+            int haveKind = rp.botIsSpectator ? 1 : 0;
+            if ( wantKind != haveKind )
+                RACE_MirrorRemoveBot( rp );
+        }
+
+        if ( wantKind < 0 )
+        {
+            RACE_MirrorRemoveBot( rp ); // no-op if already gone
             continue;
         }
 
@@ -542,12 +593,21 @@ void RACE_MirrorUpdateBots()
             if ( botCount >= maxBots )
                 continue;
             RACE_MirrorAssignColour( rp );
-            rp.botSlot = RS_MirrorBotAdd( rp.name, rp.server, rp.cr, rp.cg, rp.cb );
+            rp.botSlot = RS_MirrorBotAdd( rp.name, rp.server, rp.cr, rp.cg, rp.cb, wantKind == 1 );
             if ( rp.botSlot < 0 )
                 continue; // no free client slot right now; retry next frame
-            rp.hasRender = false; // (re)seed smoothing on a fresh bot
+            rp.botIsSpectator = ( wantKind == 1 );
+            rp.appliedScore = -1;  // force a scoreboard-time refresh onto the new bot
+            rp.hasRender = false;  // (re)seed smoothing on a fresh bot
         }
         botCount++;
+
+        if ( wantKind == 1 )
+            continue; // spectator bot: no in-world transform to drive, no scoreboard time
+
+        // Reflect the remote player's synced best time + racing state onto the
+        // fake client so the peer scoreboard shows their time (idempotent).
+        RACE_MirrorApplyScore( rp );
 
         // Target = the extrapolated position (dead-reckon a little past the last
         // sample so we track fast racers), then EASE the rendered pose toward it
@@ -577,6 +637,45 @@ void RACE_MirrorUpdateBots()
         }
 
         RS_MirrorBotUpdate( rp.botSlot, rp.renderPos, rp.renderAng, rp.velocity, rp.flags );
+    }
+}
+
+// Push the remote player's synced best time onto its fake client so the peer
+// scoreboard renders it (the race scoreboard reads Player.best_recordTime), and
+// mirror their racing state into the "Racing" column. best_recordTime is only
+// rewritten when the value actually changes. A minimal one-checkpoint finished
+// RecordTime is enough: the scoreboard only reads isFinished()/getFinishTime().
+void RACE_MirrorApplyScore( MirrorPlayer@ rp )
+{
+    if ( rp.botSlot < 0 )
+        return;
+    Client@ bc = G_GetClient( rp.botSlot );
+    if ( @bc == null )
+        return;
+    Player@ bp = RACE_GetPlayer( bc );
+    bp.inRace = ( rp.flags & MIRROR_FLAG_RACING ) != 0;
+
+    if ( rp.appliedScore == rp.score )
+        return;
+    rp.appliedScore = rp.score;
+
+    // best_recordTime is a PERSISTENT per-slot object — a real human may inherit
+    // this client slot after the bot is dropped — so keep its checkpoints array
+    // the exact shape the rest of the gametype relies on (numCheckpoints+1, set
+    // for every slot at map spawn). Never shrink it: code elsewhere indexes
+    // checkpoints[numCheckpoints], so a 1-element array would fault. The finish
+    // time lives in the last slot, matching a real finish (player.as).
+    if ( rp.score > 0 )
+    {
+        RecordTime rt;
+        rt.setupArrays( numCheckpoints + 1 );
+        rt.checkpoints[ numCheckpoints ] = Checkpoint( uint( rp.score ), CheckpointType_Finish );
+        rt.type = RecordTimeType_Finished;
+        bp.best_recordTime = rt;
+    }
+    else
+    {
+        bp.best_recordTime.clear(); // already sized numCheckpoints+1; clear() keeps the shape
     }
 }
 
@@ -695,7 +794,13 @@ bool Cmd_MirrorWatch( Client@ client, const String &cmdString, const String &arg
         client.printMessage( "No remote player matches '" + first + "'. Try /who.\n" );
         return true;
     }
-    if ( found.map != mirrorLocalMap || found.botSlot < 0 )
+    if ( found.spectator )
+    {
+        client.printMessage( "[" + found.server + S_COLOR_WHITE + "] " + found.name
+                + S_COLOR_WHITE + " is spectating - nothing to watch.\n" );
+        return true;
+    }
+    if ( found.map != mirrorLocalMap || found.botSlot < 0 || found.botIsSpectator )
     {
         client.printMessage( "[" + found.server + S_COLOR_WHITE + "] " + found.name
                 + S_COLOR_WHITE + " is on " + S_COLOR_GREEN + found.map
@@ -744,9 +849,13 @@ bool Cmd_MirrorWho( Client@ client, const String &cmdString, const String &argsS
     {
         MirrorPlayer@ rp = mirrorPlayers[i];
         String status;
-        if ( rp.map != mirrorLocalMap )
+        if ( rp.spectator )
+            status = ( rp.map != mirrorLocalMap )
+                    ? ( S_COLOR_WHITE + "spectating on " + rp.map )
+                    : ( S_COLOR_WHITE + "spectating" );
+        else if ( rp.map != mirrorLocalMap )
             status = S_COLOR_WHITE + "on " + rp.map;
-        else if ( ( rp.flags & 1 ) != 0 )
+        else if ( ( rp.flags & MIRROR_FLAG_RACING ) != 0 )
             status = S_COLOR_GREEN + "racing";
         else
             status = S_COLOR_WHITE + "idle";
