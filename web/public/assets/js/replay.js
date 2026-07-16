@@ -81,7 +81,7 @@ export async function mountReplay(root, { mapId, mapName, wr }) {
         <div class="rv-krow"><span class="rv-key" data-k="fwd">W</span></div>
         <div class="rv-krow"><span class="rv-key" data-k="left">A</span><span class="rv-key" data-k="back">S</span><span class="rv-key" data-k="right">D</span></div>
         <div class="rv-krow"><span class="rv-key rv-wide" data-k="jump">JUMP</span><span class="rv-key rv-wide" data-k="crouch">CROUCH</span></div>
-        <div class="rv-krow"><span class="rv-key rv-wide" data-k="fire">FIRE</span></div>
+        <div class="rv-krow"><span class="rv-key rv-wide" data-k="special">DASH</span><span class="rv-key rv-wide" data-k="fire">FIRE</span></div>
       </div>
     </div>
     <div class="rv-bar">
