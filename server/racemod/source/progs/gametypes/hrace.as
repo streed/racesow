@@ -326,6 +326,12 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
         // mirror mesh so peers drop the ghost instantly instead of aging it out
         if ( @client != null )
         {
+            // Close this client's spawn demo before the slot is reused. The demo
+            // now starts at spawn, so a disconnect (which, unlike a map change,
+            // is NOT followed by a respawn that would reset it) would otherwise
+            // orphan an in-progress .rec. No-op if none / a fake client.
+            if ( rsRecordDemos.boolean )
+                client.demoCancel();
             RACE_MirrorPlayerLeft( client );
             // report their uncounted race starts before the slot is reused
             RACE_FlushAttempts( client );
@@ -395,7 +401,26 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
         player.updatePos();
 
     if ( ent.isGhosting() )
+    {
+        // Not spawning as an alive racer (spectating / dead / between rounds):
+        // stop any running spawn demo so we never record a spectator POV.
+        if ( rsRecordDemos.boolean )
+            ent.client.demoCancel();
         return;
+    }
+
+    // Begin this life's per-client demo at SPAWN (not at the start line), so the
+    // saved run includes the run-up from the spawn point. The demo runs
+    // untouched through startRace()/cancelRace() and is kept (personal best) or
+    // discarded by completeRace(); the next spawn replaces it. demoCancel first
+    // clears any leftover recording from a previous life. The engine's race-demo
+    // subsystem skips bots internally and no-ops when the cvar is off; mirror
+    // bots already returned above.
+    if ( rsRecordDemos.boolean )
+    {
+        ent.client.demoCancel();
+        ent.client.demoStart( RACE_DemoName( ent.client ) );
+    }
 
     // set player movement to pass through other players
     ent.client.pmoveFeatures = ent.client.pmoveFeatures | PMFEAT_GHOSTMOVE;

@@ -25,13 +25,17 @@ const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
 
-// ---- ZIP (.pk3) reader: return the first member matching an extension. ------
-function readZipMember(buf, wantExt) {
+// ---- ZIP (.pk3) reader: return ALL members matching an extension. -----------
+// A .pk3 map pack often bundles several maps (e.g. run1-5k.pk3 holds run1k..
+// run5k), so we must extract each .bsp, not just the first — otherwise the
+// other maps in the pack get no mesh.
+function readAllZipMembers(buf, wantExt) {
   let i = buf.length - 22;
   for (; i >= 0; i--) if (buf.readUInt32LE(i) === 0x06054b50) break; // EOCD
   if (i < 0) throw new Error("not a zip / EOCD not found");
   const cdOff = buf.readUInt32LE(i + 16);
   const cdCount = buf.readUInt16LE(i + 10);
+  const out = [];
   let p = cdOff;
   for (let n = 0; n < cdCount; n++) {
     if (buf.readUInt32LE(p) !== 0x02014b50) break; // central dir header
@@ -48,10 +52,14 @@ function readZipMember(buf, wantExt) {
       const le = buf.readUInt16LE(lho + 28);
       const start = lho + 30 + ln + le;
       const raw = buf.subarray(start, start + csize);
-      return { name, data: comp === 0 ? raw : zlib.inflateRawSync(raw) };
+      out.push({ name, data: comp === 0 ? raw : zlib.inflateRawSync(raw) });
     }
   }
-  return null;
+  return out;
+}
+
+function readZipMember(buf, wantExt) {
+  return readAllZipMembers(buf, wantExt)[0] || null;
 }
 
 // ---- BSP format table -------------------------------------------------------
@@ -273,13 +281,20 @@ function loadBsp(inputPath) {
   return buf;
 }
 
-function convertOne(inputPath, outPath) {
-  const data = loadBsp(inputPath);
+function convertData(data, outPath) {
   const r = parseBsp(data);
   if (r.indices.length === 0) throw new Error("no drawable geometry produced");
   const bytes = writeGlb(r.positions, r.indices, outPath);
   return { ...r, outBytes: bytes, tris: r.indices.length / 3, outVerts: r.positions.length / 3 };
 }
+
+function convertOne(inputPath, outPath) {
+  return convertData(loadBsp(inputPath), outPath);
+}
+
+// The mesh filename MUST match the map name the viewer requests, which is the
+// .bsp basename (e.g. maps/run2k.bsp -> run2k.glb), NOT the pack filename.
+const mapNameFromBsp = (bspPath) => path.basename(bspPath).replace(/\.bsp$/i, "").toLowerCase();
 
 function main() {
   const argv = process.argv.slice(2);
@@ -287,23 +302,33 @@ function main() {
     const dir = argv[1], outDir = argv[2];
     const limIdx = argv.indexOf("--limit");
     const limit = limIdx >= 0 ? parseInt(argv[limIdx + 1], 10) : Infinity;
-    if (!dir || !outDir) { console.error("usage: --dir <mapsDir> <outDir> [--limit N]"); process.exit(2); }
+    const force = argv.includes("--force"); // re-convert even if the .glb exists
+    if (!dir || !outDir) { console.error("usage: --dir <mapsDir> <outDir> [--limit N] [--force]"); process.exit(2); }
     fs.mkdirSync(outDir, { recursive: true });
     const files = fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith(".pk3"));
-    let ok = 0, fail = 0;
+    let ok = 0, fail = 0, skip = 0;
     for (const f of files) {
       if (ok >= limit) break;
-      const base = f.replace(/\.pk3$/i, "");
-      try {
-        const r = convertOne(path.join(dir, f), path.join(outDir, base + ".glb"));
-        ok++;
-        console.log(`OK  ${base}: ${r.key} ${r.tris} tris, ${(r.outBytes / 1024).toFixed(0)}KB (patches:${r.stats.patch})`);
-      } catch (e) {
-        fail++;
-        console.log(`ERR ${base}: ${e.message}`);
+      let members;
+      try { members = readAllZipMembers(fs.readFileSync(path.join(dir, f)), ".bsp"); }
+      catch (e) { fail++; console.log(`ERR ${f}: ${e.message}`); continue; }
+      if (!members.length) { fail++; console.log(`ERR ${f}: no .bsp inside`); continue; }
+      for (const m of members) {
+        if (ok >= limit) break;
+        const name = mapNameFromBsp(m.name);
+        const outPath = path.join(outDir, name + ".glb");
+        if (!force && fs.existsSync(outPath)) { skip++; continue; }
+        try {
+          const r = convertData(m.data, outPath);
+          ok++;
+          console.log(`OK  ${name} (${f}): ${r.tris} tris, ${(r.outBytes / 1024).toFixed(0)}KB (patches:${r.stats.patch})`);
+        } catch (e) {
+          fail++;
+          console.log(`ERR ${name} (${f}): ${e.message}`);
+        }
       }
     }
-    console.log(`\n${ok} converted, ${fail} failed of ${files.length} .pk3`);
+    console.log(`\n${ok} converted, ${skip} already present, ${fail} failed — across ${files.length} .pk3`);
     return;
   }
 

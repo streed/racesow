@@ -444,7 +444,7 @@ async function viewMap(id) {
           ${d.leaderboard.map((r, i) => `
             <tr class="clickable" data-nav="#/player/${r.playerId}">
               <td class="rankcell ${rankClass(r.pos)}">${r.pos}</td>
-              <td>${wname(r.name)}${wr && wr.ghost && r.time === wr.ghost.time ? ` <span class="replay-badge" data-nav="#/replay/${id}" title="Watch this run in the browser">▶ replay</span>` : ""}</td>
+              <td>${wname(r.name)}${r.ghost ? ` <span class="replay-badge" data-nav="#/replay/${id}/${r.playerId}" title="Watch this run in the browser">▶ replay</span>` : ""}${r.demo && r.demo.url ? ` <a class="replay-badge demo" href="${esc(r.demo.url)}" download rel="noopener" title="Download this run's demo">⬇ demo</a>` : ""}</td>
               <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
               <td class="num"><span class="time">${r.pos === 1 ? "—" : "+" + fmtTime(r.time - d.leaderboard[0].time)}</span></td>
               <td class="num"><span class="time muted">${i === 0 ? "—" : "+" + fmtTime(r.time - d.leaderboard[i - 1].time)}</span></td>
@@ -467,32 +467,44 @@ function stopReplay() {
   }
 }
 
-async function viewReplay(id) {
+// Replay a specific player's run (playerId) or, when omitted, the map's fastest
+// recorded run (the WR replay). The ghost JSON carries the holder + time, so we
+// fetch it for the header; the endpoint is cached, so mountReplay's own fetch of
+// the same URL is served from the browser cache (no double download).
+async function viewReplay(id, playerId = null) {
   loading();
   const d = await api(`/maps/${id}?limit=1`);
-  const wr = d.wr;
-  if (!wr || !wr.ghost) {
+  const ghostUrl = `/api/maps/${id}/ghost${playerId ? `?player=${playerId}` : ""}`;
+  let ghost = null;
+  try {
+    const r = await fetch(ghostUrl);
+    if (r.ok) ghost = await r.json();
+  } catch { /* fall through to the empty state */ }
+  if (!ghost) {
     app.innerHTML = `<div class="crumbs"><a data-nav="#/map/${id}">${esc(d.name)}</a> / Replay</div>
-      <div class="empty">No in-browser replay for this map yet.<br><small>A ghost is captured the next time a world record is set here.</small></div>`;
+      <div class="empty">No in-browser replay for this run yet.<br><small>A ghost is captured the next time this run's player sets a personal best here.</small></div>`;
     return;
   }
-  const g = wr.ghost;
+  const isWr = d.wr && ghost.time === d.wr.time;
+  // Only the WR replay shows a demo button here; per-run demos live on the
+  // leaderboard / player-profile rows.
+  const demo = !playerId && d.wr && d.wr.demo && d.wr.demo.url ? d.wr.demo : null;
   app.innerHTML = `
     <div class="crumbs"><a data-nav="#/maps">Maps</a> / <a data-nav="#/map/${id}">${esc(d.name)}</a> / Replay</div>
     <div class="replay-head">
       <div class="page-title" style="font-size:24px">${esc(d.name)} <span class="accent">·</span> Replay</div>
-      <div class="replay-sub">by ${wname(g.holder || wr.name)}
-        <span class="pill ${g.isWr ? "wr" : "v1"}">${g.isWr ? "WORLD RECORD" : "fastest replay"}</span>
-        <span class="time">${fmtTime(g.time)}</span>
-        ${!g.isWr ? `<span class="muted">· map WR is ${fmtTime(wr.time)}, no replay captured for it yet</span>` : ""}
-        ${wr.demo && wr.demo.url ? `<a class="btn replay-demo" href="${esc(wr.demo.url)}" download rel="noopener">⬇ Download demo</a>` : ""}
+      <div class="replay-sub">by ${wname(ghost.player)}
+        <span class="pill ${isWr ? "wr" : "v1"}">${isWr ? "WORLD RECORD" : "personal best"}</span>
+        <span class="time">${fmtTime(ghost.time)}</span>
+        ${!isWr && d.wr ? `<span class="muted">· map WR is ${fmtTime(d.wr.time)}</span>` : ""}
+        ${demo ? `<a class="btn replay-demo" href="${esc(demo.url)}" download rel="noopener">⬇ Download demo</a>` : ""}
       </div>
     </div>
     <div id="replay-root" class="replay-root"></div>`;
   const root = document.getElementById("replay-root");
   try {
     const mod = await import("/assets/js/replay.js" + (REPLAY_V ? "?v=" + REPLAY_V : ""));
-    disposeReplay = await mod.mountReplay(root, { mapId: id, mapName: d.name, wr });
+    disposeReplay = await mod.mountReplay(root, { mapId: id, mapName: d.name, wr: { ghost: { url: ghostUrl } } });
   } catch (e) {
     root.innerHTML = `<div class="empty">Replay failed to load<br><small>${esc(e.message || e)}</small></div>`;
   }
@@ -543,6 +555,7 @@ async function viewPlayer(id, params) {
           ${th("Time", "time", state, "num")}
           ${th("Global Rank", "rank", state, "num")}
           ${hasAttempts ? th("Attempts", "attempts", state, "num") : ""}
+          <th>Replay</th>
         </tr></thead>
         <tbody>
           ${rec.rows.map((r) => `
@@ -551,7 +564,8 @@ async function viewPlayer(id, params) {
               <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
               <td class="num ${rankClass(r.rank)}">${r.rank === 1 ? '<span class="pill wr">WR</span> ' : ""}#${fmtNum(r.rank)}</td>
               ${hasAttempts ? `<td class="num"><span class="muted">${fmtNum(r.attempts)}</span></td>` : ""}
-            </tr>`).join("") || `<tr><td colspan="${hasAttempts ? 4 : 3}" class="empty">No records.</td></tr>`}
+              <td class="replaycell">${r.ghost ? `<span class="replay-badge" data-nav="#/replay/${r.map_id}/${d.id}" title="Watch this run in the browser">▶ replay</span>` : ""}${r.demo && r.demo.url ? ` <a class="replay-badge demo" href="${esc(r.demo.url)}" download rel="noopener" title="Download this run's demo">⬇ demo</a>` : ""}</td>
+            </tr>`).join("") || `<tr><td colspan="${hasAttempts ? 5 : 4}" class="empty">No records.</td></tr>`}
         </tbody>
       </table>
     </div>${pager(state, rec, `#/player/${id}`)}</div>`;
@@ -710,6 +724,165 @@ async function viewServer(id) {
   }, LIVE_REFRESH_MS);
 }
 
+/* ------------------------------- about ----------------------------------- */
+// Static reference page: what Racesow is, how to connect, the in-game command
+// list (mirrors server/racemod/.../hrace/commands.as + the mesh commands in
+// mirror.as / meshvote.as) and an FAQ. Kept data-driven so the command tables
+// and FAQ stay easy to edit as the gametype changes.
+const ABOUT_SERVERS = [
+  { name: "Racesow · EU Central", region: "Frankfurt, DE", connect: "eu.frankfurt.racesow.org:44400" },
+  { name: "Racesow · US East", region: "US East", connect: "us.east.racesow.org:44400" },
+];
+
+const ABOUT_CMDS = [
+  {
+    title: "Racing",
+    rows: [
+      ["/kill", "Cancel your run and respawn at the start. Your timer resets. (alias /racerestart)"],
+      ["/top", "List the fastest recorded times on the current map."],
+      ["/maplist <*|pattern> [page]", "Search the maps this server has. Use * for everything, or a keyword."],
+      ["/callvote map <name>", "Put a specific map to a vote."],
+      ["/callvote randmap <*|pattern>", "Vote for a random map from the matching pool."],
+    ],
+  },
+  {
+    title: "Practice mode",
+    note: "Times are NOT recorded while any of these are in effect. Use /kill to get back to a clean start and race for real.",
+    rows: [
+      ["/practicemode", "Toggle practice mode on/off."],
+      ["/noclip", "Fly through the world to line things up (practice mode only)."],
+      ["/position save", "Save your current spot and weapons as your spawn point."],
+      ["/position load", "Teleport back to your saved spot."],
+      ["/position speed <value>", "Spawn carrying this much speed, e.g. 1000. Use 0 to reset."],
+      ["/position clear", "Reset your saved spot and weapons to defaults."],
+      ["/position recall best [player]", "Step through the positions from your best run, or a named player's."],
+      ["/position recall steal", "Grab the live position of whoever you're spectating."],
+      ["/position recall cpX | start | end", "Jump to a checkpoint, or the first / last saved position."],
+      ["/position recall rl | pg | gl", "Jump to the first spot you were holding that weapon."],
+    ],
+  },
+  {
+    title: "Chat & players",
+    rows: [
+      ["/m <name> <message>", "Private-message a player (partial name matches). Reply with /m + part of their name."],
+    ],
+  },
+  {
+    title: "Cross-server mesh",
+    note: "The servers above are linked. On the same map you'll see players from the other server as translucent ghosts, and their chat arrives with a [TAG] prefix.",
+    rows: [
+      ["/who", "List who's playing on every linked server right now."],
+      ["/watch <name>", "Lock your spectator camera onto a player on another server to study their route."],
+      ["/meshvote <map>", "Start a vote to switch every linked server to a map together. (alias /mv)"],
+      ["/mv yes | no | status | cancel", "Cast your vote, show the live tally, or (as starter) cancel it."],
+    ],
+  },
+];
+
+const ABOUT_FAQ = [
+  ["What is Racesow?",
+    "Racesow is Warsow's race gametype: no fighting, just you against the clock. Rocket-jump, plasma-climb, strafe and bunny-hop from the start line to the finish as fast as you can. Every map keeps its own leaderboard and world record."],
+  ["How do I join?",
+    "Grab the <a class=\"extlink\" href=\"https://warsow.net/\" target=\"_blank\" rel=\"noopener external\">Warsow</a> 2.1 client, open the in-game console with the <b>~</b> key, and type one of the <b>connect</b> strings above. Any maps you don't already have download automatically from the server when you join."],
+  ["Why wasn't my time saved?",
+    "Times only count in a clean race-mode run. If you toggled <span class=\"mono\">/practicemode</span>, <span class=\"mono\">/noclip</span>, or used <span class=\"mono\">/position</span>, that run won't be recorded. Use <span class=\"mono\">/kill</span> to get back to the start and race it straight through."],
+  ["What are the ghosts I keep seeing?",
+    "The EU and US servers are meshed. Players on the other server show up as translucent, non-solid ghosts whenever you're on the same map, so you can race alongside them across the Atlantic. You never collide with them. Use <span class=\"mono\">/who</span> to see who's who, and <span class=\"mono\">/watch</span> to follow one."],
+  ["How do records end up on this site?",
+    "Each server reports finished runs to the central database here. New personal bests and world records appear within seconds, along with a downloadable demo and an in-browser replay ghost you can scrub through."],
+  ["Can I watch a record?",
+    "Yes. Open any map and look for a <b>▶ replay</b> badge to watch the ghost right in your browser, or <b>⬇ demo</b> to download it. To play a demo back in Warsow, drop the file in your <span class=\"mono\">racemod/demos</span> folder and run <span class=\"mono\">demo &lt;file&gt;</span> in the console."],
+  ["How is the ranking worked out?",
+    "You earn points for a top-15 finish on each map; your overall rank is the sum of those points across every map you've raced. World records and podium finishes are tracked separately on your profile."],
+];
+
+async function viewAbout() {
+  app.innerHTML = `
+    <div class="crumbs">Racesow / About</div>
+    <div class="page-title"><span class="accent">ABOUT</span> RACESOW</div>
+    <p class="page-sub">Warsow race: go from the start line to the finish as fast as movement will carry you. This is the network, the commands, and the answers to the usual questions.</p>
+
+    <div class="about">
+      <div class="panel about-lead">
+        <h3><span class="dot"></span> What this is</h3>
+        <div class="about-body">
+          <p>This is a rebuilding of the old <b>livesow</b> and <b>mgxrace</b> servers. It gives older players a place to keep playing, and new players a place to learn.</p>
+          <p>Along the way, new additions and features have been added to improve the experience for more people: a live record book, downloadable demos, in-browser replays, and a cross-server mesh that links the servers together.</p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3><span class="dot teal"></span> Join a server</h3>
+        <div class="about-body">
+          <p>Open the Warsow console with <b>~</b> and paste a connect line. Missing maps download from the server on join.</p>
+          <div class="srv-cards">
+            ${ABOUT_SERVERS.map((s) => `
+              <div class="srv-card">
+                <div class="srv-name">${esc(s.name)}</div>
+                <div class="srv-region muted">${esc(s.region)}</div>
+                <div class="connect-row">
+                  <code class="connect mono">connect ${esc(s.connect)}</code>
+                  <button class="copy-btn" data-copy="connect ${esc(s.connect)}" title="Copy to clipboard">copy</button>
+                </div>
+              </div>`).join("")}
+          </div>
+          <p class="muted about-fineprint">The two servers are meshed: you'll see players on the other one as ghosts and can race them across the Atlantic. See <b>/who</b>, <b>/watch</b> and <b>/meshvote</b> below.</p>
+        </div>
+      </div>
+
+      <div class="page-title about-h2">IN-GAME <span class="accent">COMMANDS</span></div>
+      <p class="page-sub">Type these in chat or the console. Run <span class="mono">/help</span> in game for the built-in list, or <span class="mono">/help &lt;cmd&gt;</span> for detail on one.</p>
+      <div class="cmd-groups">
+        ${ABOUT_CMDS.map((g) => `
+          <div class="panel cmd-group">
+            <h3><span class="dot"></span> ${esc(g.title)}</h3>
+            ${g.note ? `<p class="cmd-note muted">${esc(g.note)}</p>` : ""}
+            <table class="data cmd-table">
+              <tbody>
+                ${g.rows.map(([cmd, desc]) => `
+                  <tr>
+                    <td class="cmd"><code class="mono">${esc(cmd)}</code></td>
+                    <td class="cmd-desc">${esc(desc)}</td>
+                  </tr>`).join("")}
+              </tbody>
+            </table>
+          </div>`).join("")}
+      </div>
+
+      <div class="page-title about-h2"><span class="accent">FAQ</span></div>
+      <div class="faq">
+        ${ABOUT_FAQ.map(([q, a]) => `
+          <details class="faq-item">
+            <summary>${esc(q)}</summary>
+            <div class="faq-a">${a}</div>
+          </details>`).join("")}
+      </div>
+
+      <div class="panel about-who">
+        <h3><span class="dot"></span> Who runs it</h3>
+        <div class="about-body">
+          <p>Racesow is built and run by <b>elchupa</b>. The stats site, the game servers, the cross-server mesh and the in-browser replay viewer are all custom-built.</p>
+          <p>None of this starts from scratch. The race gametype is built on the work of <b>hettoo</b> and <b>DenMSC</b>, whose <span class="mono">wsw-race</span> racemod is the foundation everything here runs on. Their repos: <a class="extlink" href="https://github.com/hettoo/wsw-race/tree/racemod" target="_blank" rel="noopener external">hettoo/wsw-race</a> and <a class="extlink" href="https://github.com/DenMSC/wsw-race/tree/racemod" target="_blank" rel="noopener external">DenMSC/wsw-race</a>. This project extends what they already made.</p>
+          <p class="muted">The record book and maps are seeded from the historical <a class="extlink" href="http://livesow.net/race" target="_blank" rel="noopener external">livesow.net</a> race database, and grow live from the servers above. Every map page links out to <a class="extlink" href="https://padpork.org/maps" target="_blank" rel="noopener external">padpork.org</a> for more information on that map. <a class="extlink" href="https://warsow.net/" target="_blank" rel="noopener external">Warsow</a> itself is made by the Warsow team.</p>
+        </div>
+      </div>
+    </div>`;
+
+  // Copy-to-clipboard for the connect strings. Falls back silently where the
+  // Clipboard API is unavailable (non-secure context / old browser).
+  app.querySelectorAll(".copy-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(btn.getAttribute("data-copy"));
+        const prev = btn.textContent;
+        btn.textContent = "copied";
+        btn.classList.add("ok");
+        setTimeout(() => { btn.textContent = prev; btn.classList.remove("ok"); }, 1200);
+      } catch (e) { /* clipboard blocked — the string is still selectable */ }
+    });
+  });
+}
+
 /* --------------------------- shared widgets ------------------------------ */
 function pager(state, data, base) {
   const from = data.offset + 1;
@@ -857,8 +1030,9 @@ async function router() {
     else if (path === "/maps") await viewMaps(params);
     else if (path === "/players") await viewPlayers(params);
     else if (path === "/live") await viewLive();
+    else if (path === "/about") await viewAbout();
     else if (path.startsWith("/server/")) await viewServer(parseInt(path.split("/")[2], 10));
-    else if (path.startsWith("/replay/")) await viewReplay(parseInt(path.split("/")[2], 10));
+    else if (path.startsWith("/replay/")) await viewReplay(parseInt(path.split("/")[2], 10), parseInt(path.split("/")[3], 10) || null);
     else if (path.startsWith("/map/")) await viewMap(parseInt(path.split("/")[2], 10));
     else if (path.startsWith("/player/")) await viewPlayer(parseInt(path.split("/")[2], 10), params);
     else app.innerHTML = `<div class="empty">Page not found.</div>`;

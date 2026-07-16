@@ -604,12 +604,10 @@ class Player
 
         // this.report.reset();
 
-        // Begin a per-client server demo of this run (engine race-demos
-        // subsystem; skips bots internally and no-ops when disabled). demoStop
-        // on the finish renames it with the time; demoCancel on an abort
-        // discards it. Never reached by fake clients (guarded at the top).
-        if ( rsRecordDemos.boolean )
-            this.client.demoStart( RACE_DemoName( this.client ) );
+        // The per-client demo now starts at SPAWN (GT_PlayerRespawn), not here,
+        // so the saved run includes the run-up from the spawn point. This run
+        // simply keeps recording into the already-open demo; completeRace() keeps
+        // it on a personal best and the engine renames it with the finish time.
 
         this.client.newRaceRun( numCheckpoints );
 
@@ -799,10 +797,10 @@ class Player
     {
         Entity@ ent = this.client.getEnt();
 
-        // Discard this run's per-client demo (no-op if none / disabled). Guard
-        // on inRace so ordinary respawns don't spam racerecordcancel.
-        if ( rsRecordDemos.boolean && this.inRace )
-            this.client.demoCancel();
+        // The demo is NOT discarded here: it started at spawn (GT_PlayerRespawn)
+        // and must survive a run-restart, which cancels the race but keeps the
+        // same life. A respawn resets the demo in GT_PlayerRespawn; completeRace()
+        // keeps it (personal best) or discards it at the run's end.
 
         if ( this.inRace && this.currentCheckpoint > 0 )
         {
@@ -886,7 +884,8 @@ class Player
         {
             RACE_LogFinish( this );
 
-            if ( !this.best_recordTime.isFinished() || finishTime < this.best_recordTime.getFinishTime() )
+            bool newPersonalBest = !this.best_recordTime.isFinished() || finishTime < this.best_recordTime.getFinishTime();
+            if ( newPersonalBest )
             {
                 // this.client.addAward( S_COLOR_YELLOW + "Personal record!" );
                 // copy all the sectors into the new personal record backup
@@ -914,23 +913,35 @@ class Player
 
             uint pos = RACE_AddTopScore( this.best_recordTime );
 
-            // Close this run's per-client demo: the engine renames it with the
-            // finish time and keeps the fastest few per map (no-op if disabled
-            // or if none was started).
+            // Close this run's per-client demo. Keep only PERSONAL-BEST demos
+            // (one per player per map, the download the site links) and cancel
+            // the rest, so the game host isn't buried in every-attempt
+            // recordings. demoStop renames the kept file with the finish time.
+            // NOTE: the engine still caps how many demos it retains per map, so a
+            // downloadable demo for EVERY rank (not just the fastest few) needs
+            // the per-player retention work in docs/per-player-replays-design.md;
+            // browser-replay ghosts are unaffected (they live on the web).
             if ( rsRecordDemos.boolean )
-                this.client.demoStop( RACE_DemoName( this.client ), finishTime );
-
-            if ( pos == 0 )
             {
-                // #1 in the LOCAL top scores — but the local list can be stale
-                // (or empty at map start), so a personal best would false-
-                // announce. Verify against a fresh API pull before announcing
-                // (apitop.as). The demo/ghost uploads below stay on the local
-                // check: the web validates them (faster-only guard) and hides a
-                // replay whose time isn't the current WR, so a false local #1
-                // can't surface a wrong replay.
+                if ( newPersonalBest )
+                    this.client.demoStop( RACE_DemoName( this.client ), finishTime );
+                else
+                    this.client.demoCancel();
+            }
+
+            // Announce actual WORLD RECORDS only. #1 in the LOCAL top scores can
+            // be stale (or empty at map start), so a mere personal best would
+            // false-announce — apitop.as verifies against a fresh API pull first.
+            if ( pos == 0 )
                 RACE_QueueRecordAnnounce( this.client.name, finishTime );
 
+            // Upload the demo pointer + ghost trajectory for every PERSONAL BEST
+            // (one per player per map). The web keeps a per-(player, map) row
+            // with a faster-only guard, so a stale/duplicate report is harmless.
+            // (Runs on the local PB check, not the announce's WR check, so every
+            // player's best gets a replay — not just the map record.)
+            if ( newPersonalBest )
+            {
                 if ( rsRecordDemos.boolean )
                     RACE_ReportWrDemo( this, finishTime );
                 RACE_UploadWrGhost( this, finishTime );

@@ -472,6 +472,34 @@ Vec3 RACE_MirrorPredict( MirrorPlayer@ rp )
     return rp.origin + rp.velocity * ( age / 1000.0f );
 }
 
+// Release any local spectator chasing the given bot slot back to free-fly
+// spectate. Clearing chaseActive alone is NOT enough: a chasing spectator has
+// movetype MOVETYPE_NONE (the engine's G_GhostClient sets it when chasecam
+// starts), and once chaseActive is false the engine's ClientThink maps
+// "movetype is neither PLAYER nor NOCLIP" straight to PM_FREEZE — so the
+// spectator freezes in place and can only recover by reconnecting. We must
+// also restore MOVETYPE_NOCLIP, exactly as the engine's own observer fallback
+// does (G_ChasePlayer's "No one to chase" branch in g_chase.cpp), so ClientThink
+// yields PM_SPECTATOR and free-fly movement resumes. optionalMsg is printed to
+// each released spectator when non-empty.
+void RACE_MirrorReleaseChasers( int botSlot, const String &in optionalMsg )
+{
+    if ( botSlot < 0 )
+        return;
+    int botEntNum = botSlot + 1;
+    for ( int i = 0; i < maxClients; i++ )
+    {
+        Client@ c = G_GetClient( i );
+        if ( c.state() >= CS_SPAWNED && c.chaseActive && c.chaseTarget == botEntNum )
+        {
+            c.chaseActive = false;                       // drop to free spectate
+            c.getEnt().moveType = MOVETYPE_NOCLIP;       // ...and unfreeze the camera
+            if ( optionalMsg.length() > 0 )
+                c.printMessage( optionalMsg );
+        }
+    }
+}
+
 // Free the fake-client slot that represents this remote player, if any.
 // A bot is removed when its source player leaves, goes to spectator, or goes
 // idle (their server drops them from the broadcast). Any local player who was
@@ -481,17 +509,8 @@ void RACE_MirrorRemoveBot( MirrorPlayer@ rp )
 {
     if ( rp.botSlot >= 0 )
     {
-        int botEntNum = rp.botSlot + 1;
-        for ( int i = 0; i < maxClients; i++ )
-        {
-            Client@ c = G_GetClient( i );
-            if ( c.state() >= CS_SPAWNED && c.chaseActive && c.chaseTarget == botEntNum )
-            {
-                c.chaseActive = false; // drop to free spectate
-                c.printMessage( "[" + rp.server + S_COLOR_WHITE + "] " + rp.name
-                        + S_COLOR_YELLOW + " left the race - spectating freely.\n" );
-            }
-        }
+        RACE_MirrorReleaseChasers( rp.botSlot, "[" + rp.server + S_COLOR_WHITE + "] " + rp.name
+                + S_COLOR_YELLOW + " left the race - spectating freely.\n" );
         RS_MirrorBotRemove( rp.botSlot );
         rp.botSlot = -1;
     }

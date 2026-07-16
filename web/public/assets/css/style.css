@@ -439,9 +439,110 @@ tr:hover td.mapname .extlink { color: var(--cyan); }
 .rv-key.on { color: #0a0b0f; background: var(--orange);
   border-color: var(--orange); box-shadow: 0 0 12px rgba(255,106,26,.55); }
 
+/* effect legend (top-left) explaining the action markers along the path */
+.rv-legend { position: absolute; left: 14px; top: 12px; z-index: 3;
+  display: flex; flex-wrap: wrap; gap: 6px 8px; max-width: 62%;
+  pointer-events: none; user-select: none; font-family: var(--cond); font-size: 12px; }
+.rv-legend.rv-hidden { display: none; }
+.rv-lg { display: inline-flex; align-items: center; gap: 5px; color: var(--muted);
+  background: rgba(10,11,15,.5); border: 1px solid var(--line); border-radius: 5px; padding: 2px 7px; }
+.rv-lg i { font-style: normal; font-size: 15px; line-height: 1; }
+.rv-fx { min-width: 34px; }
+.rv-fx:not(.on) { opacity: .45; }
+.rv-full { min-width: 34px; font-size: 15px; }
+
+/* strafe/accel efficiency bar (mirrors the in-game race HUD accel bar) */
+.rv-strafe { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+  z-index: 3; display: flex; flex-direction: column; align-items: center; gap: 4px;
+  pointer-events: none; user-select: none; }
+.rv-strafe-track { width: 220px; height: 12px; background: rgba(255,255,255,.08);
+  border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+.rv-strafe-track > i { display: block; height: 100%; width: 0%; background: var(--faint);
+  transition: width .05s linear, background .1s linear; }
+.rv-strafe-lbl { font-family: var(--cond); text-transform: uppercase; letter-spacing: 1.5px;
+  font-size: 10px; color: var(--muted); }
+
+/* loading overlay while the ghost + map mesh + rigged models load */
+.rv-loading { position: absolute; inset: 0; z-index: 5; display: flex;
+  flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+  background: #0a0b0f; color: var(--muted); font-family: var(--cond);
+  text-transform: uppercase; letter-spacing: 1.5px; font-size: 13px; }
+.rv-loadbar { width: min(240px, 55%); height: 4px; border-radius: 3px;
+  background: var(--line); overflow: hidden; position: relative; }
+.rv-loadbar i { position: absolute; top: 0; left: 0; height: 100%; width: 40%;
+  background: linear-gradient(90deg, transparent, var(--orange), transparent);
+  animation: rv-load 1.1s ease-in-out infinite; }
+@keyframes rv-load { 0% { left: -40%; } 100% { left: 100%; } }
+
+/* fullscreen: let the canvas fill the screen, keep the control bar visible */
+.replay-root:fullscreen { display: flex; flex-direction: column; background: #0a0b0f; }
+.replay-root:fullscreen .rv-stage { flex: 1 1 auto; height: auto; }
+.rv-stage:fullscreen { height: 100vh; }
+
 /* inline "watch this run" link on the leaderboard row that has a replay */
 .replay-badge { display: inline-block; margin-left: 8px; font-family: var(--cond);
   text-transform: uppercase; letter-spacing: .5px; font-size: 11px; font-weight: 600;
   color: var(--gold); border: 1px solid rgba(255,210,74,.4); border-radius: 5px;
   padding: 1px 6px; cursor: pointer; background: rgba(255,210,74,.08); }
 .replay-badge:hover { color: #0a0b0f; background: var(--gold); border-color: var(--gold); }
+a.replay-badge { text-decoration: none; }
+/* Demo-download badge: teal, to read as distinct from the gold ▶ replay badge. */
+.replay-badge.demo { color: #7fd8c4; border-color: rgba(127,216,196,.4); background: rgba(127,216,196,.08); }
+.replay-badge.demo:hover { color: #0a0b0f; background: #7fd8c4; border-color: #7fd8c4; }
+
+/* ------------------------------- About ----------------------------------- */
+.about { display: flex; flex-direction: column; gap: 20px; }
+/* .panel has overflow:hidden and no inner padding (tables run edge-to-edge),
+   so prose blocks inside a panel need their own gutters. */
+.about-body { padding: 16px 18px; }
+.about-body p { margin: 0 0 12px; }
+.about-body p:last-child { margin-bottom: 0; }
+.about-body a.extlink { color: var(--cyan); }
+.about-lead .about-body p:first-child { font-size: 15px; }
+.about-fineprint { font-size: 13px; margin-top: 14px !important; }
+/* Section headings between panels — pull the shared .page-title down a touch. */
+.about-h2 { margin-top: 14px; font-size: 24px; }
+
+/* Connect cards */
+.srv-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 6px 0 4px; }
+.srv-card { border: 1px solid var(--line-2); border-radius: 10px; padding: 12px 14px; background: var(--bg-2); }
+.srv-name { font-family: var(--cond); font-style: italic; font-weight: 800; text-transform: uppercase;
+  letter-spacing: .5px; font-size: 15px; }
+.srv-region { font-family: var(--cond); text-transform: uppercase; letter-spacing: 1px; font-size: 11px; margin-top: 1px; }
+.connect-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.connect { flex: 1 1 auto; font-size: 13px; color: var(--text); background: rgba(255,255,255,.04);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; overflow-wrap: anywhere; }
+.copy-btn { flex: 0 0 auto; font-family: var(--cond); text-transform: uppercase; letter-spacing: .5px;
+  font-size: 11px; font-weight: 700; color: var(--muted); background: transparent;
+  border: 1px solid var(--line-2); border-radius: 6px; padding: 6px 10px; cursor: pointer; transition: .12s; }
+.copy-btn:hover { color: #fff; border-color: var(--orange); }
+.copy-btn.ok { color: var(--green); border-color: rgba(169,242,106,.5); }
+
+/* Command tables */
+.cmd-groups { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.cmd-note { padding: 12px 18px 0; margin: 0; font-size: 13px; }
+.cmd-table td { vertical-align: top; }
+.cmd-table td.cmd { white-space: nowrap; padding-right: 16px; }
+.cmd-table code.mono { font-size: 12.5px; color: var(--orange-2); }
+.cmd-table td.cmd-desc { color: var(--muted); font-size: 13px; }
+
+/* FAQ accordion */
+.faq { display: flex; flex-direction: column; gap: 10px; }
+.faq-item { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); overflow: hidden; }
+.faq-item summary { cursor: pointer; padding: 13px 16px; list-style: none;
+  font-family: var(--cond); font-weight: 700; font-size: 16px; letter-spacing: .3px;
+  display: flex; align-items: center; gap: 10px; }
+.faq-item summary::-webkit-details-marker { display: none; }
+.faq-item summary::before { content: "+"; color: var(--orange); font-weight: 800; font-size: 18px;
+  width: 14px; text-align: center; transition: transform .15s; }
+.faq-item[open] summary::before { content: "−"; }
+.faq-item summary:hover { color: #fff; }
+.faq-a { padding: 0 16px 14px 40px; color: var(--muted); font-size: 14px; }
+.faq-a .mono { color: var(--orange-2); }
+
+.about-who .about-body a { color: var(--cyan); }
+
+@media (max-width: 720px) {
+  .srv-cards { grid-template-columns: 1fr; }
+  .cmd-groups { grid-template-columns: 1fr; }
+}

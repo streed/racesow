@@ -145,6 +145,7 @@ export async function openDatabase(connectionString) {
   const race = new RaceDB(pool, caps);
   await race._loadVersions();
   await race.refreshAggregates();
+  await race._relayoutGhostFiles();
   console.log(`Database ready in ${Date.now() - t0}ms`);
   return race;
 }
@@ -531,11 +532,13 @@ class RaceDB {
   }
 
   // --------------------------------------------------------------------------
-  // Replays: WR demo metadata + ghost trajectories --------------------------
-  // Both keyed by map (top-1 only). The demo is a pointer to a .wd file on the
-  // game host; the ghost's trajectory bytes are gzipped JSON on local disk.
-  _ghostPath(mapId) {
-    return path.join(GHOST_DIR, `${mapId}.json.gz`);
+  // Replays: per-player demo metadata + ghost trajectories ------------------
+  // One row per (player, map) = that player's fastest recorded run; the map WR
+  // is the fastest of them. The demo is a pointer to a .wd on the game host;
+  // the ghost's trajectory bytes are gzipped JSON on local disk, one file per
+  // (map, player) at GHOST_DIR/<mapId>/<playerId>.json.gz.
+  _ghostPath(mapId, playerId) {
+    return path.join(GHOST_DIR, String(mapId), `${playerId}.json.gz`);
   }
 
   // Resolve version + map + player ids inside a transaction (reusing the same
@@ -555,7 +558,12 @@ class RaceDB {
          ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
         [map]
       );
-      const playerId = await this._resolvePlayer(client, { name, login });
+      // Replays are keyed per CANONICAL player (aliases are one person, and the
+      // `best`/leaderboard tables key on the canonical id), so resolve the raw
+      // (name, login) id to its representative before storing.
+      const rawPlayerId = await this._resolvePlayer(client, { name, login });
+      const cRow = (await client.query("SELECT canonical_id FROM player WHERE id = $1", [rawPlayerId])).rows[0];
+      const playerId = cRow && cRow.canonical_id != null ? num(cRow.canonical_id) : rawPlayerId;
       const out = await fn(client, {
         versionId: num(versionRow.id),
         mapId: num(mapRow.id),
@@ -572,61 +580,111 @@ class RaceDB {
     }
   }
 
-  // Record (or replace) the downloadable WR demo for a map. Only overwrites an
-  // existing row with an equal-or-faster time, so a stale/duplicate report
-  // can't bump a genuine record's demo.
-  async upsertWrDemo({ version, map, name, login = "", time, demoPath, bytes = null, serverId = null }) {
+  // Record (or replace) this player's downloadable demo for a map — one row per
+  // (player, map). Only overwrites with an equal-or-faster time, so a stale or
+  // duplicate report can't bump a genuine PB's demo.
+  async upsertPlayerDemo({ version, map, name, login = "", time, demoPath, bytes = null, serverId = null }) {
     return this._withReplayIds({ version, map, name, login }, async (client, ids) => {
       await client.query(
-        `INSERT INTO wr_demo (map_id, player_id, version_id, time, demo_path, bytes, server_id, captured_at)
+        `INSERT INTO player_demo (map_id, player_id, version_id, time, demo_path, bytes, server_id, captured_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (map_id) DO UPDATE SET
-           player_id = EXCLUDED.player_id, version_id = EXCLUDED.version_id,
-           time = EXCLUDED.time, demo_path = EXCLUDED.demo_path, bytes = EXCLUDED.bytes,
-           server_id = EXCLUDED.server_id, captured_at = EXCLUDED.captured_at
-         WHERE EXCLUDED.time <= wr_demo.time`,
+         ON CONFLICT (map_id, player_id) DO UPDATE SET
+           version_id = EXCLUDED.version_id, time = EXCLUDED.time, demo_path = EXCLUDED.demo_path,
+           bytes = EXCLUDED.bytes, server_id = EXCLUDED.server_id, captured_at = EXCLUDED.captured_at
+         WHERE EXCLUDED.time <= player_demo.time`,
         [ids.mapId, ids.playerId, ids.versionId, time, demoPath, bytes, serverId, Math.floor(Date.now() / 1000)]
       );
       return true;
     });
   }
 
-  // Store a WR ghost trajectory: gzip the canonical JSON to disk and upsert the
-  // metadata row. Faster-only guard, with the row locked FOR UPDATE so we never
-  // overwrite a faster map's file from a concurrent slower upload.
-  async upsertGhost({ version, map, name, login = "", time, hz, frames, cps = [], serverId = null }) {
+  // Store this player's ghost trajectory for a map (one per (player, map)): gzip
+  // the canonical JSON to GHOST_DIR/<mapId>/<playerId>.json.gz and upsert the
+  // metadata. Faster-only guard, the row locked FOR UPDATE so a concurrent
+  // slower upload never overwrites a faster file; the file is written only when
+  // we actually take the row.
+  async upsertPlayerGhost({ version, map, name, login = "", time, hz, frames, cps = [], serverId = null }) {
     return this._withReplayIds({ version, map, name, login }, async (client, ids) => {
-      const existing = (await client.query("SELECT time FROM ghost WHERE map_id = $1 FOR UPDATE", [ids.mapId])).rows[0];
+      const existing = (await client.query(
+        "SELECT time FROM player_ghost WHERE map_id = $1 AND player_id = $2 FOR UPDATE",
+        [ids.mapId, ids.playerId]
+      )).rows[0];
       if (existing && existing.time <= time) return false;
 
       const payload = { v: 1, map, player: name, login, time, hz, cps, frames };
       const gz = zlib.gzipSync(Buffer.from(JSON.stringify(payload)));
-      fs.mkdirSync(GHOST_DIR, { recursive: true });
-      fs.writeFileSync(this._ghostPath(ids.mapId), gz);
+      const file = this._ghostPath(ids.mapId, ids.playerId);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, gz);
 
       await client.query(
-        `INSERT INTO ghost (map_id, player_id, version_id, time, hz, frames, bytes, server_id, captured_at)
+        `INSERT INTO player_ghost (map_id, player_id, version_id, time, hz, frames, bytes, server_id, captured_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (map_id) DO UPDATE SET
-           player_id = EXCLUDED.player_id, version_id = EXCLUDED.version_id, time = EXCLUDED.time,
-           hz = EXCLUDED.hz, frames = EXCLUDED.frames, bytes = EXCLUDED.bytes,
-           server_id = EXCLUDED.server_id, captured_at = EXCLUDED.captured_at`,
+         ON CONFLICT (map_id, player_id) DO UPDATE SET
+           version_id = EXCLUDED.version_id, time = EXCLUDED.time, hz = EXCLUDED.hz,
+           frames = EXCLUDED.frames, bytes = EXCLUDED.bytes, server_id = EXCLUDED.server_id,
+           captured_at = EXCLUDED.captured_at`,
         [ids.mapId, ids.playerId, ids.versionId, time, hz, frames.length, gz.length, serverId, Math.floor(Date.now() / 1000)]
       );
       return true;
     });
   }
 
-  // Raw gzipped ghost JSON for a map id (served with Content-Encoding: gzip to
-  // the browser viewer), or null if there is no ghost / the file is missing.
-  async ghostGzip(mapId) {
-    const meta = await this.one("SELECT map_id FROM ghost WHERE map_id = $1", [mapId]);
-    if (!meta) return null;
+  // Raw gzipped ghost JSON for a (map, player), served with Content-Encoding:
+  // gzip to the browser viewer. playerId omitted => the map's fastest recorded
+  // ghost (the WR replay). null if there is no such ghost / the file is missing.
+  async ghostGzip(mapId, playerId = null) {
+    let pid = playerId;
+    if (pid == null) {
+      const row = await this.one(
+        "SELECT player_id FROM player_ghost WHERE map_id = $1 ORDER BY time ASC LIMIT 1",
+        [mapId]
+      );
+      if (!row) return null;
+      pid = num(row.player_id);
+    } else if (!(await this.one("SELECT 1 FROM player_ghost WHERE map_id = $1 AND player_id = $2", [mapId, pid]))) {
+      return null;
+    }
     try {
-      return fs.readFileSync(this._ghostPath(mapId));
+      return fs.readFileSync(this._ghostPath(mapId, pid));
     } catch {
       return null; // row without a file (e.g. volume reset): treat as absent
     }
+  }
+
+  // One-time, idempotent migration of legacy one-per-map ghost files
+  // (GHOST_DIR/<mapId>.json.gz) to the per-player layout
+  // (GHOST_DIR/<mapId>/<playerId>.json.gz). Cheap no-op once done: it early-outs
+  // when no top-level legacy files remain. Each legacy file maps to the single
+  // player_ghost row backfilled from the old `ghost` table (the map's fastest).
+  async _relayoutGhostFiles() {
+    let legacy;
+    try {
+      legacy = fs.readdirSync(GHOST_DIR).filter((f) => /^\d+\.json\.gz$/.test(f));
+    } catch {
+      return; // GHOST_DIR not created yet — nothing to move
+    }
+    if (!legacy.length) return;
+    let moved = 0;
+    for (const f of legacy) {
+      const mapId = parseInt(f, 10);
+      const src = path.join(GHOST_DIR, f);
+      const row = await this.one(
+        "SELECT player_id FROM player_ghost WHERE map_id = $1 ORDER BY time ASC LIMIT 1",
+        [mapId]
+      );
+      if (!row) continue; // no metadata: leave the orphan in place
+      const dest = this._ghostPath(mapId, num(row.player_id));
+      try {
+        if (fs.existsSync(dest)) fs.unlinkSync(src);
+        else {
+          fs.mkdirSync(path.dirname(dest), { recursive: true });
+          fs.renameSync(src, dest);
+          moved++;
+        }
+      } catch { /* best-effort */ }
+    }
+    if (moved) console.log(`Relaid out ${moved} legacy ghost file(s) to per-player paths`);
   }
 
   // Flat-text ghost for the game server's RS_ApiFetchGhost native (AngelScript
@@ -720,6 +778,34 @@ class RaceDB {
       versionName: this.versions[num(r.version)] || null,
     }));
 
+    // Per-player demo/ghost links for the leaderboard rows (one PB per player
+    // per map). A row only gets links if that player has a captured replay.
+    if (leaderboard.length) {
+      const pids = leaderboard.map((r) => r.playerId);
+      const demoByPid = new Map();
+      for (const d of await this.all(
+        "SELECT player_id, time, demo_path, bytes FROM player_demo WHERE map_id = $1 AND player_id = ANY($2)",
+        [id, pids]
+      )) demoByPid.set(num(d.player_id), d);
+      const ghostByPid = new Map();
+      for (const g of await this.all(
+        "SELECT player_id, time, hz, frames FROM player_ghost WHERE map_id = $1 AND player_id = ANY($2)",
+        [id, pids]
+      )) ghostByPid.set(num(g.player_id), g);
+      for (const row of leaderboard) {
+        const d = demoByPid.get(row.playerId);
+        if (d)
+          row.demo = {
+            url: DEMO_BASE_URL ? `${DEMO_BASE_URL}/demos/${d.demo_path}` : null,
+            path: d.demo_path,
+            bytes: num(d.bytes),
+            time: d.time,
+          };
+        const g = ghostByPid.get(row.playerId);
+        if (g) row.ghost = { url: `/api/maps/${id}/ghost?player=${row.playerId}`, hz: g.hz, frames: g.frames, time: g.time };
+      }
+    }
+
     let wr = null;
     if (idx && idx.wr_race_id != null) {
       const splits = (
@@ -739,8 +825,8 @@ class RaceDB {
         splits,
       };
 
-      // Best-captured replay for this map. Both tables hold one row per map —
-      // the fastest run we've recorded a demo/ghost for (faster-only upsert).
+      // Best-captured replay for this map: the fastest recorded demo/ghost
+      // across all players (one PB per player per map, faster-only upsert).
       // That run may pre-date or lag the absolute WR (e.g. the #1 was set before
       // the replay feature, or on a server that didn't capture it). Surface it
       // anyway — a replay of the fastest recorded run beats no replay — carrying
@@ -748,7 +834,8 @@ class RaceDB {
       // record so it can label a slower replay honestly.
       const demo = await this.one(
         `SELECT d.time, d.demo_path, d.bytes, p.name AS holder, p.simplified AS holder_s
-         FROM wr_demo d JOIN player p ON p.id = d.player_id WHERE d.map_id = $1`,
+         FROM player_demo d JOIN player p ON p.id = d.player_id
+         WHERE d.map_id = $1 ORDER BY d.time ASC LIMIT 1`,
         [id]
       );
       if (demo) {
@@ -763,13 +850,16 @@ class RaceDB {
         };
       }
       const g = await this.one(
-        `SELECT g.time, g.hz, g.frames, p.name AS holder, p.simplified AS holder_s
-         FROM ghost g JOIN player p ON p.id = g.player_id WHERE g.map_id = $1`,
+        `SELECT g.player_id, g.time, g.hz, g.frames, p.name AS holder, p.simplified AS holder_s
+         FROM player_ghost g JOIN player p ON p.id = g.player_id
+         WHERE g.map_id = $1 ORDER BY g.time ASC LIMIT 1`,
         [id]
       );
       if (g) {
         wr.ghost = {
+          // No ?player => ghostGzip serves the fastest (this) ghost.
           url: `/api/maps/${num(map.id)}/ghost`,
+          playerId: num(g.player_id),
           hz: g.hz,
           frames: g.frames,
           time: g.time,
@@ -978,6 +1068,34 @@ class RaceDB {
         [canonId, lim, off]
       )
     ).map((r) => ({ ...r, map_id: num(r.map_id) }));
+
+    // This player's demo + browser-replay link per finished map (one PB each).
+    if (records.length) {
+      const mids = records.map((r) => r.map_id);
+      const demoByMap = new Map();
+      for (const d of await this.all(
+        "SELECT map_id, time, demo_path, bytes FROM player_demo WHERE player_id = $1 AND map_id = ANY($2)",
+        [canonId, mids]
+      )) demoByMap.set(num(d.map_id), d);
+      const ghostByMap = new Map();
+      for (const g of await this.all(
+        "SELECT map_id, time, hz, frames FROM player_ghost WHERE player_id = $1 AND map_id = ANY($2)",
+        [canonId, mids]
+      )) ghostByMap.set(num(g.map_id), g);
+      for (const row of records) {
+        const d = demoByMap.get(row.map_id);
+        if (d)
+          row.demo = {
+            url: DEMO_BASE_URL ? `${DEMO_BASE_URL}/demos/${d.demo_path}` : null,
+            path: d.demo_path,
+            bytes: num(d.bytes),
+            time: d.time,
+          };
+        const g = ghostByMap.get(row.map_id);
+        if (g) row.ghost = { url: `/api/maps/${row.map_id}/ghost?player=${canonId}`, hz: g.hz, frames: g.frames, time: g.time };
+      }
+    }
+
     return {
       id: num(player.id),
       name: player.name,

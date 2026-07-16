@@ -166,26 +166,47 @@ test("WR demo + ghost ingest, then surface on the map and serve to browser + gam
   assert.equal(lines[3], "0 0 0 0 0 0 0 0 0"); // first frame
   assert.equal(lines[4], "10 0 5 0 90 0 400 0 50");
 
-  // 7) A ghost file exists on disk under the isolated GHOST_DIR.
-  assert.ok(fs.existsSync(path.join(ghostDir, `${mapId}.json.gz`)));
+  // 7) A per-player ghost file exists on disk (layout <mapId>/<playerId>.json.gz).
+  assert.ok(
+    fs.readdirSync(path.join(ghostDir, String(mapId))).some((f) => f.endsWith(".json.gz")),
+    "a per-player ghost file exists under the map subdir"
+  );
 });
 
-test("faster-only guard: a slower ghost never overwrites a faster one", async () => {
-  const detail = await getJson(`/maps/${(await getJson("/maps?q=ghostmap")).rows[0].id}`);
-  const mapId = detail.id;
-  const before = fs.readFileSync(path.join(ghostDir, `${mapId}.json.gz`));
+test("faster-only guard (per player): a slower run by the same player never overwrites their faster one", async () => {
+  const mapId = (await getJson("/maps?q=ghostmap")).rows[0].id;
+  const dir = path.join(ghostDir, String(mapId));
+  const ghostFile = () => path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith(".json.gz")));
+  const before = fs.readFileSync(ghostFile());
 
   const slower = JSON.stringify({
     version: "wsw 2.1",
     map: "ghostmap",
-    name: "Slowpoke",
-    time: 99000, // slower than the stored 12000
+    name: "Runner", // SAME player as the stored 12000 ghost — the guard is per (map, player)
+    login: "",
+    time: 99000, // slower than their stored 12000
     hz: 25,
     frames: [[1, 2, 3, 0, 0, 0, 0, 0, 0]],
   });
   assert.deepEqual((await ingest(slower, TOKEN, "/ingest/ghost")).json, { ok: true, stored: false });
-  const afterBuf = fs.readFileSync(path.join(ghostDir, `${mapId}.json.gz`));
-  assert.deepEqual(afterBuf, before, "file unchanged by the slower upload");
+  assert.deepEqual(fs.readFileSync(ghostFile()), before, "file unchanged by the slower same-player upload");
+});
+
+test("per-player: a different player's slower run is stored as their own PB", async () => {
+  const mapId = (await getJson("/maps?q=ghostmap")).rows[0].id;
+  const slower = JSON.stringify({
+    version: "wsw 2.1",
+    map: "ghostmap",
+    name: "Slowpoke",
+    login: "",
+    time: 99000, // slower than Runner's WR, but it's Slowpoke's own first run
+    hz: 25,
+    frames: [[1, 2, 3, 0, 0, 0, 0, 0, 0]],
+  });
+  assert.deepEqual((await ingest(slower, TOKEN, "/ingest/ghost")).json, { ok: true, stored: true });
+  // The map's WR replay is still Runner's faster ghost, not Slowpoke's.
+  const detail = await getJson(`/maps/${mapId}`);
+  assert.equal(detail.wr.ghost.time, 12000, "WR ghost stays the fastest recorded run");
 });
 
 test("invalid demo paths and ghosts are rejected", async () => {

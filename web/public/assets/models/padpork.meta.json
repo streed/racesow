@@ -1,0 +1,118 @@
+{
+  "model": "padpork",
+  "source": "tools/wsw-assets/models/players/padpork/tris.iqm (IQM v2)",
+  "axes": "native Quake (Z-up, X forward, Y left); viewer applies (x,y,z)->(x,z,-y)",
+  "diffuseTexture": "padpork_diff.png (grayscale fullbright diffuse; embedded in glb)",
+  "joints": 34,
+  "tag_weapon": {
+    "bone": "Bip01 R Hand",
+    "tag": "tag_weapon",
+    "offset": {
+      "forward": 6,
+      "right": 3,
+      "up": -1
+    },
+    "angles": {
+      "pitch": -14,
+      "yaw": -21,
+      "roll": -1
+    }
+  },
+  "animationClips": [
+    "idle",
+    "run",
+    "run_back",
+    "run_left",
+    "run_right",
+    "jump",
+    "walljump",
+    "dash",
+    "crouch",
+    "shoot"
+  ],
+  "clipDetails": [
+    {
+      "name": "idle",
+      "key": "LEGS_STAND_IDLE",
+      "frames": 41,
+      "fps": 30,
+      "duration": 1.367,
+      "channels": 26
+    },
+    {
+      "name": "run",
+      "key": "LEGS_RUN_FORWARD",
+      "frames": 17,
+      "fps": 30,
+      "duration": 0.567,
+      "channels": 35
+    },
+    {
+      "name": "run_back",
+      "key": "LEGS_RUN_BACK",
+      "frames": 17,
+      "fps": 30,
+      "duration": 0.567,
+      "channels": 35
+    },
+    {
+      "name": "run_left",
+      "key": "LEGS_RUN_LEFT",
+      "frames": 13,
+      "fps": 30,
+      "duration": 0.433,
+      "channels": 28
+    },
+    {
+      "name": "run_right",
+      "key": "LEGS_RUN_RIGHT",
+      "frames": 13,
+      "fps": 30,
+      "duration": 0.433,
+      "channels": 28
+    },
+    {
+      "name": "jump",
+      "key": "LEGS_JUMP_NEUTRAL",
+      "frames": 21,
+      "fps": 30,
+      "duration": 0.7,
+      "channels": 25
+    },
+    {
+      "name": "walljump",
+      "key": "LEGS_WALLJUMP",
+      "frames": 18,
+      "fps": 30,
+      "duration": 0.6,
+      "channels": 28
+    },
+    {
+      "name": "dash",
+      "key": "LEGS_DASH",
+      "frames": 16,
+      "fps": 30,
+      "duration": 0.533,
+      "channels": 34
+    },
+    {
+      "name": "crouch",
+      "key": "LEGS_CROUCH_WALK",
+      "frames": 25,
+      "fps": 30,
+      "duration": 0.833,
+      "channels": 36
+    },
+    {
+      "name": "shoot",
+      "key": "TORSO_SHOOT_LIGHTGUN",
+      "frames": 15,
+      "fps": 30,
+      "duration": 0.5,
+      "channels": 23
+    }
+  ],
+  "modelHeightUnits": 63.879,
+  "playerBBoxHeightUnits": 44,
+  "recommendedScale": 0.6888
+}

@@ -81,13 +81,9 @@ void RACE_GhostDespawn()
 {
     if ( raceGhostBotSlot >= 0 )
     {
-        int botEntNum = raceGhostBotSlot + 1;
-        for ( int i = 0; i < maxClients; i++ )
-        {
-            Client@ c = G_GetClient( i );
-            if ( c.state() >= CS_SPAWNED && c.chaseActive && c.chaseTarget == botEntNum )
-                c.chaseActive = false; // release a spectator chasing the ghost
-        }
+        // release a spectator chasing the ghost back to free-fly (clearing
+        // chaseActive alone freezes them at PM_FREEZE - see RACE_MirrorReleaseChasers)
+        RACE_MirrorReleaseChasers( raceGhostBotSlot, "" );
         RS_MirrorBotRemove( raceGhostBotSlot );
         raceGhostBotSlot = -1;
     }

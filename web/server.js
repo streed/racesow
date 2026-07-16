@@ -167,13 +167,17 @@ api.get("/maps/:id", cache(60), wrap(async (req, res) => {
   res.json(detail);
 }));
 
-// WR ghost trajectory for the in-browser replay viewer (gzipped JSON). Served
-// with Content-Encoding: gzip so the stored bytes go straight to the client.
+// Ghost trajectory for the in-browser replay viewer (gzipped JSON). Served with
+// Content-Encoding: gzip so the stored bytes go straight to the client.
+// ?player=<id> selects that player's PB ghost; omitted => the map's WR ghost.
 api.get("/maps/:id/ghost", wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid map id" });
-  const buf = await race.ghostGzip(id);
-  if (!buf) return res.status(404).json({ error: "no ghost for this map" });
+  const player = req.query.player != null ? asInt(req.query.player) : null;
+  if (req.query.player != null && player == null)
+    return res.status(400).json({ error: "invalid player id" });
+  const buf = await race.ghostGzip(id, player);
+  if (!buf) return res.status(404).json({ error: "no ghost for this map/player" });
   res.set("Content-Type", "application/json; charset=utf-8");
   res.set("Content-Encoding", "gzip");
   res.set("Cache-Control", "public, max-age=300");
@@ -430,8 +434,9 @@ api.post(
       return res.status(400).json({ error: "version and map are required" });
     }
 
-    // WR demo metadata (Phase 1): a pointer to a .wd file the game host serves.
-    // Does not touch the leaderboard — just records where the record's demo is.
+    // Player demo metadata: a pointer to a .wd file the game host serves, one
+    // per (player, map). Does not touch the leaderboard — just records where the
+    // player's PB demo is. (Wire key stays "wr_demo" for game-module compat.)
     if (body.source === "wr_demo" || body.wr_demo) {
       const d = body.wr_demo || {};
       const time = Number(d.time);
@@ -439,7 +444,7 @@ api.post(
         return res.status(400).json({ error: "invalid wr_demo record" });
       if (!validDemoPath(d.demo)) return res.status(400).json({ error: "invalid demo path" });
       try {
-        await race.upsertWrDemo({
+        await race.upsertPlayerDemo({
           version: body.version.slice(0, MAX_VERSION_LEN),
           map: body.map.slice(0, MAX_MAP_LEN).toLowerCase(),
           name: d.name.slice(0, MAX_NAME_LEN),
@@ -521,7 +526,7 @@ api.post(
     const g = sanitizeGhost(body);
     if (!g) return res.status(400).json({ error: "invalid ghost" });
     try {
-      const stored = await race.upsertGhost({
+      const stored = await race.upsertPlayerGhost({
         version: body.version.slice(0, MAX_VERSION_LEN),
         map: body.map.slice(0, MAX_MAP_LEN).toLowerCase(),
         name: g.name,
@@ -825,8 +830,23 @@ function defaultShell(req) {
 
 app.get("/", (req, res) => sendShell(res, defaultShell(req)));
 
-// Static frontend.
-app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
+// Static frontend. The 3D replay model/vendor assets are large and stable, so
+// give them a long browser cache (repeat replay views load the pig instantly);
+// everything else keeps express.static's default (fingerprinted JS/CSS carry a
+// ?v= hash, so the shell always requests the current URL).
+app.use(
+  express.static(path.join(__dirname, "public"), {
+    extensions: ["html"],
+    setHeaders: (res, filePath) => {
+      // Large, stable 3D assets: rigged models, vendored three.js, and the
+      // converted map meshes. Long browser cache so repeat/SPA replay views
+      // load them instantly instead of re-fetching from the origin.
+      if (/[\\/](assets[\\/](models|vendor)|maps)[\\/]/.test(filePath)) {
+        res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+      }
+    },
+  })
+);
 
 // SPA fallback for client-side routes (non-API, non-asset).
 app.get("*", (req, res, next) => {
