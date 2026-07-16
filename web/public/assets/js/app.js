@@ -1,6 +1,19 @@
 /* Racesow stats — vanilla-JS single-page app over the /api backend. */
 "use strict";
 
+// Content hash of replay.js, appended to THIS script's src as ?rv= by the shell
+// (server.js). replay.js is dynamically imported from a constant URL, so we use
+// this to cache-bust the import when replay.js changes. document.currentScript
+// is only valid during this synchronous top-level execution — capture it now.
+const REPLAY_V = (() => {
+  try {
+    const src = document.currentScript && document.currentScript.src;
+    return new URLSearchParams((src && src.split("?")[1]) || "").get("rv") || "";
+  } catch (e) {
+    return "";
+  }
+})();
+
 const app = document.getElementById("app");
 
 /* ----------------------------- helpers ----------------------------------- */
@@ -478,7 +491,7 @@ async function viewReplay(id) {
     <div id="replay-root" class="replay-root"></div>`;
   const root = document.getElementById("replay-root");
   try {
-    const mod = await import("/assets/js/replay.js");
+    const mod = await import("/assets/js/replay.js" + (REPLAY_V ? "?v=" + REPLAY_V : ""));
     disposeReplay = await mod.mountReplay(root, { mapId: id, mapName: d.name, wr });
   } catch (e) {
     root.innerHTML = `<div class="empty">Replay failed to load<br><small>${esc(e.message || e)}</small></div>`;

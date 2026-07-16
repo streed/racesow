@@ -572,7 +572,14 @@ function assetVersion(rel) {
   }
 }
 const INDEX_HTML = readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
-  .replace("/assets/js/app.js", `/assets/js/app.js?v=${assetVersion("assets/js/app.js")}`)
+  // app.js carries its own hash AND replay.js's (as ?rv=): app.js dynamically
+  // imports replay.js from a constant URL, so without this a browser holding an
+  // old replay.js never refetches it on a replay-only change. app.js reads the
+  // rv param off its own <script src> and appends it to the import.
+  .replace(
+    "/assets/js/app.js",
+    `/assets/js/app.js?v=${assetVersion("assets/js/app.js")}&rv=${assetVersion("assets/js/replay.js")}`
+  )
   .replace("/assets/css/style.css", `/assets/css/style.css?v=${assetVersion("assets/css/style.css")}`);
 
 // Send the SPA shell HTML with no-cache so browsers ALWAYS revalidate it (and
