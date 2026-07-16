@@ -739,22 +739,44 @@ class RaceDB {
         splits,
       };
 
-      // Downloadable .wd demo + in-browser ghost, if captured for THIS record.
-      // Both tables are top-1-per-map; a replay whose time no longer equals the
-      // current WR is stale (a faster run without a replay superseded it) and is
-      // hidden until the new record's replay lands.
-      const demo = await this.one("SELECT time, demo_path, bytes FROM wr_demo WHERE map_id = $1", [id]);
-      if (demo && demo.time === idx.wr_time) {
+      // Best-captured replay for this map. Both tables hold one row per map —
+      // the fastest run we've recorded a demo/ghost for (faster-only upsert).
+      // That run may pre-date or lag the absolute WR (e.g. the #1 was set before
+      // the replay feature, or on a server that didn't capture it). Surface it
+      // anyway — a replay of the fastest recorded run beats no replay — carrying
+      // its OWN time/holder, with isWr telling the UI whether it's the outright
+      // record so it can label a slower replay honestly.
+      const demo = await this.one(
+        `SELECT d.time, d.demo_path, d.bytes, p.name AS holder, p.simplified AS holder_s
+         FROM wr_demo d JOIN player p ON p.id = d.player_id WHERE d.map_id = $1`,
+        [id]
+      );
+      if (demo) {
         wr.demo = {
           url: DEMO_BASE_URL ? `${DEMO_BASE_URL}/demos/${demo.demo_path}` : null,
           path: demo.demo_path,
           bytes: num(demo.bytes),
           time: demo.time,
+          holder: demo.holder,
+          holderSimplified: demo.holder_s,
+          isWr: demo.time === idx.wr_time,
         };
       }
-      const g = await this.one("SELECT time, hz, frames FROM ghost WHERE map_id = $1", [id]);
-      if (g && g.time === idx.wr_time) {
-        wr.ghost = { url: `/api/maps/${num(map.id)}/ghost`, hz: g.hz, frames: g.frames, time: g.time };
+      const g = await this.one(
+        `SELECT g.time, g.hz, g.frames, p.name AS holder, p.simplified AS holder_s
+         FROM ghost g JOIN player p ON p.id = g.player_id WHERE g.map_id = $1`,
+        [id]
+      );
+      if (g) {
+        wr.ghost = {
+          url: `/api/maps/${num(map.id)}/ghost`,
+          hz: g.hz,
+          frames: g.frames,
+          time: g.time,
+          holder: g.holder,
+          holderSimplified: g.holder_s,
+          isWr: g.time === idx.wr_time,
+        };
       }
     }
 

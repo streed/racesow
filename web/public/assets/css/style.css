@@ -438,3 +438,10 @@ tr:hover td.mapname .extlink { color: var(--cyan); }
 .rv-key.rv-wide { min-width: 60px; }
 .rv-key.on { color: #0a0b0f; background: var(--orange);
   border-color: var(--orange); box-shadow: 0 0 12px rgba(255,106,26,.55); }
+
+/* inline "watch this run" link on the leaderboard row that has a replay */
+.replay-badge { display: inline-block; margin-left: 8px; font-family: var(--cond);
+  text-transform: uppercase; letter-spacing: .5px; font-size: 11px; font-weight: 600;
+  color: var(--gold); border: 1px solid rgba(255,210,74,.4); border-radius: 5px;
+  padding: 1px 6px; cursor: pointer; background: rgba(255,210,74,.08); }
+.replay-badge:hover { color: #0a0b0f; background: var(--gold); border-color: var(--gold); }

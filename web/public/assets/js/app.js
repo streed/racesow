@@ -410,7 +410,7 @@ async function viewMap(id) {
         ${splitsHtml}
         ${wr.ghost || (wr.demo && wr.demo.url) ? `
         <div class="replay-actions">
-          ${wr.ghost ? `<button class="btn replay-watch" data-nav="#/replay/${id}">▶ Watch in browser</button>` : ""}
+          ${wr.ghost ? `<button class="btn replay-watch" data-nav="#/replay/${id}">▶ Watch replay${wr.ghost.isWr ? "" : " (" + fmtTime(wr.ghost.time) + ")"}</button>` : ""}
           ${wr.demo && wr.demo.url ? `<a class="btn replay-demo" href="${esc(wr.demo.url)}" download rel="noopener">⬇ Download demo</a>` : ""}
         </div>
         ${wr.demo && wr.demo.url ? `<details class="demo-help"><summary>How to watch the demo in Warsow</summary>
@@ -431,7 +431,7 @@ async function viewMap(id) {
           ${d.leaderboard.map((r, i) => `
             <tr class="clickable" data-nav="#/player/${r.playerId}">
               <td class="rankcell ${rankClass(r.pos)}">${r.pos}</td>
-              <td>${wname(r.name)}</td>
+              <td>${wname(r.name)}${wr && wr.ghost && r.time === wr.ghost.time ? ` <span class="replay-badge" data-nav="#/replay/${id}" title="Watch this run in the browser">▶ replay</span>` : ""}</td>
               <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
               <td class="num"><span class="time">${r.pos === 1 ? "—" : "+" + fmtTime(r.time - d.leaderboard[0].time)}</span></td>
               <td class="num"><span class="time muted">${i === 0 ? "—" : "+" + fmtTime(r.time - d.leaderboard[i - 1].time)}</span></td>
@@ -463,11 +463,15 @@ async function viewReplay(id) {
       <div class="empty">No in-browser replay for this map yet.<br><small>A ghost is captured the next time a world record is set here.</small></div>`;
     return;
   }
+  const g = wr.ghost;
   app.innerHTML = `
     <div class="crumbs"><a data-nav="#/maps">Maps</a> / <a data-nav="#/map/${id}">${esc(d.name)}</a> / Replay</div>
     <div class="replay-head">
-      <div class="page-title" style="font-size:24px">${esc(d.name)} <span class="accent">·</span> WR Replay</div>
-      <div class="replay-sub">by ${wname(wr.name)} <span class="pill wr">WR</span> <span class="time">${fmtTime(wr.time)}</span>
+      <div class="page-title" style="font-size:24px">${esc(d.name)} <span class="accent">·</span> Replay</div>
+      <div class="replay-sub">by ${wname(g.holder || wr.name)}
+        <span class="pill ${g.isWr ? "wr" : "v1"}">${g.isWr ? "WORLD RECORD" : "fastest replay"}</span>
+        <span class="time">${fmtTime(g.time)}</span>
+        ${!g.isWr ? `<span class="muted">· map WR is ${fmtTime(wr.time)}, no replay captured for it yet</span>` : ""}
         ${wr.demo && wr.demo.url ? `<a class="btn replay-demo" href="${esc(wr.demo.url)}" download rel="noopener">⬇ Download demo</a>` : ""}
       </div>
     </div>

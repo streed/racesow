@@ -7,8 +7,8 @@ const float POSITION_HEIGHT = 24;
 // viewer + the in-game WR ghost racer (hrace/ghostbot.as). Separate from the
 // 2 Hz recall buffer above, which skips airborne/solid-ground samples and is
 // far too coarse for smooth playback.
-const int MAX_GHOST_FRAMES = 3000; // ~2 min at 25 Hz
-const int GHOST_INTERVAL = 40;     // ms of RACE time between samples (~25 Hz)
+const int MAX_GHOST_FRAMES = 9000; // ~3 min at 50 Hz
+const int GHOST_INTERVAL = 20;     // ms of RACE time between samples (~50 Hz, smoother playback)
 
 const int RECALL_ACTION_TIME = 200;
 const int RECALL_ACTION_JUMP = 5;
@@ -922,13 +922,15 @@ class Player
 
             if ( pos == 0 )
             {
-                String str = this.client.name + S_COLOR_YELLOW + " set a new " + SERVER_NAME + S_COLOR_YELLOW + " record: " + S_COLOR_GREEN + RACE_TimeToString( finishTime );
-                if ( levelRecords[ 1 ].isFinished() )
-                    str += " " + S_COLOR_YELLOW + "[-" + RACE_TimeToString( levelRecords[ 1 ].getFinishTime() - finishTime ) + "]";
-                G_PrintMsg( null, str + "\n" );
+                // #1 in the LOCAL top scores — but the local list can be stale
+                // (or empty at map start), so a personal best would false-
+                // announce. Verify against a fresh API pull before announcing
+                // (apitop.as). The demo/ghost uploads below stay on the local
+                // check: the web validates them (faster-only guard) and hides a
+                // replay whose time isn't the current WR, so a false local #1
+                // can't surface a wrong replay.
+                RACE_QueueRecordAnnounce( this.client.name, finishTime );
 
-                // New world record: point the web at the downloadable demo and
-                // upload the ghost trajectory (browser viewer + in-game racer).
                 if ( rsRecordDemos.boolean )
                     RACE_ReportWrDemo( this, finishTime );
                 RACE_UploadWrGhost( this, finishTime );

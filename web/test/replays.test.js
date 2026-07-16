@@ -211,18 +211,20 @@ test("invalid demo paths and ghosts are rejected", async () => {
   assert.equal((await ingest(badGhost, TOKEN, "/ingest/ghost")).status, 400);
 });
 
-test("a faster record without a replay hides the stale demo/ghost", async () => {
-  // A brand-new, faster WR by someone else, with NO demo/ghost uploaded.
+test("a faster record without a replay still surfaces the best captured replay (isWr=false)", async () => {
+  // A brand-new, faster WR by someone else, with NO demo/ghost uploaded — the
+  // 12000 run's replay is the best we have, so it's still shown, flagged as
+  // not the outright record ("use the latest fastest time to make the replay").
   assert.equal((await ingest(finishBody({ map: "ghostmap", name: "Faster", time: 11000, cps: [4500, 8000] }))).status, 200);
   await new Promise((r) => setTimeout(r, 3600)); // aggregate refresh
 
   const detail = await getJson(`/maps/${(await getJson("/maps?q=ghostmap")).rows[0].id}`);
   assert.equal(detail.wr.time, 11000, "WR is now the faster run");
-  assert.equal(detail.wr.demo, undefined, "stale demo hidden (time mismatch)");
-  assert.equal(detail.wr.ghost, undefined, "stale ghost hidden (time mismatch)");
-
-  // The raw ghost bytes still exist (kept for when a matching WR returns) but
-  // are not advertised on the map.
-  const gr = await fetch(`${base}/api/maps/${detail.id}/ghost`);
-  assert.equal(gr.status, 200);
+  // Replay still surfaced, carrying its OWN time + holder, flagged not-the-WR.
+  assert.ok(detail.wr.ghost, "ghost still surfaced");
+  assert.equal(detail.wr.ghost.isWr, false, "ghost flagged as not the WR");
+  assert.equal(detail.wr.ghost.time, 12000, "ghost carries its own time");
+  assert.equal(detail.wr.ghost.holder, "Runner");
+  assert.ok(detail.wr.demo, "demo still surfaced");
+  assert.equal(detail.wr.demo.isWr, false);
 });
