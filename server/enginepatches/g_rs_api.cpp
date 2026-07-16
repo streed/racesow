@@ -601,6 +601,46 @@ void RS_ApiReportAttempts( const char *url, const char *token, const char *versi
 }
 
 /*
+ * RS_ApiFlag
+ *
+ * Queue an in-game "/flag": <player> flags <mapname> for review, POSTed to
+ * <url> (the central /api/game/flag). <reason> is one of the API's flag reasons
+ * (broken/offensive/wrong_name/duplicate/other); an unknown or empty reason is
+ * accepted by the API and coerced to "other". Fire-and-forget, same posture as
+ * the finish/attempt reports. No-op when url or mapname is empty.
+ */
+void RS_ApiFlag( const char *url, const char *token, const char *mapname,
+	const char *reason, const char *player, const char *login )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] )
+		return;
+
+	std::string body;
+	body.reserve( 192 );
+	body += "{\"map\":\"";
+	jsonEscapeInto( body, mapname );
+	body += "\",\"reason\":\"";
+	jsonEscapeInto( body, reason ? reason : "" );
+	body += "\",\"player\":\"";
+	jsonEscapeInto( body, player ? player : "" );
+	body += "\",\"login\":\"";
+	jsonEscapeInto( body, login ? login : "" );
+	body += "\"}";
+
+	ApiState *s = ensureStarted();
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+			s->queue.pop_front();
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
+			REQ_POST_REPORT, "", 0 } );
+	}
+	s->cv.notify_one();
+}
+
+/*
  * RS_ApiFetchTop
  *
  * Fetch the map's live top scores from <url> (the central

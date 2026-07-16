@@ -1,0 +1,21 @@
+# Daily 05:00 restart of the game server (see racesow-restart.service). The
+# timezone is pinned in the OnCalendar spec (__RESTART_TZ__, substituted by
+# systemd/install.sh — Europe/Berlin on the EU full box, America/New_York on the
+# US agent) so "5am" means 5am LOCAL regardless of the box's system clock. Each
+# box therefore restarts at 5am its OWN time (different UTC instants), so the
+# EU<->US mesh is never down on both ends at once. Persistent catches up a run
+# missed while the box was off; no RandomizedDelay — 5am local is already
+# off-peak.
+#
+# Requires systemd >= v252 for the timezone suffix (Ubuntu 26.04 ships far
+# newer); install.sh runs `systemd-analyze verify` which flags an unparseable
+# OnCalendar before anything is enabled.
+[Unit]
+Description=Daily 5am local restart of the Racesow game server
+
+[Timer]
+OnCalendar=*-*-* 05:00:00 __RESTART_TZ__
+Persistent=true
+
+[Install]
+WantedBy=timers.target

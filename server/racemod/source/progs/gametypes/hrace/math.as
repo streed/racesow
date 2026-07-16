@@ -42,6 +42,24 @@ Position Lerp( Position a, float t, Position b )
     return p;
 }
 
+// Cubic Hermite interpolation of a position between two captured keyframes,
+// using the per-frame recorded velocities as tangents. Unlike a straight Lerp
+// (which chords across the interior of a curve), this hugs the actual strafe
+// arc, because the endpoints' velocities bend the path the way the runner moved.
+// p0/p1 are the keyframe origins, v0/v1 the keyframe velocities (units/sec),
+// t in [0,1] the fraction between them, dtSec the keyframe interval in seconds
+// (so v*dtSec is the tangent expressed in the same units as the positions).
+Vec3 HermitePos( Vec3 p0, Vec3 v0, Vec3 p1, Vec3 v1, float t, float dtSec )
+{
+    float t2 = t * t;
+    float t3 = t2 * t;
+    float h00 = 2.0f * t3 - 3.0f * t2 + 1.0f;
+    float h10 = t3 - 2.0f * t2 + t;
+    float h01 = -2.0f * t3 + 3.0f * t2;
+    float h11 = t3 - t2;
+    return p0 * h00 + ( v0 * dtSec ) * h10 + p1 * h01 + ( v1 * dtSec ) * h11;
+}
+
 Vec3 HorizontalVelocity( Vec3 vel )
 {
     vel.z = 0;

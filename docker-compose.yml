@@ -122,6 +122,10 @@ services:
       # across web image rebuilds and are shared by both replicas (the row is in
       # Postgres; the gzipped bytes live here).
       GHOST_DIR: "/data/ghosts"
+      # Directory the db-backup sidecar publishes the weekly public backup into
+      # (served at /backup/racesow-db-latest.zip). It lives under the ./data
+      # mount below, so no extra volume is needed.
+      BACKUP_DIR: "/data/backups"
     volumes:
       # Legacy SQLite location — only read by migrate-sqlite-to-pg.js now; also
       # holds the WR ghost files (GHOST_DIR=/data/ghosts above), shared by both
@@ -137,6 +141,29 @@ services:
       timeout: 4s
       retries: 3
       start_period: 20s
+
+  # Weekly public database backup (see backup/README.md). A self-scheduling
+  # sidecar — no host cron — that dumps the RACE RECORDS (stripped of admin
+  # accounts, ingest tokens, and server IPs) into ./data/backups as a zip the
+  # web service serves at /backup/racesow-db-latest.zip. Built on postgres:16 so
+  # pg_dump matches the server version exactly.
+  db-backup:
+    build: ./backup
+    image: racesow-db-backup:latest
+    container_name: racesow-db-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://racesow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/racesow"
+      OUT_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: "604800"   # weekly
+      BACKUP_KEEP: "8"                     # ~2 months of dated archives
+    volumes:
+      # Same host dir the web service sees at /data/backups (./data:/data),
+      # so the published zip is downloadable without an extra web mount.
+      - ./data/backups:/backups
 
   discord:
     build: ./discord

@@ -58,6 +58,9 @@ services:
       INGEST_URL: "${INGEST_URL:-}"
       INGEST_TOKEN: "${INGEST_TOKEN:-}"
       VERSION_NAME: "${VERSION_NAME:-wsw 2.1}"
+      # Ship the game console to the stats site's admin log view (needs
+      # INGEST_URL + INGEST_TOKEN). Set LOG_SHIP=0 to disable.
+      LOG_SHIP: "${LOG_SHIP:-1}"
       # Cross-server player mirroring (UDP mesh): peered servers exchange
       # live player positions, chat and join/leave events, so players on one
       # server see the others as ghosts and can chat across servers. Set all

@@ -40,7 +40,10 @@ Everything is driven by environment variables (see `docker-compose.yml`):
 | `SV_PORT`       | `44400`                       | UDP port (also map the container port to match) |
 | `G_GAMETYPE`    | `hrace`                       | Gametype to load                                |
 | `MAP_ROTATION`  | `2`                           | `0` none, `1` sequential, `2` random            |
-| `RCON_PASSWORD` | *(empty)*                     | Enables remote console when set                 |
+| `RCON_PASSWORD` | *(empty)*                     | Enables remote console when set. Register it on the stats site (`node admin.js rcon <id> <pw>`) to drive the admin panel's broadcast / maintenance / console |
+| `LOG_SHIP`      | `1`                           | Ship the game console to the stats site's admin log view (needs `INGEST_URL`+`INGEST_TOKEN`); `0` disables |
+| `LOG_FLUSH_SECS`| `5`                           | Max seconds a console line waits before it is POSTed |
+| `LOG_BATCH_LINES`| `100`                        | POST early once this many console lines have queued |
 | `SV_UPLOADS_BASEURL` | *(empty)*                | HTTP pak mirror for client downloads (see below)|
 | `MIRROR_PEERS`  | *(empty)*                     | Space-separated `host:port` mesh peers (see below); empty = mirroring off |
 | `MIRROR_TAG`    | *(empty)*                     | Short id (≤16 chars) shown as `[TAG]` in mirrored chat |
@@ -211,8 +214,20 @@ In-game, players use **`/who`** to list every peer's roster and
 - **Ghosts only render when two servers are on the same map**; chat, join/leave
   notices, and `/who` work regardless of map. When maps differ you still see
   `[US] name: msg` chat and the roster, just no in-world ghost.
+- **The WR ghost racer stays in sync across the mesh.** The in-game world-record
+  ghost is the canonical `MIN(time)` recording served by the stats site
+  (`/api/game/ghost`), so every server that feeds the same site already plays the
+  same record. When peers are meshed and on the same map, a new WR set on one
+  server is picked up by the others within seconds — the peer's finish time
+  (already synced over the mesh) triggers an immediate re-pull of the fresh
+  canonical ghost, which hot-swaps in place. Without a mesh, a periodic re-poll
+  still converges every server to the current WR within ~a minute. This needs the
+  stats feed (`INGEST_URL`); a mesh with no shared site has no WR ghost to share.
 - **Tuning cvars** (rarely needed, set via `EXTRA_ARGS`): `rs_mirror_maxghosts`
-  (default 32) caps ghost entities; `rs_mirror_debug` toggles verbose logging.
+  (default 32) caps ghost entities; `rs_mirror_debug` toggles verbose logging;
+  `rs_wr_ghost_mesh_sync` (default 1) toggles the cross-server WR-ghost re-pull;
+  `rs_wr_ghost_smooth` (default 0.35) tunes ghost-playback easing — lower is
+  smoother/laggier, higher snappier, `0` disables easing (raw interpolation).
 
 ### Security posture
 

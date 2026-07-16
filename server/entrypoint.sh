@@ -23,6 +23,11 @@ SV_UPLOADS_BASEURL="${SV_UPLOADS_BASEURL:-}"  # client-reachable HTTP pak mirror
 INGEST_URL="${INGEST_URL:-}"                # central stats /api/ingest; empty = no direct reporting
 INGEST_TOKEN="${INGEST_TOKEN:-}"            # per-server bearer token for the ingest endpoint
 VERSION_NAME="${VERSION_NAME:-wsw 2.1}"     # game version records file under on the stats site
+# Console log shipping: tee the engine's stdout to the stats site's admin log
+# view (POST /api/ingest/log). Needs INGEST_URL + INGEST_TOKEN; LOG_SHIP=0 off.
+LOG_SHIP="${LOG_SHIP:-1}"                    # 1 = ship console logs, 0 = disable
+LOG_FLUSH_SECS="${LOG_FLUSH_SECS:-5}"       # max seconds a line waits before it is POSTed
+LOG_BATCH_LINES="${LOG_BATCH_LINES:-100}"   # or POST early once this many lines have queued
 # Cross-server player mirroring (UDP mesh between peered race servers).
 MIRROR_PEERS="${MIRROR_PEERS:-}"            # "hostB:44450 hostC:44450"; empty = mirroring off
 MIRROR_SECRET="${MIRROR_SECRET:-}"          # shared HMAC key (hex recommended: openssl rand -hex 24);
@@ -102,6 +107,23 @@ INSTALLED="$(for dir in "${WARSOW_DIR}/basewsw" "${WARSOW_DIR}/${FS_GAME}"; do
             [ -e "${pk}" ] && unzip -Z1 "${pk}" 2>/dev/null
         done
     done | sed -n 's#^maps/\([^/]*\)\.bsp$#\1#p' | sort -u)"
+
+# --- Drop maps a moderator has blocked (central API) -------------------------
+# GET /api/game/blocked-maps returns one lowercased map name per line. Removing
+# them from INSTALLED here excludes them from BOTH the curated mappool and the
+# fallback below — i.e. from the vote pool and the map cycle. Fail-safe: any
+# fetch error (API down, no INGEST_URL) blocks nothing, so a network blip can
+# never empty the rotation.
+if [ -n "${INGEST_URL}" ]; then
+    BLOCKED="$(curl -fsS --max-time 5 "${INGEST_URL%/api/ingest}/api/game/blocked-maps" 2>/dev/null \
+        | tr -d '\r' | grep -vE '^\s*(//|$)' | awk '{print tolower($1)}' || true)"
+    if [ -n "${BLOCKED}" ]; then
+        before=$(echo "${INSTALLED}" | grep -c . || true)
+        INSTALLED="$(echo "${INSTALLED}" | grep -vxiF "${BLOCKED}" || true)"
+        after=$(echo "${INSTALLED}" | grep -c . || true)
+        echo ">> blocked maps excluded from rotation: $((before - after)) (blocklist had $(echo "${BLOCKED}" | grep -c .))"
+    fi
+fi
 
 # --- Build the map list from mappool.txt ------------------------------------
 # One map name per line; blank lines and '#' comments ignored. Only keep maps
@@ -276,6 +298,8 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # ghost racer's fetch (hrace/demos.as + hrace/ghostbot.as). Same host.
         echo "set rs_api_ghost_url \"${INGEST_URL%/api/ingest}/api/ingest/ghost\""
         echo "set rs_wr_ghost_url \"${INGEST_URL%/api/ingest}/api/game/ghost\""
+        # In-game /flag command target (hrace/commands.as Cmd_Flag). Same host.
+        echo "set rs_api_flag_url \"${INGEST_URL%/api/ingest}/api/game/flag\""
     fi
     # Cross-server player mirroring: the gametype reads these and drives the
     # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.
@@ -301,6 +325,82 @@ set -- \
 [ -n "${EXTRA_ARGS}" ] && set -- "$@" ${EXTRA_ARGS}
 set -- "$@" +map "${FIRST_MAP}"
 
+# --- Console log shipping (optional) ----------------------------------------
+# When enabled, the engine's stdout/stderr is redirected into a FIFO that a
+# background drainer echoes back to OUR stdout (so `docker logs` is unchanged)
+# and batches to POST /api/ingest/log. The engine still launches as its own PID
+# ($server_pid via a plain `>` redirect, NOT a pipeline), so the TERM trap +
+# restart-loop `wait` keep targeting the engine directly.
+#
+# SAFETY: log shipping must never be able to stall or wedge the game server.
+# Two properties guarantee that:
+#  1. The parent holds the FIFO open read-write on fd 9 for the whole container
+#     lifetime (O_RDWR on a FIFO never blocks on Linux). So a reader is ALWAYS
+#     present — the engine's `> FIFO` open never blocks and its writes never get
+#     EPIPE, even if the drainer momentarily isn't running — and a writer is
+#     always present, so the drainer never sees EOF between engine restarts.
+#  2. The HTTP POST is detached (backgrounded), so a slow/hung ingest endpoint
+#     can never back-pressure the read loop and fill the pipe behind the engine.
+# The drainer is also supervised (respawned) so draining always resumes.
+LOG_INGEST_URL=""
+CONSOLE_FIFO=""
+SHIPPER_PID=""
+HEARTBEAT_PID=""
+# US = 0x1f: a control-char sentinel the heartbeat injects to force a periodic
+# flush (portable time-based flush without dash-unsupported `read -t`).
+SENTINEL="$(printf '\037')"
+_ship_buf=""
+_ship_n=0
+_ship_flush() {
+    [ "${_ship_n}" -gt 0 ] || return 0
+    # Detach the POST so the read loop keeps draining the FIFO while curl runs
+    # (a synchronous curl could fill the pipe and stall the engine). curl bounds
+    # itself with --max-time; failures are ignored (best-effort logs).
+    printf '%s' "${_ship_buf}" | (
+        curl -fsS --max-time 6 -X POST \
+            -H "Authorization: Bearer ${INGEST_TOKEN}" \
+            -H "Content-Type: text/plain" \
+            --data-binary @- "${LOG_INGEST_URL}" >/dev/null 2>&1 || true
+    ) &
+    _ship_buf=""
+    _ship_n=0
+}
+log_shipper() {
+    while IFS= read -r _line; do
+        if [ "${_line}" = "${SENTINEL}" ]; then
+            _ship_flush
+            continue
+        fi
+        printf '%s\n' "${_line}"            # keep docker logs intact
+        _ship_buf="${_ship_buf}${_line}
+"
+        _ship_n=$((_ship_n + 1))
+        [ "${_ship_n}" -ge "${LOG_BATCH_LINES}" ] && _ship_flush
+    done
+    _ship_flush                              # drain if the read fd ever closes
+}
+
+if [ "${LOG_SHIP}" != "0" ] && [ -n "${INGEST_URL}" ] && [ -n "${INGEST_TOKEN}" ]; then
+    LOG_INGEST_URL="${INGEST_URL%/api/ingest}/api/ingest/log"
+    CONSOLE_FIFO="$(mktemp -u "${TMPDIR:-/tmp}/wsw-console.XXXXXX")"
+    if mkfifo "${CONSOLE_FIFO}" 2>/dev/null; then
+        echo ">> shipping console logs to ${LOG_INGEST_URL}"
+        # Hold BOTH ends open for the whole lifetime (see SAFETY above).
+        exec 9<> "${CONSOLE_FIFO}"
+        # Supervised drainer: reads via the inherited fd 9, respawned if it ever
+        # dies so draining (and thus the engine's back-pressure relief) resumes.
+        ( while true; do log_shipper <&9; sleep 1; done ) &
+        SHIPPER_PID=$!
+        # Periodic flush: inject the sentinel every LOG_FLUSH_SECS so a quiet
+        # server still ships its last lines promptly.
+        ( while true; do sleep "${LOG_FLUSH_SECS}"; printf '%s\n' "${SENTINEL}" >&9 2>/dev/null || exit 0; done ) &
+        HEARTBEAT_PID=$!
+    else
+        echo ">> WARNING: could not create console FIFO; log shipping disabled" >&2
+        CONSOLE_FIFO=""
+    fi
+fi
+
 # --- Restart loop -----------------------------------------------------------
 # The engine runs as a background child with its PID recorded so the TERM
 # trap can FORWARD the signal: this script is PID 1, and without forwarding,
@@ -314,6 +414,14 @@ shutdown() {
         kill -TERM "${server_pid}" 2>/dev/null || true
         wait "${server_pid}" 2>/dev/null || true
     fi
+    # Stop log shipping WITHOUT blocking the container's stop grace: just kill
+    # the heartbeat + drainer and exit. Any in-flight POST is a detached curl
+    # bounded by --max-time; the last partial batch may be dropped (best-effort
+    # logs). We deliberately do NOT `wait` here — the heartbeat's `sleep`
+    # grandchild keeps a copy of fd 9, so waiting for the drainer to reach EOF
+    # could hang up to LOG_FLUSH_SECS and blow past the 10s stop grace.
+    [ -n "${HEARTBEAT_PID}" ] && kill "${HEARTBEAT_PID}" 2>/dev/null || true
+    [ -n "${SHIPPER_PID}" ] && kill "${SHIPPER_PID}" 2>/dev/null || true
     exit 0
 }
 trap shutdown INT TERM
@@ -323,7 +431,13 @@ while true; do
     # Force line-buffered stdout/stderr. In a detached container the engine's
     # stdout is a pipe, so glibc block-buffers it and `docker logs` looks frozen
     # mid-startup. stdbuf keeps output flowing even if no TTY is allocated.
-    stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" &
+    # With shipping on, redirect stdout+stderr into the FIFO (a plain `>` so $!
+    # is still the engine); the background shipper echoes it back to docker logs.
+    if [ -n "${CONSOLE_FIFO}" ]; then
+        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" > "${CONSOLE_FIFO}" 2>&1 &
+    else
+        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" &
+    fi
     server_pid=$!
     wait "${server_pid}" || true
     server_pid=""

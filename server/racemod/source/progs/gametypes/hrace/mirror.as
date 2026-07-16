@@ -138,6 +138,28 @@ MirrorPlayer@ RACE_MirrorFind( const String &in server, const String &in name )
     return null;
 }
 
+// Fastest finish time (ms) any peer is currently advertising for OUR map, or 0
+// if none. Reads the per-player 'score' already synced over the mesh (see
+// RACE_MirrorSyncRoster) — no new wire traffic. Cross-map peer rows are ignored
+// (their score is a time on a DIFFERENT map); the C side already purges rows for
+// peers that change map, and we further gate on rp.map == mirrorLocalMap so a
+// peer mid-map-transition can't leak a foreign time. This is the freshness
+// signal the in-game WR ghost racer (ghostbot.as) uses to know a better WR may
+// exist and re-pull the canonical ghost from the web store.
+int RACE_MeshBestFinishForLocalMap()
+{
+    int best = 0;
+    for ( uint i = 0; i < mirrorPlayers.length(); i++ )
+    {
+        MirrorPlayer@ rp = mirrorPlayers[i];
+        if ( rp.map != mirrorLocalMap || rp.score <= 0 )
+            continue;
+        if ( best == 0 || rp.score < best )
+            best = rp.score;
+    }
+    return best;
+}
+
 ///*****************************************************************
 /// Lifecycle (called from hrace.as)
 ///*****************************************************************

@@ -68,6 +68,37 @@ export function sha256(s) {
   return crypto.createHash("sha256").update(String(s)).digest("hex");
 }
 
+// Valid map-flag reasons. Single source of truth: the HTTP endpoint, the admin
+// CLI and the server-rendered admin page all validate against this list.
+export const FLAG_REASONS = ["broken", "offensive", "wrong_name", "duplicate", "other"];
+
+// Password hashing for admin accounts — scrypt from node:crypto, so there is no
+// bcrypt/argon dependency (this codebase stays dep-light). Stored format is
+// "scrypt$<saltHex>$<hashHex>". scryptSync is intentional: admin logins are
+// rare and the deliberate CPU cost is the whole point of a KDF.
+const SCRYPT_KEYLEN = 64;
+export function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const dk = crypto.scryptSync(String(password), salt, SCRYPT_KEYLEN);
+  return `scrypt$${salt.toString("hex")}$${dk.toString("hex")}`;
+}
+export function verifyPassword(password, stored) {
+  if (typeof stored !== "string") return false;
+  const [scheme, saltHex, hashHex] = stored.split("$");
+  if (scheme !== "scrypt" || !saltHex || !hashHex) return false;
+  const salt = Buffer.from(saltHex, "hex");
+  const expected = Buffer.from(hashHex, "hex");
+  if (!salt.length || !expected.length) return false;
+  let dk;
+  try {
+    dk = crypto.scryptSync(String(password), salt, expected.length);
+  } catch {
+    return false;
+  }
+  // Constant-time compare (both buffers are the same length by construction).
+  return dk.length === expected.length && crypto.timingSafeEqual(dk, expected);
+}
+
 // Warsow ^0-^9 colour codes -> plain text, mirroring the livesow columns:
 // `simplified` keeps punctuation, `trimmed` is lowercase alphanumerics only.
 export function simplifyName(name) {
@@ -485,6 +516,66 @@ class RaceDB {
   async setServerAddress(id, address) {
     const r = await this.pool.query("UPDATE server SET address = $1 WHERE id = $2", [address || null, id]);
     return r.rowCount > 0;
+  }
+
+  // Set (or clear, with null) a server's RCON password. Stored plaintext because
+  // the connectionless `rcon <pass> <cmd>` wire format is cleartext — see the
+  // migration. Only the admin routes / CLI ever read it back (rconTargets,
+  // serverById); it is deliberately absent from servers() and every public API.
+  async setServerRcon(id, password) {
+    const r = await this.pool.query("UPDATE server SET rcon_password = $1 WHERE id = $2", [
+      password || null,
+      id,
+    ]);
+    return r.rowCount > 0;
+  }
+
+  // One server's full admin row, including the RCON secret + address. Admin-only.
+  async serverById(id) {
+    const row = await this.one(
+      "SELECT id, name, status, created_at, last_seen_at, records, address, rcon_password FROM server WHERE id = $1",
+      [id]
+    );
+    if (!row) return null;
+    return {
+      ...row,
+      id: num(row.id),
+      created_at: num(row.created_at),
+      last_seen_at: num(row.last_seen_at),
+      records: num(row.records),
+    };
+  }
+
+  // Like servers() but for the admin ops page: adds a boolean `rcon` (whether a
+  // password is set) WITHOUT ever returning the secret itself.
+  async serversAdmin() {
+    return (
+      await this.all(
+        `SELECT id, name, status, created_at, last_seen_at, records, address,
+                (rcon_password IS NOT NULL) AS rcon
+         FROM server ORDER BY last_seen_at DESC NULLS LAST, id`
+      )
+    ).map((s) => ({
+      ...s,
+      id: num(s.id),
+      created_at: num(s.created_at),
+      last_seen_at: num(s.last_seen_at),
+      records: num(s.records),
+      rcon: !!s.rcon,
+    }));
+  }
+
+  // Servers a broadcast/maintenance rcon can actually reach: trusted, with both
+  // a query address and an rcon password. Returns the secret (admin/CLI use).
+  async rconTargets() {
+    return (
+      await this.all(
+        `SELECT id, name, address, rcon_password
+         FROM server
+         WHERE status <> 'revoked' AND address IS NOT NULL AND rcon_password IS NOT NULL
+         ORDER BY id`
+      )
+    ).map((s) => ({ id: num(s.id), name: s.name, address: s.address, password: s.rcon_password }));
   }
 
   async mapIdByName(name) {
@@ -1209,6 +1300,375 @@ class RaceDB {
       records,
       id,
     ]);
+  }
+
+  // ------------------------------------------------------------------------
+  // Key/value config (maintenance state, counters). The `config` table is a
+  // plain string store; these wrap the read/upsert/delete so call sites don't
+  // repeat the ON CONFLICT dance.
+  // ------------------------------------------------------------------------
+  async getConfig(key) {
+    const row = await this.one("SELECT value FROM config WHERE key = $1", [key]);
+    return row ? row.value : null;
+  }
+  async setConfig(key, value) {
+    if (value == null) {
+      await this.pool.query("DELETE FROM config WHERE key = $1", [key]);
+      return;
+    }
+    await this.pool.query(
+      "INSERT INTO config (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+      [key, String(value)]
+    );
+  }
+
+  // Maintenance-mode state (persisted in config so both web replicas agree and
+  // it survives restarts). Returns a normalized snapshot.
+  async maintenanceState() {
+    const rows = await this.all(
+      `SELECT key, value FROM config
+       WHERE key IN ('maintenance_active','maintenance_since','maintenance_message','maintenance_by')`
+    );
+    const m = {};
+    for (const r of rows) m[r.key] = r.value;
+    return {
+      active: m.maintenance_active === "1",
+      since: m.maintenance_since ? num(m.maintenance_since) : null,
+      message: m.maintenance_message || null,
+      by: m.maintenance_by || null,
+    };
+  }
+
+  // Atomically claim the next maintenance re-broadcast so that, with multiple
+  // web replicas running the same timer, exactly ONE of them sends each round.
+  // Advances maintenance_rebroadcast_at to now+intervalSecs only if it is due;
+  // returns true to the single caller whose UPDATE won the row.
+  async claimMaintenanceRebroadcast(now, intervalSecs) {
+    const r = await this.pool.query(
+      `UPDATE config SET value = $1
+         WHERE key = 'maintenance_rebroadcast_at'
+           AND value ~ '^[0-9]+$'
+           AND value::bigint <= $2`,
+      [String(now + intervalSecs), now]
+    );
+    return r.rowCount > 0;
+  }
+
+  // ------------------------------------------------------------------------
+  // Operator log stream (server_log) — see the migration. appendServerLog takes
+  // pre-sanitized rows; the HTTP/console callers cap line length + batch size.
+  // ------------------------------------------------------------------------
+  async appendServerLog(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) return 0;
+    const now = Math.floor(Date.now() / 1000);
+    const vals = [];
+    const params = [];
+    let i = 1;
+    for (const e of entries) {
+      const line = typeof e.line === "string" ? e.line : String(e.line ?? "");
+      if (!line) continue;
+      vals.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++})`);
+      params.push(
+        e.serverId == null ? null : e.serverId,
+        e.source || "system",
+        e.level || null,
+        line.slice(0, 2000),
+        Number.isInteger(e.createdAt) ? e.createdAt : now
+      );
+    }
+    if (!vals.length) return 0;
+    await this.pool.query(
+      `INSERT INTO server_log (server_id, source, level, line, created_at) VALUES ${vals.join(",")}`,
+      params
+    );
+    return vals.length;
+  }
+
+  // Newest-first tail with optional server / source filters. `beforeId` pages
+  // backwards through history (rows with id < beforeId).
+  async recentServerLogs({ serverId = null, source = null, limit = 200, beforeId = null } = {}) {
+    const where = [];
+    const params = [];
+    let i = 1;
+    if (serverId != null) {
+      where.push(`server_id = $${i++}`);
+      params.push(serverId);
+    }
+    if (source) {
+      where.push(`source = $${i++}`);
+      params.push(source);
+    }
+    if (beforeId != null) {
+      where.push(`id < $${i++}`);
+      params.push(beforeId);
+    }
+    const lim = Math.min(Math.max(parseInt(limit, 10) || 200, 1), 2000);
+    params.push(lim);
+    const rows = await this.all(
+      `SELECT l.id, l.server_id, l.source, l.level, l.line, l.created_at, s.name AS server_name
+         FROM server_log l
+         LEFT JOIN server s ON s.id = l.server_id
+         ${where.length ? "WHERE " + where.join(" AND ") : ""}
+         ORDER BY l.id DESC
+         LIMIT $${i}`,
+      params
+    );
+    return rows.map((r) => ({
+      id: num(r.id),
+      serverId: r.server_id == null ? null : num(r.server_id),
+      serverName: r.server_name || null,
+      source: r.source,
+      level: r.level,
+      line: r.line,
+      createdAt: num(r.created_at),
+    }));
+  }
+
+  // Keep only the newest `keep` rows. Cheap and index-backed; run occasionally
+  // (server.js) rather than on every insert.
+  async pruneServerLogs(keep = 20000) {
+    // Delete everything up to and including the (keep+1)-th newest row: the row
+    // at 0-indexed OFFSET keep is the newest one to drop, so `id <=` it removes
+    // exactly the excess and keeps the newest `keep`. Fewer than keep rows ->
+    // the subselect is NULL and nothing is deleted.
+    const r = await this.pool.query(
+      `DELETE FROM server_log
+        WHERE id <= (SELECT id FROM server_log ORDER BY id DESC OFFSET $1 LIMIT 1)`,
+      [keep]
+    );
+    return r.rowCount;
+  }
+
+  // --- Map review flags ------------------------------------------------------
+  // A public "flag this map for review" report. Deduped per reporter via the
+  // partial unique index (uq_map_flag_open): a repeat OPEN flag for the same
+  // map+reason+reporter is a no-op. Returns whether a NEW row was created so the
+  // API can answer "reported" vs "already reported" without leaking counts.
+  async flagMap({ mapId, reason, note, reporterHash, reporterName, now = Math.floor(Date.now() / 1000) }) {
+    // One atomic statement: the map_id foreign key IS the existence check, so a
+    // 23503 (FK violation) means "no such map" — no separate SELECT (which would
+    // be a TOCTOU race against a concurrent map delete, and an extra round-trip).
+    try {
+      const r = await this.pool.query(
+        `INSERT INTO map_flag (map_id, reason, note, reporter_hash, reporter_name, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (map_id, reason, reporter_hash) WHERE status = 'open' DO NOTHING
+         RETURNING id`,
+        [mapId, reason, note || null, reporterHash || null, reporterName || null, now]
+      );
+      return { ok: true, created: r.rowCount > 0, duplicate: r.rowCount === 0 };
+    } catch (e) {
+      if (e && e.code === "23503") return { ok: false, error: "map not found" };
+      throw e;
+    }
+  }
+
+  // Open flags grouped by map for the admin queue: total open count, a
+  // per-reason breakdown, the most recent note and the last report time. The
+  // moderation queue is small, so a flat SELECT + JS grouping is clearer (and
+  // plenty fast) versus a window/jsonb aggregate.
+  async openFlagSummary() {
+    const rows = await this.all(
+      `SELECT f.map_id, m.name, f.reason, f.note, f.reporter_name, f.created_at
+       FROM map_flag f JOIN map m ON m.id = f.map_id
+       WHERE f.status = 'open'
+       ORDER BY f.created_at DESC`
+    );
+    const byMap = new Map();
+    for (const r of rows) {
+      const id = num(r.map_id);
+      let e = byMap.get(id);
+      if (!e) {
+        e = { mapId: id, name: r.name, openCount: 0, reasons: {}, latestNote: null, latestReporter: null, firstAt: r.created_at, lastAt: r.created_at };
+        byMap.set(id, e);
+      }
+      e.openCount++;
+      e.reasons[r.reason] = (e.reasons[r.reason] || 0) + 1;
+      if (r.note && !e.latestNote) e.latestNote = r.note; // rows are newest-first
+      if (r.reporter_name && !e.latestReporter) e.latestReporter = r.reporter_name;
+      if (r.created_at > e.lastAt) e.lastAt = r.created_at;
+      if (r.created_at < e.firstAt) e.firstAt = r.created_at;
+    }
+    return [...byMap.values()].sort((a, b) => b.lastAt - a.lastAt);
+  }
+
+  // All flags for one map (any status), newest first — the admin map detail.
+  async flagsForMap(mapId) {
+    return (
+      await this.all(
+        `SELECT id, reason, note, status, reporter_name, created_at, resolved_at, resolved_by
+         FROM map_flag WHERE map_id = $1 ORDER BY created_at DESC`,
+        [mapId]
+      )
+    ).map((r) => ({ ...r, id: num(r.id) }));
+  }
+
+  async flagById(id) {
+    const r = await this.one(
+      "SELECT id, map_id, reason, note, status, created_at, resolved_at, resolved_by FROM map_flag WHERE id = $1",
+      [id]
+    );
+    return r ? { ...r, id: num(r.id), map_id: num(r.map_id) } : null;
+  }
+
+  // Flat list for the CLI / API, filtered by status ("open" | "resolved" |
+  // "dismissed" | "all"). Bounded so a huge history can't be dumped at once.
+  async listFlags({ status = "open", limit = 200 } = {}) {
+    const lim = Math.max(1, Math.min(1000, parseInt(limit, 10) || 200));
+    const base = `SELECT f.id, f.map_id, m.name, f.reason, f.note, f.status, f.reporter_name, f.created_at, f.resolved_at, f.resolved_by
+                  FROM map_flag f JOIN map m ON m.id = f.map_id`;
+    const rows =
+      status === "all"
+        ? await this.all(`${base} ORDER BY f.created_at DESC LIMIT $1`, [lim])
+        : await this.all(`${base} WHERE f.status = $1 ORDER BY f.created_at DESC LIMIT $2`, [status, lim]);
+    return rows.map((r) => ({ ...r, id: num(r.id), map_id: num(r.map_id) }));
+  }
+
+  // Close a single OPEN flag (status must be 'resolved' or 'dismissed'). The
+  // status='open' guard makes this idempotent and keeps resolved_by/at truthful.
+  async setFlagStatus(id, status, by, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.pool.query(
+      `UPDATE map_flag SET status = $1, resolved_at = $2, resolved_by = $3
+       WHERE id = $4 AND status = 'open'`,
+      [status, now, by || null, id]
+    );
+    return r.rowCount;
+  }
+
+  // Close ALL open flags on a map at once ("handled this map"). Returns count.
+  async resolveMapFlags(mapId, status, by, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.pool.query(
+      `UPDATE map_flag SET status = $1, resolved_at = $2, resolved_by = $3
+       WHERE map_id = $4 AND status = 'open'`,
+      [status, now, by || null, mapId]
+    );
+    return r.rowCount;
+  }
+
+  // --- Map blocking (remove from play) ---------------------------------------
+  // Pull a map from the game servers' vote pool + cycle. An explicit moderator
+  // action (never automatic from a flag). Blocking also resolves the map's open
+  // flags — the report has been actioned. Idempotent (re-block updates reason).
+  // Returns { ok:false } if the map id doesn't exist (FK violation).
+  async blockMap(mapId, reason, by, now = Math.floor(Date.now() / 1000)) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO map_block (map_id, reason, blocked_at, blocked_by) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (map_id) DO UPDATE SET reason = EXCLUDED.reason, blocked_at = EXCLUDED.blocked_at, blocked_by = EXCLUDED.blocked_by`,
+        [mapId, reason || null, now, by || null]
+      );
+      const flags = await client.query(
+        `UPDATE map_flag SET status = 'resolved', resolved_at = $1, resolved_by = $2
+         WHERE map_id = $3 AND status = 'open'`,
+        [now, by || null, mapId]
+      );
+      await client.query("COMMIT");
+      return { ok: true, resolvedFlags: flags.rowCount };
+    } catch (e) {
+      await client.query("ROLLBACK");
+      if (e && e.code === "23503") return { ok: false, error: "map not found" };
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+  async unblockMap(mapId) {
+    const r = await this.pool.query("DELETE FROM map_block WHERE map_id = $1", [mapId]);
+    return r.rowCount;
+  }
+  async isMapBlocked(mapId) {
+    return !!(await this.one("SELECT 1 FROM map_block WHERE map_id = $1", [mapId]));
+  }
+  // Blocked maps with names, for the admin UI / CLI (newest block first).
+  async blockedMaps() {
+    return (
+      await this.all(
+        `SELECT b.map_id, m.name, b.reason, b.blocked_at, b.blocked_by
+         FROM map_block b JOIN map m ON m.id = b.map_id
+         ORDER BY b.blocked_at DESC`
+      )
+    ).map((r) => ({ ...r, map_id: num(r.map_id) }));
+  }
+  // Just the (lowercased) map names, for the game servers' plain-text endpoint
+  // that server/entrypoint.sh consumes when building g_maplist.
+  async blockedMapNames() {
+    return (await this.all("SELECT m.name FROM map_block b JOIN map m ON m.id = b.map_id ORDER BY m.name")).map(
+      (r) => String(r.name).toLowerCase()
+    );
+  }
+
+  // --- Admin accounts + sessions ---------------------------------------------
+  // Accounts are created out-of-band (admin.js admin-add); there is no public
+  // sign-up. Returns null if the username is already taken.
+  async createAdmin(username, passwordHash, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.one(
+      `INSERT INTO admin_user (username, password_hash, created_at) VALUES ($1, $2, $3)
+       ON CONFLICT (username) DO NOTHING RETURNING id`,
+      [username, passwordHash, now]
+    );
+    return r ? { id: num(r.id), username } : null;
+  }
+  async getAdminByUsername(username) {
+    const r = await this.one(
+      "SELECT id, username, password_hash, last_login_at FROM admin_user WHERE username = $1",
+      [username]
+    );
+    return r ? { ...r, id: num(r.id) } : null;
+  }
+  async listAdmins() {
+    return (
+      await this.all("SELECT id, username, created_at, last_login_at FROM admin_user ORDER BY username ASC")
+    ).map((r) => ({ ...r, id: num(r.id) }));
+  }
+  async countAdmins() {
+    return num((await this.one("SELECT COUNT(*) c FROM admin_user")).c);
+  }
+  async removeAdmin(username) {
+    const r = await this.pool.query("DELETE FROM admin_user WHERE username = $1", [username]);
+    return r.rowCount; // admin_session rows cascade
+  }
+  async setAdminPassword(username, passwordHash) {
+    const r = await this.pool.query("UPDATE admin_user SET password_hash = $1 WHERE username = $2", [
+      passwordHash,
+      username,
+    ]);
+    return r.rowCount;
+  }
+  async touchAdminLogin(id, now = Math.floor(Date.now() / 1000)) {
+    await this.pool.query("UPDATE admin_user SET last_login_at = $1 WHERE id = $2", [now, id]);
+  }
+
+  async createSession({ tokenHash, adminId, csrf, expiresAt, ip, userAgent, now = Math.floor(Date.now() / 1000) }) {
+    await this.pool.query(
+      `INSERT INTO admin_session (token_hash, admin_id, csrf, created_at, expires_at, ip, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [tokenHash, adminId, csrf, now, expiresAt, ip || null, userAgent ? String(userAgent).slice(0, 400) : null]
+    );
+  }
+  // Live session by cookie-hash; an expired row is treated as absent AND deleted
+  // so the table self-cleans on access. Returns { adminId, username, csrf } | null.
+  async getSession(tokenHash, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.one(
+      `SELECT s.admin_id, s.csrf, s.expires_at, a.username
+       FROM admin_session s JOIN admin_user a ON a.id = s.admin_id
+       WHERE s.token_hash = $1`,
+      [tokenHash]
+    );
+    if (!r) return null;
+    if (num(r.expires_at) <= now) {
+      await this.pool.query("DELETE FROM admin_session WHERE token_hash = $1", [tokenHash]);
+      return null;
+    }
+    return { adminId: num(r.admin_id), username: r.username, csrf: r.csrf, expiresAt: num(r.expires_at) };
+  }
+  async deleteSession(tokenHash) {
+    await this.pool.query("DELETE FROM admin_session WHERE token_hash = $1", [tokenHash]);
+  }
+  async deleteExpiredSessions(now = Math.floor(Date.now() / 1000)) {
+    const r = await this.pool.query("DELETE FROM admin_session WHERE expires_at <= $1", [now]);
+    return r.rowCount;
   }
 
   // ------------------------------------------------------------------------

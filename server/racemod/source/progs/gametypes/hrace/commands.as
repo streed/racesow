@@ -424,6 +424,9 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/callvote randmap" );
         cmdlist.addCell( "Calls a vote for a random map in the current mappool." );
 
+        cmdlist.addCell( "/flag <reason>" );
+        cmdlist.addCell( "Flags the current map for moderator review (broken, offensive, etc.)." );
+
         for ( uint i = 0; i < cmdlist.numRows(); i++ )
             client.printMessage( cmdlist.getRow(i) + "\n" );
 
@@ -524,6 +527,14 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         client.printMessage( S_COLOR_WHITE + "- Calls a vote for a random map in the current mappool. Use wildcard '*' to match any map." + "\n" );
         client.printMessage( S_COLOR_WHITE + "  Alternatively, specify a pattern keyword for a map containing the pattern as a partial match." + "\n" );
     }
+    else if ( command == "flag" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/flag <reason>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Flags the map you're on for review by the moderators. Use it for a map that's broken," + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  unfinishable, offensive, or a duplicate. Reason is optional (e.g. broken, offensive," + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  wrong_name, duplicate). Your name is attached automatically. Moderators can pull a" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  bad map from the vote pool and cycle." + "\n" );
+    }
     else
     {
         client.printMessage( S_COLOR_WHITE + "Command not found.\n");
@@ -535,5 +546,44 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
 bool Cmd_Rules( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
     RACE_ShowRules(client, 0);
+    return true;
+}
+
+// --- /flag: report the current map for review --------------------------------
+// Players type "/flag <reason>" (reason optional: broken/offensive/wrong_name/
+// duplicate). The player's name and MM login are pulled from their client (not
+// typed) and attached, so moderators can see who reported it. Delivered to the
+// central API by the RS_ApiFlag native (server/enginepatches/g_rs_api.cpp).
+Cvar rsApiFlagUrl( "rs_api_flag_url", "", 0 );
+uint[] lastFlagTime( maxClients );
+const uint FLAG_COOLDOWN_MS = 30000;
+
+bool Cmd_Flag( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    if ( rsApiFlagUrl.string.length() == 0 )
+    {
+        client.printMessage( S_COLOR_RED + "Flagging is not available on this server.\n" );
+        return false;
+    }
+
+    int pn = client.playerNum;
+    if ( lastFlagTime[pn] != 0 && levelTime - lastFlagTime[pn] < FLAG_COOLDOWN_MS )
+    {
+        client.printMessage( S_COLOR_RED + "You just flagged a map - please wait a moment before flagging again.\n" );
+        return false;
+    }
+    lastFlagTime[pn] = levelTime;
+
+    String reason = argsString.getToken( 0 ).tolower();
+
+    Cvar mapNameVar( "mapname", "", 0 );
+    String mapName = mapNameVar.string.tolower();
+
+    // Name + login come from the player's client, not from the command args.
+    RS_ApiFlag( rsApiFlagUrl.string, rsApiToken.string, mapName, reason, client.name, client.getMMLogin() );
+
+    client.printMessage( S_COLOR_GREEN + "Thanks - you flagged " + S_COLOR_WHITE + mapName
+        + ( reason != "" ? S_COLOR_GREEN + " (" + S_COLOR_WHITE + reason + S_COLOR_GREEN + ")" : "" )
+        + S_COLOR_GREEN + " for moderator review.\n" );
     return true;
 }

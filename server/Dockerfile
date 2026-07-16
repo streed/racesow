@@ -64,6 +64,7 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "RS_ApiReportRace" game/g_ascript.cpp \
     && grep -q "RS_ApiReportWrDemo" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchGhost" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFlag" game/g_ascript.cpp \
     && grep -q "curl pthread" game/CMakeLists.txt
 
 # 7. Cross-server player mirroring: the RS_Mirror* natives (UDP mesh on a
@@ -79,6 +80,20 @@ RUN python3 /tmp/patch-mirror-natives.py \
     && grep -q "asFunc_RS_MirrorPeerCount" game/g_ascript.cpp \
     && grep -q "RS_MirrorLocalChat" game/g_cmds.cpp \
     && grep -q "RS_MirrorLocalChat" game/g_gameteams.cpp
+
+# 8. Quad rocket-jump fix (rs_quad_fix, default 0): racesow's self-knockback
+#    recompute in G_RadiusDamage discards the fire-time QUAD_KNOCKBACK_SCALE, so
+#    quad does nothing for rocket/plasma/grenade jumps -- unlike Quake3/defrag,
+#    where knockback tracks quad-scaled damage. This re-applies the x3 boost
+#    behind the rs_quad_fix cvar for testing. Edits g_combat.cpp + g_racesow.{h,cpp};
+#    independent of the g_ascript.cpp natives patches above. The greps assert it landed.
+COPY enginepatches/patch-quad-fix.py /tmp/patch-quad-fix.py
+RUN python3 /tmp/patch-quad-fix.py \
+    && grep -q "rs_quad_knockback_scale" game/g_racesow.h \
+    && grep -q "rs_quad_fix = trap_Cvar_Get" game/g_racesow.cpp \
+    && grep -q "rs_quad_knockback_scale = trap_Cvar_Get" game/g_racesow.cpp \
+    && grep -q "rs_quad_fix->integer" game/g_combat.cpp \
+    && grep -q "rs_quad_knockback_scale->value" game/g_combat.cpp
 
 RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Release . \
     && make game -j"$(nproc)" \
@@ -97,9 +112,14 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
     && strings /libgame_x86_64.so | grep -q "RS_ApiReportWrDemo" \
     && strings /libgame_x86_64.so | grep -q "RS_ApiFetchGhost" \
     && strings /libgame_x86_64.so | grep -q "rs_api: ghost fetch failed" \
+    # in-game /flag: the RS_ApiFlag native registration string.
+    && strings /libgame_x86_64.so | grep -q "RS_ApiFlag" \
     && strings /libgame_x86_64.so | grep -q "racerecord" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: configured" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: bot slot" \
+    # rs_quad_fix cvar names survive stripping as trap_Cvar_Get string literals
+    && strings /libgame_x86_64.so | grep -q "rs_quad_fix" \
+    && strings /libgame_x86_64.so | grep -q "rs_quad_knockback_scale" \
     && objdump -p /libgame_x86_64.so | grep -q "NEEDED.*libcurl"
 
 # --- Patched dedicated server binary ----------------------------------------

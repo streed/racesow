@@ -23,6 +23,26 @@ async function api(path) {
   return res.json();
 }
 
+async function apiPost(path, body) {
+  const res = await fetch("/api" + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+// Map-flag reasons (value -> label). Mirrors FLAG_REASONS in web/db.js; the
+// server re-validates, so a stale client can never persist an unknown reason.
+const FLAG_REASONS_UI = [
+  ["broken", "Broken — unplayable, missing, or crashes"],
+  ["offensive", "Offensive content"],
+  ["wrong_name", "Wrong name or metadata"],
+  ["duplicate", "Duplicate of another map"],
+  ["other", "Something else"],
+];
+
 // The home page fetches /overview twice on load — once for the stat tiles
 // (viewOverview) and once for the footer "Updated" date (DOMContentLoaded).
 // Share a single in-flight request (and its result for a short window) so a
@@ -469,7 +489,70 @@ async function viewMap(id) {
             </tr>`).join("") || `<tr><td colspan="6" class="empty">No runs recorded.</td></tr>`}
         </tbody>
       </table>
-    </div></div>`;
+    </div></div>
+
+    <div class="mapflag" id="mapflag">
+      <button class="flag-toggle" type="button">⚑ Flag this map for review</button>
+      <form class="flag-form" hidden>
+        <div class="flag-title">Report a problem with this map</div>
+        <label class="flag-label" for="flag-reason">Reason</label>
+        <select id="flag-reason" class="flag-reason">
+          ${FLAG_REASONS_UI.map(([v, l]) => `<option value="${v}">${esc(l)}</option>`).join("")}
+        </select>
+        <label class="flag-label" for="flag-note">Details <span class="flag-opt">(optional)</span></label>
+        <textarea id="flag-note" class="flag-note" rows="2" maxlength="500"
+          placeholder="What's wrong? (max 500 characters)"></textarea>
+        <div class="flag-actions">
+          <button class="flag-submit btn" type="submit">Submit report</button>
+          <button class="flag-cancel btn" type="button">Cancel</button>
+          <span class="flag-msg" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+    </div>`;
+
+  wireFlag(id);
+}
+
+// Wire the "flag this map" control rendered by viewMap. Kept out of the
+// delegated data-nav dispatch because it POSTs and manages its own inline
+// status, rather than routing.
+function wireFlag(id) {
+  const root = document.getElementById("mapflag");
+  if (!root) return;
+  const toggle = root.querySelector(".flag-toggle");
+  const form = root.querySelector(".flag-form");
+  const note = root.querySelector(".flag-note");
+  const msg = root.querySelector(".flag-msg");
+  const submit = root.querySelector(".flag-submit");
+  toggle.addEventListener("click", () => {
+    form.hidden = !form.hidden;
+    if (!form.hidden) root.querySelector(".flag-reason").focus();
+  });
+  root.querySelector(".flag-cancel").addEventListener("click", () => {
+    form.hidden = true;
+    msg.textContent = "";
+    msg.className = "flag-msg";
+  });
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const reason = root.querySelector(".flag-reason").value;
+    submit.disabled = true;
+    msg.className = "flag-msg";
+    msg.textContent = "Sending…";
+    try {
+      const r = await apiPost(`/maps/${id}/flag`, { reason, note: note.value.trim() });
+      msg.textContent = r.duplicate ? "You've already reported this map — thanks!" : "Thanks — flagged for review.";
+      msg.classList.add("ok");
+      note.value = "";
+      toggle.textContent = "⚑ Reported — thank you";
+      setTimeout(() => { form.hidden = true; }, 1500);
+    } catch (err) {
+      msg.classList.add("err");
+      msg.textContent = /429/.test(String(err && err.message)) ? "Too many reports — try again later." : "Couldn't submit — please try again.";
+    } finally {
+      submit.disabled = false;
+    }
+  });
 }
 
 /* ------------------------------ replay view ------------------------------ */
@@ -655,7 +738,11 @@ async function renderLive() {
   const d = await api("/live");
   const online = d.servers.filter((s) => s.online);
   const total = online.reduce((n, s) => n + s.players.length, 0);
+  const maint = d.maintenance && d.maintenance.active
+    ? `<div class="maint-banner">🛠 Maintenance in progress — ${esc((d.maintenance.message || "").replace(/\^[0-9]/g, ""))}</div>`
+    : "";
   const html = `
+    ${maint}
     <div class="page-title">LIVE <span class="livedot big"></span></div>
     <p class="page-sub">
       ${d.servers.length
@@ -794,6 +881,13 @@ const ABOUT_CMDS = [
       ["/mv yes | no | status | cancel", "Cast your vote, show the live tally, or (as starter) cancel it."],
     ],
   },
+  {
+    title: "Report a bad map",
+    note: "Broken, unfinishable, offensive, or a duplicate? Flag it. Moderators review flagged maps and can pull one from the vote pool and map cycle.",
+    rows: [
+      ["/flag [reason]", "Flag the map you're currently on for review. Optional reason: broken, offensive, wrong_name, duplicate. One flag per player per map."],
+    ],
+  },
 ];
 
 const ABOUT_FAQ = [
@@ -811,6 +905,8 @@ const ABOUT_FAQ = [
     "Yes. Open any map and look for a <b>▶ replay</b> badge to watch the ghost right in your browser, or <b>⬇ demo</b> to download it. To play a demo back in Warsow, drop the file in your <span class=\"mono\">racemod/demos</span> folder and run <span class=\"mono\">demo &lt;file&gt;</span> in the console."],
   ["How is the ranking worked out?",
     "You earn points for a top-15 finish on each map; your overall rank is the sum of those points across every map you've raced. World records and podium finishes are tracked separately on your profile."],
+  ["A map is broken or shouldn't be here — what do I do?",
+    "Flag it for review. In-game, type <span class=\"mono\">/flag</span> while you're on the map (add a reason if you like, e.g. <span class=\"mono\">/flag broken</span>). Or open the map on this site and hit <b>⚑ Flag this map for review</b>. Moderators check flagged maps and can pull a bad one from the vote pool and map cycle."],
 ];
 
 async function viewAbout() {

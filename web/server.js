@@ -4,9 +4,11 @@ import express from "express";
 import path from "node:path";
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { openDatabase, sha256, simplifyName } from "./db.js";
-import { createLivePoller } from "./live.js";
+import { openDatabase, sha256, simplifyName, hashPassword, verifyPassword, FLAG_REASONS } from "./db.js";
+import { createLivePoller, parseAddress } from "./live.js";
+import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js";
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
 import { cache } from "./cache.js";
 
@@ -25,6 +27,14 @@ const DATABASE_URL =
 // poison the id-keyed OG image cache). Unset -> derive per request (dev).
 const PUBLIC_ORIGIN = (process.env.PUBLIC_ORIGIN || "").replace(/\/+$/, "");
 const PUBLIC_HOST = PUBLIC_ORIGIN ? new URL(PUBLIC_ORIGIN).host : "";
+
+// Weekly public database backup, published by the db-backup sidecar (see
+// backup/ + docker-compose.yml) into BACKUP_DIR under the shared ./data mount.
+// The zip is served for download at /backup/racesow-db-latest.zip and its
+// metadata at /api/backup; both 404 gracefully until the first backup exists.
+const BACKUP_DIR = process.env.BACKUP_DIR || "/data/backups";
+const BACKUP_LATEST_ZIP = path.join(BACKUP_DIR, "racesow-db-latest.zip");
+const BACKUP_LATEST_META = path.join(BACKUP_DIR, "racesow-db-latest.json");
 
 // Legacy single-server token (optional). Per-server tokens live in the DB
 // `server` table and are the recommended path for multi-server deploys.
@@ -50,6 +60,8 @@ const MAX_VERSION_LEN = 64;
 const MAX_CHECKPOINTS = 4096;
 const MAX_TIME_MS = 24 * 60 * 60 * 1000;
 const MAX_RECORDS_PER_REQUEST = 1000;
+// Free-text on a public map-flag report; capped so a report can't be an essay.
+const FLAG_NOTE_MAX = 500;
 
 // Signals are handled from the very first tick: node may run as container
 // PID 1, where SIGTERM with no handler installed is silently ignored (docker
@@ -116,6 +128,15 @@ const ingestLimiter = rateLimiter({
   max: 120,
   key: (req) => "ingest:" + (req.ingest ? req.ingest.serverId ?? req.ingest.serverName : req.ip),
 });
+// Public map-flag submissions: per IP, well under the read budget so a script
+// can't spam the review queue (dedupe in the DB is the second line of defence).
+const flagLimiter = rateLimiter({ windowMs: 60_000, max: 8, key: (req) => "flag:" + (req.ip || "?") });
+// Admin login POST: tight per-IP brute-force backstop (nginx also fronts this).
+const loginLimiter = rateLimiter({ windowMs: 60_000, max: 10, key: (req) => "login:" + (req.ip || "?") });
+// Public backup download: a multi-MB file, so cap per-IP pulls (nginx also
+// fronts it) — generous enough for a browser plus a resumed/parallel download
+// manager, tight enough that it can't be used as a bandwidth amplifier.
+const backupLimiter = rateLimiter({ windowMs: 60_000, max: 20, key: (req) => "backup:" + (req.ip || "?") });
 
 app.use((req, _res, next) => {
   if (req.path.startsWith("/api/")) console.log(`${req.method} ${req.originalUrl}`);
@@ -159,6 +180,22 @@ api.get("/servers/:id", wrap(async (req, res) => {
 
 api.get("/maps", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.maps(req.query))));
 
+// Maps a moderator has blocked from play (see the admin area). Registered BEFORE
+// "/maps/:id" so "blocked" isn't captured as an :id. Public read — it only names
+// maps already pulled from rotation.
+api.get("/maps/blocked", cache(60), wrap(async (_req, res) => {
+  const rows = await race.blockedMaps();
+  res.json({
+    maps: rows.map((r) => ({
+      id: r.map_id,
+      name: r.name,
+      reason: r.reason,
+      blockedAt: Number(r.blocked_at),
+      blockedBy: r.blocked_by,
+    })),
+  });
+}));
+
 api.get("/maps/:id", cache(60, { edge: true }), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid map id" });
@@ -183,6 +220,31 @@ api.get("/maps/:id/ghost", wrap(async (req, res) => {
   res.set("Cache-Control", "public, max-age=300");
   res.send(buf);
 }));
+
+// Public "flag this map for review" (broken / offensive / wrong metadata / …).
+// Anonymous, tightly rate-limited, and deduped per reporter (db.flagMap): a
+// reporter is identified only by a salted hash of their IP, never stored raw.
+// A duplicate (same reporter+reason still open) returns ok with duplicate:true
+// rather than an error, so the UI can say "already reported" without leaking
+// how many others flagged it.
+api.post(
+  "/maps/:id/flag",
+  flagLimiter,
+  express.json({ limit: "8kb" }),
+  wrap(async (req, res) => {
+    const id = asInt(req.params.id);
+    if (id == null) return res.status(400).json({ error: "invalid map id" });
+    const body = req.body || {};
+    const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+    if (!FLAG_REASONS.includes(reason)) return res.status(400).json({ error: "invalid reason" });
+    let note = typeof body.note === "string" ? body.note.trim().slice(0, FLAG_NOTE_MAX) : "";
+    if (!note) note = null;
+    const reporterHash = sha256("mapflag:" + (req.ip || "?"));
+    const r = await race.flagMap({ mapId: id, reason, note, reporterHash });
+    if (!r.ok) return res.status(404).json({ error: r.error || "map not found" });
+    res.json({ ok: true, duplicate: !!r.duplicate });
+  })
+);
 
 api.get("/players", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.players(req.query))));
 
@@ -214,7 +276,13 @@ api.get("/live", wrap(async (_req, res) => {
   const servers = await Promise.all(
     snap.servers.map(async (s) => ({ ...s, mapId: s.map ? await race.mapIdByName(s.map) : null }))
   );
-  res.json({ ...snap, servers });
+  res.json({
+    ...snap,
+    servers,
+    maintenance: maintenance.active
+      ? { active: true, message: maintenance.message, since: maintenance.since }
+      : { active: false },
+  });
 }));
 
 // Live topscores for game servers: the hrace gametype's RS_ApiFetchTop
@@ -233,13 +301,41 @@ api.get("/game/topscores", cache(120), wrap(async (req, res) => {
 // Flat-text WR ghost for game servers: the hrace gametype's RS_ApiFetchGhost
 // native GETs this on map load and drives an in-game "ghost racer" along it.
 // Text (not the gzipped JSON) because AngelScript can't decompress/parse JSON.
-api.get("/game/ghost", cache(120), wrap(async (req, res) => {
+// Short TTL (not 120s): meshed servers re-pull this the moment a peer sets a
+// faster time (hrace/ghostbot.as) so every server races the current WR ghost —
+// a long cache would keep serving the superseded ghost for minutes. The MIN(time)
+// lookup is index-backed and game-server fetch volume is low, so 15s is cheap.
+api.get("/game/ghost", cache(15), wrap(async (req, res) => {
   const body = await race.gameGhostText(req.query.map);
   if (body == null) return res.status(404).type("text/plain").send("// no ghost\n");
   res.type("text/plain").send(body);
 }));
 
+// Blocked maps for the game servers: server/entrypoint.sh GETs this while
+// building g_maplist and drops these maps from the vote pool + cycle. Plain
+// text, one lowercased map name per line (empty body = nothing blocked).
+api.get("/game/blocked-maps", cache(30), wrap(async (_req, res) => {
+  const names = await race.blockedMapNames();
+  res.type("text/plain").send(names.length ? names.join("\n") + "\n" : "");
+}));
+
 api.get("/health", (_req, res) => res.json({ ok: true }));
+
+// Metadata for the latest public database backup: size, sha256, when it was
+// generated, and what it includes/excludes. A missing file means "no backup
+// yet" (404); any other error (permissions, disk, corrupt JSON) is a real fault
+// worth surfacing (500 + a log) rather than masking as the not-yet-run state.
+api.get("/backup", wrap(async (_req, res) => {
+  let meta;
+  try {
+    meta = JSON.parse(await readFile(BACKUP_LATEST_META, "utf8"));
+  } catch (e) {
+    if (e.code === "ENOENT") return res.status(404).json({ error: "no backup available yet" });
+    console.error("backup metadata unavailable:", e.message);
+    return res.status(500).json({ error: "backup metadata unavailable" });
+  }
+  res.json(meta);
+}));
 
 // --- Aggregate refresh (debounced, with a max-wait so a continuous ingest
 // stream from many servers can't starve the rebuild indefinitely). ----------
@@ -283,6 +379,139 @@ function scheduleAggregateRefresh() {
   clearTimeout(refreshTimer);
   const wait = Math.min(REFRESH_DEBOUNCE_MS, firstDirtyAt + REFRESH_MAX_WAIT_MS - now);
   refreshTimer = setTimeout(doRefresh, wait);
+}
+
+// ===================== Operator log stream + maintenance ====================
+// The admin "servers" page (server-rendered, no client JS) is an operator
+// console: it ships game-server stdout into /admin/logs, sends RCON broadcasts,
+// and drives a persistent "maintenance mode" that re-notifies players on a
+// timer. State lives in the DB (config + server_log) so both web replicas agree.
+const LOG_MAX_LINES_PER_POST = 500;
+const LOG_MAX_LINE_LEN = 2000;
+const LOG_KEEP = Math.max(1000, parseInt(process.env.LOG_KEEP || "20000", 10));
+// Re-broadcast cadence while maintenance mode is active (so players who join
+// mid-maintenance still see the notice). Clamped to a sane floor.
+const MAINT_REBROADCAST_SECS = Math.max(30, parseInt(process.env.MAINT_REBROADCAST_SECS || "180", 10));
+const MAINT_STATE_REFRESH_MS = 10_000;
+const DEFAULT_MAINT_MSG =
+  "^3Scheduled maintenance in progress^7 — the server may restart shortly. Thanks for your patience!";
+
+// In-memory maintenance snapshot for the hot /api/live path. Both replicas
+// reconcile it from the DB every MAINT_STATE_REFRESH_MS; the replica that serves
+// a toggle updates its own copy immediately.
+let maintenance = { active: false, since: null, message: null, by: null };
+
+// Record one operator-log line: keep the existing stdout log AND persist it to
+// server_log for /admin/logs. Fire-and-forget — a log write must never break a
+// request or the poller.
+function recordEvent(serverId, line, source = "event", level = null) {
+  console.log(line);
+  race.appendServerLog([{ serverId: serverId ?? null, source, level, line }]).catch(() => {});
+}
+
+// Best-effort severity from a shipped console line so /admin/logs can tint it.
+function logLevelOf(line) {
+  if (/\b(error|failed|fatal)\b/i.test(line)) return "error";
+  if (/\b(warn|warning)\b/i.test(line)) return "warn";
+  return null;
+}
+
+let lastPruneAt = 0;
+function maybePruneLogs() {
+  const now = Date.now();
+  if (now - lastPruneAt < 60_000) return;
+  lastPruneAt = now;
+  race.pruneServerLogs(LOG_KEEP).catch(() => {});
+}
+
+// Fan a command out to every RCON-enabled server and log the per-server outcome.
+async function broadcastCommand(command, { source = "rcon", label = "rcon" } = {}) {
+  const targets = await race.rconTargets();
+  if (!targets.length) return { targets: 0, ok: 0, results: [] };
+  const results = await broadcastRcon(targets, command, { parseAddress });
+  const ok = results.filter((r) => r.ok).length;
+  const entries = results.map((r) => ({
+    serverId: r.id,
+    source,
+    level: r.ok ? null : "warn",
+    line: `${label} → ${r.name}: ${
+      r.ok ? "sent" : "FAILED (" + (r.error || (r.authFailed ? "bad rcon password" : "no reply")) + ")"
+    }`,
+  }));
+  race.appendServerLog(entries).catch(() => {});
+  return { targets: targets.length, ok, results };
+}
+
+// --- Maintenance re-broadcast timer (replica-safe) ---------------------------
+let maintTimer = null;
+let maintRefreshTimer = null;
+function startMaintTimer() {
+  if (maintTimer) return;
+  maintTimer = setInterval(async () => {
+    if (shuttingDown || !maintenance.active) return;
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      // Atomic claim: with two replicas running this timer, exactly one wins the
+      // round and sends, so players don't get duplicate notices.
+      if (await race.claimMaintenanceRebroadcast(now, MAINT_REBROADCAST_SECS)) {
+        await broadcastCommand(sayCommand(maintenance.message || DEFAULT_MAINT_MSG), {
+          source: "maintenance",
+          label: "maintenance re-notice",
+        });
+      }
+    } catch {
+      /* transient DB/UDP issue — the next tick retries */
+    }
+  }, 30_000);
+  maintTimer.unref();
+}
+function stopMaintTimer() {
+  clearInterval(maintTimer);
+  maintTimer = null;
+}
+
+// Reconcile the in-memory snapshot from the DB (startup + periodic, both
+// replicas) and (de)activate the local re-broadcast timer to match.
+async function refreshMaintenance() {
+  try {
+    maintenance = await race.maintenanceState();
+    if (maintenance.active) startMaintTimer();
+    else stopMaintTimer();
+  } catch {
+    /* keep the last snapshot on a transient DB error */
+  }
+}
+
+// Toggle maintenance mode: persist state, announce it in-game, and (on) arm the
+// re-broadcast timer / (off) send an all-clear. Returns the broadcast summary.
+async function setMaintenance(active, message, by) {
+  const now = Math.floor(Date.now() / 1000);
+  if (active) {
+    const msg = message || DEFAULT_MAINT_MSG;
+    await race.setConfig("maintenance_active", "1");
+    await race.setConfig("maintenance_since", String(now));
+    await race.setConfig("maintenance_message", msg);
+    await race.setConfig("maintenance_by", by || "");
+    await race.setConfig("maintenance_rebroadcast_at", String(now + MAINT_REBROADCAST_SECS));
+    maintenance = { active: true, since: now, message: msg, by: by || null };
+    const b = await broadcastCommand(sayCommand(msg), { source: "maintenance", label: "maintenance ON" });
+    recordEvent(null, `maintenance ENABLED by ${by || "?"} — notified ${b.ok}/${b.targets} server(s)`, "maintenance");
+    startMaintTimer();
+    return b;
+  }
+  await race.setConfig("maintenance_active", "0");
+  await race.setConfig("maintenance_since", null);
+  await race.setConfig("maintenance_message", null);
+  await race.setConfig("maintenance_by", null);
+  await race.setConfig("maintenance_rebroadcast_at", null);
+  maintenance = { active: false, since: null, message: null, by: null };
+  stopMaintTimer();
+  const b = await broadcastCommand(
+    sayCommand("^2Maintenance complete^7 — thanks for your patience! Racing is back to normal."),
+    { source: "maintenance", label: "maintenance OFF" }
+  );
+  recordEvent(null, `maintenance DISABLED by ${by || "?"} — notified ${b.ok}/${b.targets} server(s)`, "maintenance");
+  return b;
 }
 
 // Constant-time bearer-token check. Hashing both sides first makes the compare
@@ -454,7 +683,7 @@ api.post(
           bytes: Number.isInteger(Number(d.bytes)) && Number(d.bytes) >= 0 ? Number(d.bytes) : null,
           serverId: req.ingest.serverId,
         });
-        console.log(`wr_demo ${body.map} from ${req.ingest.serverName}: ${d.demo}`);
+        recordEvent(req.ingest.serverId, `wr_demo ${body.map} from ${req.ingest.serverName}: ${d.demo}`);
         return res.json({ ok: true });
       } catch (e) {
         console.error("wr_demo ingest failed:", e);
@@ -492,7 +721,8 @@ api.post(
         await race.touchServer(req.ingest.serverId, counts.inserted + counts.improved);
       }
       if (counts.inserted || counts.improved) {
-        console.log(
+        recordEvent(
+          req.ingest.serverId,
           `ingest ${map} from ${req.ingest.serverName} [${source}]: +${counts.inserted} new, ${counts.improved} improved`
         );
         scheduleAggregateRefresh();
@@ -537,7 +767,8 @@ api.post(
         cps: g.cps,
         serverId: req.ingest.serverId,
       });
-      console.log(
+      recordEvent(
+        req.ingest.serverId,
         `ghost ${body.map} from ${req.ingest.serverName}: ${g.frames.length} frames${stored ? "" : " (kept faster)"}`
       );
       res.json({ ok: true, stored });
@@ -548,14 +779,791 @@ api.post(
   })
 );
 
+// Game-server console log shipping: the game host tees its stdout through a
+// batcher (server/entrypoint.sh) and POSTs newline-delimited lines here. Same
+// per-server bearer auth + rate limiter as /ingest, so a line is attributed to
+// the authenticated server and shows up in /admin/logs. Body is text/plain
+// (not JSON) so the shell shipper can just pipe raw lines with curl --data-binary.
+api.post(
+  "/ingest/log",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  express.text({ type: () => true, limit: "256kb" }),
+  wrap(async (req, res) => {
+    const raw = typeof req.body === "string" ? req.body : "";
+    const lines = raw.split(/\r?\n/).filter((l) => l.length > 0).slice(0, LOG_MAX_LINES_PER_POST);
+    if (!lines.length) return res.json({ ok: true, stored: 0 });
+    const entries = lines.map((l) => ({
+      serverId: req.ingest.serverId,
+      source: "console",
+      level: logLevelOf(l),
+      line: l.slice(0, LOG_MAX_LINE_LEN),
+    }));
+    const stored = await race.appendServerLog(entries);
+    maybePruneLogs();
+    res.json({ ok: true, stored });
+  })
+);
+
+// In-game "/flag" command target: a game server flags the CURRENT map on behalf
+// of a player. Server-token authed (same as /ingest) and keyed by map NAME (the
+// game doesn't know the web's map id). Deduped per player, so a player's repeat
+// /flag on a map is a no-op. The map must already exist in the DB.
+api.post(
+  "/game/flag",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  express.json({ limit: "8kb" }),
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const mapName = typeof body.map === "string" ? body.map.slice(0, MAX_MAP_LEN).toLowerCase() : "";
+    if (!mapName) return res.status(400).json({ error: "map required" });
+    const reason = FLAG_REASONS.includes(body.reason) ? body.reason : "other";
+    let note = typeof body.note === "string" ? body.note.trim().slice(0, FLAG_NOTE_MAX) : "";
+    if (!note) note = null;
+    const mapId = await race.mapIdByName(mapName);
+    if (mapId == null) return res.status(404).json({ error: "unknown map" });
+    // Dedupe per player: prefer the auth login, else the display name, else the
+    // reporting server (so an anonymous /flag still can't be spammed endlessly).
+    const who =
+      (typeof body.login === "string" && body.login) ||
+      (typeof body.player === "string" && body.player) ||
+      `srv${req.ingest.serverId}`;
+    const reporterHash = sha256("gameflag:" + who);
+    // Store the reporter's display name (colour codes stripped) so moderators
+    // can see who flagged it — the /flag command pulls it from the player's client.
+    const reporterName =
+      typeof body.player === "string" && body.player ? simplifyName(body.player).slice(0, MAX_NAME_LEN) || null : null;
+    const r = await race.flagMap({ mapId, reason, note, reporterHash, reporterName });
+    if (!r.ok) return res.status(404).json({ error: "unknown map" });
+    recordEvent(req.ingest.serverId, `/flag ${mapName} from ${req.ingest.serverName} (${reason})${r.duplicate ? " [dup]" : ""}`);
+    res.json({ ok: true, duplicate: !!r.duplicate });
+  })
+);
+
 app.use("/api", api);
 
 // JSON body-parse errors (and any other error surfaced by middleware) return
 // JSON, not Express's default HTML page — keeps the API contract consistent.
 app.use("/api", (err, _req, res, _next) => {
-  if (err && err.type === "entity.too.large") return res.status(413).json({ error: "payload too large" });
-  if (err) return res.status(400).json({ error: "bad request" });
+  if (!err) return res.status(500).json({ error: "internal error" });
+  if (err.type === "entity.too.large") return res.status(413).json({ error: "payload too large" });
+  // Body-parse / malformed-request faults are genuine client errors (400).
+  // Anything else here is an unexpected server fault forwarded by wrap()'s
+  // .catch(next) (e.g. a DB error) — report 500 and log it, so a real failure
+  // isn't hidden from monitoring behind a 400.
+  if (err.type === "entity.parse.failed" || err.status === 400 || err.statusCode === 400) {
+    return res.status(400).json({ error: "bad request" });
+  }
+  console.error("api error:", err);
   res.status(500).json({ error: "internal error" });
+});
+
+// ============================ Admin area ====================================
+// Map-flag review behind a login. Deliberately UNLINKED from the public site
+// (no nav entry, and a noindex header) — you reach it by knowing the URL and
+// having an account (created out-of-band with `node admin.js admin-add`).
+//
+// Every page is a pure server-rendered form: the production CSP
+// (deploy/nginx/racesow.conf) permits inline <style> ('unsafe-inline' in
+// style-src) but NOT inline <script>, so there is zero client JS in here — all
+// state changes are <form> POSTs. Sessions are DB-backed (web/db.js
+// admin_session): the browser holds only an opaque random cookie value; the DB
+// stores its SHA-256, an absolute expiry, and a per-session CSRF token.
+const ADMIN_COOKIE = "rs_admin";
+const ADMIN_SESSION_TTL = 7 * 24 * 3600; // seconds (absolute, no sliding renew)
+const REASON_LABELS = {
+  broken: "Broken",
+  offensive: "Offensive",
+  wrong_name: "Wrong name / metadata",
+  duplicate: "Duplicate",
+  other: "Other",
+};
+// A constant-cost decoy hash: verified against when the username is unknown so
+// a failed login costs the same scrypt work whether or not the account exists
+// (defeats username enumeration by timing). Computed once at boot.
+const DECOY_PW_HASH = hashPassword(crypto.randomBytes(24).toString("hex"));
+
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
+
+function parseCookies(req) {
+  const out = {};
+  const raw = req.headers.cookie;
+  if (!raw) return out;
+  for (const part of raw.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    const k = part.slice(0, i).trim();
+    if (k) out[k] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+function cookieAttrs(req) {
+  const a = ["HttpOnly", "SameSite=Strict", "Path=/admin"];
+  // Secure whenever TLS is terminated at the edge (trust proxy honours
+  // X-Forwarded-Proto); dropped for plain-HTTP local dev / tests so the cookie
+  // still round-trips. ADMIN_COOKIE_INSECURE=1 forces it off explicitly.
+  if (req.secure && process.env.ADMIN_COOKIE_INSECURE !== "1") a.push("Secure");
+  return a;
+}
+function setSessionCookie(req, res, value, maxAge) {
+  res.append("Set-Cookie", [`${ADMIN_COOKIE}=${value}`, ...cookieAttrs(req), `Max-Age=${maxAge}`].join("; "));
+}
+function clearSessionCookie(req, res) {
+  res.append("Set-Cookie", [`${ADMIN_COOKIE}=`, ...cookieAttrs(req), "Max-Age=0"].join("; "));
+}
+
+async function currentSession(req) {
+  const raw = parseCookies(req)[ADMIN_COOKIE];
+  if (!raw || !/^[a-f0-9]{64}$/.test(raw)) return null;
+  const sess = await race.getSession(sha256(raw));
+  return sess ? { ...sess, raw } : null;
+}
+
+// Gate: attach req.session or bounce. GET -> redirect to the login page;
+// state-changing verbs -> 401 (the form will 302 the user to login on reload).
+async function requireAdmin(req, res, next) {
+  try {
+    const sess = await currentSession(req);
+    if (!sess) {
+      if (req.method === "GET") return res.redirect(302, "/admin/login");
+      return res.status(401).type("text/plain").send("Not signed in.");
+    }
+    req.session = sess;
+    next();
+  } catch (e) {
+    next(e);
+  }
+}
+
+// True when a request is an explicit cross-site submission. Sec-Fetch-Site is
+// browser-set and not forgeable by page script; the Origin host check is the
+// fallback for browsers that don't send it. Absent headers (same-origin form
+// posts, server-to-server) pass. Used for CSRF defence AND for login (where
+// there is no session yet, so a cross-site auto-submit could otherwise fixate a
+// victim into the attacker's account — "login CSRF").
+function isCrossSite(req) {
+  if (req.get("sec-fetch-site") === "cross-site") return true;
+  const origin = req.get("origin");
+  if (origin) {
+    let host = null;
+    try { host = new URL(origin).host; } catch { host = null; }
+    if (host && host !== req.get("host") && !(PUBLIC_HOST && host === PUBLIC_HOST)) return true;
+  }
+  return false;
+}
+
+// CSRF for session-bearing form POSTs: the per-session token (defeats a blind
+// cross-site submit) plus the cross-site guard (defence in depth over
+// SameSite=Strict and the CSP's form-action 'self'). Returns true to proceed.
+function checkCsrf(req, res) {
+  const token = req.body && req.body._csrf;
+  if (!token || typeof token !== "string" || token !== req.session.csrf) {
+    res.status(403).type("text/plain").send("Bad CSRF token — reload and retry.");
+    return false;
+  }
+  if (isCrossSite(req)) {
+    res.status(403).type("text/plain").send("Cross-origin request refused.");
+    return false;
+  }
+  return true;
+}
+
+const ADMIN_STYLE = `
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#12100e;color:#eee;font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+a{color:#ff8a3c;text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:940px;margin:0 auto;padding:0 20px}
+header{background:#1b1815;border-bottom:1px solid #2c2823;padding:14px 0;margin-bottom:26px}
+header .wrap{display:flex;align-items:center;justify-content:space-between}
+header b{color:#ff6a1a}
+.who{font-size:13px;color:#b7ada2}
+.who form{display:inline}
+h1{font-size:20px;margin:0 0 4px}
+h2{font-size:16px;margin:26px 0 10px;color:#e9c9a8}
+.sub{color:#b7ada2;margin:0 0 18px}
+.card{background:#1b1815;border:1px solid #2c2823;border-radius:10px;padding:16px 18px;margin:0 0 14px}
+.flag-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+.mapname{font-weight:700;font-size:16px}
+.tags{margin:8px 0}
+.tag{display:inline-block;background:#2a2620;border:1px solid #3a352d;border-radius:20px;padding:2px 10px;margin:2px 6px 2px 0;font-size:12px}
+.tag b{color:#ffb87a}
+.note{color:#cdbfae;font-style:italic;margin:6px 0 0;white-space:pre-wrap;word-break:break-word}
+.meta{color:#8f857a;font-size:12px;margin-top:6px}
+.actions{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap}
+form.inline{display:inline}
+button,.btn{font:inherit;cursor:pointer;border-radius:7px;border:1px solid #3a352d;background:#2a2620;color:#eee;padding:7px 13px}
+button.primary{background:#ff6a1a;border-color:#ff6a1a;color:#1a1206;font-weight:600}
+button.ok{border-color:#3a6b3a;color:#bfe6bf}
+button.warn{border-color:#6b5a2a;color:#e6d6a0}
+button.danger{border-color:#6b2f22;color:#ffb4a0}
+button:hover{filter:brightness(1.12)}
+label{display:block;margin:12px 0 4px;font-size:13px;color:#cdbfae}
+input,select,textarea{width:100%;font:inherit;background:#12100e;color:#eee;border:1px solid #3a352d;border-radius:7px;padding:9px 11px}
+.login{max-width:360px;margin:8vh auto 0}
+.msg{border-radius:8px;padding:10px 13px;margin:0 0 14px}
+.msg.err{background:#3a1c17;border:1px solid #6b2f22;color:#ffb4a0}
+.msg.ok{background:#1c3320;border:1px solid #2f6b3a;color:#b4e6bf}
+.empty{color:#8f857a;padding:30px 0;text-align:center}
+.crumbs{margin:0 0 14px;font-size:13px;color:#8f857a}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid #2c2823}
+th{color:#b7ada2;font-weight:600}
+.st-open{color:#ffb87a}.st-resolved{color:#9fd6a0}.st-dismissed{color:#9a9088}
+.rcon-out{background:#0c0b09;border:1px solid #2c2823;border-radius:8px;padding:12px;white-space:pre-wrap;word-break:break-word;font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cdead0;max-height:60vh;overflow:auto}
+.logfilter{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.logfilter label{margin:0}
+.logfilter>div{flex:0 0 auto}
+.logfilter select,.logfilter input{width:auto;min-width:90px}
+.logs{background:#0c0b09;border:1px solid #2c2823;border-radius:8px;padding:8px 10px;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:70vh;overflow:auto}
+.logline{white-space:pre-wrap;word-break:break-word;padding:1px 0;border-bottom:1px solid #191612}
+.logline .lt{color:#7d746a}
+.logline .lg{color:#e9c9a8}
+.logline.err{color:#ffb4a0}.logline.warn{color:#e6d6a0}
+.src-console .ls{color:#8fb0d6}.src-event .ls{color:#9a9088}.src-rcon .ls{color:#ff8a3c}.src-maintenance .ls{color:#e6b0ff}.src-system .ls{color:#9a9088}
+`;
+
+function adminShell(title, bodyHtml, session, headExtra = "") {
+  const logout = session
+    ? `<span class="who">${escHtml(session.username)} ·
+         <form class="inline" method="post" action="/admin/logout">
+           <input type="hidden" name="_csrf" value="${escHtml(session.csrf)}">
+           <button type="submit" style="padding:2px 8px;font-size:12px">sign out</button>
+         </form></span>`
+    : "";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+${headExtra}<title>${escHtml(title)} · Racesow Admin</title>
+<style>${ADMIN_STYLE}</style></head>
+<body><header><div class="wrap"><span><b>RACESOW</b> ADMIN</span>${logout}</div></header>
+<main class="wrap">${bodyHtml}</main></body></html>`;
+}
+function sendAdmin(res, title, body, session, headExtra = "") {
+  res.type("html").send(adminShell(title, body, session, headExtra));
+}
+
+function fmtWhen(ts) {
+  return ts ? new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 16) + "Z" : "—";
+}
+
+const admin = express.Router();
+// Security headers FIRST — before the body parser — so they also cover a
+// parser-error response (e.g. a 413 from an over-limit form body): the admin
+// area must never be indexed, cached, or referrer-leaked on ANY path.
+admin.use((_req, res, next) => {
+  res.set("X-Robots-Tag", "noindex, nofollow");
+  res.set("Cache-Control", "no-store");
+  res.set("Referrer-Policy", "no-referrer");
+  next();
+});
+admin.use(express.urlencoded({ extended: false, limit: "16kb" }));
+
+// --- Auth ---
+admin.get("/login", wrap(async (req, res) => {
+  if (await currentSession(req)) return res.redirect(302, "/admin/flags");
+  const err = req.query.error ? `<div class="msg err">Invalid username or password.</div>` : "";
+  sendAdmin(res, "Sign in", `
+    <form class="login card" method="post" action="/admin/login" autocomplete="off">
+      <h1>Racesow Admin</h1>
+      <p class="sub">Moderator sign-in.</p>
+      ${err}
+      <label for="u">Username</label>
+      <input id="u" name="username" autocomplete="username" autofocus maxlength="64" required>
+      <label for="p">Password</label>
+      <input id="p" name="password" type="password" autocomplete="current-password" maxlength="200" required>
+      <div class="actions"><button class="primary" type="submit">Sign in</button></div>
+    </form>`);
+}));
+
+admin.post("/login", loginLimiter, wrap(async (req, res) => {
+  // Login CSRF guard: no session exists yet (nothing to token-check), but a
+  // cross-site auto-submitted login would fixate the victim into the attacker's
+  // account. Refuse an explicitly cross-site POST.
+  if (isCrossSite(req)) return res.status(403).type("text/plain").send("Cross-origin request refused.");
+  const username = String((req.body && req.body.username) || "").trim().slice(0, 64);
+  const password = String((req.body && req.body.password) || "");
+  const acct = username ? await race.getAdminByUsername(username) : null;
+  // Always run scrypt (decoy when the account is missing) for uniform timing.
+  const ok = verifyPassword(password, acct ? acct.password_hash : DECOY_PW_HASH);
+  if (!acct || !ok) return res.redirect(303, "/admin/login?error=1");
+
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  const csrf = crypto.randomBytes(24).toString("hex");
+  const now = Math.floor(Date.now() / 1000);
+  await race.createSession({
+    tokenHash: sha256(rawToken),
+    adminId: acct.id,
+    csrf,
+    expiresAt: now + ADMIN_SESSION_TTL,
+    ip: req.ip,
+    userAgent: req.get("user-agent"),
+    now,
+  });
+  await race.touchAdminLogin(acct.id, now);
+  race.deleteExpiredSessions(now).catch(() => {}); // opportunistic sweep
+  setSessionCookie(req, res, rawToken, ADMIN_SESSION_TTL);
+  res.redirect(303, "/admin/flags");
+}));
+
+admin.post("/logout", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  await race.deleteSession(sha256(req.session.raw));
+  clearSessionCookie(req, res);
+  res.redirect(303, "/admin/login");
+}));
+
+// --- Flag review ---
+admin.get("/", requireAdmin, (req, res) => res.redirect(302, "/admin/flags"));
+
+admin.get("/flags", requireAdmin, wrap(async (req, res) => {
+  const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
+  const groups = await race.openFlagSummary();
+  const csrf = escHtml(req.session.csrf);
+  const body = groups.length
+    ? groups.map((g) => {
+        const tags = Object.entries(g.reasons)
+          .map(([r, c]) => `<span class="tag"><b>${escHtml(REASON_LABELS[r] || r)}</b> ×${c}</span>`)
+          .join("");
+        return `<div class="card">
+          <div class="flag-head">
+            <span class="mapname">${escHtml(g.name)}</span>
+            <span class="meta">${g.openCount} open · last ${fmtWhen(g.lastAt)}${g.latestReporter ? ` · latest by ${escHtml(g.latestReporter)}` : ""}</span>
+          </div>
+          <div class="tags">${tags}</div>
+          ${g.latestNote ? `<p class="note">“${escHtml(g.latestNote)}”</p>` : ""}
+          <div class="actions">
+            <a class="btn" href="/admin/flags/map/${g.mapId}">Review ${g.openCount} flag${g.openCount === 1 ? "" : "s"}</a>
+            <a class="btn" href="/map/${g.mapId}" target="_blank" rel="noopener">Open map ↗</a>
+            <form class="inline" method="post" action="/admin/flags/map/${g.mapId}/resolve-all">
+              <input type="hidden" name="_csrf" value="${csrf}">
+              <button class="ok" type="submit">Resolve all</button>
+            </form>
+            <form class="inline" method="post" action="/admin/flags/map/${g.mapId}/dismiss-all">
+              <input type="hidden" name="_csrf" value="${csrf}">
+              <button class="warn" type="submit">Dismiss all</button>
+            </form>
+            <form class="inline" method="post" action="/admin/flags/map/${g.mapId}/block">
+              <input type="hidden" name="_csrf" value="${csrf}">
+              <button class="danger" type="submit" title="Remove from the vote pool + map cycle">Block map</button>
+            </form>
+          </div>
+        </div>`;
+      }).join("")
+    : `<div class="empty">No open flags. All clear. 🎉</div>`;
+  sendAdmin(res, "Flag queue", `
+    <h1>Open map flags</h1>
+    <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a> · <a href="/admin/logs">logs</a> · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/account">account</a></p>
+    ${done}${body}`, req.session);
+}));
+
+admin.get("/flags/all", requireAdmin, wrap(async (req, res) => {
+  const rows = await race.listFlags({ status: "all", limit: 500 });
+  const body = rows.length
+    ? `<table><thead><tr><th>Map</th><th>Reason</th><th>Status</th><th>Note</th><th>By</th><th>Reported</th><th>Closed by</th></tr></thead>
+       <tbody>${rows.map((f) => `<tr>
+         <td><a href="/admin/flags/map/${f.map_id}">${escHtml(f.name)}</a></td>
+         <td>${escHtml(REASON_LABELS[f.reason] || f.reason)}</td>
+         <td class="st-${escHtml(f.status)}">${escHtml(f.status)}</td>
+         <td>${f.note ? escHtml(f.note) : ""}</td>
+         <td>${f.reporter_name ? escHtml(f.reporter_name) : ""}</td>
+         <td class="meta">${fmtWhen(f.created_at)}</td>
+         <td class="meta">${f.resolved_by ? escHtml(f.resolved_by) : ""}</td>
+       </tr>`).join("")}</tbody></table>`
+    : `<div class="empty">No flags on record.</div>`;
+  sendAdmin(res, "Flag history", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Flag history</h1><p class="sub">Most recent ${rows.length} report(s).</p>${body}`, req.session);
+}));
+
+admin.get("/flags/map/:id", requireAdmin, wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad map id");
+  const map = await race.mapDetail(id, { limit: 1 });
+  if (!map) return res.status(404).type("text/plain").send("map not found");
+  const flags = await race.flagsForMap(id);
+  const blocked = await race.isMapBlocked(id);
+  const csrf = escHtml(req.session.csrf);
+  const blockBox = blocked
+    ? `<div class="msg err">⛔ This map is <b>blocked</b> — removed from the vote pool + map cycle.
+         <form class="inline" method="post" action="/admin/maps/${id}/unblock" style="margin-left:8px">
+           <input type="hidden" name="_csrf" value="${csrf}"><button class="ok" type="submit">Unblock</button></form></div>`
+    : `<form class="inline" method="post" action="/admin/flags/map/${id}/block">
+         <input type="hidden" name="_csrf" value="${csrf}">
+         <button class="danger" type="submit" title="Remove from the vote pool + map cycle">Block this map</button></form>`;
+  const rows = flags.length
+    ? flags.map((f) => `<div class="card">
+        <div class="flag-head">
+          <span class="mapname">${escHtml(REASON_LABELS[f.reason] || f.reason)}</span>
+          <span class="st-${escHtml(f.status)}">${escHtml(f.status)}</span>
+        </div>
+        ${f.note ? `<p class="note">“${escHtml(f.note)}”</p>` : `<p class="meta">no note</p>`}
+        <div class="meta">reported ${fmtWhen(f.created_at)}${f.reporter_name ? ` by ${escHtml(f.reporter_name)}` : ""}${f.resolved_by ? ` · closed by ${escHtml(f.resolved_by)} ${fmtWhen(f.resolved_at)}` : ""}</div>
+        ${f.status === "open" ? `<div class="actions">
+          <form class="inline" method="post" action="/admin/flags/${f.id}/resolve">
+            <input type="hidden" name="_csrf" value="${csrf}"><button class="ok" type="submit">Resolve</button></form>
+          <form class="inline" method="post" action="/admin/flags/${f.id}/dismiss">
+            <input type="hidden" name="_csrf" value="${csrf}"><button class="warn" type="submit">Dismiss</button></form>
+        </div>` : ""}
+      </div>`).join("")
+    : `<div class="empty">No flags for this map.</div>`;
+  sendAdmin(res, `Flags · ${map.name}`, `
+    <div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <div class="flag-head"><h1>${escHtml(map.name)}</h1>
+      <a class="btn" href="/map/${id}" target="_blank" rel="noopener">Open map ↗</a></div>
+    <p class="sub">${flags.filter((f) => f.status === "open").length} open · ${flags.length} total</p>
+    <div class="actions" style="margin:0 0 16px">${blockBox}</div>
+    ${rows}`, req.session);
+}));
+
+// Resolve/dismiss one flag, then all-flags for a map. Each guards CSRF and
+// bounces back to the map's flag page (or the queue for the bulk actions).
+async function closeOneFlag(req, res, status) {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad flag id");
+  const flag = await race.flagById(id);
+  await race.setFlagStatus(id, status, req.session.username);
+  res.redirect(303, flag ? `/admin/flags/map/${flag.map_id}` : "/admin/flags");
+}
+admin.post("/flags/:id/resolve", requireAdmin, wrap((req, res) => closeOneFlag(req, res, "resolved")));
+admin.post("/flags/:id/dismiss", requireAdmin, wrap((req, res) => closeOneFlag(req, res, "dismissed")));
+
+async function closeMapFlags(req, res, status) {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad map id");
+  const n = await race.resolveMapFlags(id, status, req.session.username);
+  res.redirect(303, `/admin/flags?done=${encodeURIComponent(`${status === "resolved" ? "Resolved" : "Dismissed"} ${n} flag(s).`)}`);
+}
+admin.post("/flags/map/:id/resolve-all", requireAdmin, wrap((req, res) => closeMapFlags(req, res, "resolved")));
+admin.post("/flags/map/:id/dismiss-all", requireAdmin, wrap((req, res) => closeMapFlags(req, res, "dismissed")));
+
+// Block a map (remove from the vote pool + cycle) — also resolves its open
+// flags. Unblock reverses it. Both CSRF-guarded.
+admin.post("/flags/map/:id/block", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad map id");
+  const r = await race.blockMap(id, "blocked via admin flag review", req.session.username);
+  if (!r.ok) return res.status(404).type("text/plain").send("map not found");
+  res.redirect(303, `/admin/flags?done=${encodeURIComponent("Blocked the map and closed its open flags. It will drop from rotation on the game servers' next restart.")}`);
+}));
+admin.post("/maps/:id/unblock", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad map id");
+  await race.unblockMap(id);
+  res.redirect(303, `/admin/blocked?done=${encodeURIComponent("Unblocked. It returns to rotation on the game servers' next restart.")}`);
+}));
+
+admin.get("/blocked", requireAdmin, wrap(async (req, res) => {
+  const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
+  const rows = await race.blockedMaps();
+  const csrf = escHtml(req.session.csrf);
+  const body = rows.length
+    ? rows.map((m) => `<div class="card">
+        <div class="flag-head">
+          <span class="mapname">${escHtml(m.name)}</span>
+          <span class="meta">blocked ${fmtWhen(Number(m.blocked_at))}${m.blocked_by ? ` by ${escHtml(m.blocked_by)}` : ""}</span>
+        </div>
+        ${m.reason ? `<p class="note">${escHtml(m.reason)}</p>` : ""}
+        <div class="actions">
+          <a class="btn" href="/admin/flags/map/${m.map_id}">Flags</a>
+          <a class="btn" href="/map/${m.map_id}" target="_blank" rel="noopener">Open map ↗</a>
+          <form class="inline" method="post" action="/admin/maps/${m.map_id}/unblock">
+            <input type="hidden" name="_csrf" value="${csrf}"><button class="ok" type="submit">Unblock</button></form>
+        </div>
+      </div>`).join("")
+    : `<div class="empty">No blocked maps.</div>`;
+  sendAdmin(res, "Blocked maps", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Blocked maps</h1>
+    <p class="sub">${rows.length} map${rows.length === 1 ? "" : "s"} removed from the vote pool + cycle ·
+      served to game servers at <span style="font-family:monospace">/api/game/blocked-maps</span></p>
+    ${done}${body}`, req.session);
+}));
+
+// --- Account (self-service password change) ---
+admin.get("/account", requireAdmin, (req, res) => {
+  const msg = req.query.ok
+    ? `<div class="msg ok">Password changed. Other sessions were signed out.</div>`
+    : req.query.error === "mismatch"
+    ? `<div class="msg err">New passwords did not match, or the new one was too short (min 10).</div>`
+    : req.query.error
+    ? `<div class="msg err">Current password was incorrect.</div>`
+    : "";
+  sendAdmin(res, "Account", `
+    <div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Account · ${escHtml(req.session.username)}</h1>
+    ${msg}
+    <form class="card" method="post" action="/admin/account/password" autocomplete="off" style="max-width:420px">
+      <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+      <label for="cur">Current password</label>
+      <input id="cur" name="current" type="password" autocomplete="current-password" required>
+      <label for="n1">New password (min 10 chars)</label>
+      <input id="n1" name="next" type="password" autocomplete="new-password" minlength="10" maxlength="200" required>
+      <label for="n2">Confirm new password</label>
+      <input id="n2" name="confirm" type="password" autocomplete="new-password" minlength="10" maxlength="200" required>
+      <div class="actions"><button class="primary" type="submit">Change password</button></div>
+    </form>`, req.session);
+});
+
+admin.post("/account/password", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const current = String((req.body && req.body.current) || "");
+  const next = String((req.body && req.body.next) || "");
+  const confirm = String((req.body && req.body.confirm) || "");
+  const acct = await race.getAdminByUsername(req.session.username);
+  if (!acct || !verifyPassword(current, acct.password_hash)) return res.redirect(303, "/admin/account?error=1");
+  if (next.length < 10 || next !== confirm) return res.redirect(303, "/admin/account?error=mismatch");
+  await race.setAdminPassword(req.session.username, hashPassword(next));
+  // Invalidate every OTHER session for this admin, then re-issue this one so the
+  // current browser stays signed in (a password change should boot stale/leaked
+  // cookies but not the person doing the change).
+  const now = Math.floor(Date.now() / 1000);
+  const keep = sha256(req.session.raw);
+  await race.pool.query("DELETE FROM admin_session WHERE admin_id = $1 AND token_hash <> $2", [acct.id, keep]);
+  res.redirect(303, "/admin/account?ok=1");
+}));
+
+// --- Servers, RCON, maintenance & logs (operator console) ------------------
+// One page ties together: the live/enrolled server list, a persistent
+// maintenance toggle (re-broadcasts on a timer), a one-off broadcast, per-server
+// RCON, and the /admin/logs tail. All POSTs are CSRF-guarded; RCON secrets are
+// set out-of-band (node admin.js rcon <id> <pw>) and never rendered.
+function fmtSec(ts) {
+  return ts ? new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z" : "—";
+}
+
+// Commands that can drop players, wipe config, or lock you out — allowed only
+// when the operator explicitly ticks the confirm box in the console.
+const DANGEROUS_RCON = /^\s*(quit|killserver|rcon_password|set\s+rcon_password|sv_cheats|exec|unbindall|writeconfig|reconnect)\b/i;
+// The engine's command buffer runs ';'-separated commands in one line, so a
+// bare first-token check would let `status; quit` slip past the confirm guard.
+// Classify EVERY segment. sanitizeCommand already strips newlines, but split on
+// them too for defence in depth.
+function isDangerousRcon(command) {
+  return String(command)
+    .split(/[;\n]/)
+    .some((seg) => DANGEROUS_RCON.test(seg));
+}
+
+admin.get("/servers", requireAdmin, wrap(async (req, res) => {
+  const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
+  const err = req.query.error ? `<div class="msg err">${escHtml(String(req.query.error))}</div>` : "";
+  const servers = await race.serversAdmin();
+  const snap = live.getLive();
+  const csrf = escHtml(req.session.csrf);
+  const everyMin = Math.round(MAINT_REBROADCAST_SECS / 60);
+  const maintBox = maintenance.active
+    ? `<div class="msg err">🛠 <b>Maintenance mode ACTIVE</b>${maintenance.since ? ` since ${fmtWhen(maintenance.since)}` : ""}${maintenance.by ? ` (by ${escHtml(maintenance.by)})` : ""} —
+         re-notifying servers every ${everyMin} min.
+         <p class="note" style="margin:6px 0 8px">“${escHtml(maintenance.message || "")}”</p>
+         <form class="inline" method="post" action="/admin/maintenance">
+           <input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="action" value="off">
+           <button class="ok" type="submit">Turn OFF + send all-clear</button></form></div>`
+    : `<form class="card" method="post" action="/admin/maintenance">
+         <input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="action" value="on">
+         <label for="mmsg">Maintenance notice — broadcast to all servers now, then re-sent every ${everyMin} min while active</label>
+         <input id="mmsg" name="message" maxlength="300" value="${escHtml(DEFAULT_MAINT_MSG)}">
+         <div class="actions"><button class="warn" type="submit">Enable maintenance mode</button></div></form>`;
+  const bcast = `<form class="card" method="post" action="/admin/broadcast">
+      <input type="hidden" name="_csrf" value="${csrf}">
+      <label for="bmsg">One-off message to all servers (in-game chat via RCON <span style="font-family:monospace">say</span>)</label>
+      <input id="bmsg" name="message" maxlength="300" placeholder="e.g. New maps added — have fun!" required>
+      <div class="actions"><button class="primary" type="submit">Broadcast</button></div></form>`;
+  const rows = servers.length
+    ? servers.map((s) => {
+        const li = (snap.servers || []).find((x) => x.id === s.id) || null;
+        const state = li && li.online
+          ? `<span class="st-resolved">online</span>${li.map ? ` · ${escHtml(li.map)}` : ""}${li.players ? ` · ${li.players.length}p` : ""}`
+          : `<span class="st-dismissed">offline</span>`;
+        return `<tr>
+          <td>${escHtml(s.name)}${s.status !== "trusted" ? ` <span class="st-dismissed">(${escHtml(s.status)})</span>` : ""}</td>
+          <td class="meta">${s.address ? escHtml(s.address) : "—"}</td>
+          <td>${s.rcon ? '<span class="st-resolved">yes</span>' : '<span class="st-dismissed">no</span>'}</td>
+          <td>${state}</td>
+          <td class="meta">${fmtWhen(s.last_seen_at)}</td>
+          <td>${s.rcon ? `<a class="btn" href="/admin/servers/${s.id}/rcon">Console</a> ` : ""}<a class="btn" href="/admin/logs?server=${s.id}">Logs</a></td>
+        </tr>`;
+      }).join("")
+    : `<tr><td colspan="6" class="empty">No servers enrolled.</td></tr>`;
+  sendAdmin(res, "Servers", `
+    <h1>Servers &amp; operations</h1>
+    <p class="sub"><a href="/admin/flags">← flag queue</a> · <a href="/admin/logs">logs</a> ·
+      RCON is enabled per server with <span style="font-family:monospace">node admin.js rcon &lt;id&gt; &lt;password&gt;</span></p>
+    ${done}${err}
+    <h2>Maintenance mode</h2>${maintBox}
+    <h2>Broadcast</h2>${bcast}
+    <h2>Enrolled servers</h2>
+    <table><thead><tr><th>Name</th><th>Address</th><th>RCON</th><th>Live</th><th>Last seen</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>`, req.session);
+}));
+
+admin.post("/maintenance", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const action = String((req.body && req.body.action) || "");
+  const message = String((req.body && req.body.message) || "").trim();
+  if (action !== "on" && action !== "off")
+    return res.redirect(303, "/admin/servers?error=" + encodeURIComponent("Unknown maintenance action."));
+  const b = await setMaintenance(action === "on", message || DEFAULT_MAINT_MSG, req.session.username);
+  const verb = action === "on" ? "ON" : "OFF";
+  const summary = b.targets
+    ? `Maintenance mode ${verb} — notified ${b.ok}/${b.targets} server(s).`
+    : `Maintenance mode ${verb}. No RCON-enabled servers to notify.`;
+  res.redirect(303, "/admin/servers?done=" + encodeURIComponent(summary));
+}));
+
+admin.post("/broadcast", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const message = String((req.body && req.body.message) || "").trim();
+  if (!message) return res.redirect(303, "/admin/servers?error=" + encodeURIComponent("Message was empty."));
+  const b = await broadcastCommand(sayCommand(message), { source: "rcon", label: "broadcast" });
+  recordEvent(null, `broadcast by ${req.session.username}: “${message.slice(0, 200)}” → ${b.ok}/${b.targets} server(s)`, "rcon");
+  const summary = b.targets ? `Broadcast sent to ${b.ok}/${b.targets} server(s).` : "No RCON-enabled servers to broadcast to.";
+  res.redirect(303, "/admin/servers?done=" + encodeURIComponent(summary));
+}));
+
+// The RCON console page: form + last result + this server's recent RCON audit.
+async function renderRconConsole(res, req, s, result, command) {
+  const csrf = escHtml(req.session.csrf);
+  const ready = !!(s.rcon_password && s.address);
+  const warn = !s.rcon_password
+    ? `<div class="msg err">No RCON password set. Enable it: <span style="font-family:monospace">node admin.js rcon ${s.id} &lt;password&gt;</span></div>`
+    : "";
+  const noAddr = !s.address
+    ? `<div class="msg err">No query address set: <span style="font-family:monospace">node admin.js address ${s.id} &lt;host:port&gt;</span></div>`
+    : "";
+  const out = result
+    ? `<h2>Result</h2>
+       <p class="meta">${result.ok ? '<span class="st-resolved">sent</span>' : `<span class="st-dismissed">${escHtml(result.error || (result.authFailed ? "bad rcon password" : "no reply"))}</span>`}${result.replied ? "" : " · no reply datagram (many commands don't echo)"}</p>
+       <pre class="rcon-out">${escHtml(result.reply && result.reply.length ? result.reply : "(no output returned)")}</pre>`
+    : "";
+  const recent = await race.recentServerLogs({ serverId: s.id, source: "rcon", limit: 20 });
+  const history = recent.length
+    ? `<h2>Recent RCON actions</h2><div class="logs">${recent
+        .map((r) => `<div class="logline"><span class="lt">${fmtSec(r.createdAt)}</span> ${escHtml(r.line)}</div>`)
+        .join("")}</div>`
+    : "";
+  sendAdmin(res, `RCON · ${s.name}`, `
+    <div class="crumbs"><a href="/admin/servers">← servers</a></div>
+    <h1>RCON console · ${escHtml(s.name)}</h1>
+    <p class="sub">${s.address ? escHtml(s.address) : "no address"} · <a href="/admin/logs?server=${s.id}">logs</a></p>
+    ${warn}${noAddr}
+    <form class="card" method="post" action="/admin/servers/${s.id}/rcon" autocomplete="off">
+      <input type="hidden" name="_csrf" value="${csrf}">
+      <label for="cmd">Command</label>
+      <input id="cmd" name="command" maxlength="480" placeholder="status" value="${escHtml(command || "")}" ${ready ? "autofocus" : "disabled"}>
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" name="confirm" value="1" style="width:auto"> Allow potentially disruptive commands (quit, killserver, exec, …)</label>
+      <div class="actions"><button class="primary" type="submit" ${ready ? "" : "disabled"}>Run</button></div>
+    </form>
+    ${out}${history}`, req.session);
+}
+
+admin.get("/servers/:id/rcon", requireAdmin, wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad server id");
+  const s = await race.serverById(id);
+  if (!s) return res.status(404).type("text/plain").send("server not found");
+  await renderRconConsole(res, req, s, null, "");
+}));
+
+admin.post("/servers/:id/rcon", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad server id");
+  const s = await race.serverById(id);
+  if (!s) return res.status(404).type("text/plain").send("server not found");
+  const command = sanitizeCommand(String((req.body && req.body.command) || ""));
+  const confirm = !!(req.body && req.body.confirm);
+  if (!command || !s.rcon_password || !s.address) return renderRconConsole(res, req, s, null, command);
+  if (isDangerousRcon(command) && !confirm) {
+    recordEvent(s.id, `rcon by ${req.session.username} BLOCKED (needs confirm): ${command}`, "rcon", "warn");
+    return renderRconConsole(res, req, s, { ok: false, error: "blocked — tick the confirm box to run a disruptive command", replied: false, reply: "" }, command);
+  }
+  const parsed = parseAddress(s.address);
+  const result = parsed
+    ? await sendRcon(parsed.host, parsed.port, s.rcon_password, command)
+    : { ok: false, error: "bad address", replied: false, reply: "" };
+  recordEvent(
+    s.id,
+    `rcon by ${req.session.username}: ${command} → ${result.ok ? "ok" : "FAIL (" + (result.error || (result.authFailed ? "auth" : "no reply")) + ")"}`,
+    "rcon",
+    result.ok ? null : "warn"
+  );
+  await renderRconConsole(res, req, s, result, command);
+}));
+
+admin.get("/logs", requireAdmin, wrap(async (req, res) => {
+  const serverId = req.query.server && req.query.server !== "all" ? asInt(req.query.server) : null;
+  const SOURCES = ["console", "event", "rcon", "maintenance", "system"];
+  const source = SOURCES.includes(req.query.source) ? req.query.source : null;
+  const n = Math.min(Math.max(asInt(req.query.n) || 200, 20), 1000);
+  const refresh = req.query.refresh == null ? 5 : Math.max(0, Math.min(60, asInt(req.query.refresh) ?? 0));
+  const [logs, servers] = await Promise.all([
+    race.recentServerLogs({ serverId, source, limit: n }),
+    race.serversAdmin(),
+  ]);
+  const opt = (val, label, sel) => `<option value="${escHtml(val)}"${String(sel) === String(val) ? " selected" : ""}>${escHtml(label)}</option>`;
+  const serverOpts = [opt("all", "all servers", serverId == null ? "all" : serverId)]
+    .concat(servers.map((s) => opt(String(s.id), s.name, serverId == null ? "all" : serverId)))
+    .join("");
+  const sourceOpts = [opt("all", "all sources", source || "all")]
+    .concat(SOURCES.map((s) => opt(s, s, source || "all")))
+    .join("");
+  const refreshOpts = [0, 3, 5, 10, 30].map((v) => opt(String(v), v === 0 ? "off" : v + "s", refresh)).join("");
+  const filter = `<form class="card logfilter" method="get" action="/admin/logs">
+      <div><label>Server</label><select name="server">${serverOpts}</select></div>
+      <div><label>Source</label><select name="source">${sourceOpts}</select></div>
+      <div><label>Lines</label><input name="n" type="number" min="20" max="1000" value="${n}"></div>
+      <div><label>Auto-refresh</label><select name="refresh">${refreshOpts}</select></div>
+      <div><button class="primary" type="submit">Apply</button></div>
+    </form>`;
+  const body = logs.length
+    ? `<div class="logs">${logs
+        .map((l) => {
+          const cls = `logline src-${escHtml(l.source)}${l.level === "error" ? " err" : l.level === "warn" ? " warn" : ""}`;
+          return `<div class="${cls}"><span class="lt">${fmtSec(l.createdAt)}</span> <span class="ls">${escHtml(l.source)}</span> ${l.serverName ? `<span class="lg">${escHtml(l.serverName)}</span> ` : ""}${escHtml(l.line)}</div>`;
+        })
+        .join("")}</div>`
+    : `<div class="empty">No log lines match.</div>`;
+  // Auto-refresh via <meta http-equiv> keeps this page pure-HTML (no client JS,
+  // which the admin CSP forbids). refresh=0 disables it.
+  const headExtra = refresh > 0 ? `<meta http-equiv="refresh" content="${refresh}">\n` : "";
+  sendAdmin(res, "Logs", `
+    <div class="crumbs"><a href="/admin/servers">← servers</a></div>
+    <h1>Server logs</h1>
+    <p class="sub">Newest first · ${logs.length} line(s)${refresh > 0 ? ` · auto-refresh ${refresh}s` : ""}. Console lines are shipped from each game server's stdout.</p>
+    ${filter}${body}`, req.session, headExtra);
+}));
+
+// Unknown /admin/* paths 404 as plain text (never fall through to the public
+// SPA shell that the app.get("*") fallback would otherwise serve).
+admin.use((_req, res) => res.status(404).type("text/plain").send("not found"));
+
+app.use("/admin", admin);
+// Admin form/parse errors (bad CSRF body, oversized form) as plain text, not
+// the SPA shell, so a broken POST doesn't render a 200 HTML page.
+app.use("/admin", (err, _req, res, _next) => {
+  if (err && err.type === "entity.too.large") return res.status(413).type("text/plain").send("too large");
+  res.status(400).type("text/plain").send("bad request");
 });
 
 // --- Server-rendered Open Graph tags -----------------------------------------
@@ -828,6 +1836,15 @@ function defaultShell(req) {
   ]);
 }
 
+// Public database backup download (the db-backup sidecar refreshes it weekly).
+// A fixed path with no user input, so there is no path-traversal surface; the
+// callback turns a missing file into a clean 404 instead of an Express error.
+app.get("/backup/racesow-db-latest.zip", backupLimiter, (_req, res) => {
+  res.download(BACKUP_LATEST_ZIP, "racesow-db-latest.zip", { maxAge: "1h" }, (err) => {
+    if (err && !res.headersSent) res.status(404).json({ error: "no backup available yet" });
+  });
+});
+
 app.get("/", (req, res) => sendShell(res, defaultShell(req)));
 
 // Static frontend. The 3D replay model/vendor assets are large and stable, so
@@ -864,6 +1881,16 @@ const server = app.listen(PORT, async () => {
   if (!shuttingDown) live.start(); // a signal may land during the await above
   const liveTargets = servers.filter((s) => s.address).length;
   console.log(`Live poller: ${liveTargets} server(s) with a query address`);
+  // Maintenance mode: load persisted state and keep it (and the re-broadcast
+  // timer) reconciled from the DB so both web replicas agree.
+  await refreshMaintenance();
+  if (!shuttingDown) {
+    maintRefreshTimer = setInterval(() => {
+      if (!shuttingDown) refreshMaintenance();
+    }, MAINT_STATE_REFRESH_MS);
+    maintRefreshTimer.unref();
+  }
+  if (maintenance.active) console.log("Maintenance mode is ACTIVE (re-broadcasting notices)");
 });
 
 // Graceful shutdown, swapped in over the boot-time handler installed at the
@@ -878,6 +1905,8 @@ async function shutdown(signal) {
   // pool refuses to drain.
   setTimeout(() => process.exit(1), 8000).unref();
   live.stop();
+  stopMaintTimer();
+  clearInterval(maintRefreshTimer);
   clearTimeout(refreshTimer);
   await new Promise((resolve) => {
     server.close(resolve); // stop accepting; resolves once all sockets close

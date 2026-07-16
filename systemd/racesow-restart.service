@@ -1,0 +1,19 @@
+# Restart the Racesow game server (the warsow-race container). Run daily at
+# 05:00 local by racesow-restart.timer. `docker restart` re-executes the
+# container's entrypoint.sh, so on the way back up the server rebuilds g_maplist
+# — picking up any maps a moderator has newly blocked (GET /api/game/blocked-maps)
+# and dropping them from the vote pool + cycle — and recompiles the gametype.
+# The container name is identical on the full and agent tiers, so this one unit
+# serves both.
+#
+# Template: __RACESOW_USER__ is substituted by systemd/install.sh (the user must
+# be able to talk to Docker, same as the other racesow units).
+[Unit]
+Description=Restart the Racesow game server (daily 5am local)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=__RACESOW_USER__
+ExecStart=/usr/bin/docker restart warsow-race

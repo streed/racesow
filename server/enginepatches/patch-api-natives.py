@@ -215,6 +215,39 @@ GHOST_ENTRIES = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, GHOST_ENTRIES, "asGlobFuncs ghost entries")
 
+# --- 1e. in-game /flag: report the current map for review --------------------
+# Adds the RS_ApiFlag native (implementation in g_rs_api.cpp). Wrapper/entry
+# inserted the same way as above; the anchors are re-emitted so they stay unique
+# for any later patcher. The Dockerfile asserts on "asFunc_RS_ApiFlag".
+FLAG_WRAPPER = (
+    "// racesow-docker: in-game /flag - report the current map for review\n"
+    "// (implementation in g_rs_api.cpp; queued + POSTed on the worker thread)\n"
+    "void RS_ApiFlag( const char *url, const char *token, const char *mapname,\n"
+    "\tconst char *reason, const char *player, const char *login );\n"
+    "\n"
+    "static void asFunc_RS_ApiFlag( asstring_t *url, asstring_t *token, asstring_t *mapname,\n"
+    "\tasstring_t *reason, asstring_t *player, asstring_t *login )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !mapname || !mapname->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFlag( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tmapname->buffer,\n"
+    "\t\treason && reason->buffer ? reason->buffer : \"\",\n"
+    "\t\tplayer && player->buffer ? player->buffer : \"\",\n"
+    "\t\tlogin && login->buffer ? login->buffer : \"\" );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, FLAG_WRAPPER, "asFunc flag wrapper")
+
+FLAG_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFlag( const String &in url, const String &in token, "
+    "const String &in map, const String &in reason, const String &in player, "
+    "const String &in login )\", asFUNCTION(asFunc_RS_ApiFlag), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, FLAG_ENTRY, "asGlobFuncs flag entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

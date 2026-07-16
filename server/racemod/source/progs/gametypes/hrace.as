@@ -185,6 +185,8 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_MirrorWatch( client, cmdString, argsString, argc );
     else if ( cmdString == "meshvote" || cmdString == "mv" )
         return Cmd_MeshVote( client, cmdString, argsString, argc );
+    else if ( cmdString == "flag" )
+        return Cmd_Flag( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -897,6 +899,7 @@ void GT_InitGametype()
     G_RegisterCommand( "maplist" );
     G_RegisterCommand( "help" );
     G_RegisterCommand( "rules" );
+    G_RegisterCommand( "flag" );
 
     RACE_MirrorInit(); // registers "who" and "watch"
     RACE_GhostInit();

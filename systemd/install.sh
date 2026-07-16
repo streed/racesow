@@ -41,18 +41,23 @@ else
         || die "user ${RACESOW_USER} cannot talk to Docker — the units run as this user"
 fi
 
-# Both tiers host game pk3 packs, so both get the weekly ClamAV pak scan.
+# Both tiers host game pk3 packs, so both get the weekly ClamAV pak scan, and
+# both get the daily 5am-local game-server restart — the timezone differs per
+# tier (RESTART_TZ, baked into racesow-restart.timer's OnCalendar).
 if [ "${MODE}" = "full" ]; then
-    UNITS="racesow-web.service racesow-server.service racesow-db-backup.service racesow-db-backup.timer racesow-pakscan.service racesow-pakscan.timer"
-    ENABLE="racesow-web.service racesow-server.service racesow-db-backup.timer racesow-pakscan.timer"
+    UNITS="racesow-web.service racesow-server.service racesow-db-backup.service racesow-db-backup.timer racesow-pakscan.service racesow-pakscan.timer racesow-restart.service racesow-restart.timer"
+    ENABLE="racesow-web.service racesow-server.service racesow-db-backup.timer racesow-pakscan.timer racesow-restart.timer"
+    RESTART_TZ="${RESTART_TZ:-Europe/Berlin}"
 else
-    UNITS="racesow-agent.service racesow-pakscan.service racesow-pakscan.timer"
-    ENABLE="racesow-agent.service racesow-pakscan.timer"
+    UNITS="racesow-agent.service racesow-pakscan.service racesow-pakscan.timer racesow-restart.service racesow-restart.timer"
+    ENABLE="racesow-agent.service racesow-pakscan.timer racesow-restart.timer"
+    RESTART_TZ="${RESTART_TZ:-America/New_York}"
 fi
 
 for u in ${UNITS}; do
     sed -e "s#__RACESOW_DIR__#${REPO_ROOT}#g" \
         -e "s#__RACESOW_USER__#${RACESOW_USER}#g" \
+        -e "s#__RESTART_TZ__#${RESTART_TZ}#g" \
         "${REPO_ROOT}/systemd/${u}" | sudo tee "${UNIT_DIR}/${u}" >/dev/null
     say "installed ${UNIT_DIR}/${u}"
 done

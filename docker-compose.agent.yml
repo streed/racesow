@@ -45,6 +45,8 @@ services:
       INGEST_URL: "${INGEST_URL:?set INGEST_URL in .env}"
       INGEST_TOKEN: "${INGEST_TOKEN:?set INGEST_TOKEN in .env}"
       VERSION_NAME: "${VERSION_NAME:-wsw 2.1}"
+      # Ship the game console to the central site's admin log view. LOG_SHIP=0 off.
+      LOG_SHIP: "${LOG_SHIP:-1}"
       # Client-reachable HTTP pak mirror (optional; see server/docker-compose.yml).
       SV_UPLOADS_BASEURL: "${SV_UPLOADS_BASEURL:-}"
       # Cross-server player mirroring (UDP mesh). Peers exchange live player
