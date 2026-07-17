@@ -18,14 +18,18 @@ hrace/entities/gates.as;
 hrace/entities/accuracy.as;
 hrace/entities/target_init.as;
 hrace/entities/timers.as;
+hrace/entities/xonotic.as;
 
 hrace/utils.as;
+hrace/entityfinder.as;
 hrace/commands.as;
 hrace/player.as;
 hrace/math.as;
 hrace/position.as;
+hrace/positionstore.as;
 hrace/quickmenu.as;
 hrace/recordtime.as;
+hrace/lastrecords.as;
 hrace/racelog.as;
 hrace/apitop.as;
 hrace/demos.as;

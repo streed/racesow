@@ -179,6 +179,13 @@ void RACE_LoadTopScores()
             uint numSectors = uint( sectorToken.toInt() );
             // TODO: should probably check if numSectors == numCheckpoints
 
+            // Sanity-clamp: a corrupt/hostile line (huge or negative-as-uint
+            // sector count) would otherwise drive a gigabyte-scale resize()
+            // below and OOM the server. Real maps have far fewer checkpoints;
+            // the token stream is desynced garbage past a bad line, so stop.
+            if ( numSectors > 512 )
+                break;
+
             // store this one
             RecordTime record;
             record.setupArrays( numSectors + 1 );
@@ -205,6 +212,81 @@ void RACE_LoadTopScores()
 
         RACE_UpdateHUDTopScores();
     }
+}
+
+// Read topscores/race/<mapName>.txt into a fresh array (best-first, as stored
+// in the file) WITHOUT touching the live levelRecords board or the HUD. Used by
+// "/top <map>" to inspect another map's records without loading that map. This
+// mirrors the parsing in RACE_LoadTopScores above, but targets an arbitrary map
+// and returns the records instead of inserting them into the level board.
+RecordTime[] RACE_ReadTopScoresFile( const String &in mapName )
+{
+    RecordTime[] list;
+
+    String topScores = G_LoadFile( "topscores/race/" + mapName.tolower() + ".txt" );
+    if ( topScores.length() == 0 )
+        return list;
+
+    String timeToken, loginToken, nameToken, sectorToken;
+    int count = 0;
+    uint sep;
+
+    for ( int i = 0; i < MAX_RECORDS; i++ )
+    {
+        timeToken = topScores.getToken( count++ );
+        if ( timeToken.length() == 0 )
+            break;
+
+        sep = timeToken.locate( "|", 0 );
+        if ( sep == timeToken.length() )
+        {
+            loginToken = "";
+        }
+        else
+        {
+            loginToken = timeToken.substr( sep + 1 );
+            timeToken = timeToken.substr( 0, sep );
+        }
+
+        nameToken = topScores.getToken( count++ );
+        if ( nameToken.length() == 0 )
+            break;
+
+        sectorToken = topScores.getToken( count++ );
+        if ( sectorToken.length() == 0 )
+            break;
+
+        uint numSectors = uint( sectorToken.toInt() );
+
+        // Same sanity-clamp as RACE_LoadTopScores: never let a corrupt line
+        // drive a huge resize() (OOM). Past a bad line the stream is garbage.
+        if ( numSectors > 512 )
+            break;
+
+        RecordTime record;
+        record.setupArrays( numSectors + 1 );
+        for ( uint j = 0; j < numSectors; j++ )
+        {
+            sectorToken = topScores.getToken( count++ );
+            if ( sectorToken.length() == 0 )
+                break;
+
+            uint sectorTime = uint( sectorToken.toInt() );
+            if ( sectorTime != 0 )
+                record.checkpoints[ j ] = Checkpoint( sectorTime, CheckpointType_Normal );
+        }
+
+        record.ident = RecordTimeIdent( nameToken, loginToken );
+        record.type = RecordTimeType_Finished;
+
+        uint finishTime = uint( timeToken.toInt() );
+        record.checkpoints[ numSectors ] = Checkpoint( finishTime, CheckpointType_Finish );
+        record.deduceCheckpointOrder();
+
+        list.insertLast( record );
+    }
+
+    return list;
 }
 
 void RACE_UpdateHUDTopScores()

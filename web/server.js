@@ -8,6 +8,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { openDatabase, sha256, simplifyName, hashPassword, verifyPassword, FLAG_REASONS } from "./db.js";
 import { createLivePoller, parseAddress } from "./live.js";
+import { createStreamRegistry } from "./streams.js";
 import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js";
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
 import { cache } from "./cache.js";
@@ -79,6 +80,10 @@ const race = await openDatabase(DATABASE_URL);
 // Live "who's playing" poller: UDP getstatus against each enrolled server
 // that has a query address (admin.js address). /api/live serves the cache.
 const live = createLivePoller(race);
+
+// Live video streams: maps enrolled servers -> their HLS playback URL (from the
+// STREAM_URLS env), refined by optional encoder heartbeats. See streams.js.
+const streams = createStreamRegistry();
 
 const app = express();
 app.disable("x-powered-by");
@@ -175,6 +180,7 @@ api.get("/servers/:id", wrap(async (req, res) => {
     ...s,
     updatedAt: snap.updatedAt,
     live: li ? { ...li, mapId } : { online: false, players: [] },
+    stream: streams.for(id),
   });
 }));
 
@@ -274,7 +280,11 @@ api.get("/records", cache(60), wrap(async (req, res) => {
 api.get("/live", wrap(async (_req, res) => {
   const snap = live.getLive();
   const servers = await Promise.all(
-    snap.servers.map(async (s) => ({ ...s, mapId: s.map ? await race.mapIdByName(s.map) : null }))
+    snap.servers.map(async (s) => ({
+      ...s,
+      mapId: s.map ? await race.mapIdByName(s.map) : null,
+      stream: streams.for(s.id),
+    }))
   );
   res.json({
     ...snap,
@@ -283,6 +293,53 @@ api.get("/live", wrap(async (_req, res) => {
       ? { active: true, message: maintenance.message, since: maintenance.since }
       : { active: false },
   });
+}));
+
+// Active live video streams, joined with the live poller snapshot so the site
+// can list "what can I watch right now". Public read (the HLS URLs are public).
+api.get("/streams", cache(10), wrap(async (_req, res) => {
+  const snap = live.getLive();
+  const byId = new Map((snap.servers || []).map((s) => [s.id, s]));
+  const list = [];
+  for (const s of await race.servers()) {
+    const stream = streams.for(s.id);
+    if (!stream) continue;
+    const li = byId.get(s.id) || null;
+    list.push({
+      id: s.id,
+      name: s.name,
+      hls: stream.hls,
+      status: stream.status,
+      pov: stream.pov,
+      online: !!(li && li.online),
+      players: li && li.players ? li.players.length : 0,
+      map: li ? li.map || null : null,
+    });
+  }
+  res.json({ updatedAt: snap.updatedAt, streams: list });
+}));
+
+// Encoder heartbeat: the tv-capture container POSTs its live status + current
+// POV here every few seconds. Per-server bearer token (same as /ingest); the
+// token's server must match the :id. The URL is never taken from the body — it
+// stays trusted config — so a compromised token can't redirect viewers.
+api.post("/streams/:id/health", wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).json({ error: "invalid server id" });
+  const ident = await authenticateIngest(req);
+  if (!ident || ident.revoked) return res.status(401).json({ error: "unauthorized" });
+  if (ident.serverId != null && ident.serverId !== id) {
+    return res.status(403).json({ error: "token/server mismatch" });
+  }
+  if (!streams.has(id)) return res.status(404).json({ error: "no stream configured for server" });
+  const b = req.body || {};
+  streams.recordHeartbeat(id, {
+    status: b.status,
+    players: Number(b.players),
+    map: b.map,
+    pov: b.pov,
+  });
+  res.json({ ok: true });
 }));
 
 // Live topscores for game servers: the hrace gametype's RS_ApiFetchTop

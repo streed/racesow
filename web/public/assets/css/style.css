@@ -180,6 +180,12 @@ main { max-width: 1180px; margin: 0 auto; padding: 26px 20px 80px; }
   color: var(--text); font-size: 14px; outline: none;
 }
 .toolbar input.filter:focus { border-color: var(--orange); box-shadow: 0 0 0 3px rgba(255,106,26,.15); }
+.toolbar select.filter {
+  flex: 0 0 auto; padding: 10px 12px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--line-2); border-radius: 8px;
+  color: var(--text); font-size: 14px; outline: none;
+}
+.toolbar select.filter:focus { border-color: var(--orange); box-shadow: 0 0 0 3px rgba(255,106,26,.15); }
 .toolbar .count { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
 
 .table-wrap { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--panel); }
@@ -583,3 +589,31 @@ a.replay-badge { text-decoration: none; }
 .flag-msg { font-size: 13px; color: var(--muted); }
 .flag-msg.ok { color: var(--green); }
 .flag-msg.err { color: #ff7a6b; }
+
+/* ------------------------------- live stream ----------------------------- */
+.srv-stream { margin-bottom: 18px; padding: 10px; background: #000; }
+.srv-stream-head {
+  display: flex; align-items: center; gap: 8px; padding: 4px 4px 10px;
+  font: 700 12px/1 var(--cond); letter-spacing: .14em; text-transform: uppercase;
+  color: var(--muted);
+}
+.srv-pov { margin-left: 4px; color: var(--text); font-weight: 500; text-transform: none; letter-spacing: 0; }
+.live-video {
+  display: block; width: 100%; aspect-ratio: 16 / 9; max-height: 74vh;
+  background: #000; border-radius: 8px; object-fit: contain;
+}
+.watch-badge {
+  display: inline-flex; align-items: center; gap: 5px; margin-left: 8px;
+  padding: 2px 9px; border-radius: 999px; color: #fff; background: var(--orange);
+  font: 700 11px/1 var(--cond); letter-spacing: .1em; vertical-align: middle;
+}
+.watch-badge .livedot { width: 7px; height: 7px; background: #fff; }
+.srv-connect { padding: 10px 12px 4px; color: var(--muted); font-size: 13px; }
+.connect-copy {
+  border: 1px solid var(--line-2); background: var(--panel-2); color: var(--text);
+  padding: 3px 9px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  transition: border-color .15s, color .15s;
+}
+.connect-copy:hover { border-color: var(--orange); color: var(--orange-2); }
+.connect-copy.copied { border-color: var(--green); color: var(--green); }
+.connect-copy.copied::after { content: " ✓ copied"; font-family: var(--sans); font-size: 11px; }

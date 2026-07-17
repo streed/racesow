@@ -613,16 +613,29 @@ async function viewReplay(id, playerId = null) {
 async function viewPlayer(id, params) {
   loading();
   const state = {
+    q: params.q || "",
+    version: params.version || "",
     sort: params.sort || "time",
     order: params.order || "asc",
     offset: parseInt(params.offset || "0", 10) || 0,
   };
   const d = await api(
-    `/players/${id}` + buildQuery({ sort: state.sort, order: state.order, limit: PAGE, offset: state.offset })
+    `/players/${id}` +
+      buildQuery({ q: state.q, version: state.version, sort: state.sort, order: state.order, limit: PAGE, offset: state.offset })
   );
   const s = d.standing;
   const rec = d.records;
   const hasAttempts = d.attempts != null; // legacy DBs have no attempts column
+  const cols = 5 + (hasAttempts ? 1 : 0); // Map, Time, Rank, Version, Replay (+Attempts)
+
+  const versionOpts =
+    `<option value="">All versions</option>` +
+    (d.versions || [])
+      .map(
+        (v) =>
+          `<option value="${v.id}" ${String(state.version) === String(v.id) ? "selected" : ""}>${esc(v.name)} (${fmtNum(v.count)})</option>`
+      )
+      .join("");
 
   const aliasHtml =
     d.aliases && d.aliases.length
@@ -648,12 +661,18 @@ async function viewPlayer(id, params) {
     </div>
 
     <div class="page-title" style="font-size:20px">RECORDS <span class="accent">·</span> ${fmtNum(rec.total)}</div>
+    <div class="toolbar">
+      <input class="filter" id="rfilter" placeholder="Search this player's maps…" value="${esc(state.q)}">
+      <select class="filter version" id="rversion" title="Filter by game version">${versionOpts}</select>
+      <span class="count">${fmtNum(rec.total)} records</span>
+    </div>
     <div class="table-wrap"><div class="tscroll">
       <table class="data">
         <thead><tr>
           ${th("Map", "map", state)}
           ${th("Time", "time", state, "num")}
           ${th("Global Rank", "rank", state, "num")}
+          <th>Version</th>
           ${hasAttempts ? th("Attempts", "attempts", state, "num") : ""}
           <th>Replay</th>
         </tr></thead>
@@ -663,13 +682,20 @@ async function viewPlayer(id, params) {
               <td class="mapname">${esc(r.map_name)}</td>
               <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
               <td class="num ${rankClass(r.rank)}">${r.rank === 1 ? '<span class="pill wr">WR</span> ' : ""}#${fmtNum(r.rank)}</td>
+              <td><span class="pill ${r.version === 1 ? "v1" : ""}">${esc(r.versionName || "")}</span></td>
               ${hasAttempts ? `<td class="num"><span class="muted">${fmtNum(r.attempts)}</span></td>` : ""}
               <td class="replaycell">${r.ghost ? `<span class="replay-badge" data-nav="#/replay/${r.map_id}/${d.id}" title="Watch this run in the browser">▶ replay</span>` : ""}${r.demo && r.demo.url ? ` <a class="replay-badge demo" href="${esc(r.demo.url)}" download rel="noopener" title="Download this run's demo">⬇ demo</a>` : ""}</td>
-            </tr>`).join("") || `<tr><td colspan="${hasAttempts ? 5 : 4}" class="empty">No records.</td></tr>`}
+            </tr>`).join("") || `<tr><td colspan="${cols}" class="empty">${state.q || state.version ? "No records match those filters." : "No records."}</td></tr>`}
         </tbody>
       </table>
     </div>${pager(state, rec, `#/player/${id}`)}</div>`;
 
+  wireFilter("rfilter", `#/player/${id}`, state);
+  const vsel = document.getElementById("rversion");
+  if (vsel)
+    vsel.addEventListener("change", () =>
+      go(`#/player/${id}` + buildQuery({ ...pageParams(state), version: vsel.value, offset: 0 }))
+    );
   wireSort(`#/player/${id}`, state, ["map", "time", "rank", "attempts"]);
   // (The address bar is already the clean /player/<id> path from pushState —
   // where the server-rendered OG tags for Discord/social unfurls live.)
@@ -694,6 +720,7 @@ function liveServerCard(s) {
       <span class="srvname clickable" data-nav="#/server/${s.id}">${esc(s.name)}</span>
       <span class="pill ${s.online ? "ok" : ""}">${s.online ? "online" : "offline"}</span>
       ${s.online && s.maxclients ? `<span class="live-count">${s.players.length}/${s.maxclients}</span>` : ""}
+      ${s.stream && s.stream.hls ? `<span class="watch-badge clickable" data-nav="#/server/${s.id}" title="Watch the live stream"><span class="livedot"></span> WATCH</span>` : ""}
     </h3>`;
   if (!s.online) {
     return `<div class="panel live-srv off">${head}
@@ -772,8 +799,69 @@ async function viewLive() {
 }
 
 /* ---------------------------- single server ------------------------------ */
-async function renderServer(id) {
-  const s = await api(`/servers/${id}`);
+// A server's live video stream (when one is configured) lives in its OWN
+// element, kept OUTSIDE the 5s body refresh so the <video> is never torn down
+// mid-watch. hls.js is vendored (CSP blocks CDNs) and lazily loaded only when a
+// server page actually has a stream.
+let serverHls = null;
+let hlsLoading = null;
+
+function loadHlsJs() {
+  if (window.Hls) return Promise.resolve();
+  if (hlsLoading) return hlsLoading;
+  hlsLoading = new Promise((resolve, reject) => {
+    const sc = document.createElement("script");
+    sc.src = "/assets/vendor/hls/hls.min.js";
+    sc.onload = resolve;
+    sc.onerror = reject;
+    document.head.appendChild(sc);
+  }).catch((e) => { hlsLoading = null; throw e; });
+  return hlsLoading;
+}
+
+function mountHls(video, url) {
+  if (!video || !url) return;
+  // Safari / iOS play HLS natively; everyone else via hls.js (MSE).
+  if (video.canPlayType("application/vnd.apple.mpegurl")) {
+    video.src = url;
+    return;
+  }
+  if (window.Hls && window.Hls.isSupported()) {
+    const hls = new window.Hls({ liveSyncDurationCount: 3, backBufferLength: 30 });
+    hls.on(window.Hls.Events.ERROR, (_e, data) => {
+      if (!data.fatal) return; // transient (a rolled segment) — hls.js self-heals
+      if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+      else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      else { hls.destroy(); if (serverHls === hls) serverHls = null; }
+    });
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    serverHls = hls;
+  }
+}
+
+function stopServerStream() {
+  if (serverHls) { try { serverHls.destroy(); } catch { /* ignore */ } serverHls = null; }
+}
+
+function streamAreaHtml(stream, address) {
+  if (!stream || !stream.hls) return "";
+  const pov = stream.pov ? `<span class="srv-pov">watching ${esc(stream.pov)}</span>` : "";
+  // Let viewers jump in: show the GAME server's connect string (click to copy).
+  const connect = address
+    ? `<div class="srv-connect">Jump in — open the Warsow console (<span class="mono">~</span>) and run
+         <button type="button" class="connect-copy mono" data-copy="connect ${esc(address)}"
+           title="Click to copy">connect ${esc(address)}</button></div>`
+    : "";
+  return `
+    <div class="srv-stream panel">
+      <div class="srv-stream-head"><span class="livedot"></span> LIVE STREAM ${pov}</div>
+      <video id="srvVideo" class="live-video" controls autoplay muted playsinline></video>
+      ${connect}
+    </div>`;
+}
+
+function serverBodyHtml(s) {
   const li = s.live || { online: false, players: [] };
   const statusPill = `<span class="pill ${li.online ? "ok" : ""}">${li.online ? "online" : "offline"}</span>`;
   const meta = li.online
@@ -796,7 +884,7 @@ async function renderServer(id) {
         : `<div class="muted live-empty">Server is empty — hop in and set a record.</div>`)
     : "";
 
-  const html = `
+  return `
     <div class="crumbs"><a data-nav="#/live">Live</a> / ${esc(s.name)}</div>
     <div class="page-title" style="font-size:32px">
       <span class="livedot ${li.online ? "" : "off"}"></span> ${esc(s.name)} ${statusPill}
@@ -811,20 +899,36 @@ async function renderServer(id) {
       <div class="s"><div class="n">${s.status}</div><div class="l">Status</div></div>
       ${s.created_at ? `<div class="s"><div class="n">${new Date(s.created_at * 1000).toISOString().slice(0, 10)}</div><div class="l">Enrolled</div></div>` : ""}
     </div>`;
-  if (app.dataset.srvHtml !== html) {
-    app.dataset.srvHtml = html;
-    app.innerHTML = html;
-  }
+}
+
+// Refresh only the body (stats/players); the stream player above is untouched.
+async function renderServerBody(id) {
+  const s = await api(`/servers/${id}`);
+  const body = document.getElementById("srvBody");
+  if (!body) return s;
+  const html = serverBodyHtml(s);
+  if (body.dataset.html !== html) { body.dataset.html = html; body.innerHTML = html; }
+  return s;
 }
 
 async function viewServer(id) {
   loading();
-  delete app.dataset.srvHtml;
-  await renderServer(id);
+  stopServerStream();
+  const s = await api(`/servers/${id}`);
+  const stream = s.stream && s.stream.hls ? s.stream : null;
+  const bodyHtml = serverBodyHtml(s);
+  app.innerHTML = `${streamAreaHtml(stream, s.address)}<div id="srvBody"></div>`;
+  const body = document.getElementById("srvBody");
+  body.dataset.html = bodyHtml;
+  body.innerHTML = bodyHtml;
+  if (stream) {
+    try { await loadHlsJs(); } catch { /* leave a bare <video> if hls.js won't load */ }
+    if (parseRoute().path === `/server/${id}`) mountHls(document.getElementById("srvVideo"), stream.hls);
+  }
   stopLiveRefresh();
   liveTimer = setInterval(() => {
     if (document.hidden || parseRoute().path !== `/server/${id}`) return;
-    renderServer(id).catch(() => {});
+    renderServerBody(id).catch(() => {});
   }, LIVE_REFRESH_MS);
 }
 
@@ -895,6 +999,8 @@ const ABOUT_FAQ = [
     "Racesow is Warsow's race gametype: no fighting, just you against the clock. Rocket-jump, plasma-climb, strafe and bunny-hop from the start line to the finish as fast as you can. Every map keeps its own leaderboard and world record."],
   ["How do I join?",
     "Grab the <a class=\"extlink\" href=\"https://warsow.net/\" target=\"_blank\" rel=\"noopener external\">Warsow</a> 2.1 client, open the in-game console with the <b>~</b> key, and type one of the <b>connect</b> strings above. Any maps you don't already have download automatically from the server when you join."],
+  ["Why aren't my old racemod binds and settings here?",
+    "This server's mod folder is called <span class=\"mono\">racemod</span>, but the old livesow / mgxrace servers ran under <span class=\"mono\">racemod_2.1</span>. Warsow keeps each mod's binds, configs and texture packs in its own folder, so your old setup doesn't carry over on its own. To bring it across, open your Warsow game folder, go into the old <span class=\"mono\">racemod_2.1</span> folder, and copy your config files (e.g. <span class=\"mono\">config.cfg</span> / autoexec) and any texture or HUD packs into the <span class=\"mono\">racemod</span> folder. Restart Warsow, reconnect, and your binds will be back."],
   ["Why wasn't my time saved?",
     "Times only count in a clean race-mode run. If you toggled <span class=\"mono\">/practicemode</span>, <span class=\"mono\">/noclip</span>, or used <span class=\"mono\">/position</span>, that run won't be recorded. Use <span class=\"mono\">/kill</span> to get back to the start and race it straight through."],
   ["What are the ghosts I keep seeing?",
@@ -1018,6 +1124,7 @@ function pageParams(state) {
   if (state.q) p.q = state.q;
   if (state.sort) p.sort = state.sort;
   if (state.order) p.order = state.order;
+  if (state.version) p.version = state.version;
   return p;
 }
 
@@ -1045,12 +1152,13 @@ function wireFilter(inputId, base, state) {
     timer = setTimeout(() => {
       const q = el.value.trim();
       if (q === (state.q || "")) return; // unchanged -> no refetch/re-render
-      go(base + buildQuery({ q, sort: state.sort, order: state.order, offset: 0 }));
+      go(base + buildQuery({ ...pageParams(state), q, offset: 0 }));
     }, 350);
   });
-  // keep focus + caret after re-render
+  // keep focus + caret after re-render (preventScroll so the page doesn't
+  // jump to the toolbar on initial load — matters on the tall player page)
   const v = el.value;
-  el.focus();
+  el.focus({ preventScroll: true });
   el.setSelectionRange(v.length, v.length);
 }
 
@@ -1115,6 +1223,19 @@ document.addEventListener("click", (e) => {
   if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
   // Real links (e.g. the padpork ↗ chips) inside clickable rows keep their
   // native behaviour instead of being hijacked by the row's data-nav.
+  // Click-to-copy (e.g. the stream page's `connect <addr>` chip).
+  const copyEl = e.target.closest("[data-copy]");
+  if (copyEl) {
+    e.preventDefault();
+    const txt = copyEl.getAttribute("data-copy");
+    (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject())
+      .then(() => {
+        copyEl.classList.add("copied");
+        setTimeout(() => copyEl.classList.remove("copied"), 1200);
+      })
+      .catch(() => {});
+    return;
+  }
   const link = e.target.closest("a[href]");
   if (link && !link.hasAttribute("data-nav")) return;
   const el = e.target.closest("[data-nav]");
@@ -1130,6 +1251,7 @@ document.addEventListener("click", (e) => {
 async function router() {
   stopLiveRefresh();
   stopReplay();
+  stopServerStream();
   // Legacy "#/…" URL (old shared link / bookmark): rewrite to the clean path
   // once, so the address bar never keeps a "#".
   if (location.hash) {

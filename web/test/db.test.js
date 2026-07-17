@@ -6,7 +6,7 @@
 // so tests are independent and order-free.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { openDatabase, simplifyName, normToken, identKey, canonKey, sha256 } from "../db.js";
+import { openDatabase, simplifyName, normToken, identKey, canonKey, rebuildCanonical, sha256 } from "../db.js";
 import { createTestDb } from "./pg-util.js";
 
 async function freshDb(t) {
@@ -36,7 +36,10 @@ test("name helpers strip colours and collision suffixes", () => {
   assert.equal(normToken("ELchupa(1)"), "elchupa");
   // Identity grouping: colour-strip + lowercase + drop trailing (N), exact match.
   assert.equal(canonKey("^8EL^9chupa^7", ""), canonKey("ELchupa(1)", "")); // colour + (N) variants merge
-  assert.equal(canonKey("Player", "elchupa"), "elchupa"); // login wins over nick
+  // Login is IGNORED for grouping (auth servers are gone): the nick alone keys
+  // identity, so a historical login token never splits one person into rows.
+  assert.equal(canonKey("Player", "elchupa"), "player");
+  assert.equal(canonKey("Player", "elchupa"), canonKey("Player", "")); // login makes no difference
 });
 
 test("identity grouping is exact on punctuation/spacing (no over-merge)", () => {
@@ -61,14 +64,15 @@ test("openDatabase bootstraps a usable schema on an empty database", async (t) =
 
 test("a later racelog nick cannot seize an existing canonical group (identity hijack)", async (t) => {
   const race = await freshDb(t);
-  // Victim establishes the group under login 'vic'.
-  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Victim", 50000, [], "vic")] });
+  // Victim establishes the group under the nick "Victim".
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Victim", 50000, [], "")] });
   const victimId = N((await race.one("SELECT id FROM player WHERE name = 'Victim'")).id);
-  const key = canonKey(simplifyName("Victim"), "vic");
+  const key = canonKey(simplifyName("Victim"), "");
   assert.equal(N((await race.one("SELECT player_id FROM canonical WHERE key = $1", [key])).player_id), victimId);
 
-  // Attacker submits a NEW nick under the victim's login with a faster time.
-  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("PWNED_BY_ATTACKER", 40000, [], "vic")] });
+  // Attacker submits a COLOUR VARIANT of the victim's nick (same identity key)
+  // with a faster time. It JOINS the victim's group but must not seize it.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("^1Victim", 40000, [], "")] });
   await race.refreshAggregates();
 
   // The group representative (display identity) must NOT move to the attacker's
@@ -76,6 +80,55 @@ test("a later racelog nick cannot seize an existing canonical group (identity hi
   assert.equal(N((await race.one("SELECT player_id FROM canonical WHERE key = $1", [key])).player_id), victimId);
   const mapId = N((await race.one("SELECT id FROM map WHERE name = $1", [MAP])).id);
   assert.equal((await race.mapDetail(mapId)).leaderboard[0].name, "Victim");
+});
+
+// The "sjn|gibbz" bug: one human who raced anonymously AND under old matchmaker
+// logins used to split into several Hall-of-Fame rows because canonKey keyed on
+// login. Identity now keys on the nick alone, so the login no longer matters.
+const GIBBZ = "^0sjn^6|^7gi^6b^5b^7z^7"; // simplifies + identKeys to "sjn|gibbz"
+
+test("distinct historical logins for one nick collapse into a single identity", async (t) => {
+  const race = await freshDb(t);
+  // Same nick finished on three maps under three different login states.
+  await race.ingest({ version: VER, map: "m1", source: "racelog", records: [finish(GIBBZ, 50000, [], "")] });
+  await race.ingest({ version: VER, map: "m2", source: "racelog", records: [finish(GIBBZ, 51000, [], "loginA")] });
+  await race.ingest({ version: VER, map: "m3", source: "racelog", records: [finish(GIBBZ, 52000, [], "loginB")] });
+  await race.refreshAggregates();
+
+  // Three player rows (UNIQUE(name, login)) but ONE canonical group...
+  assert.equal(N((await race.one("SELECT COUNT(*) c FROM player WHERE simplified = 'sjn|gibbz'")).c), 3);
+  assert.equal(N((await race.one("SELECT COUNT(DISTINCT canonical_id) c FROM player WHERE simplified = 'sjn|gibbz'")).c), 1);
+  // ...so the Hall of Fame shows the player exactly once, across all three maps.
+  const hof = (await race.overview()).hallOfFame.filter((r) => simplifyName(r.name) === "sjn|gibbz");
+  assert.equal(hof.length, 1);
+  assert.equal(N(hof[0].maps), 3);
+});
+
+test("rebuildCanonical regroups a legacy login-split identity by nick", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({ version: VER, map: "m1", source: "racelog", records: [finish(GIBBZ, 50000, [], "")] });
+  await race.ingest({ version: VER, map: "m2", source: "racelog", records: [finish(GIBBZ, 51000, [], "loginA")] });
+  await race.ingest({ version: VER, map: "m3", source: "racelog", records: [finish(GIBBZ, 52000, [], "loginB")] });
+
+  // Recreate the pre-migration state: each row its OWN login-keyed canonical
+  // group (what canonKey used to produce), the exact shape the migration fixes.
+  await race.pool.query("UPDATE player SET canonical_id = id WHERE simplified = 'sjn|gibbz'");
+  await race.pool.query("DELETE FROM canonical");
+  await race.pool.query(
+    "INSERT INTO canonical (key, player_id) " +
+    "SELECT login, id FROM player WHERE simplified = 'sjn|gibbz' AND login <> '' " +
+    "UNION ALL SELECT 'sjn|gibbz', id FROM player WHERE simplified = 'sjn|gibbz' AND login = ''"
+  );
+  assert.equal(N((await race.one("SELECT COUNT(DISTINCT canonical_id) c FROM player WHERE simplified = 'sjn|gibbz'")).c), 3);
+
+  // The regroup (same logic the SQL migration runs) collapses them into one.
+  await rebuildCanonical(race.pool);
+  await race.refreshAggregates();
+  assert.equal(N((await race.one("SELECT COUNT(DISTINCT canonical_id) c FROM player WHERE simplified = 'sjn|gibbz'")).c), 1);
+  assert.equal(N((await race.one("SELECT COUNT(*) c FROM canonical WHERE key = 'sjn|gibbz'")).c), 1);
+  const hof = (await race.overview()).hallOfFame.filter((r) => simplifyName(r.name) === "sjn|gibbz");
+  assert.equal(hof.length, 1);
+  assert.equal(N(hof[0].maps), 3);
 });
 
 test("inherited Object.prototype sort keys fall back to default, never error", async (t) => {
@@ -214,6 +267,43 @@ test("player detail returns the player's PRs across maps plus attempt count", as
   assert.equal(d.records.total, 2); // one PR per map
   const byMap = Object.fromEntries(d.records.rows.map((r) => [r.map_name, r.time]));
   assert.deepEqual(byMap, { map_a: 48000, map_b: 61000 });
+});
+
+test("player detail exposes game version per record and filters by map + version", async (t) => {
+  const race = await freshDb(t);
+  // Nova sets PRs on three maps across two game versions.
+  await race.ingest({ version: "wsw 2.1", map: "alpha", source: "racelog", records: [finish("Nova", 50000)] });
+  await race.ingest({ version: "wsw 2.1", map: "beta", source: "racelog", records: [finish("Nova", 51000)] });
+  await race.ingest({ version: "wsw 1.6", map: "gamma", source: "racelog", records: [finish("Nova", 52000)] });
+  await race.refreshAggregates();
+  const pid = N((await race.one("SELECT id FROM player LIMIT 1")).id);
+
+  // Every record carries the game version of the best run.
+  const all = await race.playerDetail(pid, { sort: "map", order: "asc" });
+  assert.equal(all.records.total, 3);
+  assert.deepEqual(
+    Object.fromEntries(all.records.rows.map((r) => [r.map_name, r.versionName])),
+    { alpha: "wsw 2.1", beta: "wsw 2.1", gamma: "wsw 1.6" }
+  );
+
+  // Version list for the filter dropdown: counts, most-common first.
+  assert.deepEqual(all.versions.map((v) => `${v.name}:${v.count}`).sort(), ["wsw 1.6:1", "wsw 2.1:2"]);
+
+  // Map-name search narrows both rows and total.
+  const q = await race.playerDetail(pid, { q: "amm" }); // substring of "gamma"
+  assert.equal(q.records.total, 1);
+  assert.equal(q.records.rows[0].map_name, "gamma");
+
+  // Version filter keeps only that version's records.
+  const v21 = all.versions.find((v) => v.name === "wsw 2.1").id;
+  const filtered = await race.playerDetail(pid, { version: v21 });
+  assert.equal(filtered.records.total, 2);
+  assert.ok(filtered.records.rows.every((r) => r.versionName === "wsw 2.1"));
+
+  // Combined map search + version filter.
+  const combo = await race.playerDetail(pid, { q: "alp", version: v21 });
+  assert.equal(combo.records.total, 1);
+  assert.equal(combo.records.rows[0].map_name, "alpha");
 });
 
 test("per-server enrollment: token hash lookup and provenance stamping", async (t) => {

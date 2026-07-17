@@ -181,16 +181,38 @@ bool Cmd_RaceRestart( Client@ client, const String &cmdString, const String &arg
     if ( player.practicing && client.team != TEAM_SPECTATOR )
     {
         Entity@ ent = client.getEnt();
+        // Un-freeze a recall-held (MOVETYPE_NONE) player inline; routing through
+        // toggleNoclip() here would spuriously print "Noclip mode disabled."
         if ( ent.moveType == MOVETYPE_NONE )
-            player.toggleNoclip();
+        {
+            ent.moveType = MOVETYPE_PLAYER;
+            player.release = 0;
+            player.client.selectWeapon( player.noclipWeapon );
+            player.noclipBackup.saved = false;
+        }
 
-        if ( ent.health >= 0 && player.loadPosition( Verbosity_Silent ) )
+        if ( ent.health >= 0 && player.loadPosition( "", Verbosity_Silent ) )
+        {
             player.noclipWeapon = player.savedPosition().weapon;
+            // A position saved at a standstill (0 speed) would strand the player;
+            // respawn instead so the run can actually start.
+            if ( player.getSpeed() == 0 )
+                client.respawn( false );
+        }
         else
             client.respawn( false );
 
         if ( ent.moveType == MOVETYPE_NOCLIP )
             ent.velocity = Vec3();
+
+        // Recall delay: freeze a recalled restart (unless a respawn above already
+        // froze it via GT_PlayerRespawn) so walljump/dash starts stay consistent.
+        if ( player.recalled && ent.moveType != MOVETYPE_NONE )
+        {
+            ent.moveType = MOVETYPE_NONE;
+            player.noclipWeapon = ent.client.pendingWeapon; // for manual-unfreeze restore
+            player.release = player.recallHold;
+        }
     }
     else
     {
@@ -222,9 +244,18 @@ bool Cmd_Position( Client@ client, const String &cmdString, const String &argsSt
     String action = argsString.getToken( 0 );
     Player@ player = RACE_GetPlayer ( client );
     if ( action == "save" )
-        return player.savePosition();
+        return player.savePosition( argsString.getToken( 1 ) );
     else if ( action == "load" )
-        return player.loadPosition( Verbosity_Verbose );
+        return player.loadPosition( argsString.getToken( 1 ), Verbosity_Verbose );
+    else if ( action == "list" )
+    {
+        player.listPositions();
+        return true;
+    }
+    else if ( action == "find" )
+        return player.findPosition( argsString.getToken( 1 ).tolower(), argsString.getToken( 2 ).tolower() );
+    else if ( action == "join" )
+        return player.joinPosition( argsString.getToken( 1 ) );
     else if ( action == "recall" )
     {
         String option = argsString.getToken( 1 ).tolower();
@@ -237,6 +268,16 @@ bool Cmd_Position( Client@ client, const String &cmdString, const String &argsSt
             String pattern = argsString.getToken( 2 );
             return player.recallBest( pattern );
         }
+        else if ( option == "current" )
+            return player.recallCurrent( argsString.getToken( 2 ) );
+        else if ( option == "fake" )
+            return player.recallFake( uint( argsString.getToken( 2 ).toInt() ) );
+        else if ( option == "interval" )
+            return player.recallInterval( argsString.getToken( 2 ) );
+        else if ( option == "delay" )
+            return player.recallDelay( argsString.getToken( 2 ) );
+        else if ( option == "extend" )
+            return player.recallExtend( argsString.getToken( 2 ).tolower() );
         else if ( option == "start" )
             return player.recallStart();
         else if ( option == "end" )
@@ -263,19 +304,118 @@ bool Cmd_Position( Client@ client, const String &cmdString, const String &argsSt
     else if ( action == "speed" && argsString.getToken( 1 ) != "" )
     {
         String speedStr = argsString.getToken( 1 );
-        return player.positionSpeed( speedStr );
+        return player.positionSpeed( speedStr, argsString.getToken( 2 ) );
     }
     else if ( action == "clear" )
-        return player.clearPosition();
+        return player.clearPosition( argsString.getToken( 1 ) );
     else
     {
-        G_PrintMsg( client.getEnt(), "position <save | load | speed <value> | recall <offset> | clear>\n" );
+        G_PrintMsg( client.getEnt(), "position <save [name] | load [name] | list | find <type> [info] | join <player> | speed <value> [name] | recall <offset> | clear [name]>\n" );
         return false;
     }
 }
 
+bool Cmd_Mark( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    return RACE_GetPlayer( client ).setMarker( argsString.getToken( 0 ) );
+}
+
+bool Cmd_PreRandmap( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    Player@ player = RACE_GetPlayer( client );
+    String pattern = argsString.getToken( 0 );
+    if ( pattern == "" )
+    {
+        client.printMessage( "Usage: /prerandmap <* | pattern>\n" );
+        return false;
+    }
+
+    String result = player.randomMap( pattern, true );
+    if ( result == "" )
+        return false;
+
+    client.printMessage( S_COLOR_YELLOW + "Showing top for " + S_COLOR_WHITE + result + "\n" );
+    RACE_ShowMapTop( client, result.tolower() );
+
+    client.printMessage( S_COLOR_YELLOW + "Chosen map: " + S_COLOR_WHITE + result + S_COLOR_YELLOW + " (out of " + S_COLOR_WHITE + player.randmapMatches + S_COLOR_YELLOW + " matches)\n" );
+    return true;
+}
+
+bool Cmd_LastRecs( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    return lastRecords.show( client.getEnt() );
+}
+
+// On-demand per-checkpoint splits for your current/last run (vs personal best
+// and the server record). Reuses RecordTime.report(), the same proven display
+// shown automatically on finish/kill.
+bool Cmd_CPs( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    Player@ player = RACE_GetPlayer( client );
+    // Re-derive checkpoint order from times (robust to a recall/load having
+    // mutated currentCheckpoint) before checking/printing.
+    player.current_recordTime.deduceCheckpointOrder();
+    if ( player.current_recordTime.checkpoint_order[ 0 ] == UINT_MAX )
+    {
+        client.printMessage( S_COLOR_RED + "No checkpoint splits recorded for your current run.\n" );
+        return true;
+    }
+    player.current_recordTime.report( player );
+    return true;
+}
+
+// Where "/top" points players to see the full leaderboards. Admin-overridable
+// (e.g. a self-hosted stats site); defaults to the historical livesow address.
+Cvar race_toplists( "race_toplists", "http://livesow.net/race", CVAR_ARCHIVE );
+
+// Print another map's stored top board (read from its topscores file) without
+// loading it. Shared by "/top <map>" and "/prerandmap".
+void RACE_ShowMapTop( Client@ client, const String &in mapName )
+{
+    RecordTime[] records = RACE_ReadTopScoresFile( mapName );
+    if ( records.length() == 0 || !records[ 0 ].isFinished() )
+    {
+        client.printMessage( S_COLOR_RED + "No records found for map \"" + mapName + "\".\n" );
+        return;
+    }
+
+    RecordTime@ mapTop = records[ 0 ];
+    client.printMessage( S_COLOR_WHITE + "Top records for " + S_COLOR_YELLOW + mapName.tolower() + S_COLOR_WHITE + ":\n" );
+
+    Table maptable( "r r r l l" );
+    int shown = ( int( records.length() ) < DISPLAY_RECORDS ) ? int( records.length() ) : DISPLAY_RECORDS;
+    for ( int i = 0; i < shown; i++ )
+    {
+        RecordTime@ record = records[ i ];
+        if ( record.isFinished() )
+        {
+            maptable.addCell( ( i + 1 ) + "." );
+            maptable.addCell( S_COLOR_GREEN + RACE_TimeToString( record.getFinishTime() ) );
+            maptable.addCell( S_COLOR_YELLOW + "[+" + RACE_TimeToString( record.getFinishTime() - mapTop.getFinishTime() ) + "]" );
+            maptable.addCell( S_COLOR_WHITE + record.ident.playerName );
+            if ( record.ident.login != "" )
+                maptable.addCell( "(" + S_COLOR_YELLOW + record.ident.login + S_COLOR_WHITE + ")" );
+            else
+                maptable.addCell( "" );
+        }
+    }
+    uint maprows = maptable.numRows();
+    for ( uint i = 0; i < maprows; i++ )
+        client.printMessage( maptable.getRow( i ) + "\n" );
+}
+
 bool Cmd_Top( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
+    // "/top <map>": inspect another map's stored board without loading it. The
+    // records are read straight from that map's topscores file into a scratch
+    // array, so the live level board and HUD are untouched.
+    String mapName = argsString.getToken( 0 );
+    if ( mapName != "" )
+    {
+        RACE_ShowMapTop( client, mapName );
+        return true;
+    }
+
     RecordTime@ top = levelRecords[ 0 ];
     if ( !top.isFinished() )
     {
@@ -409,11 +549,23 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/position clear" );
         cmdlist.addCell( "Resets your weapons and spawn position to their defaults." );
 
-        cmdlist.addCell( "/top" );
-        cmdlist.addCell( "Shows the top record times for the current map." );
+        cmdlist.addCell( "/top <map>" );
+        cmdlist.addCell( "Shows the top record times for the current map, or the given map." );
+
+        cmdlist.addCell( "/mark <player>" );
+        cmdlist.addCell( "Places a marker at your position (or copies another player's marker)." );
 
         cmdlist.addCell( "/m" );
         cmdlist.addCell( "Lets you send a private message." );
+
+        cmdlist.addCell( "/prerandmap <*|pattern>" );
+        cmdlist.addCell( "Previews a random map (and its top scores) matching a pattern." );
+
+        cmdlist.addCell( "/lastrecs" );
+        cmdlist.addCell( "Shows the most recent records set on this server across maps." );
+
+        cmdlist.addCell( "/cps" );
+        cmdlist.addCell( "Shows your per-checkpoint splits vs your PB and the server record." );
 
         cmdlist.addCell( "/maplist" );
         cmdlist.addCell( "Lets you search available maps." );
@@ -468,6 +620,39 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         client.printMessage( S_COLOR_WHITE + "- Teleports you to your saved position depending on which mode you are in." + "\n" );
         client.printMessage( S_COLOR_WHITE + "  Note: This command does not work during race." + "\n" );
     }
+    else if ( command == "position" && subcommand == "find" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/position find <start|finish|rl|gl|pg|push|door|button|cp|tele|slick> [info]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Teleports you to a notable map entity; repeat to cycle through matches. With no type," + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  prints map stats. Add 'info' to print entity details instead of teleporting." + "\n" );
+    }
+    else if ( command == "position" && subcommand == "join" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/position join <player>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Teleports you to a live player's current position (practicemode/spectator only)." + "\n" );
+    }
+    else if ( command == "mark" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/mark <player>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Drops a marker dummy at your position as a visual reference. With a player name," + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  copies that player's marker instead. Use /mark with no marker set to clear it." + "\n" );
+    }
+    else if ( command == "prerandmap" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/prerandmap <*|pattern>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Previews a random map matching the pattern (use * for any) and shows its top scores." + "\n" );
+    }
+    else if ( command == "lastrecs" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/lastrecs" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Shows the most recent records set on this server (across maps), with who beat whom." + "\n" );
+    }
+    else if ( command == "cps" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/cps" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Shows your per-checkpoint split times for the current run, compared to your" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  personal best and the server record." + "\n" );
+    }
     else if ( command == "position" && subcommand == "speed" )
     {
         client.printMessage( S_COLOR_YELLOW + "/position speed <value>" + "\n" );
@@ -486,8 +671,18 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         client.printMessage( S_COLOR_WHITE + "- Leave recall mode." + "\n" );
         client.printMessage( S_COLOR_YELLOW + "/position recall best [player]" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Loads positions from your best run, or a matching player." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall current <player>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Loads the in-progress run from a matching player." + "\n" );
         client.printMessage( S_COLOR_YELLOW + "/position recall steal" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Loads current positions from the player you are spectating." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall fake [time]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Marks your saved position as a recalled-run start at the given time." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall extend [on|off]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Toggles auto-recall: extend a recalled run by moving forward." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall interval [n|auto]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Sets ms between recall samples ('auto' fits a full best run)." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall delay [n]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Sets frames frozen after respawning into a recalled position." + "\n" );
         client.printMessage( S_COLOR_YELLOW + "/position recall start" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Moves to the first recalled position." + "\n" );
         client.printMessage( S_COLOR_YELLOW + "/position recall end" + "\n" );
@@ -505,9 +700,9 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
     }
     else if ( command == "top" )
     {
-        client.printMessage( S_COLOR_YELLOW + "/top" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Shows a list of the top record times for the current map along with the names and time" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  difference compared to the number 1 time. To see all lists visit: http://livesow.net/race." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/top <map>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Shows a list of the top record times for the current map (or the given map) along with the names and time" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  difference compared to the number 1 time. To see all lists visit: " + race_toplists.string + "." + "\n" );
     }
     else if ( command == "maplist" )
     {

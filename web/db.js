@@ -136,12 +136,19 @@ export function identKey(name) {
     .trim();
 }
 
-// The grouping key for collapsing duplicate identities into one person. Login
-// and nick share ONE namespace: a logged-in row keys on its login, an
-// anonymous row on its identKey'd nick. `simplified` is already colour-stripped
-// but identKey re-strips defensively. Empty key falls back to a sentinel.
-export function canonKey(simplified, login) {
-  return (login ? String(login).toLowerCase().trim() : identKey(simplified)) || "?empty?";
+// The grouping key for collapsing every duplicate identity of ONE person into a
+// single leaderboard row. Identity keys PURELY on the colour-stripped nick
+// (identKey). Login used to win over the nick, but the matchmaker auth servers
+// are gone: `login` is empty on every new record, and the only non-empty logins
+// left are historical. Keying on those dead logins split one human who raced
+// both anonymously AND under an old auth login (e.g. "sjn|gibbz") into several
+// canonical groups — each surfacing as its own Hall-of-Fame / per-map row with
+// an independent points/WR/map total. Login is therefore ignored for grouping.
+// It is still STORED on the player row, so login-first grouping is fully
+// reversible (see migration 20260717120000000_canonical_group_by_nick). Empty
+// nick falls back to a sentinel. `_login` is kept only for call-site parity.
+export function canonKey(simplified, _login) {
+  return identKey(simplified) || "?empty?";
 }
 
 // Escape LIKE/ILIKE metacharacters in user-supplied search text so "50%" or
@@ -260,10 +267,11 @@ async function buildAggregates(client) {
     DROP TABLE IF EXISTS best_new, standings_new, map_index_new;
 
     CREATE UNLOGGED TABLE best_new AS
-      SELECT pl.canonical_id AS player_id, r.map_id,
-             MIN(r.global_rank) AS rank, MIN(r.time) AS time
+      SELECT DISTINCT ON (pl.canonical_id, r.map_id)
+             pl.canonical_id AS player_id, r.map_id,
+             r.global_rank AS rank, r.time, r.version_id
       FROM race r JOIN player pl ON pl.id = r.player_id
-      GROUP BY pl.canonical_id, r.map_id;
+      ORDER BY pl.canonical_id, r.map_id, r.time ASC, r.id ASC;
     CREATE INDEX ON best_new(map_id);
     CREATE INDEX ON best_new(player_id);
 
@@ -847,12 +855,8 @@ class RaceDB {
 
     const leaderboard = (
       await this.all(
-        `SELECT b.player_id, b.time, b.rank AS global_rank,
-                p.name, p.simplified,
-                (SELECT r.version_id FROM race r
-                   JOIN player pv ON pv.id = r.player_id
-                   WHERE r.map_id = b.map_id AND pv.canonical_id = b.player_id
-                   ORDER BY r.time LIMIT 1) AS version
+        `SELECT b.player_id, b.time, b.rank AS global_rank, b.version_id AS version,
+                p.name, p.simplified
          FROM best b JOIN player p ON p.id = b.player_id
          WHERE b.map_id = $1
          ORDER BY b.time ASC, b.player_id ASC LIMIT $2`,
@@ -1108,7 +1112,7 @@ class RaceDB {
     return { total, limit: lim, offset: off, rows };
   }
 
-  async playerDetail(id, { sort = "time", order, limit, offset } = {}) {
+  async playerDetail(id, { sort = "time", order, limit, offset, q, version } = {}) {
     // Resolve any variant id to its canonical representative.
     let canonId = id;
     const c = await this.one("SELECT canonical_id FROM player WHERE id = $1", [id]);
@@ -1142,10 +1146,45 @@ class RaceDB {
     const direction = dir(order, "ASC");
     const lim = clampLimit(limit, 50, 500);
     const off = toOffset(offset);
-    const total = num((await this.one("SELECT COUNT(*) c FROM best WHERE player_id = $1", [canonId])).c);
+
+    // Optional record filters: map-name search (q) and game version (version).
+    // Both narrow the records list AND the total/pager count. $1 is always the
+    // canonical player id; any filter params are appended after it.
+    const filters = ["b.player_id = $1"];
+    const fargs = [canonId];
+    const qStr = typeof q === "string" ? q.trim() : "";
+    if (qStr) {
+      fargs.push(`%${likeEscape(qStr)}%`);
+      filters.push(`m.name ILIKE $${fargs.length} ESCAPE '\\'`);
+    }
+    const vId = version == null || version === "" ? null : parseInt(version, 10);
+    if (vId != null && !Number.isNaN(vId)) {
+      fargs.push(vId);
+      filters.push(`b.version_id = $${fargs.length}`);
+    }
+    const recWhere = filters.join(" AND ");
+
+    const total = num(
+      (await this.one(`SELECT COUNT(*) c FROM best b JOIN map m ON m.id = b.map_id WHERE ${recWhere}`, fargs)).c
+    );
+
+    // Game versions this player has records in — powers the filter dropdown.
+    // Always the full list (independent of the active q/version) so the user
+    // can switch between them.
+    const versions = (
+      await this.all(
+        "SELECT version_id, COUNT(*)::int c FROM best WHERE player_id = $1 GROUP BY version_id ORDER BY c DESC",
+        [canonId]
+      )
+    ).map((v) => ({
+      id: num(v.version_id),
+      name: this.versions[num(v.version_id)] || String(v.version_id),
+      count: num(v.c),
+    }));
+
     const records = (
       await this.all(
-        `SELECT b.map_id, m.name AS map_name, b.time, b.rank,
+        `SELECT b.map_id, m.name AS map_name, b.time, b.rank, b.version_id,
                 GREATEST(COALESCE(t.attempts, 0), COALESCE(t.finishes, 0))::int AS attempts,
                 COALESCE(t.finishes, 0)::int AS finishes
          FROM best b JOIN map m ON m.id = b.map_id
@@ -1153,12 +1192,17 @@ class RaceDB {
            SELECT map_id, SUM(attempts) attempts, SUM(finishes) finishes
            FROM run_tally WHERE ${groupWhere} GROUP BY map_id
          ) t ON t.map_id = b.map_id
-         WHERE b.player_id = $1
+         WHERE ${recWhere}
          ORDER BY ${col} ${direction}, b.time ASC, b.map_id ASC
-         LIMIT $2 OFFSET $3`,
-        [canonId, lim, off]
+         LIMIT $${fargs.length + 1} OFFSET $${fargs.length + 2}`,
+        [...fargs, lim, off]
       )
-    ).map((r) => ({ ...r, map_id: num(r.map_id) }));
+    ).map((r) => ({
+      ...r,
+      map_id: num(r.map_id),
+      version: num(r.version_id),
+      versionName: this.versions[num(r.version_id)] || String(r.version_id),
+    }));
 
     // This player's demo + browser-replay link per finished map (one PB each).
     if (records.length) {
@@ -1196,6 +1240,7 @@ class RaceDB {
       standing,
       finishes,
       attempts,
+      versions,
       records: { total, limit: lim, offset: off, rows: records },
     };
   }

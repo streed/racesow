@@ -20,8 +20,8 @@ void target_init_use( Entity@ self, Entity@ other, Entity@ activator )
     if ( ( self.spawnFlags & 1 ) == 0 )
         activator.client.armor = 0;
 
-    // health
-    if ( ( self.spawnFlags & 2 ) == 0 )
+    // health (don't heal a passing ghost/spectator — target_init ghosting fix)
+    if ( ( self.spawnFlags & 2 ) == 0 && !activator.isGhosting() )
     {
         activator.health = activator.maxHealth;
     }

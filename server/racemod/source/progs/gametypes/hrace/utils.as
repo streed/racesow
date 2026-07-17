@@ -9,6 +9,14 @@ enum Keys {
     Key_Special = 128,
 };
 
+// Geometric centre of an entity's bounding box (used by the entity finder).
+Vec3 Centre( Entity@ ent )
+{
+    Vec3 mins, maxs;
+    ent.getSize( mins, maxs );
+    return ent.origin + 0.5 * mins + 0.5 * maxs;
+}
+
 enum Wildcard {
     Wildcard_No,
     Wildcard_Yes,

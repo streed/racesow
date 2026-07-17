@@ -25,6 +25,18 @@ enum Verbosity {
 uint numCheckpoints = 0;
 bool demoRecording = false;
 
+// Player hitbox, used to un-stick spawn points embedded in geometry (see the
+// info_player_deathmatch handling in GT_SpawnGametype).
+Vec3 playerMins( -16.0, -16.0, -24.0 );
+Vec3 playerMaxs(  16.0,  16.0,  40.0 );
+const float HITBOX_EPSILON = 0.01f;
+
+// Entity finder: indexes notable map entities at spawn for "/position find".
+// (Definition in hrace/entityfinder.as; population in GT_SpawnGametype.)
+EntityFinder entityFinder;
+const uint SLICK_ABOVE = 32;
+const uint SLICK_BELOW = 2048;
+
 // ch : MM
 const uint RECORD_SEND_INTERVAL = 5 * 60 * 1000; // 5 minutes
 uint lastRecordSent = 0;
@@ -35,6 +47,19 @@ uint practiceModeMsg, defaultMsg;
 const String SERVER_NAME = S_COLOR_YELLOW + "livesow.net";
 
 const uint UINT_MAX = 4294967295;
+
+// TV auto-director: a dedicated spectator whose clean name equals rs_tv_name is
+// driven ENTIRELY server-side (see RACE_TvDirectorThink) so the website video
+// stream follows the action with no client-side input. Empty = disabled (normal
+// servers unaffected); the game box sets it via EXTRA_ARGS / server env.
+Cvar rs_tv_name( "rs_tv_name", "", 0 );
+bool RACE_IsTvClient( Client@ client )
+{
+    if ( @client is null )
+        return false;
+    String want = rs_tv_name.string.removeColorTokens().tolower();
+    return want.length() > 0 && client.name.removeColorTokens().tolower() == want;
+}
 
 // the player has finished the race. This entity times his automatic respawning
 void race_respawner_think( Entity@ respawner )
@@ -139,6 +164,9 @@ void RACE_ShowRules(Client@ client, int delay)
 
 void RACE_ShowIntro(Client@ client)
 {
+    // Never pop the intro menu onto the TV director's video stream.
+    if ( RACE_IsTvClient( client ) )
+        return;
     if ( client.getUserInfoKey("racemod_seenintro").toInt() == 0 )
     {
         client.execGameCommand("meop racemod_main");
@@ -173,6 +201,14 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_Position( client, cmdString, argsString, argc );
     else if ( cmdString == "top" )
         return Cmd_Top( client, cmdString, argsString, argc );
+    else if ( cmdString == "mark" )
+        return Cmd_Mark( client, cmdString, argsString, argc );
+    else if ( cmdString == "prerandmap" )
+        return Cmd_PreRandmap( client, cmdString, argsString, argc );
+    else if ( cmdString == "lastrecs" )
+        return Cmd_LastRecs( client, cmdString, argsString, argc );
+    else if ( cmdString == "cps" )
+        return Cmd_CPs( client, cmdString, argsString, argc );
     else if ( cmdString == "maplist" )
         return Cmd_Maplist( client, cmdString, argsString, argc );
     else if ( cmdString == "help" )
@@ -337,6 +373,16 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
             RACE_MirrorPlayerLeft( client );
             // report their uncounted race starts before the slot is reused
             RACE_FlushAttempts( client );
+            // free their /mark dummy now, while the handle is still valid —
+            // otherwise the edict stays orphaned in the world until map change
+            // (and SVF_ONLYOWNER would show it to the slot's next occupant)
+            Player@ leaver = RACE_GetPlayer( client );
+            if ( @leaver.marker != null )
+            {
+                leaver.marker.unlinkEntity();
+                leaver.marker.freeEntity();
+                @leaver.marker = null;
+            }
         }
     }
     else if ( score_event == "userinfochanged" )
@@ -406,6 +452,7 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     {
         // Not spawning as an alive racer (spectating / dead / between rounds):
         // stop any running spawn demo so we never record a spectator POV.
+        player.release = 0; // never carry a recall-hold freeze into a ghost body
         if ( rsRecordDemos.boolean )
             ent.client.demoCancel();
         return;
@@ -441,7 +488,36 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     G_RemoveProjectiles( ent );
     RS_ResetPjState( ent.client.playerNum );
 
-    player.loadPosition( Verbosity_Silent );
+    player.loadPosition( "", Verbosity_Silent );
+
+    // noclip-spawn (from /noclip while dead or spectating): put the fresh body
+    // into noclip and clear any recall-freeze so checkRelease can't yank it back
+    // out. Runs BEFORE the recall-freeze block below (mirrors hettoo's spawn
+    // ordering, where noclip-spawn and recall-freeze are mutually exclusive).
+    if ( player.noclipSpawn )
+    {
+        if ( player.practicing )
+        {
+            ent.moveType = MOVETYPE_NOCLIP;
+            ent.velocity = Vec3(0,0,0);
+            player.noclipWeapon = ent.client.pendingWeapon;
+        }
+        player.recalled = false;
+        player.release = 0;
+        player.noclipSpawn = false;
+    }
+
+    // Recall delay: freeze a recalled respawn for recallHold frames so
+    // walljump/dash starts are timing-consistent (checkRelease unfreezes).
+    if ( player.recalled )
+    {
+        ent.moveType = MOVETYPE_NONE;
+        // capture the weapon the loaded position gave us, so any manual
+        // unfreeze path (selectWeapon(noclipWeapon)) restores it — the field
+        // is otherwise zero (WEAP_NONE) for players who never noclipped
+        player.noclipWeapon = ent.client.pendingWeapon;
+        player.release = player.recallHold;
+    }
 
     // msc: permanent practicemode message
     Client@ ref = ent.client;
@@ -451,17 +527,6 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
         ent.client.setHelpMessage( practiceModeMsg );
     else
         ent.client.setHelpMessage( defaultMsg );
-
-    if ( player.noclipSpawn )
-    {
-        if ( player.practicing )
-        {
-            ent.moveType = MOVETYPE_NOCLIP;
-            ent.velocity = Vec3(0,0,0);
-            player.noclipWeapon = ent.client.pendingWeapon;
-        }
-        player.noclipSpawn = false;
-    }
 }
 
 // Thinking function. Called each frame
@@ -570,6 +635,7 @@ void GT_ThinkRules()
         player.saveRunPosition();
         player.saveGhostFrame();
         player.checkNoclipAction();
+        player.checkRelease();
         player.updateMaxSpeed();
 
         // hettoo: force practicemode message on spectators
@@ -621,6 +687,91 @@ void GT_ThinkRules()
     if ( ( lastRecordSent + RECORD_SEND_INTERVAL ) >= levelTime )
     {
 
+    }
+
+    // Drive the website TV spectator's camera server-side (after the per-client
+    // loop, so its help overlay stays cleared).
+    RACE_TvDirectorThink();
+}
+
+// ---------------------------------------------------------------------------
+// TV auto-director (website live stream)
+//
+// A dedicated spectator client whose clean name equals rs_tv_name is driven
+// ENTIRELY server-side, so the stream always follows the action with no
+// (leak-prone) client-side console input: it is forced to spectator, its help
+// overlay is cleared, and its chasecam is locked each frame onto the most
+// interesting subject, in priority order:
+//     a live racer  ->  any player on the server  ->  the WR ghost  ->  free-fly
+// Empty rs_tv_name (the default) disables the director entirely, so normal
+// servers are unaffected; the game box sets it via EXTRA_ARGS / server env.
+// (rs_tv_name + RACE_IsTvClient are declared near the top of this file.)
+// ---------------------------------------------------------------------------
+
+// The entnum the TV cam should chase, or 0 when there is nothing worth watching.
+int RACE_TvPickTarget()
+{
+    Team@ team = G_GetTeam( TEAM_PLAYERS );
+    int racerEnt = 0;
+    int anyEnt = 0;
+    for ( int i = 0; @team.ent( i ) != null; i++ )
+    {
+        Entity@ e = @team.ent( i );
+        Client@ c = @e.client;
+        if ( @c is null || c.state() < CS_SPAWNED )
+            continue;
+        if ( RS_MirrorBotIs( c.playerNum ) )      // ghost/mesh bots considered last
+            continue;
+        if ( anyEnt == 0 )
+            anyEnt = e.entNum;
+        Player@ p = RACE_GetPlayer( c );
+        if ( p.inRace && !p.postRace )            // actively racing = best subject
+        {
+            racerEnt = e.entNum;
+            break;
+        }
+    }
+    if ( racerEnt != 0 )
+        return racerEnt;
+    if ( anyEnt != 0 )
+        return anyEnt;
+    if ( raceGhostBotSlot >= 0 )                  // nobody live -> the WR ghost racer
+        return raceGhostBotSlot + 1;
+    return 0;
+}
+
+void RACE_TvDirectorThink()
+{
+    if ( rs_tv_name.string.length() == 0 )
+        return;
+
+    for ( int i = 0; i < maxClients; i++ )
+    {
+        Client@ tv = @G_GetClient( i );
+        if ( @tv is null || tv.state() < CS_SPAWNED )
+            continue;
+        if ( !RACE_IsTvClient( tv ) )
+            continue;
+
+        if ( tv.team != TEAM_SPECTATOR )          // keep the TV client a spectator
+        {
+            tv.team = TEAM_SPECTATOR;
+            tv.respawn( false );
+        }
+        tv.setHUDStat( STAT_MESSAGE_SELF, 0 );
+        tv.setHelpMessage( 0 );                   // no help overlay on the stream
+
+        int target = RACE_TvPickTarget();
+        if ( target != 0 )
+        {
+            tv.chaseActive = true;
+            tv.chaseTarget = target;
+        }
+        else if ( tv.chaseActive )
+        {
+            tv.chaseActive = false;               // free-fly; unfreeze the camera
+            tv.getEnt().moveType = MOVETYPE_NOCLIP;
+        }
     }
 }
 
@@ -729,6 +880,10 @@ void GT_MatchStateStarted()
 // the gametype is shutting down cause of a match restart or map change
 void GT_Shutdown()
 {
+    // Persist this map's best new record into the cross-map "/lastrecs" feed
+    // before the module unloads.
+    lastRecords.toFile();
+
     // Report uncounted race starts before the module unloads (clean server
     // shutdown / restart mid-map — the WAITEXIT flush only covers map
     // changes). The native's worker drains the queued POST during library
@@ -745,23 +900,105 @@ void GT_SpawnGametype()
 {
     //G_Print( "numCheckpoints: " + numCheckpoints + "\n" );
 
+    // Build the entity-finder index and apply per-entity spawn fixups. Ported
+    // from hettoo/wsw-race: the addTriggering("start", .., resetWait=true) call
+    // subsumes the old trigger_multiple wait-reset by walking the whole trigger
+    // chain that fires the start timer.
+    Cvar cm_mapHeader( "cm_mapHeader", "", 0 );
+
+    // NOTE: do NOT entityFinder.clear() here — target_checkpoint / trigger_race_
+    // checkpoint already added their "cp" entries during entity spawn (which
+    // runs before this), and clearing would wipe them (leaving /position find cp
+    // dead). The per-map module reload reconstructs the global finder, so stale
+    // cross-map state is not an issue (matches hettoo, which never clears here).
+
     //TODO: fix in source, /kill should reset touch timeouts.
     for ( int i = 0; i < numEntities; i++ )
     {
         Entity@ ent = G_GetEntity(i);
-        if ( ent.classname == "trigger_multiple" )
+
+        // MSC target_teleporter fix: on non-FBSP maps, clear spawnflag 1 so the
+        // teleporter destination angle behaves as intended.
+        if ( ent.classname == "target_teleporter" )
         {
-            Entity@[] targets = ent.findTargets();
-            for ( uint j = 0; j < targets.length; j++ )
+            if ( cm_mapHeader.string != "FBSP" && ( ent.spawnFlags & 1 ) != 0 )
+                ent.spawnFlags = ent.spawnFlags & ~1;
+        }
+
+        Vec3 centre = Centre( ent );
+
+        // Record one slick surface for "/position find slick".
+        if ( entityFinder.slicks.length() < 1 )
+        {
+            Trace slick;
+            Vec3 slick_above = ent.origin;
+            slick_above.z += SLICK_ABOVE;
+            Vec3 slick_below = ent.origin;
+            slick_below.z -= SLICK_BELOW;
+            if ( slick.doTrace( slick_above, playerMins, playerMaxs, slick_below, ent.entNum, MASK_DEADSOLID ) && ( slick.surfFlags & SURF_SLICK ) > 0 )
             {
-                Entity@ target = targets[j];
-                if ( target.classname == "target_starttimer" )
+                entityFinder.add( "slick", null, slick.endPos );
+            }
+            else
+            {
+                slick_above = centre;
+                slick_above.z += SLICK_ABOVE;
+                slick_below = centre;
+                slick_below.z -= SLICK_BELOW;
+                if ( slick.doTrace( slick_above, playerMins, playerMaxs, slick_below, ent.entNum, MASK_DEADSOLID ) && ( slick.surfFlags & SURF_SLICK ) > 0 )
+                    entityFinder.add( "slick", null, slick.endPos );
+            }
+        }
+
+        if ( ent.classname == "target_starttimer" )
+            entityFinder.addTriggering( "start", ent, false, true, null );
+        else if ( ent.classname == "target_stoptimer" )
+            entityFinder.addTriggering( "finish", ent, false, false, null );
+        else if ( ent.classname == "info_player_deathmatch" || ent.classname == "info_player_start" )
+        {
+            // Un-stick spawn points embedded in the floor/geometry: if the hitbox
+            // at the spawn origin starts solid, trace down and drop the spawn onto
+            // the surface so the player doesn't telefrag/fall on spawn. Only acts
+            // on genuinely-stuck spawns (a clear spawn is left untouched).
+            Vec3 start = ent.origin;
+            Vec3 end = ent.origin;
+            Vec3 mins = playerMins;
+            Vec3 maxs = playerMaxs;
+            mins.x += HITBOX_EPSILON;
+            mins.y += HITBOX_EPSILON;
+            maxs.x -= HITBOX_EPSILON;
+            maxs.y -= HITBOX_EPSILON;
+            Trace tr;
+            if ( tr.doTrace( start, mins, maxs, end, ent.entNum, MASK_DEADSOLID ) )
+            {
+                mins.z = 0;
+                maxs.z = 0;
+                start.z += playerMaxs.z;
+                end.z += playerMins.z;
+                if ( tr.doTrace( start, mins, maxs, end, ent.entNum, MASK_DEADSOLID ) && !tr.startSolid )
                 {
-                    ent.wait = 0;
-                    break;
+                    Vec3 origin = tr.endPos;
+                    origin.z -= playerMins.z;
+                    ent.origin = origin;
                 }
             }
         }
+        else if ( ent.classname == "weapon_rocketlauncher" )
+            entityFinder.addTriggering( "rl", ent, true, false, null );
+        else if ( ent.classname == "weapon_grenadelauncher" )
+            entityFinder.addTriggering( "gl", ent, true, false, null );
+        else if ( ent.classname == "weapon_plasmagun" )
+            entityFinder.addTriggering( "pg", ent, true, false, null );
+        else if ( ent.classname == "trigger_push" || ent.classname == "trigger_push_velocity" )
+            entityFinder.add( "push", ent, centre );
+        else if ( ent.classname == "target_speed" )
+            entityFinder.addTriggering( "push", ent, false, false, null );
+        else if ( ent.classname == "func_door" || ent.classname == "func_door_rotating" )
+            entityFinder.add( "door", ent, centre );
+        else if ( ent.classname == "func_button" )
+            entityFinder.add( "button", ent, centre );
+        else if ( ent.classname == "misc_teleporter_dest" || ent.classname == "target_teleporter" )
+            entityFinder.add( "tele", ent, centre );
     }
 
     // setup the checkpoints arrays sizes adjusted to numCheckpoints
@@ -772,6 +1009,7 @@ void GT_SpawnGametype()
         levelRecords[i].setupArrays( numCheckpoints + 1 );
 
     RACE_LoadTopScores();
+    lastRecords.fromFile(); // recent-records feed: snapshot this map's current #1
 
     RACE_MirrorSpawnGametype();
     RACE_GhostSpawnGametype();
@@ -896,6 +1134,10 @@ void GT_InitGametype()
     G_RegisterCommand( "noclip" );
     G_RegisterCommand( "position" );
     G_RegisterCommand( "top" );
+    G_RegisterCommand( "mark" );
+    G_RegisterCommand( "prerandmap" );
+    G_RegisterCommand( "lastrecs" );
+    G_RegisterCommand( "cps" );
     G_RegisterCommand( "maplist" );
     G_RegisterCommand( "help" );
     G_RegisterCommand( "rules" );
