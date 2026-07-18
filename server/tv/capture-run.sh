@@ -28,6 +28,7 @@ WARSOW_DIR="${WARSOW_DIR:-/warsow}"
 STATUS_ADDR="${STATUS_ADDR:-${TV_CONNECT}}"
 TV_NAME="${TV_NAME:-RACESOW-TV}"
 EXCLUDE_NAMES="${EXCLUDE_NAMES:-RACESOW}"
+TV_HUD="${TV_HUD-ale_racemod}"        # race HUD applied AFTER connect ("" = keep the default HUD)
 W="${WIDTH:-1280}"; H="${HEIGHT:-720}"; FPS="${FPS:-30}"
 VBITRATE="${VBITRATE:-2500k}"; VBUF="${VBUF:-5000k}"
 STREAM_ID="${STREAM_ID:-stream}"; HLS_DIR="${HLS_DIR:-/hls}"
@@ -46,11 +47,28 @@ OUT="${HLS_DIR}/${STREAM_ID}"; CARD="${HLS_DIR}/${STREAM_ID}.card.png"
 rm -rf "${OUT}"; mkdir -p "${OUT}"
 log(){ echo ">> [capture] $*"; }
 
+# Mirror the game's map paks so this pure spectator never has to DOWNLOAD one on
+# connect. The server offers each map's pak (and base_tex.pk3 is ~140MB) over the
+# game channel; a stalled/failed download leaves the client unable to spawn, so
+# tv_connected never goes green and the director loops forever "reconnecting".
+# When the game's maps dir is mounted read-only at /warsow/maps_extra (same bind
+# the game uses), symlink every pak into the mod's fs_game dir so they are already
+# present and pure-checksum-matched — exactly what the game's own entrypoint does.
+if [ -d "${WARSOW_DIR}/maps_extra" ]; then
+  n=0
+  for pk in "${WARSOW_DIR}/maps_extra"/*.pk3; do
+    [ -e "${pk}" ] || break
+    ln -sf "${pk}" "${WARSOW_DIR}/racemod/$(basename "${pk}")" 2>/dev/null && n=$(( n + 1 ))
+  done
+  log "linked ${n} map paks from maps_extra (no pure downloads needed)"
+fi
+
 XVFB_PID=0; FEH_PID=0; FFMPEG_PID=0; CLIENT_PID=0; WID=""; FEHWID=""
 cleanup(){ for p in "${CLIENT_PID}" "${FFMPEG_PID}" "${FEH_PID}" "${XVFB_PID}"; do [ "${p}" -ne 0 ] && kill "${p}" 2>/dev/null; done; exit 0; }
 trap cleanup TERM INT
 
 # --- 1. virtual display ------------------------------------------------------
+rm -f "/tmp/.X${DPY}-lock" 2>/dev/null || true   # avoid stale-lock on restart/reboot
 Xvfb ":${DPY}" -screen 0 "${W}x${H}x24" +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &
 XVFB_PID=$!
 for _ in $(seq 1 60); do xdpyinfo -display ":${DPY}" >/dev/null 2>&1 && break; sleep 0.1; done
@@ -141,6 +159,7 @@ start_client(){
     +set vid_customwidth "${W}" +set vid_customheight "${H}" \
     +set in_grabinput 0 +set s_module 0 +set cl_maxfps "${FPS}" \
     +set name "${TV_NAME}" +set racemod_seenintro 1 +exec profiles/stream.cfg \
+    +set cg_showhelp 0 +set cg_clientHUD "" \
     +connect "${TV_CONNECT}" >/tmp/client.log 2>&1 &
   CLIENT_PID=$!
 }
@@ -161,14 +180,68 @@ init_client(){
   return 0
 }
 
+# Apply the race HUD (ale_racemod: speed / strafe / accel / keystate / timers)
+# AFTER the client has connected and the renderer is warm. Setting cg_clientHUD
+# at LAUNCH instead makes the cold first-connect precache load the HUD's gfx
+# under llvmpipe, which stalls the client long enough for the server to time it
+# out (it enters the game, then drops); by here the client has rendered a while
+# so the warm load is quick and the connection survives. (start_client also
+# forces cg_clientHUD "" at launch so a value archived to config.cfg on a prior
+# run can't reintroduce that stall.) Each cvar goes on its OWN console line — the
+# console does not reliably split a ;-chained line, and one clean cvar per line is
+# what makes it actually stick. Only called once we are in-game (see boot_client),
+# so it runs once, not once-per-reconnect-retry. The idle card is raised on top,
+# so the brief console never shows on the stream. TV_HUD="" keeps the default HUD.
+apply_hud(){
+  [ -z "${TV_HUD}" ] && return
+  [ -z "$(curwid)" ] && return
+  cmd "cg_clientHUD ${TV_HUD}"
+  cmd "cg_showSpeed 1"
+  cmd "cg_showPressedKeys 1"
+  cmd "cg_showFPS 0"
+  log "race HUD applied (${TV_HUD})"
+}
+
 boot_client(){
   start_client
-  for _ in $(seq 1 90); do WID="$(xdotool search --class 'warsow.x86_64' 2>/dev/null | head -1)"; [ -n "${WID}" ] && break; sleep 0.5; done
-  sleep 18                                            # connect + pak download + spawn
+  # Wait for the GL window (a cold llvmpipe boot can be slow); bail early if the
+  # client process dies so the director can restart it.
+  for _ in $(seq 1 120); do
+    kill -0 "${CLIENT_PID}" 2>/dev/null || break
+    WID="$(xdotool search --class 'warsow.x86_64' 2>/dev/null | head -1)"; [ -n "${WID}" ] && break
+    sleep 0.5
+  done
+  # Wait until we are ACTUALLY in the game before dismissing the menu / applying
+  # the HUD — not a fixed sleep. This is what stops the reconnect thrash (and the
+  # HUD being re-applied on every retry) when a cold boot runs long: boot_client
+  # doesn't "finish" until connected, so the main loop won't prematurely reconnect.
+  for _ in $(seq 1 60); do
+    kill -0 "${CLIENT_PID}" 2>/dev/null || break
+    tv_connected && break
+    sleep 1
+  done
+  sleep 2                                             # let the spawn/menu settle
   init_client && log "spectator initialised (win ${WID})" || log "spectator: no window yet"
+  apply_hud                                           # race HUD, set warm (see apply_hud) — never at launch
+  last_map="$(current_map "${STATUS_ADDR}" 2>/dev/null)"   # sync so a (re)connect isn't seen as a map change
 }
 
 watchable(){ /opt/tv/getstatus.sh "${STATUS_ADDR}" "${EXCLUDE_NAMES}" 2>/dev/null || echo 0; }
+
+# Is our spectator ACTUALLY connected to the game right now? getstatus the game
+# and look for our own TV_NAME among the clients. The GL client stays alive at
+# the menu after a server restart/kick/timeout, so a process-alive check is not
+# enough. Returns: 0 = connected; 1 = game reachable but we are NOT in it
+# (dropped); 2 = game unreachable (down/restarting — transient, don't reconnect).
+tv_connected(){
+  local host="${STATUS_ADDR%:*}" port="${STATUS_ADDR##*:}" resp
+  exec 6<>"/dev/udp/${host}/${port}" 2>/dev/null || return 2
+  printf '\xff\xff\xff\xffgetstatus\n' >&6 2>/dev/null || { exec 6<&- 6>&- 2>/dev/null || true; return 2; }
+  resp="$(timeout 1 cat <&6 2>/dev/null | tr -d '\000')"
+  exec 6<&- 6>&- 2>/dev/null || true
+  [ -z "${resp}" ] && return 2
+  printf '%s\n' "${resp}" | grep -qF "\"${TV_NAME}\"" && return 0 || return 1
+}
 heartbeat(){
   [ -z "${HEARTBEAT_URL:-}" ] && return
   curl -fsS -m 3 -X POST "${HEARTBEAT_URL}" -H "Authorization: Bearer ${HEARTBEAT_TOKEN:-}" \
@@ -177,15 +250,64 @@ heartbeat(){
 }
 
 # --- 5. director -------------------------------------------------------------
+last_map=""
+MAP_SETTLE="${MAP_SETTLE:-14}"            # seconds to show the card while a new map loads
+
+# On a map change Warsow re-pops the team/"join game" menu when the client
+# respawns into the new map. The server-side director keeps us a spectator but
+# cannot close a CLIENT-SIDE menu overlay, so it would sit on the stream until
+# the next reconnect. Detect the change (the server's mapname in getstatus) and
+# dismiss it exactly as on connect (a single Escape) — raising the branded card
+# meanwhile so viewers see the new map's card, not the join prompt, as it loads.
+handle_map_change(){
+  local newmap="$1"
+  log "map changed (${last_map:-?} -> ${newmap}); card up while the client reloads"
+  refresh_card; raise_card; state="idle"
+  sleep "${MAP_SETTLE}"                   # let the client finish loading + the menu pop
+  init_client && log "join menu dismissed (win ${WID})" || log "post-map: no window yet"
+  state="init"                            # re-decide live/idle + raise the right layer next tick
+}
+
 boot_client
 state="init"
 card_age=0
+disc=0
+RECONNECT_AFTER="${RECONNECT_AFTER:-8}"   # seconds dropped-but-game-up before we reconnect
 log "director running (connect=${TV_CONNECT}, exclude=${EXCLUDE_NAMES})"
 while true; do
   kill -0 "${XVFB_PID}"  2>/dev/null || cleanup
   kill -0 "${FFMPEG_PID}" 2>/dev/null || { log "ffmpeg died; restart"; start_ffmpeg; }
-  if [ "${CLIENT_PID}" -ne 0 ] && ! kill -0 "${CLIENT_PID}" 2>/dev/null; then
-    log "client died; reconnecting"; boot_client; state="init"
+
+  # --- connection management: keep the spectator IN the game -----------------
+  rc=2                                     # default: unknown/unreachable this tick
+  if [ "${CLIENT_PID}" -eq 0 ] || ! kill -0 "${CLIENT_PID}" 2>/dev/null; then
+    # (a) client process exited (crash / clean quit) -> reconnect
+    log "client process gone; reconnecting"; raise_card; boot_client; state="init"; disc=0
+  else
+    # (b) process alive but no longer IN the game (server restart/kick/timeout).
+    #     The GL client just sits at the menu, so only a getstatus probe catches it.
+    tv_connected; rc=$?
+    if [ "${rc}" -eq 1 ]; then
+      disc=$(( disc + POLL ))
+      if [ "${disc}" -ge "${RECONNECT_AFTER}" ]; then
+        log "spectator dropped from game (${disc}s alive-but-out); reconnecting"
+        kill "${CLIENT_PID}" 2>/dev/null || true; CLIENT_PID=0
+        raise_card; boot_client; state="init"; disc=0
+      fi
+    else
+      disc=0   # 0 = connected, 2 = game unreachable (transient — wait, don't thrash)
+    fi
+  fi
+
+  # --- map change: the client re-pops the join menu on the new map -----------
+  # Only when we are actually in the game (rc=0); a reconnect above already
+  # re-synced last_map via boot_client, so this won't double-fire.
+  if [ "${rc}" -eq 0 ]; then
+    cur_map="$(current_map "${STATUS_ADDR}")"
+    if [ -n "${cur_map}" ]; then
+      [ -n "${last_map}" ] && [ "${cur_map}" != "${last_map}" ] && handle_map_change "${cur_map}"
+      last_map="${cur_map}"
+    fi
   fi
 
   n="$(watchable)"; case "${n}" in ''|*[!0-9]*) n=0;; esac

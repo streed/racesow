@@ -15,6 +15,17 @@
 # Both binaries ship in the official warsow-2.1.2 tarball. Ubuntu 18.04 for
 # glibc/libstdc++ compatibility with the 2018-era binaries (same base as the
 # dedicated-server image).
+
+# --- Game image (source of the deterministic racemod UI/HUD pak) -------------
+# The spectator's race HUD (ale_racemod) lives in racemod_ui_v5_local.pk3, built
+# deterministically by server/Dockerfile. We copy that exact pak from the game
+# image so the checksum matches the running server's (pure-safe) AND the HUD is
+# present at launch — otherwise cg_clientHUD points at a HUD that only arrives
+# mid-connect as a referenced-pak download, which stalls the spectator's connect.
+# Override GAME_IMAGE per box so the pak matches THAT box's server exactly.
+ARG GAME_IMAGE=warsow-race:2.1.2
+FROM ${GAME_IMAGE} AS gamedata
+
 FROM ubuntu:18.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -46,6 +57,13 @@ RUN set -eux; \
     cd "${WARSOW_DIR}"; \
     test -f warsow.x86_64; \
     test -f wswtv_server.x86_64
+
+# Race HUD: the racemod UI pak (ships huds/ale_racemod.hud — speed / strafe /
+# accel / keystate / timers) copied byte-for-byte from the game image, so it
+# matches the server's pure checksum and is present before the spectator even
+# connects. fs_game is racemod (the server switches the client to it on connect),
+# so the pak must live under racemod/. Selected at launch via cg_clientHUD.
+COPY --from=gamedata /warsow/racemod/racemod_ui_v5_local.pk3 ${WARSOW_DIR}/racemod/racemod_ui_v5_local.pk3
 
 # --- TV scripts + assets -----------------------------------------------------
 COPY tv/entrypoint.sh tv/relay-run.sh tv/capture-run.sh tv/getstatus.sh tv/make-card.sh /opt/tv/
