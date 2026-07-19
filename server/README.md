@@ -228,6 +228,14 @@ In-game, players use **`/who`** to list every peer's roster and
   `rs_wr_ghost_mesh_sync` (default 1) toggles the cross-server WR-ghost re-pull;
   `rs_wr_ghost_smooth` (default 0.35) tunes ghost-playback easing — lower is
   smoother/laggier, higher snappier, `0` disables easing (raw interpolation).
+- **Hiding the WR ghost.** `rs_wr_ghost` (default 1) toggles it server-wide. A
+  player who prefers to race without it uses **`/wrghost off`** (`/wrghost on` to
+  bring it back, no argument toggles): the server culls the ghost from just that
+  player's snapshot, leaving mesh ghosts, other players' views, and the
+  scoreboard untouched, and re-applies the choice across map changes. This works
+  on stock clients — it needs no client cvar. (The client's own
+  `cg_raceGhostsAlpha 0` also hides it, but hides *all* race ghosts including
+  mesh ones; `cg_raceGhosts` does not affect the player-model ghost at all.)
 
 ### Security posture
 

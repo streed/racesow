@@ -68,6 +68,11 @@ int RS_MirrorBotAdd( const char *name, const char *clan, int r, int g, int b, bo
 	edict_t *ent = &game.edicts[entNum];
 	int playerNum = entNum - 1;
 	rs_mirrorBotSlot[playerNum] = true;
+	// Fresh slot: not the WR ghost until RS_MirrorBotUpdate says so, and a bot
+	// never opts out of seeing the ghost (these are the per-client visibility
+	// fields consumed by SNAP_SnapCullEntity - see RS_SetHideWrGhost).
+	ent->r.rs_isWrGhost = false;
+	ent->r.rs_hideWrGhost = false;
 
 	if( ent->r.client )
 	{
@@ -130,8 +135,35 @@ void RS_MirrorBotUpdate( int playerNum, float ox, float oy, float oz,
 	{
 		ent->r.solid = SOLID_NOT;
 		ent->r.svflags &= ~SVF_NOCLIENT;
+		// Mark it the WR ghost so a viewer who ran "wrghost off" can have it
+		// culled from just their own snapshot (SNAP_SnapCullEntity). Re-asserted
+		// every frame, like the visibility above.
+		ent->r.rs_isWrGhost = true;
+	}
+	else
+	{
+		ent->r.rs_isWrGhost = false; // a mesh mirror bot is never the WR ghost
 	}
 	GClip_LinkEntity( ent );
+}
+
+/*
+ * RS_SetHideWrGhost — per-client opt-out of seeing the in-game WR ghost racer.
+ * When hide is true, the WR ghost (marked r.rs_isWrGhost by RS_MirrorBotUpdate)
+ * is culled from THIS client's snapshot only, so the player races without the
+ * ghost while everyone else still sees it and the scoreboard is untouched. The
+ * flag lives on the viewing client's own edict; the gametype re-applies the
+ * player's saved choice on (re)spawn since a level reload zeroes it (see
+ * hrace/ghostbot.as). No-op for a bot/empty slot.
+ */
+void RS_SetHideWrGhost( int playerNum, bool hide )
+{
+	if( playerNum < 0 || playerNum >= gs.maxclients )
+		return;
+	edict_t *ent = &game.edicts[playerNum + 1];
+	if( !ent->r.inuse || !ent->r.client )
+		return;
+	ent->r.rs_hideWrGhost = hide;
 }
 
 // RS_MirrorBotRemove — drop the fake client and free its slot.
@@ -141,6 +173,9 @@ void RS_MirrorBotRemove( int playerNum )
 		return;
 	edict_t *ent = &game.edicts[playerNum + 1];
 	rs_mirrorBotSlot[playerNum] = false;
+	// Clear the WR-ghost marker so a real player who reuses this slot is never
+	// mistaken for the ghost and hidden from opted-out viewers.
+	ent->r.rs_isWrGhost = false;
 	if( ent->r.inuse )
 		trap_DropClient( ent, DROP_TYPE_GENERAL, NULL );
 }

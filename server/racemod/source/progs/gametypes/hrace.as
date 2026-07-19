@@ -223,6 +223,8 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_MeshVote( client, cmdString, argsString, argc );
     else if ( cmdString == "flag" )
         return Cmd_Flag( client, cmdString, argsString, argc );
+    else if ( cmdString == "wrghost" )
+        return Cmd_WrGhost( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -356,7 +358,11 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
         // "connected" notice is announced once per real join. netname is set
         // just before this event, so client.name is valid here.
         if ( @client != null )
+        {
             RACE_MirrorPlayerJoined( client );
+            // Fresh occupant: default the WR ghost back to visible for this slot.
+            RACE_GhostResetPref( client.playerNum );
+        }
     }
     else if ( score_event == "disconnect" )
     {
@@ -439,6 +445,10 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     // their frozen, streamed position/view.
     if ( RS_MirrorBotIs( ent.client.playerNum ) )
         return;
+
+    // Re-assert this player's saved "wrghost off" choice: a level reload zeroes
+    // the per-client visibility flag the engine reads, so re-apply it each spawn.
+    RACE_GhostApplyPref( ent.client.playerNum );
 
     Player@ player = RACE_GetPlayer( ent.client );
     player.cancelRace();

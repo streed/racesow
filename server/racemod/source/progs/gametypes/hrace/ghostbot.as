@@ -11,8 +11,16 @@
 // straight through it, and it is excluded from the player count and scoreboard
 // (see RACE_RealPlayerCount + the raceGhostBotSlot skip in hrace.as). It never
 // enters a race (startRace refuses fake clients) so it is never timed and
-// never triggers checkpoints. Toggle with rs_wr_ghost (default on); a distracted
-// player can also hide it client-side with cg_raceGhosts 0.
+// never triggers checkpoints.
+//
+// Visibility. rs_wr_ghost (default on) toggles the ghost SERVER-WIDE. An
+// individual player can hide it for THEMSELVES with the "wrghost off" command
+// (Cmd_WrGhost below): the server marks the viewer's edict and culls the ghost
+// from just their snapshot (SNAP_SnapCullEntity, via RS_SetHideWrGhost) without
+// touching mesh ghosts, other players' views, or the scoreboard. The stock
+// client also offers cg_raceGhostsAlpha (set it to 0 to hide ALL race ghosts,
+// mesh ones included) - note cg_raceGhosts does NOT affect the player-model
+// ghost, it only shells projectiles, so "cg_raceGhosts 0" does not hide it.
 
 Cvar rsWrGhost( "rs_wr_ghost", "1", 0 );
 // GET target for the WR ghost (INGEST_URL/api/game/ghost); set by entrypoint.sh.
@@ -96,9 +104,78 @@ int RACE_RealPlayerCount()
     return n;
 }
 
+// Per-client "wrghost off" preference. An AngelScript global, so it persists
+// across map changes (the script module outlives level reloads); the matching
+// engine-side edict flag is zeroed on every reload, so RACE_GhostApplyPref
+// re-asserts this on (re)spawn. Default false = the player sees the WR ghost.
+bool[] raceGhostHiddenFor( maxClients );
+
 void RACE_GhostInit()
 {
-    // cvars auto-register; nothing else needed at gametype init.
+    // cvars auto-register. Register the per-player visibility toggle.
+    G_RegisterCommand( "wrghost" );
+    for ( int i = 0; i < maxClients; i++ )
+        raceGhostHiddenFor[i] = false;
+}
+
+// Re-assert this client's saved WR-ghost preference on the engine. Called on
+// every (re)spawn from GT_PlayerRespawn, because a level reload zeroes the
+// per-edict flag - without this a player's "wrghost off" would silently reset
+// each map. Cheap (a single native call); skips out-of-range slots.
+void RACE_GhostApplyPref( int playerNum )
+{
+    if ( playerNum < 0 || playerNum >= maxClients )
+        return;
+    RS_SetHideWrGhost( playerNum, raceGhostHiddenFor[playerNum] );
+}
+
+// Reset a slot to the default (visible) on a genuine connect, so a new player
+// never inherits the previous occupant's choice. Called from GT_scoreEvent.
+void RACE_GhostResetPref( int playerNum )
+{
+    if ( playerNum < 0 || playerNum >= maxClients )
+        return;
+    raceGhostHiddenFor[playerNum] = false;
+    RS_SetHideWrGhost( playerNum, false );
+}
+
+// wrghost [on|off|toggle] - per-player toggle for the in-game WR ghost racer.
+// Hides/shows ONLY the WR ghost for the caller (server-side per-client cull),
+// leaving mesh ghosts and everyone else's view untouched. No argument toggles.
+bool Cmd_WrGhost( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    if ( @client == null )
+        return false;
+
+    int slot = client.playerNum;
+    if ( slot < 0 || slot >= maxClients )
+        return false;
+
+    bool hide;
+    String arg = argsString.getToken( 0 ).tolower();
+    if ( arg == "" || arg == "toggle" )
+        hide = !raceGhostHiddenFor[slot];
+    else if ( arg == "off" || arg == "0" || arg == "hide" )
+        hide = true;
+    else if ( arg == "on" || arg == "1" || arg == "show" )
+        hide = false;
+    else
+    {
+        client.printMessage( "Usage: " + S_COLOR_YELLOW + "wrghost [on|off]" + S_COLOR_WHITE
+                + " - show or hide the world-record ghost racer (just for you).\n" );
+        return true;
+    }
+
+    raceGhostHiddenFor[slot] = hide;
+    RS_SetHideWrGhost( slot, hide );
+
+    if ( hide )
+        client.printMessage( S_COLOR_YELLOW + "World-record ghost hidden" + S_COLOR_WHITE
+                + " for you - use " + S_COLOR_GREEN + "wrghost on" + S_COLOR_WHITE + " to bring it back.\n" );
+    else
+        client.printMessage( S_COLOR_GREEN + "World-record ghost shown" + S_COLOR_WHITE
+                + " for you - use " + S_COLOR_GREEN + "wrghost off" + S_COLOR_WHITE + " to hide it.\n" );
+    return true;
 }
 
 // Map load: drop any stale bot and arm a fresh fetch of this map's WR ghost.

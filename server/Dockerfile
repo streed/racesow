@@ -78,8 +78,23 @@ RUN python3 /tmp/patch-mirror-natives.py \
     && grep -q "asFunc_RS_MirrorRefresh" game/g_ascript.cpp \
     && grep -q "asFunc_RS_MirrorBotAdd" game/g_ascript.cpp \
     && grep -q "asFunc_RS_MirrorPeerCount" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_SetHideWrGhost" game/g_ascript.cpp \
     && grep -q "RS_MirrorLocalChat" game/g_cmds.cpp \
     && grep -q "RS_MirrorLocalChat" game/g_gameteams.cpp
+
+# 7b. Per-client world-record ghost visibility: two server-only booleans on
+#     entity_shared_t + one filter in SNAP_SnapCullEntity so a player can hide
+#     just the WR ghost for themselves ("wrghost off"), without touching mesh
+#     ghosts, other viewers, the scoreboard, or the wire format. The RS_Set-
+#     HideWrGhost native (g_rs_mirrorbots.cpp) drives it. Patches g_public.h
+#     (needed by the game build below) and qcommon/snap_write.c (needed by the
+#     dedicated-server build later). The greps assert both edits landed.
+COPY enginepatches/patch-wrghost-cull.py /tmp/patch-wrghost-cull.py
+RUN python3 /tmp/patch-wrghost-cull.py \
+    && grep -q "rs_isWrGhost" game/g_public.h \
+    && grep -q "rs_hideWrGhost" game/g_public.h \
+    && grep -q "rs_isWrGhost" qcommon/snap_write.c \
+    && grep -q "rs_hideWrGhost" qcommon/snap_write.c
 
 # 8. Quad rocket-jump fix (rs_quad_fix, default 0): racesow's self-knockback
 #    recompute in G_RadiusDamage discards the fire-time QUAD_KNOCKBACK_SCALE, so
@@ -117,6 +132,8 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
     && strings /libgame_x86_64.so | grep -q "racerecord" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: configured" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: bot slot" \
+    # per-client WR-ghost toggle native registration string (survives stripping)
+    && strings /libgame_x86_64.so | grep -q "RS_SetHideWrGhost" \
     # rs_quad_fix cvar names survive stripping as trap_Cvar_Get string literals
     && strings /libgame_x86_64.so | grep -q "rs_quad_fix" \
     && strings /libgame_x86_64.so | grep -q "rs_quad_knockback_scale" \

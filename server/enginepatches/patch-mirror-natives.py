@@ -62,6 +62,9 @@ wrapper = (
     " float pitch, float yaw, float roll, float vx, float vy, float vz, int flags );\n"
     "void RS_MirrorBotRemove( int playerNum );\n"
     "bool RS_MirrorBotIs( int playerNum );\n"
+    "// racesow-docker: per-client WR-ghost visibility (g_rs_mirrorbots.cpp); a\n"
+    "// viewer who runs \"wrghost off\" has the WR ghost culled from their snapshot\n"
+    "void RS_SetHideWrGhost( int playerNum, bool hide );\n"
     "// mirror peer liveness (heard peers with their advertised map + silence age)\n"
     "int RS_MirrorPeerCount( void );\n"
     "int RS_MirrorPeerAge( int i );\n"
@@ -142,6 +145,11 @@ wrapper += (
     "\treturn RS_MirrorBotIs( playerNum );\n"
     "}\n"
     "\n"
+    "static void asFunc_RS_SetHideWrGhost( int playerNum, bool hide )\n"
+    "{\n"
+    "\tRS_SetHideWrGhost( playerNum, hide );\n"
+    "}\n"
+    "\n"
     "static int asFunc_RS_MirrorPeerCount( void )\n"
     "{\n"
     "\treturn RS_MirrorPeerCount();\n"
@@ -205,6 +213,11 @@ for decl, func in [
     ("int RS_MirrorPeerAge( int index )", "PeerAge"),
 ]:
     entries += "\t{ \"%s\", asFUNCTION(asFunc_RS_Mirror%s), NULL },\n" % (decl, func)
+
+# Per-client WR-ghost visibility native (not a RS_Mirror* name, so registered
+# explicitly rather than through the loop above).
+entries += ("\t{ \"void RS_SetHideWrGhost( int playerNum, bool hide )\", "
+            "asFUNCTION(asFunc_RS_SetHideWrGhost), NULL },\n")
 
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, entries, "asGlobFuncs mirror entries")
 
