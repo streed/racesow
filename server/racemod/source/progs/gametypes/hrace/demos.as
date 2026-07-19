@@ -97,9 +97,14 @@ void RACE_ReportWrDemo( Player@ player, uint finishTime )
 {
     if ( rsApiUrl.string.length() == 0 )
         return;
+    // Report under the variant name so a reversed PB's demo attaches to the
+    // "<map>-reversed" level on the site. The on-disk demo path still uses the
+    // physical BSP name (the engine writes demos/server/<bsp>/...), so build the
+    // relative path from the real map name but report the effective one.
     Cvar mapNameVar( "mapname", "", 0 );
-    String map = mapNameVar.string.tolower();
-    String relPath = RACE_DemoRelPath( map, player.client, finishTime );
+    String diskMap = mapNameVar.string.tolower();
+    String map = RACE_EffectiveMapName( player.reversed );
+    String relPath = RACE_DemoRelPath( diskMap, player.client, finishTime );
     RS_ApiReportWrDemo( rsApiUrl.string, rsApiToken.string, rsApiVersion.string,
             map, player.client.name, player.client.getMMLogin(),
             int( finishTime ), relPath );
@@ -134,8 +139,7 @@ void RACE_UploadWrGhost( Player@ player, uint finishTime )
         cps += player.bestGhostCp[i];
     }
 
-    Cvar mapNameVar( "mapname", "", 0 );
     RS_GhostEnd( rsApiGhostUrl.string, rsApiToken.string, rsApiVersion.string,
-            mapNameVar.string.tolower(), player.client.name, player.client.getMMLogin(),
+            RACE_EffectiveMapName( player.reversed ), player.client.name, player.client.getMMLogin(),
             int( finishTime ), GHOST_HZ, cps );
 }

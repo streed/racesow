@@ -4,6 +4,24 @@ const int HUD_RECORDS = 3;
 
 RecordTime[] levelRecords( MAX_RECORDS );
 
+// Reverse-mode variant board. A reversed run (see /reverse) is a wholly
+// separate record set from the normal run of the same BSP — it is persisted,
+// ranked, announced and reported to the API under the map name
+// "<map>-reversed", so its live in-game top board is kept here, parallel to the
+// standard levelRecords above. RACE_Records() selects the board for a given
+// player's mode; every board-scoped helper below takes a `bool reversed`.
+RecordTime[] levelRecordsReversed( MAX_RECORDS );
+
+// The live top board for a run: the reversed variant board when `reversed`,
+// else the standard board. Arrays are reference types, so this hands back a
+// handle to the actual global array (not a copy).
+RecordTime[]@ RACE_Records( bool reversed )
+{
+    if ( reversed )
+        return levelRecordsReversed;
+    return levelRecords;
+}
+
 Table raceReport( S_COLOR_ORANGE + "l " + S_COLOR_WHITE + "r " + S_COLOR_ORANGE + "/ l r " + S_COLOR_ORANGE + "/ l r " + S_COLOR_ORANGE + "/ l " + S_COLOR_WHITE + "r" + S_COLOR_ORANGE + "l " + S_COLOR_WHITE + "r" );
 Table practiceReport( S_COLOR_CYAN + "l " + S_COLOR_WHITE + "r " + S_COLOR_CYAN + "/ l r " + S_COLOR_CYAN + "/ l r " + S_COLOR_CYAN + "/ l " + S_COLOR_WHITE + "r" + S_COLOR_CYAN + "l " + S_COLOR_WHITE + "r" );
 
@@ -137,11 +155,10 @@ class RecordTime
     }
 }
 
-void RACE_LoadTopScores()
+void RACE_LoadTopScores( bool reversed = false )
 {
     String topScores;
-    Cvar mapNameVar( "mapname", "", 0 );
-    String mapName = mapNameVar.string.tolower();
+    String mapName = RACE_EffectiveMapName( reversed );
 
     topScores = G_LoadFile( "topscores/race/" + mapName + ".txt" );
 
@@ -207,10 +224,14 @@ void RACE_LoadTopScores()
             record.checkpoints[ numSectors ] = Checkpoint( finishTime, CheckpointType_Finish );
             record.deduceCheckpointOrder();
 
-            RACE_AddTopScore( record, false );
+            RACE_AddTopScore( record, reversed, false );
         }
 
-        RACE_UpdateHUDTopScores();
+        // The HUD record lines (CS_GENERAL config strings) are a server-global
+        // singleton broadcast to everyone, so they always reflect the STANDARD
+        // board — a reversed reload never overwrites them.
+        if ( !reversed )
+            RACE_UpdateHUDTopScores();
     }
 }
 
@@ -299,28 +320,28 @@ void RACE_UpdateHUDTopScores()
     }
 }
 
-void RACE_WriteTopScores()
+void RACE_WriteTopScores( bool reversed = false )
 {
     String topScores;
-    Cvar mapNameVar( "mapname", "", 0 );
-    String mapName = mapNameVar.string.tolower();
+    String mapName = RACE_EffectiveMapName( reversed );
+    RecordTime[]@ board = RACE_Records( reversed );
 
     topScores = "//" + mapName + " top scores\n\n";
 
     for ( int i = 0; i < MAX_RECORDS; i++ )
     {
-        if ( levelRecords[ i ].isFinished() && levelRecords[ i ].ident.playerName.length() > 0 )
+        if ( board[ i ].isFinished() && board[ i ].ident.playerName.length() > 0 )
         {
-            topScores += "\"" + int( levelRecords[ i ].getFinishTime() );
-            if ( levelRecords[ i ].ident.login != "" )
-                topScores += "|" + levelRecords[ i ].ident.login; // optionally storing it in a token with another value provides backwards compatibility
-            topScores += "\" \"" + levelRecords[ i ].ident.playerName + "\" ";
+            topScores += "\"" + int( board[ i ].getFinishTime() );
+            if ( board[ i ].ident.login != "" )
+                topScores += "|" + board[ i ].ident.login; // optionally storing it in a token with another value provides backwards compatibility
+            topScores += "\" \"" + board[ i ].ident.playerName + "\" ";
 
             // add the sectors
             topScores += "\"" + numCheckpoints+ "\" ";
 
             for ( uint j = 0; j < numCheckpoints; j++ )
-                topScores += "\"" + int( levelRecords[ i ].checkpoints[ j ].time ) + "\" ";
+                topScores += "\"" + int( board[ i ].checkpoints[ j ].time ) + "\" ";
 
             topScores += "\n";
         }
@@ -329,8 +350,9 @@ void RACE_WriteTopScores()
     G_WriteFile( "topscores/race/" + mapName + ".txt", topScores );
 }
 
-uint RACE_AddTopScore( RecordTime record, bool take_priority = true )
+uint RACE_AddTopScore( RecordTime record, bool reversed = false, bool take_priority = true )
 {
+    RecordTime[]@ levelRecords = RACE_Records( reversed );
     // UINT_MAX = "no slot": if the board is full and the record is slower
     // than every entry, the scan below never breaks and id keeps this value.
     // (It used to be declared uninitialized — indexing levelRecords with the

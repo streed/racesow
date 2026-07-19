@@ -19,6 +19,10 @@ class LastRecords
     LastRecord[] recs;
     uint lastRec;
     String lastRecPlayer;
+    // Parallel baseline for the reverse-variant board, so a reversed #1 set this
+    // map session is captured to the cross-map feed under "<map>-reversed".
+    uint lastRecReversed;
+    String lastRecPlayerReversed;
 
     LastRecords( String fileName )
     {
@@ -26,6 +30,8 @@ class LastRecords
         this.recs.resize( LAST_RECORDS );
         this.lastRec = 0;
         this.lastRecPlayer = "";
+        this.lastRecReversed = 0;
+        this.lastRecPlayerReversed = "";
         this.count = 0;
     }
 
@@ -60,6 +66,11 @@ class LastRecords
         this.lastRecPlayer = levelRecords[0].ident.playerName;
         if ( this.lastRecPlayer == "" )
             this.lastRecPlayer = ";";
+
+        this.lastRecReversed = levelRecordsReversed[0].getFinishTime();
+        this.lastRecPlayerReversed = levelRecordsReversed[0].ident.playerName;
+        if ( this.lastRecPlayerReversed == "" )
+            this.lastRecPlayerReversed = ";";
     }
 
     void toFile()
@@ -68,15 +79,32 @@ class LastRecords
         // getFinishTime() on a never-sized RecordTime indexes checkpoints[-1].
         if ( levelRecords[0].checkpoints.length() == 0 )
             return;
-        if ( levelRecords[0].getFinishTime() == 0 || ( this.lastRec > 0 && levelRecords[0].getFinishTime() >= this.lastRec ) )
-            return;
 
         Cvar mapNameVar( "mapname", "", 0 );
-        LastRecord newRecord = LastRecord( levelRecords[0].getFinishTime(), this.lastRec, mapNameVar.string.tolower(), levelRecords[0].ident.playerName, this.lastRecPlayer );
-        String result = newRecord.format();
+        String baseMap = mapNameVar.string.tolower();
+
+        // Prepend any newly-set #1 this session — standard first, then reverse.
+        String result = "";
+        uint newCount = 0;
+        if ( levelRecords[0].getFinishTime() != 0 && ( this.lastRec == 0 || levelRecords[0].getFinishTime() < this.lastRec ) )
+        {
+            LastRecord r = LastRecord( levelRecords[0].getFinishTime(), this.lastRec, baseMap, levelRecords[0].ident.playerName, this.lastRecPlayer );
+            result += r.format();
+            newCount++;
+        }
+        if ( levelRecordsReversed[0].getFinishTime() != 0 && ( this.lastRecReversed == 0 || levelRecordsReversed[0].getFinishTime() < this.lastRecReversed ) )
+        {
+            LastRecord r = LastRecord( levelRecordsReversed[0].getFinishTime(), this.lastRecReversed, baseMap + REVERSE_SUFFIX, levelRecordsReversed[0].ident.playerName, this.lastRecPlayerReversed );
+            result += r.format();
+            newCount++;
+        }
+
+        if ( newCount == 0 )
+            return;
+
         uint bound = this.count;
-        if ( LAST_RECORDS - 1 < bound )
-            bound = LAST_RECORDS - 1;
+        if ( LAST_RECORDS - newCount < bound )
+            bound = LAST_RECORDS - newCount;
         for ( uint i = 0; i < bound; i++ )
             result += this.recs[i].format();
 

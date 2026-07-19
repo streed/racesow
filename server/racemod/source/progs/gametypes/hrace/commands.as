@@ -239,6 +239,40 @@ bool Cmd_Noclip( Client@ client, const String &cmdString, const String &argsStri
     return player.toggleNoclip();
 }
 
+// /reverse — race the map backwards. A 3-state toggle:
+//   OFF   -> SETUP  : arm reverse mode + positioning noclip (fly to the finish)
+//   SETUP -> ARMED  : leave noclip, ready at the reverse start
+//   ARMED -> OFF    : cancel reverse mode
+// While armed, crossing the map's FINISH line starts the timed run and crossing
+// the START line finishes it; the result is recorded to the "<map>-reversed"
+// level, entirely separate from normal times. "/reverse off" forces it off.
+bool Cmd_Reverse( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    Player@ player = RACE_GetPlayer( client );
+    String action = argsString.getToken( 0 ).tolower();
+
+    if ( player.inRace )
+    {
+        client.printMessage( S_COLOR_RED + "Finish or /racerestart before toggling reverse mode.\n" );
+        return false;
+    }
+
+    if ( action == "off" )
+    {
+        if ( player.reversed )
+            return player.disableReverse();
+        client.printMessage( "Reverse mode is already off.\n" );
+        return false;
+    }
+
+    if ( !player.reversed )
+        return player.enterReverseSetup(); // OFF -> SETUP
+    else if ( player.reverseSetup )
+        return player.armReverse();        // SETUP -> ARMED
+    else
+        return player.disableReverse();    // ARMED -> OFF
+}
+
 bool Cmd_Position( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
     String action = argsString.getToken( 0 );
@@ -416,6 +450,9 @@ bool Cmd_Top( Client@ client, const String &cmdString, const String &argsString,
         return true;
     }
 
+    // Show the board matching the player's current mode: a reversed racer's
+    // "/top" reflects the "<map>-reversed" leaderboard.
+    RecordTime[]@ levelRecords = RACE_Records( RACE_GetPlayer( client ).reversed );
     RecordTime@ top = levelRecords[ 0 ];
     if ( !top.isFinished() )
     {
@@ -537,6 +574,9 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/noclip" );
         cmdlist.addCell( "Lets you move freely through the world whilst in practicemode." );
 
+        cmdlist.addCell( "/reverse" );
+        cmdlist.addCell( "Race the map in reverse (finish->start); recorded as a separate '-reversed' map." );
+
         cmdlist.addCell( "/position save" );
         cmdlist.addCell( "Saves your position including your weapons as the new spawn position." );
 
@@ -606,6 +646,14 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         client.printMessage( S_COLOR_YELLOW + "/noclip" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Lets you move freely through the world whilst in practicemode. Use this command to get more" + "\n" );
         client.printMessage( S_COLOR_WHITE + "  control over your position when using /position save. Only works in practicemode." + "\n" );
+    }
+    else if ( command == "reverse" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/reverse" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Race the course backwards. Run /reverse to enter a positioning noclip, fly to the map's" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  FINISH line, then /reverse again to arm. Cross the finish to start the timer, run the" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  checkpoints in reverse, and cross the START line to finish. Prejump rules still apply." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  Reverse times are recorded separately as the '<map>-reversed' map. Use /reverse off to cancel." + "\n" );
     }
     else if ( command == "position" && subcommand == "save" )
     {

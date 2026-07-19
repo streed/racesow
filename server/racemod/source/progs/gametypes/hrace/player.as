@@ -53,6 +53,15 @@ class Player
     bool practicing;
     bool recalled;
 
+    // Reverse mode (/reverse): race the course backwards — start by crossing the
+    // map's finish line, run the checkpoints in reverse, end at the start line.
+    // `reversed` is the armed/active state (records go to the "<map>-reversed"
+    // level and its own board); `reverseSetup` is the transient positioning
+    // noclip used to fly to the reverse start. reverseSetup is NOT practicemode,
+    // so a reversed run is still recorded normally.
+    bool reversed;
+    bool reverseSetup;
+
     // "/position find" cursor: last searched entity type + which match to cycle to
     String lastFind;
     uint findIndex;
@@ -144,6 +153,8 @@ class Player
         this.postRace = false;
         this.practicing = false;
         this.recalled = false;
+        this.reversed = false;
+        this.reverseSetup = false;
         this.lastFind = "";
         this.findIndex = 0;
         // Free (not just drop) any marker dummy: clear() runs on enterGame when a
@@ -236,6 +247,7 @@ class Player
         if ( !this.best_recordTime.isFinished() )
             return;
 
+        RecordTime[]@ levelRecords = RACE_Records( this.reversed );
         String cleanName = this.client.name.removeColorTokens().tolower();
         for ( int i = 0; i < MAX_RECORDS; i++ )
         {
@@ -258,6 +270,7 @@ class Player
     String@ scoreboardEntry()
     {
         Entity@ ent = this.client.getEnt();
+        RecordTime[]@ levelRecords = RACE_Records( this.reversed );
         int playerID = ( ent.isGhosting() && ( match.getState() == MATCH_STATE_PLAYTIME ) ) ? -( ent.playerNum + 1 ) : ent.playerNum;
         String racing;
         String pos = "\u00A0";
@@ -357,6 +370,14 @@ class Player
             return false;
         }
 
+        // Noclip auto-enters practicemode (which makes runs unrecorded); reverse
+        // mode has its own positioning noclip and must stay recordable.
+        if ( this.reversed )
+        {
+            G_PrintMsg( ent, "Leave reverse mode first (/reverse).\n" );
+            return false;
+        }
+
         // From spectator or while dead: join (if needed), enter practicemode,
         // and respawn IN PLACE in noclip. enterPracticeMode() does not respawn,
         // so this is safe to call before the respawn; the GT_PlayerRespawn
@@ -422,6 +443,132 @@ class Player
         this.setQuickMenu();
 
         return true;
+    }
+
+    // /reverse step 1: arm reverse mode and drop into a positioning noclip so
+    // the player can fly to the map's FINISH line (their reverse start). This is
+    // deliberately NOT practicemode, so the ensuing run is recorded normally —
+    // to the separate "<map>-reversed" level. From spectator/dead we join and
+    // respawn in place; GT_PlayerRespawn's reverse block puts the body in noclip.
+    bool enterReverseSetup()
+    {
+        Entity@ ent = this.client.getEnt();
+
+        if ( pending_endmatch || match.getState() >= MATCH_STATE_POSTMATCH )
+        {
+            G_PrintMsg( ent, "Can't use reverse mode in overtime.\n" );
+            return false;
+        }
+
+        // Reversing only makes sense if the map has both a start and a finish
+        // line to swap (checkpoints are optional).
+        if ( entityFinder.starts.length() == 0 || entityFinder.finishes.length() == 0 )
+        {
+            G_PrintMsg( ent, S_COLOR_RED + "This map has no start/finish line to reverse.\n" );
+            return false;
+        }
+
+        // Never carry practicemode/recall into a reverse run — it must record.
+        if ( this.practicing )
+            this.leavePracticeMode();
+        this.cancelRace();
+
+        this.reversed = true;
+        this.reverseSetup = true;
+        this.resetBestForMode(); // point best_recordTime at the reverse board
+
+        if ( this.client.team == TEAM_SPECTATOR || ent.health <= 0 )
+        {
+            Vec3 origin = ent.origin;
+            Vec3 angles = ent.angles;
+            if ( this.client.team == TEAM_SPECTATOR )
+            {
+                this.client.team = TEAM_PLAYERS;
+                G_PrintMsg( null, this.client.name + S_COLOR_WHITE + " joined the " + G_GetTeam( this.client.team ).name + S_COLOR_WHITE + " team.\n" );
+            }
+            this.client.respawn( false ); // reverse block in GT_PlayerRespawn noclips it
+            ent.origin = origin;
+            ent.angles = angles;
+        }
+        else
+        {
+            ent.moveType = MOVETYPE_NOCLIP;
+            ent.set_velocity( Vec3() );
+            this.noclipWeapon = ent.weapon;
+        }
+
+        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse mode: fly to the FINISH line,\nthen /reverse again to arm" );
+        this.setQuickMenu();
+        return true;
+    }
+
+    // /reverse step 2: leave the positioning noclip and stand ready as a normal
+    // pre-race body at the reverse start. Crossing the finish line then starts
+    // the timed reverse run (the prejump gate in startRace() still applies).
+    bool armReverse()
+    {
+        Entity@ ent = this.client.getEnt();
+        this.reverseSetup = false;
+        if ( ent.moveType == MOVETYPE_NOCLIP || ent.moveType == MOVETYPE_NONE )
+        {
+            ent.moveType = MOVETYPE_PLAYER;
+            this.client.selectWeapon( this.noclipWeapon );
+        }
+        ent.set_velocity( Vec3() );
+        this.release = 0;
+        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse armed:\ncross the FINISH line to start" );
+        this.setQuickMenu();
+        return true;
+    }
+
+    // /reverse toggle-off (or leaving reverse setup): drop reverse mode entirely
+    // and respawn as a normal racer.
+    bool disableReverse()
+    {
+        this.cancelRace();
+        this.reversed = false;
+        this.reverseSetup = false;
+        this.resetBestForMode(); // point best_recordTime back at the standard board
+        Entity@ ent = this.client.getEnt();
+        if ( ent.moveType == MOVETYPE_NOCLIP || ent.moveType == MOVETYPE_NONE )
+            ent.moveType = MOVETYPE_PLAYER;
+        this.release = 0;
+        if ( this.client.team != TEAM_SPECTATOR )
+            this.client.respawn( false );
+        G_CenterPrintMsg( this.client.getEnt(), S_COLOR_CYAN + "Reverse mode off" );
+        this.setQuickMenu();
+        return true;
+    }
+
+    // best_recordTime is a single per-player value, so switching between the
+    // standard and reverse variant must re-point it at the current mode's board.
+    // Otherwise a reverse run would be judged a "personal best" against a
+    // STANDARD time — mis-awarding records and, worse, gating the reverse ghost/
+    // demo upload (completeRace's newPersonalBest) on the wrong baseline. Clears
+    // the previous mode's best + replay buffers, then re-seeds from this mode's
+    // board by clean name (logins are empty since the auth servers are gone).
+    void resetBestForMode()
+    {
+        this.best_recordTime.clear();
+        this.bestMaxSpeed = 0;
+        this.bestRunPositionCount = 0;
+        this.bestGhostCount = 0;
+        this.bestGhostCpCount = 0;
+
+        RecordTime[]@ board = RACE_Records( this.reversed );
+        String cleanName = this.client.name.removeColorTokens().tolower();
+        for ( int i = 0; i < MAX_RECORDS; i++ )
+        {
+            if ( !board[ i ].isFinished() )
+                break;
+            if ( board[ i ].ident.cleanName == cleanName )
+            {
+                this.best_recordTime = board[ i ];
+                break;
+            }
+        }
+        this.updateScore();
+        this.updatePos();
     }
 
     PositionStore@ positionStore()
@@ -1378,7 +1525,7 @@ class Player
                 this.best_recordTime = this.current_recordTime;
             }
 
-            uint pos = RACE_AddTopScore( this.best_recordTime );
+            uint pos = RACE_AddTopScore( this.best_recordTime, this.reversed );
 
             // Close this run's per-client demo. Keep only PERSONAL-BEST demos
             // (one per player per map, the download the site links) and cancel
@@ -1400,7 +1547,7 @@ class Player
             // be stale (or empty at map start), so a mere personal best would
             // false-announce — apitop.as verifies against a fresh API pull first.
             if ( pos == 0 )
-                RACE_QueueRecordAnnounce( this.client.name, finishTime );
+                RACE_QueueRecordAnnounce( this.client.name, finishTime, this.reversed );
 
             // Upload the demo pointer + ghost trajectory for every PERSONAL BEST
             // (one per player per map). The web keeps a per-(player, map) row
@@ -1415,8 +1562,10 @@ class Player
             }
 
 
-            RACE_WriteTopScores();
-            RACE_UpdateHUDTopScores();
+            RACE_WriteTopScores( this.reversed );
+            // HUD record lines are a shared singleton -> standard board only.
+            if ( !this.reversed )
+                RACE_UpdateHUDTopScores();
             RACE_UpdatePosValues();
 
             // set up for respawning the player with a delay
@@ -1516,7 +1665,9 @@ class Player
 
     void togglePracticeMode()
     {
-        if ( pending_endmatch )
+        if ( this.reversed )
+            this.client.printMessage("Leave reverse mode first (/reverse).\n");
+        else if ( pending_endmatch )
             this.client.printMessage("Can't join practicemode in overtime.\n");
         else if ( this.practicing )
             this.leavePracticeMode();

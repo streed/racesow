@@ -38,40 +38,43 @@ bool raceAnnouncePending = false;
 uint raceAnnounceTime = 0;
 String raceAnnounceName = "";
 uint raceAnnounceDeadline = 0;
+bool raceAnnounceReversed = false; // which board the pending finish belongs to
 const uint ANNOUNCE_VERIFY_TIMEOUT = 6000; // ms to wait for the API before falling back
 
-void RACE_DoRecordAnnounce( const String &in playerName, uint finishTime )
+void RACE_DoRecordAnnounce( const String &in playerName, uint finishTime, bool reversed )
 {
+    RecordTime[]@ board = RACE_Records( reversed );
     String str = playerName + S_COLOR_YELLOW + " set a new " + SERVER_NAME
-            + S_COLOR_YELLOW + " record: " + S_COLOR_GREEN + RACE_TimeToString( finishTime );
-    if ( levelRecords[ 1 ].isFinished() )
-        str += " " + S_COLOR_YELLOW + "[-" + RACE_TimeToString( levelRecords[ 1 ].getFinishTime() - finishTime ) + "]";
+            + S_COLOR_YELLOW + " record" + ( reversed ? " (reverse)" : "" ) + ": " + S_COLOR_GREEN + RACE_TimeToString( finishTime );
+    if ( board[ 1 ].isFinished() )
+        str += " " + S_COLOR_YELLOW + "[-" + RACE_TimeToString( board[ 1 ].getFinishTime() - finishTime ) + "]";
     G_PrintMsg( null, str + "\n" );
 }
 
 // Called from completeRace when a finish is a LOCAL #1. Defers the announce
 // until a fresh API pull confirms it, unless the API is unconfigured (then we
 // can't verify, so fall back to announcing on the local check as before).
-void RACE_QueueRecordAnnounce( const String &in playerName, uint finishTime )
+void RACE_QueueRecordAnnounce( const String &in playerName, uint finishTime, bool reversed )
 {
     if ( rsApiTopUrl.string.length() == 0 )
     {
-        RACE_DoRecordAnnounce( playerName, finishTime );
+        RACE_DoRecordAnnounce( playerName, finishTime, reversed );
         return;
     }
     // Two records verified at once is vanishingly rare; flush any prior pending
     // one on its local merit rather than dropping it.
     if ( raceAnnouncePending )
-        RACE_DoRecordAnnounce( raceAnnounceName, raceAnnounceTime );
+        RACE_DoRecordAnnounce( raceAnnounceName, raceAnnounceTime, raceAnnounceReversed );
 
     raceAnnouncePending = true;
     raceAnnounceTime = finishTime;
     raceAnnounceName = playerName;
+    raceAnnounceReversed = reversed;
     raceAnnounceDeadline = realTime + ANNOUNCE_VERIFY_TIMEOUT;
 
-    // Pull the current records now (don't wait for the periodic interval).
-    Cvar mapNameVar( "mapname", "", 0 );
-    RS_ApiFetchTop( rsApiTopUrl.string, "", mapNameVar.string.tolower() );
+    // Pull the current records for the matching variant now (don't wait for the
+    // periodic interval).
+    RS_ApiFetchTop( rsApiTopUrl.string, "", RACE_EffectiveMapName( reversed ) );
     apiTopLastFetch = levelTime == 0 ? 1 : levelTime; // avoid a redundant periodic fetch next frame
 }
 
@@ -84,15 +87,16 @@ void RACE_CheckPendingAnnounce( bool refreshed )
     if ( !raceAnnouncePending )
         return;
 
+    RecordTime[]@ board = RACE_Records( raceAnnounceReversed );
     if ( refreshed )
     {
-        if ( !levelRecords[ 0 ].isFinished() || raceAnnounceTime <= levelRecords[ 0 ].getFinishTime() )
-            RACE_DoRecordAnnounce( raceAnnounceName, raceAnnounceTime );
+        if ( !board[ 0 ].isFinished() || raceAnnounceTime <= board[ 0 ].getFinishTime() )
+            RACE_DoRecordAnnounce( raceAnnounceName, raceAnnounceTime, raceAnnounceReversed );
         raceAnnouncePending = false;
     }
     else if ( realTime >= raceAnnounceDeadline )
     {
-        RACE_DoRecordAnnounce( raceAnnounceName, raceAnnounceTime );
+        RACE_DoRecordAnnounce( raceAnnounceName, raceAnnounceTime, raceAnnounceReversed );
         raceAnnouncePending = false;
     }
 }
@@ -105,9 +109,12 @@ void RACE_ApiTopThink()
     int status = RS_ApiPollTop();
     if ( status == 1 )
     {
-        // Fresh global top scores are on disk — merge them in through the
-        // normal loader (also refreshes the HUD record config strings).
+        // A fresh top-scores file landed on disk — but the poll flag doesn't say
+        // which map (standard or "<map>-reversed"), so reload BOTH boards
+        // through the normal loader; the merge is idempotent. The standard
+        // reload also refreshes the HUD record config strings.
         RACE_LoadTopScores();
+        RACE_LoadTopScores( true );
         RACE_CheckPendingAnnounce( true ); // verify any pending record against them
     }
     else
@@ -119,8 +126,11 @@ void RACE_ApiTopThink()
     {
         apiTopLastFetch = levelTime == 0 ? 1 : levelTime;
         Cvar mapNameVar( "mapname", "", 0 );
+        String baseMap = mapNameVar.string.tolower();
         // empty token: the endpoint is public, so the ingest write-credential
-        // has no business riding along on this request
-        RS_ApiFetchTop( rsApiTopUrl.string, "", mapNameVar.string.tolower() );
+        // has no business riding along on this request. Refresh both the
+        // standard and the reverse-variant boards.
+        RS_ApiFetchTop( rsApiTopUrl.string, "", baseMap );
+        RS_ApiFetchTop( rsApiTopUrl.string, "", baseMap + REVERSE_SUFFIX );
     }
 }

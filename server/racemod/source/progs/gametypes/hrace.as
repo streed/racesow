@@ -197,6 +197,8 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_Practicemode( client, cmdString, argsString, argc );
     else if ( cmdString == "noclip" )
         return Cmd_Noclip( client, cmdString, argsString, argc );
+    else if ( cmdString == "reverse" )
+        return Cmd_Reverse( client, cmdString, argsString, argc );
     else if ( cmdString == "position" )
         return Cmd_Position( client, cmdString, argsString, argc );
     else if ( cmdString == "top" )
@@ -507,6 +509,22 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
         player.noclipSpawn = false;
     }
 
+    // Reversed racers respawn at the normal spawn point (the map's start = the
+    // reverse FINISH), so drop them back into a positioning noclip to fly to the
+    // reverse start (the map's finish line). Keeps them in reverse mode across a
+    // death / kill / finished run without having to re-type /reverse. Only for a
+    // live racer; leaving reverse mode (disableReverse) clears the flag first.
+    if ( player.reversed && !ent.isGhosting() && ent.client.team == TEAM_PLAYERS )
+    {
+        player.reverseSetup = true;
+        ent.moveType = MOVETYPE_NOCLIP;
+        ent.velocity = Vec3( 0, 0, 0 );
+        player.noclipWeapon = ent.client.pendingWeapon;
+        player.recalled = false;
+        player.release = 0;
+        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse: fly to the FINISH line,\nthen /reverse to arm" );
+    }
+
     // Recall delay: freeze a recalled respawn for recallHold frames so
     // walljump/dash starts are timing-consistent (checkRelease unfreezes).
     if ( player.recalled )
@@ -790,6 +808,7 @@ bool GT_MatchStateFinished( int incomingMatchState )
 
         // ch : also send rest of results
         RACE_WriteTopScores();
+        RACE_WriteTopScores( true ); // persist the reverse-variant board too
         RACE_UpdatePosValues();
         // script globals reset on map change: report uncounted race starts now
         RACE_FlushAllAttempts();
@@ -1006,9 +1025,13 @@ void GT_SpawnGametype()
         players[i].setupArrays( numCheckpoints + 1 );
 
     for ( int i = 0; i < MAX_RECORDS; i++ )
+    {
         levelRecords[i].setupArrays( numCheckpoints + 1 );
+        levelRecordsReversed[i].setupArrays( numCheckpoints + 1 );
+    }
 
     RACE_LoadTopScores();
+    RACE_LoadTopScores( true ); // reverse-variant board ("<map>-reversed")
     lastRecords.fromFile(); // recent-records feed: snapshot this map's current #1
 
     RACE_MirrorSpawnGametype();
@@ -1132,6 +1155,7 @@ void GT_InitGametype()
     G_RegisterCommand( "join" );
     G_RegisterCommand( "practicemode" );
     G_RegisterCommand( "noclip" );
+    G_RegisterCommand( "reverse" );
     G_RegisterCommand( "position" );
     G_RegisterCommand( "top" );
     G_RegisterCommand( "mark" );
