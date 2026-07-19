@@ -364,8 +364,10 @@ class Player
         }
         else
         {
+            // No MI_EMPTY spacer here (unlike the practicing branch's noclip
+            // slot): dropping it keeps this branch within the quick-menu slot
+            // budget once the reverse + triggers items below are added.
             s += menuItems[MI_ENTER_PRACTICE] +
-                 menuItems[MI_EMPTY] +
                  menuItems[MI_SAVE_POSITION];
             if ( position.saved && ( this.preRace() || this.client.team == TEAM_SPECTATOR ) )
                 s += menuItems[MI_LOAD_POSITION] +
