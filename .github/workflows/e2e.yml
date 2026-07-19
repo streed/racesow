@@ -59,4 +59,6 @@ jobs:
         run: sh e2e/fullstack_run.sh --no-build
 
       - name: mesh boot (3-node gametype compile + peer set)
-        run: sh server/test/verify-mesh.sh --no-build --boot-only
+        # verify-mesh.sh is a bash script (set -o pipefail, [[ ]]); run it with
+        # bash, not the runner's default dash `sh`.
+        run: bash server/test/verify-mesh.sh --no-build --boot-only
