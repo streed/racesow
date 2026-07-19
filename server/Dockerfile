@@ -257,13 +257,13 @@ RUN set -eux; \
     # rebuild of the same clientdata tree is byte-identical, so all servers
     # reference the same checksum. A drifted checksum under the same pak name
     # means "Pure check failed" for every client holding the other copy.
-    find ui huds gfx scripts sounds racemod_ui_v5.txt -exec touch -t 200901010000.00 {} +; \
-    find ui huds gfx scripts sounds racemod_ui_v5.txt -type f ! -name '.*' | sort \
-        | TZ=UTC zip -X -D "${WARSOW_DIR}/${FS_GAME}/racemod_ui_v5_local.pk3" -@; \
+    find ui huds gfx scripts sounds racemod_ui_v6.txt -exec touch -t 200901010000.00 {} +; \
+    find ui huds gfx scripts sounds racemod_ui_v6.txt -type f ! -name '.*' | sort \
+        | TZ=UTC zip -X -D "${WARSOW_DIR}/${FS_GAME}/racemod_ui_v6_local.pk3" -@; \
     # the gametype must pure-index the marker this pak actually ships, else
     # clients are never told to download it (the recurring v3/v4 drift bug)
-    unzip -p "${WARSOW_DIR}/${FS_GAME}/hrace.pk3" progs/gametypes/hrace.as | grep -q 'racemod_ui_v5.txt'; \
-    unzip -Z1 "${WARSOW_DIR}/${FS_GAME}/racemod_ui_v5_local.pk3" | grep -qx 'racemod_ui_v5.txt'; \
+    unzip -p "${WARSOW_DIR}/${FS_GAME}/hrace.pk3" progs/gametypes/hrace.as | grep -q 'racemod_ui_v6.txt'; \
+    unzip -Z1 "${WARSOW_DIR}/${FS_GAME}/racemod_ui_v6_local.pk3" | grep -qx 'racemod_ui_v6.txt'; \
     rm -rf /tmp/clientdata
 
 # --- Server configuration + entrypoint --------------------------------------

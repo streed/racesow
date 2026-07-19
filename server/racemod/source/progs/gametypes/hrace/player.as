@@ -370,7 +370,23 @@ class Player
             if ( position.saved && ( this.preRace() || this.client.team == TEAM_SPECTATOR ) )
                 s += menuItems[MI_LOAD_POSITION] +
                      menuItems[MI_CLEAR_POSITION];
+
+            // Reverse mode (mutually exclusive with practice). Hidden mid-run
+            // since Cmd_Reverse refuses to toggle while racing; the label tracks
+            // the tri-state: enable -> lock in the start -> leave.
+            if ( !this.inRace )
+            {
+                if ( this.reversed && this.reverseSetup )
+                    s += menuItems[MI_REVERSE_LOCK];
+                else if ( this.reversed )
+                    s += menuItems[MI_REVERSE_OFF];
+                else
+                    s += menuItems[MI_REVERSE_START];
+            }
         }
+
+        // Trigger-plane markers toggle (a viewing aid, useful in any mode).
+        s += this.showingTriggers ? menuItems[MI_HIDE_TRIGGERS] : menuItems[MI_SHOW_TRIGGERS];
 
         GENERIC_SetQuickMenu( this.client, s );
     }
@@ -700,6 +716,7 @@ class Player
             this.freeTriggerMarkers();
             this.showingTriggers = false;
             G_PrintMsg( this.client.getEnt(), "Trigger markers off.\n" );
+            this.setQuickMenu();
             return true;
         }
 
@@ -708,6 +725,7 @@ class Player
         this.spawnTriggerMarkers( entityFinder.allEntities( "finish" ) );
         this.showingTriggers = true;
         G_PrintMsg( this.client.getEnt(), "Trigger markers on: " + S_COLOR_GREEN + "start" + S_COLOR_WHITE + " and " + S_COLOR_RED + "finish" + S_COLOR_WHITE + " planes marked.\n" );
+        this.setQuickMenu();
         return true;
     }
 
