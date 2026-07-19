@@ -1,0 +1,62 @@
+# Heavy end-to-end lane: build the REAL Warsow race-server image once, then
+# exercise the whole mod the way production runs it. Split from ci.yml because
+# these need a Docker daemon and the ~20-30 min engine/game-module compile.
+#
+# The image is built ONCE (buildx + a GitHub Actions layer cache, so unchanged
+# server/ trees rebuild in minutes) and reused by every step below via the
+# warsow-race:2.1.2 tag loaded into the local daemon:
+#
+#   boot + connect   game server boots, the hrace gametype (AngelScript)
+#                    compiles, and a real client completes the connect
+#                    handshake (e2e/client_connect_probe.py).
+#   full stack       postgres + web + game together: site healthy + homepage,
+#                    game boots + client connects, and the live game ships
+#                    console logs to the web over HTTP (game->web round-trip).
+#   mesh boot        the 3-node cross-server mirror mesh: every node's gametype
+#                    compiles and the peer set configures (verify-mesh boot-only,
+#                    the deterministic subset of the mesh gate).
+name: e2e
+
+on:
+  push:
+  pull_request:
+
+# Superseded runs of the same ref are pointless to keep building.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  game-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The engine build tree (Ubuntu 18.04 base + Warsow 2.1.2 ~465 MB + the
+      # compiled qfusion tree) is large; reclaim runner disk up front.
+      - name: free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build the game-server image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./server
+          load: true
+          tags: warsow-race:2.1.2
+          cache-from: type=gha,scope=warsow-race
+          cache-to: type=gha,mode=max,scope=warsow-race
+
+      - name: boot + real client-connect handshake
+        run: sh e2e/gameserver_smoke.sh --no-build
+
+      - name: full stack (web + db + game, game->web over HTTP)
+        run: sh e2e/fullstack_run.sh --no-build
+
+      - name: mesh boot (3-node gametype compile + peer set)
+        run: sh server/test/verify-mesh.sh --no-build --boot-only

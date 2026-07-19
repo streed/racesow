@@ -142,21 +142,45 @@ the standalone collector of the basic tier below.)
 
 ## Testing
 
-Layers, all runnable on a dev box (node ≥ 18, g++, libcurl headers, and a
-throwaway PostgreSQL — see `web/README.md` — reachable via `TEST_PG_URL`):
+Two lanes cover the whole mod — website, game/engine/hrace, and clients
+connecting. See `e2e/README.md` for the full map.
+
+**Fast lane** (`.github/workflows/ci.yml`, no Docker; node ≥ 18, g++, libcurl
+headers, and a throwaway PostgreSQL — see `web/README.md` — via `TEST_PG_URL`):
 
 ```bash
 cd web && npm test                    # DB semantics + HTTP API (throwaway pg database per test)
 sh server/test/entrypoint.test.sh     # env vars -> env.cfg -> launch-args contract
 sh e2e/run.sh                         # the REAL g_rs_api.cpp -> live server.js -> API
 sh e2e/mirror_fuzz_run.sh             # mesh parser vs ~300k hostile datagrams (ASan+UBSan)
+node --test server/test/demoname.test.mjs   # WR-demo filename: engine C vs .as, byte-for-byte
 ```
 
-The e2e compiles `server/enginepatches/g_rs_api.cpp` into a harness that calls
-`RS_ApiReportRace` exactly like `racelog.as` does, so the bytes on the wire are
-the game module's. It covers: every finish counted as an attempt, PR upserts,
-leaderboard for all players, WR splits, the perfect-run (sum of best splits)
-computation, and delivery via the retry queue across a server restart.
+`e2e/run.sh` compiles `server/enginepatches/g_rs_api.cpp` into a harness that
+calls `RS_ApiReportRace` exactly like `racelog.as` does, so the bytes on the
+wire are the game module's. It covers: every finish counted as an attempt, PR
+upserts, leaderboard for all players, WR splits, the perfect-run (sum of best
+splits) computation, and delivery via the retry queue across a server restart.
+
+**Heavy lane** (`.github/workflows/e2e.yml`, needs Docker; builds the real
+server image once — the engine compile is ~20-30 min — then reuses it):
+
+```bash
+sh e2e/gameserver_smoke.sh            # boot the server: hrace gametype compiles,
+                                      #   then a REAL client connect handshake
+                                      #   (getchallenge -> getinfo -> connect ->
+                                      #   client_connect); see client_connect_probe.py
+sh e2e/fullstack_run.sh               # postgres + web + game together: site healthy
+                                      #   + homepage, client connects, and the live
+                                      #   game ships console logs to the web over HTTP
+sh server/test/verify-mesh.sh --boot-only   # 3-node mesh: every gametype compiles + peers configure
+```
+
+These are the parts only a live server can prove: the AngelScript gametype
+compiles at *boot* (never at Docker-build time), and a client can actually
+establish a connection. The full mesh regression (`e2e/mesh_regression.py`,
+`verify-mesh.sh` without `--boot-only`) stays a local/manual gate — it needs a
+~2 min mesh warm-up that is too timing-sensitive for a per-push CI signal.
 
 ## Notes
 
