@@ -511,9 +511,13 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
         player.noclipSpawn = false;
     }
 
-    // Reversed racers spawn at the reverse start (just outside the finish line):
-    // enableReverse() and /position save store that spot in the prerace slot, so
-    // the loadPosition("") above already placed them there — nothing to do here.
+    // Reversed racers spawn at the reverse start: enableReverse()/finalizeReverse
+    // stored that spot in the prerace slot, so the loadPosition("") above already
+    // placed them there. Clear the fine-tune flag so a death mid-setup respawns
+    // armed at the saved spot (enableReverse sets reverseSetup AFTER its own
+    // join-respawn, so this can't clobber a fresh setup).
+    if ( player.reversed )
+        player.reverseSetup = false;
 
     // Recall delay: freeze a recalled respawn for recallHold frames so
     // walljump/dash starts are timing-consistent (checkRelease unfreezes).

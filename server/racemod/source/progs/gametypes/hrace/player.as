@@ -57,8 +57,11 @@ class Player
     // map's finish line, run the checkpoints in reverse, end at the start line.
     // `reversed` is the active state; records go to the "<map>-reversed" level
     // and its own board. Enabling it teleports the player to the reverse start
-    // and saves that as their prerace spawn.
+    // and drops them into a fine-tune noclip (`reverseSetup`); leaving that
+    // noclip saves their final spawn and arms them. reverseSetup is NOT
+    // practicemode, so the run still records.
     bool reversed;
+    bool reverseSetup;
     // The normal prerace spawn, stashed while reversed (reverse mode overwrites
     // the prerace slot with the reverse start) and restored on /reverse off.
     Position preReverseMain;
@@ -162,6 +165,7 @@ class Player
         this.practicing = false;
         this.recalled = false;
         this.reversed = false;
+        this.reverseSetup = false;
         this.preReverseMainSaved = false;
         this.preReverseMain.clear();
         this.showingTriggers = false;
@@ -381,12 +385,25 @@ class Player
             return false;
         }
 
-        // Noclip auto-enters practicemode (which makes runs unrecorded); reverse
-        // mode has its own positioning noclip and must stay recordable.
+        // In reverse mode, /noclip is the fine-tune noclip (never practicemode, so
+        // the run still records): leaving it locks in your reverse start
+        // (finalizeReverse), and toggling back in lets you re-adjust it.
         if ( this.reversed )
         {
-            G_PrintMsg( ent, "Leave reverse mode first (/reverse).\n" );
-            return false;
+            if ( this.reverseSetup )
+                return this.finalizeReverse();
+            if ( ent.health <= 0 || this.client.team == TEAM_SPECTATOR )
+            {
+                G_PrintMsg( ent, "Not available right now.\n" );
+                return false;
+            }
+            this.reverseSetup = true;
+            ent.moveType = MOVETYPE_NOCLIP;
+            ent.set_velocity( Vec3() );
+            this.noclipWeapon = ent.weapon;
+            G_CenterPrintMsg( ent, S_COLOR_CYAN + "Adjust your reverse start,\nthen /noclip to lock it in" );
+            this.setQuickMenu();
+            return true;
         }
 
         // From spectator or while dead: join (if needed), enter practicemode,
@@ -456,11 +473,13 @@ class Player
         return true;
     }
 
-    // /reverse ON: enable reverse mode and TELEPORT the player to a spot just
-    // outside the map's FINISH line (their reverse start), facing it. That spot
-    // becomes their spawn — saved into the prerace slot, so /kill, /racerestart
-    // and the post-finish respawn all return here — and /position save refines
-    // it. Deliberately NOT practicemode, so the run records to "<map>-reversed".
+    // /reverse ON: enable reverse mode, TELEPORT the player to a spot just
+    // outside the map's FINISH line (their reverse start), and drop them into a
+    // fine-tune noclip so they can adjust it. A tentative spawn is saved now;
+    // leaving the noclip (/noclip or /reverse -> finalizeReverse) saves the final
+    // spawn and arms them. That spawn is the prerace slot, so /kill, /racerestart
+    // and the post-finish respawn all return here. Deliberately NOT practicemode,
+    // so the run records to "<map>-reversed".
     bool enableReverse()
     {
         Entity@ ent = this.client.getEnt();
@@ -505,28 +524,61 @@ class Player
         if ( this.preReverseMainSaved )
             this.preReverseMain.copy( main );
 
-        // Teleport to the reverse start and make it the spawn.
+        // Teleport to the reverse start and save it as a TENTATIVE spawn (so a
+        // death during setup returns here); the final spawn is committed when the
+        // player leaves the fine-tune noclip below.
         Vec3 origin, angles;
         if ( this.computeReverseStart( origin, angles ) )
         {
-            ent.moveType = MOVETYPE_PLAYER;
             ent.origin = origin;
             ent.angles = angles;
             ent.set_velocity( Vec3() );
             ent.teleported = true;
-            // Persist as the prerace spawn (slot 0) so every respawn returns
-            // here. Write it directly rather than via savePosition() to skip its
-            // user-facing "not on solid ground" messages — computeReverseStart
-            // already validated the spot (or fell back to the finish centre).
-            Position@ p = this.currentPosition();
-            p.saved = true;
-            p.recalled = false;
-            p.velocity = Vec3();
-            p.skipWeapons = false;
-            this.preRacePositionStore.set( "", p );
+            this.storeReverseSpawn();
         }
 
-        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse: cross the FINISH line to start\n" + S_COLOR_WHITE + "(/position save to set your spawn)" );
+        // Fine-tune noclip: fly to the exact start, then /noclip (or /reverse) to
+        // lock it in. reverseSetup is set AFTER the join-respawn above so
+        // GT_PlayerRespawn's reverseSetup reset can't race it.
+        this.reverseSetup = true;
+        ent.moveType = MOVETYPE_NOCLIP;
+        ent.set_velocity( Vec3() );
+        this.noclipWeapon = ent.weapon;
+
+        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse: fine-tune your start in noclip,\nthen /noclip to lock it in" );
+        this.setQuickMenu();
+        return true;
+    }
+
+    // Write the player's current position into the prerace spawn slot (slot 0),
+    // so every respawn returns here. Written directly (not via savePosition) to
+    // skip its user-facing "not on solid ground" messages.
+    void storeReverseSpawn()
+    {
+        Position@ p = this.currentPosition();
+        p.saved = true;
+        p.recalled = false;
+        p.velocity = Vec3();
+        p.skipWeapons = false;
+        this.preRacePositionStore.set( "", p );
+    }
+
+    // Leave the reverse fine-tune noclip: drop to normal movement where the
+    // player is now, SAVE that as the reverse spawn (so /kill and restarts return
+    // here), and arm the run — crossing the finish line then starts the timer.
+    bool finalizeReverse()
+    {
+        Entity@ ent = this.client.getEnt();
+        this.reverseSetup = false;
+        if ( ent.moveType == MOVETYPE_NOCLIP || ent.moveType == MOVETYPE_NONE )
+        {
+            ent.moveType = MOVETYPE_PLAYER;
+            this.client.selectWeapon( this.noclipWeapon );
+        }
+        ent.set_velocity( Vec3() );
+        this.release = 0;
+        this.storeReverseSpawn();
+        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse start saved —\ncross the FINISH line to start" );
         this.setQuickMenu();
         return true;
     }
@@ -618,6 +670,7 @@ class Player
     {
         this.cancelRace();
         this.reversed = false;
+        this.reverseSetup = false;
         this.resetBestForMode(); // point best_recordTime back at the standard board
 
         if ( this.preReverseMainSaved )

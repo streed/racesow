@@ -989,10 +989,9 @@ const ABOUT_CMDS = [
     title: "Reverse mode",
     note: "Race the map backwards. Cross the FINISH line to start your timer, run the checkpoints in reverse, and cross the START line to finish. Prejump rules still apply. Your time is saved on a separate “<map>-reversed” leaderboard (shown with a REVERSE badge on this site) and never mixes with the normal times.",
     rows: [
-      ["/reverse", "Turn reverse mode on. It teleports you to just outside the map's finish line — your reverse start — and makes that your spawn. Run through the finish to start the clock."],
-      ["/position save", "Adjust your reverse spawn: stand where you want to start and save it. /kill and restarts return you there."],
+      ["/reverse", "Race the map backwards. Teleports you to the finish line (your reverse start) and drops you into noclip to fine-tune the spot; leave noclip (/noclip, or /reverse again) to lock it in as your spawn. Then cross the finish to start."],
       ["/showtriggers", "Toggle markers at the start and finish trigger planes so you can see where to cross. Only you see them."],
-      ["/reverse off", "Leave reverse mode and go back to a normal run."],
+      ["/reverse off", "Leave reverse mode and go back to a normal run. /kill and restarts return you to your saved reverse start."],
     ],
   },
   {
@@ -1030,7 +1029,7 @@ const ABOUT_FAQ = [
   ["Why wasn't my time saved?",
     "Times only count in a clean race-mode run. If you toggled <span class=\"mono\">/practicemode</span>, <span class=\"mono\">/noclip</span>, or used <span class=\"mono\">/position</span>, that run won't be recorded. Use <span class=\"mono\">/kill</span> to get back to the start and race it straight through."],
   ["What is reverse mode?",
-    "Reverse mode lets you race a map <b>backwards</b>. Type <span class=\"mono\">/reverse</span> to turn it on: it teleports you to just outside the map's <b>finish</b> line — that's your reverse start — and makes that your spawn. Run through the finish line to start the clock, run the checkpoints in reverse, and cross the <b>start</b> line to finish. Prejump rules still apply. Use <span class=\"mono\">/position save</span> to set your exact spawn (<span class=\"mono\">/kill</span> and restarts return you there), and <span class=\"mono\">/showtriggers</span> to see where the planes are. Reverse times live on their own separate leaderboard — the map appears here as <span class=\"mono\">&lt;map&gt;-reversed</span> with a <span class=\"pill rev\">REVERSE</span> badge — and never mix with the normal times. Use <span class=\"mono\">/reverse off</span> to go back to a normal run."],
+    "Reverse mode lets you race a map <b>backwards</b>. Type <span class=\"mono\">/reverse</span> to turn it on: it teleports you to just outside the map's <b>finish</b> line — your reverse start — and drops you into noclip to fine-tune the exact spot. Leave noclip (<span class=\"mono\">/noclip</span>, or <span class=\"mono\">/reverse</span> again) to lock it in as your spawn — <span class=\"mono\">/kill</span> and restarts return you there. Then run through the finish line to start the clock, run the checkpoints in reverse, and cross the <b>start</b> line to finish. Prejump rules still apply. Use <span class=\"mono\">/showtriggers</span> to see where the planes are. Reverse times live on their own separate leaderboard — the map appears here as <span class=\"mono\">&lt;map&gt;-reversed</span> with a <span class=\"pill rev\">REVERSE</span> badge — and never mix with the normal times. Use <span class=\"mono\">/reverse off</span> to go back to a normal run."],
   ["What are the ghosts I keep seeing?",
     "The EU and US servers are meshed. Players on the other server show up as translucent, non-solid ghosts whenever you're on the same map, so you can race alongside them across the Atlantic. You never collide with them. Use <span class=\"mono\">/who</span> to see who's who, and <span class=\"mono\">/watch</span> to follow one."],
   ["How do records end up on this site?",

@@ -239,12 +239,13 @@ bool Cmd_Noclip( Client@ client, const String &cmdString, const String &argsStri
     return player.toggleNoclip();
 }
 
-// /reverse — race the map backwards. A simple on/off toggle: enabling it
-// teleports you to just outside the map's FINISH line (your reverse start) and
-// makes that your spawn; crossing the finish line starts the timed run and
-// crossing the START line finishes it, recorded to the "<map>-reversed" level
-// entirely separate from normal times. "/position save" refines the spawn;
-// "/reverse off" forces it off.
+// /reverse — race the map backwards. Enabling it teleports you to just outside
+// the map's FINISH line (your reverse start) and drops you into a fine-tune
+// noclip; leaving the noclip (/noclip, or /reverse again) locks that spot in as
+// your spawn. Crossing the finish line then starts the timed run and crossing
+// the START line finishes it, recorded to the "<map>-reversed" level entirely
+// separate from normal times. "/reverse off" (or /reverse while armed) forces
+// it off.
 bool Cmd_Reverse( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
     Player@ player = RACE_GetPlayer( client );
@@ -264,9 +265,12 @@ bool Cmd_Reverse( Client@ client, const String &cmdString, const String &argsStr
         return false;
     }
 
-    if ( player.reversed )
-        return player.disableReverse();
-    return player.enableReverse();
+    if ( !player.reversed )
+        return player.enableReverse();   // OFF -> SETUP (teleport + fine-tune noclip)
+    else if ( player.reverseSetup )
+        return player.finalizeReverse(); // SETUP -> ARMED (leave noclip, save spawn)
+    else
+        return player.disableReverse();  // ARMED -> OFF
 }
 
 // /showtriggers — toggle per-player beacons marking the start and finish trigger
@@ -658,10 +662,10 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
     {
         client.printMessage( S_COLOR_YELLOW + "/reverse" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Race the course backwards. Running /reverse teleports you to just outside the map's FINISH" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  line (your reverse start) and makes that your spawn. Cross the finish to start the timer, run" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  the checkpoints in reverse, and cross the START line to finish. Prejump rules still apply." + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  Use /position save to adjust your spawn. Reverse times are recorded separately as the" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  '<map>-reversed' map. Use /reverse off to cancel." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  line (your reverse start) and drops you into noclip to fine-tune the spot. Leave noclip" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  (/noclip, or /reverse again) to lock it in as your spawn, then cross the finish to start the" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  timer, run the checkpoints in reverse, and cross the START line to finish. Prejump rules" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  still apply. Reverse times are recorded separately as '<map>-reversed'. /reverse off cancels." + "\n" );
     }
     else if ( command == "showtriggers" )
     {
