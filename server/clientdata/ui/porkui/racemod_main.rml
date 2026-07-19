@@ -9,6 +9,10 @@
 		Cvar cg_clientHUD( "cg_clientHUD", "default", ::CVAR_ARCHIVE );
 		Cvar cg_specHUD( "cg_specHUD", "default", ::CVAR_ARCHIVE );
 		Cvar racemod_seenintro( "racemod_seenintro", "0", ::CVAR_ARCHIVE | ::CVAR_USERINFO );
+			// Per-client toggle for the in-game world-record ghost racer. USERINFO
+			// so the server (hrace/ghostbot.as) can read it and hide the ghost from
+			// just this player's view; default 1 = shown.
+			Cvar cg_raceShowWorldRecord( "cg_raceShowWorldRecord", "1", ::CVAR_ARCHIVE | ::CVAR_USERINFO );
 
 		void onPlayerLoad( Element@ body, Event@ evt )
 		{
@@ -256,6 +260,8 @@
 							<input cvar="cg_raceGhosts" type="checkbox" realtime="1"/>
 							<div class="title">Transparent players opacity</div>
 							<input cvar="cg_raceGhostsAlpha" class="slider" type="range" min="0" max="1" step="0.05" value="0" realtime="1"/>
+							<div class="title">Show world-record ghost</div>
+							<input cvar="cg_raceShowWorldRecord" type="checkbox" realtime="1"/>
 							<div class="title">I have seen the intro message</div>
 							<input cvar="racemod_seenintro" type="checkbox" realtime="1"/>
 						</optionsform>

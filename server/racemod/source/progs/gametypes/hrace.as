@@ -223,8 +223,6 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_MeshVote( client, cmdString, argsString, argc );
     else if ( cmdString == "flag" )
         return Cmd_Flag( client, cmdString, argsString, argc );
-    else if ( cmdString == "wrghost" )
-        return Cmd_WrGhost( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -358,11 +356,7 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
         // "connected" notice is announced once per real join. netname is set
         // just before this event, so client.name is valid here.
         if ( @client != null )
-        {
             RACE_MirrorPlayerJoined( client );
-            // Fresh occupant: default the WR ghost back to visible for this slot.
-            RACE_GhostResetPref( client.playerNum );
-        }
     }
     else if ( score_event == "disconnect" )
     {
@@ -395,6 +389,10 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
     {
         if ( @client != null )
         {
+            // Pick up a live change to cg_raceShowWorldRecord (the per-client WR
+            // ghost toggle) the moment the player flips it in Race Options.
+            RACE_GhostApplyClientPref( client );
+
             Player@ player = RACE_GetPlayer( client );
             String login = client.getMMLogin();
             if ( login != "" )
@@ -446,9 +444,9 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     if ( RS_MirrorBotIs( ent.client.playerNum ) )
         return;
 
-    // Re-assert this player's saved "wrghost off" choice: a level reload zeroes
-    // the per-client visibility flag the engine reads, so re-apply it each spawn.
-    RACE_GhostApplyPref( ent.client.playerNum );
+    // Re-apply this player's cg_raceShowWorldRecord choice: a level reload zeroes
+    // the per-client visibility flag the engine reads, so re-assert it each spawn.
+    RACE_GhostApplyClientPref( ent.client );
 
     Player@ player = RACE_GetPlayer( ent.client );
     player.cancelRace();
@@ -1048,7 +1046,7 @@ void GT_InitGametype()
     gametype.author = "Warsow Development Team";
 
     // Pure-index a (silent) sound that lives inside the client UI pak
-    // (racemod_ui_v5_local.pk3, built from server/clientdata). This puts the
+    // (racemod_ui_v6_local.pk3, built from server/clientdata). This puts the
     // pak on the sv_pure list as a *referenced* file, so connecting clients
     // download it from this server over the game connection. The pak must NOT
     // be *pure-named: clients only fetch explicit-pure paks from the official
@@ -1165,7 +1163,7 @@ void GT_InitGametype()
 
     // msc: force pk3 download — the marker version MUST match the pak built
     // in server/Dockerfile (asserted there at build time)
-    G_SoundIndex( "racemod_ui_v5.txt", true );
+    G_SoundIndex( "racemod_ui_v6.txt", true );
     G_SoundIndex( "missing_tex.txt", true );
 
     demoRecording = false;

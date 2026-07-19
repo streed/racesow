@@ -17,7 +17,7 @@
 # dedicated-server image).
 
 # --- Game image (source of the deterministic racemod UI/HUD pak) -------------
-# The spectator's race HUD (ale_racemod) lives in racemod_ui_v5_local.pk3, built
+# The spectator's race HUD (ale_racemod) lives in racemod_ui_v6_local.pk3, built
 # deterministically by server/Dockerfile. We copy that exact pak from the game
 # image so the checksum matches the running server's (pure-safe) AND the HUD is
 # present at launch — otherwise cg_clientHUD points at a HUD that only arrives
@@ -63,7 +63,7 @@ RUN set -eux; \
 # matches the server's pure checksum and is present before the spectator even
 # connects. fs_game is racemod (the server switches the client to it on connect),
 # so the pak must live under racemod/. Selected at launch via cg_clientHUD.
-COPY --from=gamedata /warsow/racemod/racemod_ui_v5_local.pk3 ${WARSOW_DIR}/racemod/racemod_ui_v5_local.pk3
+COPY --from=gamedata /warsow/racemod/racemod_ui_v6_local.pk3 ${WARSOW_DIR}/racemod/racemod_ui_v6_local.pk3
 
 # --- TV scripts + assets -----------------------------------------------------
 COPY tv/entrypoint.sh tv/relay-run.sh tv/capture-run.sh tv/getstatus.sh tv/make-card.sh /opt/tv/

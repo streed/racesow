@@ -579,9 +579,6 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/flag <reason>" );
         cmdlist.addCell( "Flags the current map for moderator review (broken, offensive, etc.)." );
 
-        cmdlist.addCell( "/wrghost <on|off>" );
-        cmdlist.addCell( "Shows or hides the world-record ghost racer, just for you." );
-
         for ( uint i = 0; i < cmdlist.numRows(); i++ )
             client.printMessage( cmdlist.getRow(i) + "\n" );
 
@@ -591,13 +588,6 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
     {
         client.printMessage( S_COLOR_YELLOW + "/m name message" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Sends a private message to the player whose name matches." + "\n" );
-    }
-    else if ( command == "wrghost" )
-    {
-        client.printMessage( S_COLOR_YELLOW + "/wrghost <on|off>" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Shows or hides the world-record ghost racer for you only; with no argument it toggles." + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  Other players and the scoreboard are unaffected. The stock client's " + S_COLOR_YELLOW + "cg_raceGhostsAlpha 0" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  hides ALL race ghosts instead (this command hides only the record ghost)." + "\n" );
     }
     else if ( command == "kill" || command == "racerestart" )
     {
