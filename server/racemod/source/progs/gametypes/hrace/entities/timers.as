@@ -28,7 +28,7 @@ void target_stoptimer_use( Entity@ self, Entity@ other, Entity@ activator )
     // run here (same path — and prejump gate — as a normal start).
     if ( player.reversed )
     {
-        if ( player.reverseSetup || player.inRace )
+        if ( player.inRace )
             return;
 
         if ( player.startRace() )
@@ -74,8 +74,6 @@ void target_starttimer_use( Entity@ self, Entity@ other, Entity@ activator )
     // and bank the reversed run here (same path as a normal finish).
     if ( player.reversed )
     {
-        if ( player.reverseSetup )
-            return;
         if ( !player.inRace && !player.practicing )
             return;
 

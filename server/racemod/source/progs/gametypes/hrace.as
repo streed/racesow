@@ -199,6 +199,8 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_Noclip( client, cmdString, argsString, argc );
     else if ( cmdString == "reverse" )
         return Cmd_Reverse( client, cmdString, argsString, argc );
+    else if ( cmdString == "showtriggers" )
+        return Cmd_ShowTriggers( client, cmdString, argsString, argc );
     else if ( cmdString == "position" )
         return Cmd_Position( client, cmdString, argsString, argc );
     else if ( cmdString == "top" )
@@ -509,21 +511,9 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
         player.noclipSpawn = false;
     }
 
-    // Reversed racers respawn at the normal spawn point (the map's start = the
-    // reverse FINISH), so drop them back into a positioning noclip to fly to the
-    // reverse start (the map's finish line). Keeps them in reverse mode across a
-    // death / kill / finished run without having to re-type /reverse. Only for a
-    // live racer; leaving reverse mode (disableReverse) clears the flag first.
-    if ( player.reversed && !ent.isGhosting() && ent.client.team == TEAM_PLAYERS )
-    {
-        player.reverseSetup = true;
-        ent.moveType = MOVETYPE_NOCLIP;
-        ent.velocity = Vec3( 0, 0, 0 );
-        player.noclipWeapon = ent.client.pendingWeapon;
-        player.recalled = false;
-        player.release = 0;
-        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse: fly to the FINISH line,\nthen /reverse to arm" );
-    }
+    // Reversed racers spawn at the reverse start (just outside the finish line):
+    // enableReverse() and /position save store that spot in the prerace slot, so
+    // the loadPosition("") above already placed them there — nothing to do here.
 
     // Recall delay: freeze a recalled respawn for recallHold frames so
     // walljump/dash starts are timing-consistent (checkRelease unfreezes).
@@ -1156,6 +1146,7 @@ void GT_InitGametype()
     G_RegisterCommand( "practicemode" );
     G_RegisterCommand( "noclip" );
     G_RegisterCommand( "reverse" );
+    G_RegisterCommand( "showtriggers" );
     G_RegisterCommand( "position" );
     G_RegisterCommand( "top" );
     G_RegisterCommand( "mark" );

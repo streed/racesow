@@ -239,13 +239,12 @@ bool Cmd_Noclip( Client@ client, const String &cmdString, const String &argsStri
     return player.toggleNoclip();
 }
 
-// /reverse — race the map backwards. A 3-state toggle:
-//   OFF   -> SETUP  : arm reverse mode + positioning noclip (fly to the finish)
-//   SETUP -> ARMED  : leave noclip, ready at the reverse start
-//   ARMED -> OFF    : cancel reverse mode
-// While armed, crossing the map's FINISH line starts the timed run and crossing
-// the START line finishes it; the result is recorded to the "<map>-reversed"
-// level, entirely separate from normal times. "/reverse off" forces it off.
+// /reverse — race the map backwards. A simple on/off toggle: enabling it
+// teleports you to just outside the map's FINISH line (your reverse start) and
+// makes that your spawn; crossing the finish line starts the timed run and
+// crossing the START line finishes it, recorded to the "<map>-reversed" level
+// entirely separate from normal times. "/position save" refines the spawn;
+// "/reverse off" forces it off.
 bool Cmd_Reverse( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
     Player@ player = RACE_GetPlayer( client );
@@ -265,12 +264,17 @@ bool Cmd_Reverse( Client@ client, const String &cmdString, const String &argsStr
         return false;
     }
 
-    if ( !player.reversed )
-        return player.enterReverseSetup(); // OFF -> SETUP
-    else if ( player.reverseSetup )
-        return player.armReverse();        // SETUP -> ARMED
-    else
-        return player.disableReverse();    // ARMED -> OFF
+    if ( player.reversed )
+        return player.disableReverse();
+    return player.enableReverse();
+}
+
+// /showtriggers — toggle per-player beacons marking the start and finish trigger
+// planes, so it's obvious where to cross (especially the finish, which is the
+// reverse start). Visible only to the player who ran the command.
+bool Cmd_ShowTriggers( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    return RACE_GetPlayer( client ).toggleTriggerMarkers();
 }
 
 bool Cmd_Position( Client@ client, const String &cmdString, const String &argsString, int argc )
@@ -575,7 +579,10 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "Lets you move freely through the world whilst in practicemode." );
 
         cmdlist.addCell( "/reverse" );
-        cmdlist.addCell( "Race the map in reverse (finish->start); recorded as a separate '-reversed' map." );
+        cmdlist.addCell( "Race the map in reverse (finish->start); teleports you to the start, recorded separately." );
+
+        cmdlist.addCell( "/showtriggers" );
+        cmdlist.addCell( "Toggle markers showing the start and finish trigger planes (only you see them)." );
 
         cmdlist.addCell( "/position save" );
         cmdlist.addCell( "Saves your position including your weapons as the new spawn position." );
@@ -650,10 +657,17 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
     else if ( command == "reverse" )
     {
         client.printMessage( S_COLOR_YELLOW + "/reverse" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Race the course backwards. Run /reverse to enter a positioning noclip, fly to the map's" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  FINISH line, then /reverse again to arm. Cross the finish to start the timer, run the" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  checkpoints in reverse, and cross the START line to finish. Prejump rules still apply." + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  Reverse times are recorded separately as the '<map>-reversed' map. Use /reverse off to cancel." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Race the course backwards. Running /reverse teleports you to just outside the map's FINISH" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  line (your reverse start) and makes that your spawn. Cross the finish to start the timer, run" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  the checkpoints in reverse, and cross the START line to finish. Prejump rules still apply." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  Use /position save to adjust your spawn. Reverse times are recorded separately as the" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  '<map>-reversed' map. Use /reverse off to cancel." + "\n" );
+    }
+    else if ( command == "showtriggers" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/showtriggers" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Toggles translucent markers at the centre of the start and finish trigger planes, so you can" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  see where to cross (handy for reverse mode, where the finish is your start). Only you see them." + "\n" );
     }
     else if ( command == "position" && subcommand == "save" )
     {

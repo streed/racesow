@@ -55,12 +55,20 @@ class Player
 
     // Reverse mode (/reverse): race the course backwards — start by crossing the
     // map's finish line, run the checkpoints in reverse, end at the start line.
-    // `reversed` is the armed/active state (records go to the "<map>-reversed"
-    // level and its own board); `reverseSetup` is the transient positioning
-    // noclip used to fly to the reverse start. reverseSetup is NOT practicemode,
-    // so a reversed run is still recorded normally.
+    // `reversed` is the active state; records go to the "<map>-reversed" level
+    // and its own board. Enabling it teleports the player to the reverse start
+    // and saves that as their prerace spawn.
     bool reversed;
-    bool reverseSetup;
+    // The normal prerace spawn, stashed while reversed (reverse mode overwrites
+    // the prerace slot with the reverse start) and restored on /reverse off.
+    Position preReverseMain;
+    bool preReverseMainSaved;
+
+    // /showtriggers: per-player beacon entities marking the start/finish trigger
+    // planes, visible only to this client (like /mark). Freed on toggle-off and
+    // in clear().
+    bool showingTriggers;
+    Entity@[] triggerMarkers;
 
     // "/position find" cursor: last searched entity type + which match to cycle to
     String lastFind;
@@ -154,7 +162,10 @@ class Player
         this.practicing = false;
         this.recalled = false;
         this.reversed = false;
-        this.reverseSetup = false;
+        this.preReverseMainSaved = false;
+        this.preReverseMain.clear();
+        this.showingTriggers = false;
+        this.freeTriggerMarkers();
         this.lastFind = "";
         this.findIndex = 0;
         // Free (not just drop) any marker dummy: clear() runs on enterGame when a
@@ -445,12 +456,12 @@ class Player
         return true;
     }
 
-    // /reverse step 1: arm reverse mode and drop into a positioning noclip so
-    // the player can fly to the map's FINISH line (their reverse start). This is
-    // deliberately NOT practicemode, so the ensuing run is recorded normally —
-    // to the separate "<map>-reversed" level. From spectator/dead we join and
-    // respawn in place; GT_PlayerRespawn's reverse block puts the body in noclip.
-    bool enterReverseSetup()
+    // /reverse ON: enable reverse mode and TELEPORT the player to a spot just
+    // outside the map's FINISH line (their reverse start), facing it. That spot
+    // becomes their spawn — saved into the prerace slot, so /kill, /racerestart
+    // and the post-finish respawn all return here — and /position save refines
+    // it. Deliberately NOT practicemode, so the run records to "<map>-reversed".
+    bool enableReverse()
     {
         Entity@ ent = this.client.getEnt();
 
@@ -474,61 +485,147 @@ class Player
         this.cancelRace();
 
         this.reversed = true;
-        this.reverseSetup = true;
         this.resetBestForMode(); // point best_recordTime at the reverse board
 
+        // A live body is required to teleport + save a prerace spawn.
         if ( this.client.team == TEAM_SPECTATOR || ent.health <= 0 )
         {
-            Vec3 origin = ent.origin;
-            Vec3 angles = ent.angles;
             if ( this.client.team == TEAM_SPECTATOR )
             {
                 this.client.team = TEAM_PLAYERS;
                 G_PrintMsg( null, this.client.name + S_COLOR_WHITE + " joined the " + G_GetTeam( this.client.team ).name + S_COLOR_WHITE + " team.\n" );
             }
-            this.client.respawn( false ); // reverse block in GT_PlayerRespawn noclips it
-            ent.origin = origin;
-            ent.angles = angles;
-        }
-        else
-        {
-            ent.moveType = MOVETYPE_NOCLIP;
-            ent.set_velocity( Vec3() );
-            this.noclipWeapon = ent.weapon;
+            this.client.respawn( false );
+            @ent = this.client.getEnt();
         }
 
-        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse mode: fly to the FINISH line,\nthen /reverse again to arm" );
-        this.setQuickMenu();
-        return true;
-    }
+        // Stash any normal prerace spawn so /reverse off can restore it.
+        Position@ main = this.preRacePositionStore.get( "" );
+        this.preReverseMainSaved = ( @main != null && main.saved );
+        if ( this.preReverseMainSaved )
+            this.preReverseMain.copy( main );
 
-    // /reverse step 2: leave the positioning noclip and stand ready as a normal
-    // pre-race body at the reverse start. Crossing the finish line then starts
-    // the timed reverse run (the prejump gate in startRace() still applies).
-    bool armReverse()
-    {
-        Entity@ ent = this.client.getEnt();
-        this.reverseSetup = false;
-        if ( ent.moveType == MOVETYPE_NOCLIP || ent.moveType == MOVETYPE_NONE )
+        // Teleport to the reverse start and make it the spawn.
+        Vec3 origin, angles;
+        if ( this.computeReverseStart( origin, angles ) )
         {
             ent.moveType = MOVETYPE_PLAYER;
-            this.client.selectWeapon( this.noclipWeapon );
+            ent.origin = origin;
+            ent.angles = angles;
+            ent.set_velocity( Vec3() );
+            ent.teleported = true;
+            // Persist as the prerace spawn (slot 0) so every respawn returns
+            // here. Write it directly rather than via savePosition() to skip its
+            // user-facing "not on solid ground" messages — computeReverseStart
+            // already validated the spot (or fell back to the finish centre).
+            Position@ p = this.currentPosition();
+            p.saved = true;
+            p.recalled = false;
+            p.velocity = Vec3();
+            p.skipWeapons = false;
+            this.preRacePositionStore.set( "", p );
         }
-        ent.set_velocity( Vec3() );
-        this.release = 0;
-        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse armed:\ncross the FINISH line to start" );
+
+        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse: cross the FINISH line to start\n" + S_COLOR_WHITE + "(/position save to set your spawn)" );
         this.setQuickMenu();
         return true;
     }
 
-    // /reverse toggle-off (or leaving reverse setup): drop reverse mode entirely
-    // and respawn as a normal racer.
+    // Compute a reverse-start spot just OUTSIDE the finish trigger, on solid
+    // ground, facing the finish — so the player runs through the finish plane to
+    // start (mirroring a normal start line). The outward direction is away from
+    // the course: opposite the last checkpoint (nearest the finish), or the
+    // start line if the map has no checkpoints. Falls back to the finish centre
+    // when no standable spot is found (the player can /position save to fix it).
+    bool computeReverseStart( Vec3 &out origin, Vec3 &out angles )
+    {
+        EntityList@ finishes = entityFinder.allEntities( "finish" );
+        if ( finishes.isEmpty() )
+            return false;
+        Entity@ fin = finishes.getEnt( 0 );
+        if ( @fin == null )
+            return false;
+        Vec3 fmins, fmaxs;
+        fin.getSize( fmins, fmaxs );
+        Vec3 center = fin.origin + 0.5f * ( fmins + fmaxs );
+
+        Vec3 courtside = center;
+        bool haveRef = false;
+        EntityList@ cps = entityFinder.allEntities( "cp" );
+        uint bestCount = 0;
+        for ( uint i = 0; i < cps.length(); i++ )
+        {
+            Entity@ cp = cps.getEnt( i );
+            if ( @cp == null )
+                continue;
+            if ( !haveRef || uint( cp.count ) >= bestCount )
+            {
+                bestCount = uint( cp.count );
+                courtside = cps.getPosition( i );
+                haveRef = true;
+            }
+        }
+        if ( !haveRef )
+        {
+            EntityList@ starts = entityFinder.allEntities( "start" );
+            if ( !starts.isEmpty() )
+            {
+                courtside = starts.getPosition( 0 );
+                haveRef = true;
+            }
+        }
+
+        Vec3 dir = center - courtside;
+        dir.z = 0;
+        if ( dir.length() < 1 )
+            dir = Vec3( 1, 0, 0 );
+        dir.normalize();
+
+        float spanX = fmaxs.x - fmins.x;
+        float spanY = fmaxs.y - fmins.y;
+        float halfSpan = 0.5f * ( spanX > spanY ? spanX : spanY );
+        Vec3 spot = center + dir * ( halfSpan + 48.0f );
+        spot.z = center.z + 16;
+
+        Entity@ ent = this.client.getEnt();
+        int ignore = ent.entNum;
+
+        // Drop to the floor.
+        Vec3 down = spot;
+        down.z -= 4096;
+        Trace tr;
+        if ( tr.doTrace( spot, playerMins, playerMaxs, down, ignore, MASK_DEADSOLID ) && !tr.startSolid )
+        {
+            spot = tr.endPos;
+            spot.z -= playerMins.z;
+        }
+
+        // Reject a spot where a standing hitbox does not fit; fall back to centre.
+        Trace fit;
+        if ( fit.doTrace( spot, playerMins, playerMaxs, spot, ignore, MASK_DEADSOLID ) )
+            spot = center;
+
+        Vec3 face = center - spot;
+        face.z = 0;
+        angles = face.toAngles();
+        origin = spot;
+        return true;
+    }
+
+    // /reverse OFF: drop reverse mode, restore the stashed normal prerace spawn
+    // (or clear the slot), and respawn as a normal racer.
     bool disableReverse()
     {
         this.cancelRace();
         this.reversed = false;
-        this.reverseSetup = false;
         this.resetBestForMode(); // point best_recordTime back at the standard board
+
+        if ( this.preReverseMainSaved )
+            this.preRacePositionStore.set( "", this.preReverseMain );
+        else
+            this.preRacePositionStore.remove( "" );
+        this.preReverseMainSaved = false;
+
         Entity@ ent = this.client.getEnt();
         if ( ent.moveType == MOVETYPE_NOCLIP || ent.moveType == MOVETYPE_NONE )
             ent.moveType = MOVETYPE_PLAYER;
@@ -538,6 +635,58 @@ class Player
         G_CenterPrintMsg( this.client.getEnt(), S_COLOR_CYAN + "Reverse mode off" );
         this.setQuickMenu();
         return true;
+    }
+
+    // /showtriggers: toggle per-player beacons marking the start & finish trigger
+    // planes. Uses the /mark per-client pattern (SVF_ONLYOWNER) so only this
+    // player sees them; a translucent ghost effect marks them as guides.
+    bool toggleTriggerMarkers()
+    {
+        if ( this.showingTriggers )
+        {
+            this.freeTriggerMarkers();
+            this.showingTriggers = false;
+            G_PrintMsg( this.client.getEnt(), "Trigger markers off.\n" );
+            return true;
+        }
+
+        this.freeTriggerMarkers(); // belt-and-suspenders before repopulating
+        this.spawnTriggerMarkers( entityFinder.allEntities( "start" ) );
+        this.spawnTriggerMarkers( entityFinder.allEntities( "finish" ) );
+        this.showingTriggers = true;
+        G_PrintMsg( this.client.getEnt(), "Trigger markers on: " + S_COLOR_GREEN + "start" + S_COLOR_WHITE + " and " + S_COLOR_RED + "finish" + S_COLOR_WHITE + " planes marked.\n" );
+        return true;
+    }
+
+    void spawnTriggerMarkers( EntityList@ list )
+    {
+        Entity@ owner = this.client.getEnt();
+        uint n = list.length();
+        for ( uint i = 0; i < n; i++ )
+        {
+            Entity@ beacon = G_SpawnEntity( "dummy" );
+            beacon.modelindex = G_ModelIndex( "models/players/bigvic/tris.iqm" );
+            beacon.svflags |= SVF_ONLYOWNER;   // this client only
+            beacon.svflags &= ~SVF_NOCLIENT;   // ...and actually transmit it
+            beacon.effects |= EF_RACEGHOST_FLAG; // translucent -> reads as a guide
+            beacon.ownerNum = owner.entNum;
+            beacon.origin = list.getPosition( i );
+            beacon.linkEntity();
+            this.triggerMarkers.push_back( beacon );
+        }
+    }
+
+    void freeTriggerMarkers()
+    {
+        for ( uint i = 0; i < this.triggerMarkers.length(); i++ )
+        {
+            if ( @this.triggerMarkers[i] != null )
+            {
+                this.triggerMarkers[i].unlinkEntity();
+                this.triggerMarkers[i].freeEntity();
+            }
+        }
+        this.triggerMarkers.resize( 0 );
     }
 
     // best_recordTime is a single per-player value, so switching between the
