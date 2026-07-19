@@ -15,10 +15,10 @@ client does when a player types `connect <host>`:
 Reaching `client_connect` is the real "clients can connect" signal: the server
 issued a challenge, accepted our protocol version, and allocated a client slot.
 
-The engine is built from DenMSC/racemod_2.1 with PUBLIC_BUILD undefined, so its
-APP_PROTOCOL_VERSION is 1001; a PUBLIC_BUILD would be 1. We try both candidates
-(and any passed with --protocols) and succeed on whichever the built binary
-actually accepts, so the probe stays correct across either build flavour.
+The built Warsow 2.1.2 server speaks protocol 22. We try a small candidate list
+(and, if those miss, the number the server itself names in its protocol-mismatch
+reject, e.g. "Server is version 2.10. Protocol  22"), so the probe stays correct
+even if the engine's protocol changes.
 
 Usage:
   python3 client_connect_probe.py <host> <port> [--expect-map NAME]
@@ -27,6 +27,7 @@ Usage:
 Exit 0 iff every stage passed; non-zero with a diagnostic otherwise.
 """
 import argparse
+import re
 import socket
 import sys
 import time
@@ -158,12 +159,25 @@ class Probe:
     # -- stage 4: the real connection handshake ------------------------------
     def connect(self, protocols):
         # A minimal but valid userinfo — the server needs at least a name.
-        userinfo = "\\name\\ci_connect_probe\\rate\\5000\\port\\0"
+        userinfo = "\\name\\ci_connect_probe\\rate\\5000"
         qport = 29200  # any 16-bit; the server records it for the netchan
         last = b""
-        for proto in protocols:
+        tried = set()
+        # A protocol mismatch makes the server announce its own version, e.g.
+        # "Server is version 2.10. Protocol  22" — so if our candidates miss, we
+        # learn the real number from the reject and try it. That keeps the probe
+        # correct even if the engine's protocol changes.
+        candidates = list(protocols)
+        idx = 0
+        while idx < len(candidates):
+            proto = candidates[idx]
+            idx += 1
+            if proto in tried:
+                continue
+            tried.add(proto)
             challenge = self.getchallenge_quiet()
             if challenge is None:
+                last = b"(no challenge for protocol %d)" % proto
                 continue
             payload = ('connect %d %d %d "%s"' % (proto, qport, challenge, userinfo)).encode()
             reply = request(self.sock, self.addr, payload,
@@ -177,6 +191,13 @@ class Probe:
                 return
             last = reply[:160]
             print("       protocol %d rejected: %r" % (proto, last))
+            # Learn the server's advertised protocol from the reject/print text.
+            m = re.search(rb"[Pp]rotocol\s+(\d+)", reply)
+            if m:
+                learned = int(m.group(1))
+                if learned not in tried and learned not in candidates:
+                    print("       server advertises protocol %d; will try it" % learned)
+                    candidates.append(learned)
         self.fail("connect", "no protocol reached client_connect; last=%r" % last)
 
     def getchallenge_quiet(self):
@@ -210,8 +231,9 @@ def main():
     ap.add_argument("host")
     ap.add_argument("port", type=int)
     ap.add_argument("--expect-map", default=None, help="assert the running map name")
-    ap.add_argument("--protocols", default="1001,1",
-                    help="comma-separated protocol candidates to try for connect")
+    ap.add_argument("--protocols", default="22,1001,1",
+                    help="comma-separated protocol candidates to try for connect "
+                         "(the probe also auto-learns the real one from a reject)")
     ap.add_argument("--timeout", type=float, default=3.0, help="per-datagram timeout (s)")
     ap.add_argument("--tries", type=int, default=40,
                     help="retries per request (also the boot-settle window)")
