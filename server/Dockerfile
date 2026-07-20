@@ -65,6 +65,7 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "RS_ApiReportWrDemo" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchGhost" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFlag" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchBlocked" game/g_ascript.cpp \
     && grep -q "curl pthread" game/CMakeLists.txt
 
 # 7. Cross-server player mirroring: the RS_Mirror* natives (UDP mesh on a
@@ -129,6 +130,9 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
     && strings /libgame_x86_64.so | grep -q "rs_api: ghost fetch failed" \
     # in-game /flag: the RS_ApiFlag native registration string.
     && strings /libgame_x86_64.so | grep -q "RS_ApiFlag" \
+    # live map blocklist: the fetch native + its worker log string.
+    && strings /libgame_x86_64.so | grep -q "RS_ApiFetchBlocked" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: blocked-maps fetch failed" \
     && strings /libgame_x86_64.so | grep -q "racerecord" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: configured" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: bot slot" \

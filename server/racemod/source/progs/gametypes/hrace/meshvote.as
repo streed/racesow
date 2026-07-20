@@ -294,6 +294,14 @@ bool Cmd_MeshVote( Client@ client, const String &cmdString, const String &argsSt
             client.printMessage( "Map '" + map + "' is not installed on this server.\n" );
             return true;
         }
+        // Blocked by a moderator in the web admin (live list from blockedmaps.as).
+        // The wildcard branch above is already filtered via GetMapsByPattern; this
+        // guards the explicit single-map case.
+        if ( RACE_IsMapBlocked( map ) )
+        {
+            client.printMessage( "Map '" + map + "' is blocked and can't be voted right now.\n" );
+            return true;
+        }
     }
 
     mvActive = true;
@@ -401,6 +409,17 @@ void RACE_MeshVoteArmSwitch( const String &in map )
     if ( !RACE_MapExists( map ) )
     {
         RACE_MeshVoteAnnounce( "vote passed for " + map + " but it is not installed here - staying put." );
+        return;
+    }
+    // Blocked by a moderator on THIS server. The open-time guard only runs on the
+    // vote's master, and a peer adopts the master's map verbatim — so this
+    // terminal switch (the one chokepoint every mesh switch passes through,
+    // whether adopted from a peer's OPEN or applied from a PASS result) is where
+    // a locally-blocked map must be refused. Diverging from the rest of the mesh
+    // is the correct outcome here, same as the not-installed case above.
+    if ( RACE_IsMapBlocked( map ) )
+    {
+        RACE_MeshVoteAnnounce( "vote passed for " + map + " but it is blocked here - staying put." );
         return;
     }
     mvSwitching = true;

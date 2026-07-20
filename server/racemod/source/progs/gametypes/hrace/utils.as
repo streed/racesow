@@ -46,6 +46,12 @@ String[] GetMapsByPattern( String@ pattern, String@ ignore = null )
         String clean_map = map.removeColorTokens().tolower();
         if ( @ignore != null && map == ignore )
             continue;
+        // Drop maps a moderator has blocked in the web admin (fetched live by
+        // blockedmaps.as). Fail-open: unfetched/unconfigured => nothing blocked.
+        // This filters every selection path that funnels through here: randmap,
+        // meshvote wildcards, prerandmap and the /maps listing.
+        if ( RACE_IsMapBlocked( clean_map ) )
+            continue;
         if ( PatternMatch( clean_map, pattern, Wildcard_Yes ) )
         {
             maps.insertLast( map );

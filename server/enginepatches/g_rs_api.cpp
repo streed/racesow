@@ -41,7 +41,8 @@ namespace {
 enum RequestType {
 	REQ_POST_REPORT,   // fire-and-forget race finish -> /api/ingest
 	REQ_GET_TOPSCORES, // live top scores -> swapped into the local topscores file
-	REQ_GET_GHOST      // WR ghost trajectory -> parsed into memory (RS_ApiPollGhost)
+	REQ_GET_GHOST,     // WR ghost trajectory -> parsed into memory (RS_ApiPollGhost)
+	REQ_GET_BLOCKED    // live map blocklist -> stored in memory (RS_ApiPollBlocked)
 };
 
 // note: no default member initializers — the game module builds as C++11,
@@ -96,8 +97,19 @@ struct ApiState {
 	std::string ghostName; // record holder (raw, may carry ^ colour codes)
 	std::string ghostCps;  // checkpoint frame indices, space-separated
 
+	// Blocked-maps fetch handshake (same shape as the top-scores/ghost ones, a
+	// separate result so a blocklist fetch never clobbers another fetch's
+	// outcome). blockedText holds the raw payload (one lowercased map name per
+	// line, possibly empty); the script thread copies it out with
+	// RS_BlockedListText after RS_ApiPollBlocked reports 1.
+	std::atomic<unsigned> fetchBlockedGen;
+	std::atomic<int> fetchBlockedResult;
+	std::mutex blockedMutex;
+	std::string blockedText;
+
 	ApiState()
 		: stop( false ), fetchGen( 0 ), fetchResult( 0 ), fetchGhostGen( 0 ), fetchGhostResult( 0 ),
+		  fetchBlockedGen( 0 ), fetchBlockedResult( 0 ),
 		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ) {}
 };
 
@@ -407,6 +419,47 @@ void workerMain( ApiState *s )
 				s->fetchResult.store( -1 );
 				continue;
 			}
+		} else if( req.type == REQ_GET_BLOCKED ) {
+			// A fetch queued once shutdown is under way is worthless: nobody
+			// will ever poll the result.
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchBlockedGen.load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded while in flight — drop silently
+				// The list is plain text, one map name per line; an empty body
+				// is valid ("nothing blocked"). Reject an HTML body, though — a
+				// captive portal / proxy error page answering 200 must never
+				// overwrite the good list. Map names never contain '<', so its
+				// presence marks a non-blocklist payload.
+				if( payload.find( '<' ) != std::string::npos ) {
+					fprintf( stderr, "rs_api: rejecting non-blocklist payload from %s\n",
+						req.url.c_str() );
+					s->fetchBlockedResult.store( -1 );
+					continue;
+				}
+				{
+					std::lock_guard<std::mutex> lock( s->blockedMutex );
+					s->blockedText.swap( payload );
+				}
+				s->fetchBlockedResult.store( 1 );
+				continue;
+			}
+			if( !current )
+				continue; // superseded — do not burn retries on a stale fetch
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				if( status != 404 )
+					fprintf( stderr, "rs_api: blocked-maps fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchBlockedResult.store( -1 );
+				continue;
+			}
+			// transient: fall through to the requeue below
 		} else {
 			status = doPost( req );
 			if( status >= 200 && status < 300 )
@@ -977,4 +1030,71 @@ const char *RS_GhostFrameAt( int i )
 	snprintf( buf, sizeof( buf ), "%d %d %d %d %d %d %d %d %d",
 		f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8] );
 	return buf;
+}
+
+/*
+ * RS_ApiFetchBlocked / RS_ApiPollBlocked / RS_BlockedListText
+ *
+ * Fetch the central map blocklist from <url> (the public
+ * /api/game/blocked-maps endpoint: plain text, one lowercased map name per
+ * line, empty body = nothing blocked) into memory. RS_ApiPollBlocked() returns
+ * 1 when a fresh list has landed (read it with RS_BlockedListText and parse it),
+ * -1 when the last fetch failed for good, 0 otherwise. The gametype refreshes
+ * this every ~30s so a map blocked in the web admin drops out of the in-game
+ * vote pool without a server restart. A newer fetch supersedes an in-flight one;
+ * a failed fetch leaves the last good list in place. No-op when url is empty.
+ */
+void RS_ApiFetchBlocked( const char *url, const char *token )
+{
+	if( !url || !url[0] )
+		return;
+
+	ApiState *s = ensureStarted();
+	unsigned gen = s->fetchBlockedGen.fetch_add( 1 ) + 1;
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			// evict another fetch (fully reproducible next interval) before a
+			// one-shot race report
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
+			REQ_GET_BLOCKED, "", gen } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollBlocked( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	return s->fetchBlockedResult.exchange( 0 );
+}
+
+// Copy out the last-fetched blocklist text. Called from the script thread after
+// a poll of 1; the AngelScript wrapper copies the static buffer immediately (no
+// reentrancy on the single script thread).
+const char *RS_BlockedListText( void )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->blockedMutex );
+	buf = s->blockedText;
+	return buf.c_str();
 }

@@ -576,6 +576,11 @@ void GT_ThinkRules()
     // empty); also before the early-return so records stay current postmatch
     RACE_ApiTopThink();
 
+    // live map blocklist from the central admin (no-op when rs_api_blocked_url
+    // is empty); keeps the vote pool current so a map blocked in the web admin
+    // drops out of randmap/meshvote/prerandmap without a server restart
+    RACE_ApiBlockedThink();
+
     // in-game WR ghost racer (no-op unless rs_wr_ghost + its URL are set); also
     // before the early-return so the ghost keeps looping while the scoreboard
     // is up

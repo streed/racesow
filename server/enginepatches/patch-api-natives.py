@@ -248,6 +248,47 @@ FLAG_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, FLAG_ENTRY, "asGlobFuncs flag entry")
 
+# --- 1f. live map blocklist: pull the central blocked-maps list --------------
+# Adds RS_ApiFetchBlocked / RS_ApiPollBlocked / RS_BlockedListText (impl in
+# g_rs_api.cpp). The gametype polls the list every ~30s so a map blocked in the
+# web admin drops out of the vote pool live, without a server restart. Anchors
+# re-emitted so they stay unique. The Dockerfile asserts on
+# "asFunc_RS_ApiFetchBlocked".
+BLOCKED_WRAPPER = (
+    "// racesow-docker: live map blocklist - GETs the central\n"
+    "// /api/game/blocked-maps text (one lowercased map name per line) into\n"
+    "// memory; the gametype polls RS_ApiPollBlocked and reads RS_BlockedListText\n"
+    "// so a map blocked in the web admin leaves the vote pool without a restart.\n"
+    "void RS_ApiFetchBlocked( const char *url, const char *token );\n"
+    "int RS_ApiPollBlocked( void );\n"
+    "const char *RS_BlockedListText( void );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchBlocked( asstring_t *url, asstring_t *token )\n"
+    "{\n"
+    "\tif( !url || !url->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchBlocked( url->buffer, token && token->buffer ? token->buffer : \"\" );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollBlocked( void ) { return RS_ApiPollBlocked(); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_BlockedListText( void )\n"
+    "{\n"
+    "\tconst char *s = RS_BlockedListText();\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, BLOCKED_WRAPPER, "asFunc blocked wrapper")
+
+BLOCKED_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchBlocked( const String &in url, const String &in token )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchBlocked), NULL },\n"
+    "\t{ \"int RS_ApiPollBlocked()\", asFUNCTION(asFunc_RS_ApiPollBlocked), NULL },\n"
+    "\t{ \"const String @RS_BlockedListText()\", asFUNCTION(asFunc_RS_BlockedListText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, BLOCKED_ENTRY, "asGlobFuncs blocked entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"
