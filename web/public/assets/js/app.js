@@ -159,10 +159,15 @@ function navHref(target) {
 }
 
 function parseRoute() {
-  const path = location.pathname || "/";
+  // Ignore trailing slashes ("/maps/" ≡ "/maps"): serve-static's old directory
+  // redirect left permanently-cached 301s to /maps/ in visitors' browsers, and
+  // the exact-match routing below turned those into "Page not found". Keep the
+  // normalization even though the server no longer redirects — the cached 301s
+  // (and hand-typed trailing slashes) still arrive here.
+  let path = (location.pathname || "/").replace(/\/+$/, "") || "/";
   const params = {};
   new URLSearchParams(location.search).forEach((v, k) => (params[k] = v));
-  return { path: path || "/", params };
+  return { path, params };
 }
 
 function go(target) {

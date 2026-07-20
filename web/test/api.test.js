@@ -260,6 +260,18 @@ test("/player/:id serves the SPA shell with player-specific OG tags", async () =
   assert.match(fallback, /<meta property="og:image" content="http:\/\/[^"]+\/assets\/img\/warsow-logo.png">/);
 });
 
+test("client routes serve the shell directly — no directory 301, slashes tolerated", async () => {
+  // public/maps/ (replay meshes) shares its name with the client-side /maps
+  // route. serve-static's default directory redirect turned /maps into a 301
+  // to /maps/ — which browsers cache PERMANENTLY, stranding visitors on a URL
+  // the strict router called "Page not found". redirect:false must hold.
+  for (const p of ["/maps", "/maps?sort=records", "/maps/", "/players", "/about"]) {
+    const r = await fetch(`${base}${p}`, { redirect: "manual" });
+    assert.equal(r.status, 200, `${p} must serve the shell, got ${r.status}`);
+    assert.match(await r.text(), /<!doctype html>/i, `${p} must be the SPA shell`);
+  }
+});
+
 test("names are truncated and checkpoint garbage is normalised, not fatal", async () => {
   const longName = "N".repeat(200);
   const { status } = await ingest(

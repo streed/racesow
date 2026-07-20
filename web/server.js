@@ -1911,6 +1911,13 @@ app.get("/", (req, res) => sendShell(res, defaultShell(req)));
 app.use(
   express.static(path.join(__dirname, "public"), {
     extensions: ["html"],
+    // No trailing-slash directory redirects: public/maps/ (the replay meshes)
+    // shares a name with the client-side /maps route, and serve-static's
+    // default 301 to /maps/ breaks that page — browsers cache 301s
+    // PERMANENTLY, so one hit stuck every future visit on the dead-end
+    // /maps/ URL until a hard refresh. A directory path now just falls
+    // through to the SPA fallback below.
+    redirect: false,
     setHeaders: (res, filePath) => {
       // Large, stable 3D assets: rigged models, vendored three.js, and the
       // converted map meshes. Long browser cache so repeat/SPA replay views

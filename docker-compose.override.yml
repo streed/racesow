@@ -15,6 +15,14 @@ services:
   # Second web replica for zero-downtime rolling deploys (scripts/rolling-deploy.sh
   # recreates web and web2 one at a time behind the nginx upstream). Stateless —
   # same image/env as web, all state is in Postgres. Distinct name + port.
+  #
+  # web2 MUST mirror web's environment and volumes exactly (only the container
+  # name and host port differ). This block is hand-copied, so any env var or
+  # mount added to `web` in docker-compose.yml must be added here too — a
+  # missing one makes HALF of all requests misbehave (nginx round-robins the
+  # replicas): drifted GHOST_DIR/DEMO_BASE_URL/maps-mount once made ghosts,
+  # demo links and replay meshes fail intermittently. rolling-deploy.sh now
+  # fails fast on such drift (config-parity preflight).
   web2:
     image: racesow-web:latest
     container_name: racesow-web-2
@@ -25,6 +33,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       PORT: "8080"
       DATABASE_URL: "postgres://racesow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/racesow"
@@ -32,8 +42,14 @@ services:
       # Shares the same Redis as the base web replica (see docker-compose.yml).
       REDIS_URL: "redis://redis:6379"
       INGEST_TOKEN: "${INGEST_TOKEN:-}"
+      DEMO_BASE_URL: "${DEMO_BASE_URL:-}"
+      GHOST_DIR: "/data/ghosts"
+      BACKUP_DIR: "/data/backups"
     volumes:
       - ./data:/data
+      # Same read-only replay-mesh mount as `web` — without it this replica
+      # 404s every /maps/<map>.glb the viewer requests.
+      - ./web/public/maps:/app/public/maps:ro
     ports:
       - "127.0.0.1:8081:8080"
     healthcheck:
