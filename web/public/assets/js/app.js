@@ -249,20 +249,6 @@ async function viewOverview() {
               </div>`; }).join("")}
           </div>
         </div>
-        <div class="panel">
-          <h3><span class="dot"></span> Most-Raced Maps</h3>
-          <div class="tscroll"><table class="data most-raced">
-            <thead><tr><th>Map</th><th class="num">Records</th><th class="num">Finishes</th></tr></thead>
-            <tbody>
-              ${d.topMaps.map((m) => `
-                <tr class="clickable" data-nav="#/map/${m.id}">
-                  <td class="mapname">${mapNameHtml(m.name)}</td>
-                  <td class="num">${fmtNum(m.records != null ? m.records : m.races)}</td>
-                  <td class="num">${fmtNum(m.finishes != null ? m.finishes : m.races)}</td>
-                </tr>`).join("")}
-            </tbody>
-          </table></div>
-        </div>
         ${d.servers && d.servers.length ? `
         <div class="panel" style="margin-top:20px">
           <h3><span class="dot teal"></span> Contributing Servers</h3>
@@ -281,30 +267,6 @@ async function viewOverview() {
         </div>` : ""}
       </div>
     </div>`;
-
-  // Fill the Hall of Fame to exactly the right column's height: the API
-  // sends more rows than ever fit and the excess is trimmed against the
-  // measured layout, so the panel ends flush — no scrollbar, no dead gap —
-  // whatever the recent/servers panels happen to contain. (In the stacked
-  // single-column layout the right column sits below, so nothing trims.)
-  // The top-20 Hall of Fame is the fixed reference; the right column trims
-  // trailing Most-Raced Maps rows (served with spares) until it ends flush
-  // with it. Two-column layout only — stacked columns need no matching.
-  // NB: measure the right column's last PANEL, not the column div — the grid
-  // stretches the column container to the row height, so the container's own
-  // bottom never moves as rows are removed.
-  if (window.matchMedia("(min-width: 821px)").matches) {
-    const hof = app.querySelector(".panel.hof");
-    const rightEnd = hof && hof.nextElementSibling && hof.nextElementSibling.lastElementChild;
-    const mostRaced = app.querySelector("table.most-raced tbody");
-    if (hof && rightEnd && mostRaced) {
-      const hofBottom = hof.getBoundingClientRect().bottom;
-      const rows = [...mostRaced.querySelectorAll("tr")];
-      while (rows.length > 3 && rightEnd.getBoundingClientRect().bottom > hofBottom + 2) {
-        rows.pop().remove();
-      }
-    }
-  }
 }
 
 /* unix seconds -> "3m ago" / "2h ago" / "5d ago" */

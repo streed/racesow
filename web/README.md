@@ -90,7 +90,7 @@ All responses are JSON. List endpoints accept `q`, `sort`, `order`
 
 | Method & path            | Description                                                      |
 |--------------------------|------------------------------------------------------------------|
-| `GET /api/overview`      | Totals, per-version run counts, top maps, hall of fame.          |
+| `GET /api/overview`      | Totals, per-version run counts, hall of fame.                    |
 | `GET /api/maps`          | Maps with race count + world-record holder. Sort: `name`, `races`, `wr_time`. Filter with `q`. |
 | `GET /api/maps/:id`      | Map detail: world record + split times, full leaderboard.        |
 | `GET /api/players`       | Player standings. Sort: `points`, `wr`, `podium`, `maps`, `rank`, `name`. Filter with `q`. |

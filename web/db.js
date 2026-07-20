@@ -411,9 +411,6 @@ class RaceDB {
       records: num(r.records),
       races: num(r.records),
     }));
-    const topMaps = (
-      await this.all("SELECT map_id id, name, records, finishes FROM map_index ORDER BY records DESC LIMIT 15")
-    ).map((m) => ({ id: num(m.id), name: m.name, records: m.records, finishes: m.finishes, races: m.records }));
     const hallOfFame = (
       await this.all(
         `SELECT s.rank, s.player_id id, p.name, p.simplified, s.points, s.wr, s.podium, s.maps
@@ -427,7 +424,6 @@ class RaceDB {
       lastUpdate: lastUpdate ? parseInt(lastUpdate.value, 10) : null,
       totals,
       versions,
-      topMaps,
       hallOfFame,
       recent,
       servers: await this.servers(),
