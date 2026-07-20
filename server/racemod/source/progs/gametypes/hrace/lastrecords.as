@@ -123,6 +123,10 @@ class LastRecords
         uint add = 1;
         Table table( S_COLOR_ORANGE + "r " + S_COLOR_WHITE + "r" + S_COLOR_YELLOW + " [r] " + S_COLOR_ORANGE + "l " + S_COLOR_WHITE + "l " + S_COLOR_ORANGE + "l " + S_COLOR_WHITE + "ll" );
 
+        // Prepend any #1 set THIS session that isn't yet in the persisted feed —
+        // standard board first, then the reverse-variant board (mirrors toFile(),
+        // which persists both). The bound clamp shrinks the historical tail by one
+        // row per prepend so the total never exceeds LAST_RECORDS.
         if ( levelRecords[0].getFinishTime() != 0 && ( this.lastRec == 0 || levelRecords[0].getFinishTime() < this.lastRec ) )
         {
             table.addCell( add + "." );
@@ -138,8 +142,27 @@ class LastRecords
             else
                 table.addCell( S_COLOR_ORANGE + " (previously " + S_COLOR_WHITE + this.lastRecPlayer + S_COLOR_ORANGE + ")" );
             add++;
-            if ( LAST_RECORDS - 1 < bound )
-                bound = LAST_RECORDS - 1;
+            if ( LAST_RECORDS - ( add - 1 ) < bound )
+                bound = LAST_RECORDS - ( add - 1 );
+        }
+
+        if ( levelRecordsReversed[0].getFinishTime() != 0 && ( this.lastRecReversed == 0 || levelRecordsReversed[0].getFinishTime() < this.lastRecReversed ) )
+        {
+            table.addCell( add + "." );
+            table.addCell( RACE_TimeToString( levelRecordsReversed[0].getFinishTime() ) );
+            table.addCell( RACE_TimeDiffString( levelRecordsReversed[0].getFinishTime(), this.lastRecReversed, false ).removeColorTokens() );
+            table.addCell( "by" );
+            table.addCell( levelRecordsReversed[0].ident.playerName );
+            table.addCell( "on" );
+            Cvar mapNameVarRev( "mapname", "", 0 );
+            table.addCell( mapNameVarRev.string.tolower() + REVERSE_SUFFIX );
+            if ( this.lastRecPlayerReversed == ";" )
+                table.addCell( "" );
+            else
+                table.addCell( S_COLOR_ORANGE + " (previously " + S_COLOR_WHITE + this.lastRecPlayerReversed + S_COLOR_ORANGE + ")" );
+            add++;
+            if ( LAST_RECORDS - ( add - 1 ) < bound )
+                bound = LAST_RECORDS - ( add - 1 );
         }
 
         for ( uint i = 0; i < bound; i++ )
