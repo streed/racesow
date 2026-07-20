@@ -1005,6 +1005,8 @@ const ABOUT_FAQ = [
     "Times only count in a clean race-mode run. If you toggled <span class=\"mono\">/practicemode</span>, <span class=\"mono\">/noclip</span>, or used <span class=\"mono\">/position</span>, that run won't be recorded. Use <span class=\"mono\">/kill</span> to get back to the start and race it straight through."],
   ["What are the ghosts I keep seeing?",
     "The EU and US servers are meshed. Players on the other server show up as translucent, non-solid ghosts whenever you're on the same map, so you can race alongside them across the Atlantic. You never collide with them. Use <span class=\"mono\">/who</span> to see who's who, and <span class=\"mono\">/watch</span> to follow one."],
+  ["Who's the ghost racing the world record?",
+    "On any map that has a record, the current world-record run replays in-game as a translucent ghost you can pace yourself against — this one's the record, separate from the cross-server player ghosts above. You never collide with it and it's never timed. Don't want it? Open <span class=\"mono\">Race Options</span> (the gametype menu, bound to <span class=\"mono\">gametypemenu</span>) and untick <b>Show world-record ghost</b> — the <span class=\"mono\">cg_raceShowWorldRecord</span> setting. That hides it for you only; everyone else still sees it, and your times are unaffected."],
   ["How do records end up on this site?",
     "Each server reports finished runs to the central database here. New personal bests and world records appear within seconds, along with a downloadable demo and an in-browser replay ghost you can scrub through."],
   ["Can I watch a record?",
