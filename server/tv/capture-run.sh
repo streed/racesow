@@ -20,6 +20,8 @@
 #   EXCLUDE_NAMES comma list of name prefixes that are NOT watchable      (RACESOW)
 #   WIDTH HEIGHT FPS / VBITRATE VBUF / STREAM_ID / HLS_DIR / SERVER_NAME
 #   POLL          director poll seconds                                   (4)
+#   WATCHDOG_STALL seconds of stalled director loop before the watchdog
+#                  hard-exits the container (docker restarts it)           (300)
 #   HEARTBEAT_URL HEARTBEAT_TOKEN SERVER_ID   optional registry POST
 set -uo pipefail
 
@@ -63,8 +65,8 @@ if [ -d "${WARSOW_DIR}/maps_extra" ]; then
   log "linked ${n} map paks from maps_extra (no pure downloads needed)"
 fi
 
-XVFB_PID=0; FEH_PID=0; FFMPEG_PID=0; CLIENT_PID=0; WID=""; FEHWID=""
-cleanup(){ for p in "${CLIENT_PID}" "${FFMPEG_PID}" "${FEH_PID}" "${XVFB_PID}"; do [ "${p}" -ne 0 ] && kill "${p}" 2>/dev/null; done; exit 0; }
+XVFB_PID=0; FEH_PID=0; FFMPEG_PID=0; CLIENT_PID=0; WATCHDOG_PID=0; WID=""; FEHWID=""
+cleanup(){ for p in "${WATCHDOG_PID}" "${CLIENT_PID}" "${FFMPEG_PID}" "${FEH_PID}" "${XVFB_PID}"; do [ "${p}" -ne 0 ] && kill "${p}" 2>/dev/null; done; exit 0; }
 trap cleanup TERM INT
 
 # --- 1. virtual display ------------------------------------------------------
@@ -78,13 +80,31 @@ log "Xvfb up (${W}x${H})"
 # The card shows the current map's TOP 3 times (from API_TOP_URL) when the
 # server is empty, or a waiting line otherwise. Regenerated periodically; feh
 # --reload picks up the new file (make-card writes atomically).
+# One-shot UDP getstatus probe -> raw response on stdout ("" on any failure or
+# ~1.5s timeout). ONE perl process using select-with-timeout: no child pipeline,
+# no signal-based teardown, guaranteed to exit. This replaces the old
+# `timeout 1 cat </dev/udp/... | tr` pipeline: a UDP read never sees EOF, so
+# every poll ended via timeout's SIGALRM/SIGTERM path, and coreutils 8.28
+# `timeout` has a lost-SIGCHLD race (delivered between waitpid(WNOHANG) and
+# sigsuspend) that wedges it in sigsuspend forever while it still holds the
+# $()-pipe write end — freezing the whole director (both prod boxes froze
+# within ~a day of boot, 2026-07-19).
+udp_getstatus(){
+  perl -MIO::Socket::INET -MIO::Select -e '
+    my ($host, $port) = @ARGV;
+    my $r = "";
+    my $s = IO::Socket::INET->new(Proto => "udp", PeerAddr => $host, PeerPort => $port);
+    if ($s && defined $s->send("\xff\xff\xff\xffgetstatus\x0a")) {
+        $s->recv($r, 65535) if IO::Select->new($s)->can_read(1.5);
+    }
+    $r =~ tr/\000//d;
+    print $r;
+  ' "${1%:*}" "${1##*:}" 2>/dev/null
+}
+
 current_map(){
-  local addr="${1}" host port resp
-  host="${addr%:*}"; port="${addr##*:}"
-  exec 5<>"/dev/udp/${host}/${port}" 2>/dev/null || { echo ""; return; }
-  printf '\xff\xff\xff\xffgetstatus\n' >&5 2>/dev/null
-  resp="$(timeout 1 cat <&5 2>/dev/null | tr -d '\000')"
-  exec 5<&- 5>&- 2>/dev/null || true
+  local resp
+  resp="$(udp_getstatus "${1}")"
   # info string (line 2) is \key\value\...; pull the mapname value
   printf '%s\n' "${resp}" | sed -n '2p' | tr '\\' '\n' | awk 'p{print;exit} $0=="mapname"{p=1}'
 }
@@ -234,11 +254,8 @@ watchable(){ /opt/tv/getstatus.sh "${STATUS_ADDR}" "${EXCLUDE_NAMES}" 2>/dev/nul
 # enough. Returns: 0 = connected; 1 = game reachable but we are NOT in it
 # (dropped); 2 = game unreachable (down/restarting — transient, don't reconnect).
 tv_connected(){
-  local host="${STATUS_ADDR%:*}" port="${STATUS_ADDR##*:}" resp
-  exec 6<>"/dev/udp/${host}/${port}" 2>/dev/null || return 2
-  printf '\xff\xff\xff\xffgetstatus\n' >&6 2>/dev/null || { exec 6<&- 6>&- 2>/dev/null || true; return 2; }
-  resp="$(timeout 1 cat <&6 2>/dev/null | tr -d '\000')"
-  exec 6<&- 6>&- 2>/dev/null || true
+  local resp
+  resp="$(udp_getstatus "${STATUS_ADDR}")"
   [ -z "${resp}" ] && return 2
   printf '%s\n' "${resp}" | grep -qF "\"${TV_NAME}\"" && return 0 || return 1
 }
@@ -268,6 +285,29 @@ handle_map_change(){
   state="init"                            # re-decide live/idle + raise the right layer next tick
 }
 
+# --- 4.5 watchdog: the director must NEVER silently freeze -------------------
+# The main loop touches BEAT every tick; if it goes stale the loop is wedged
+# (whatever the cause), so hard-exit the container and let docker's restart
+# policy boot a fresh one. kill -9 because a wedged loop can be blocked
+# somewhere a TERM trap would never run (e.g. mid-$() read); killing the main
+# script takes down docker --init and with it the whole namespace — a clean
+# restart beats a frozen stream. Threshold is generous: a cold boot_client
+# alone can legitimately run ~130s without a tick.
+BEAT="/tmp/tv-director.beat"
+WATCHDOG_STALL="${WATCHDOG_STALL:-300}"
+touch "${BEAT}"
+(
+  while sleep 60; do
+    last="$(stat -c %Y "${BEAT}" 2>/dev/null || echo 0)"
+    if [ $(( $(date +%s) - last )) -gt "${WATCHDOG_STALL}" ]; then
+      echo ">> [watchdog] director stalled >${WATCHDOG_STALL}s; exiting container for a fresh start"
+      kill -9 "$$" 2>/dev/null
+      exit 0
+    fi
+  done
+) &
+WATCHDOG_PID=$!
+
 boot_client
 state="init"
 card_age=0
@@ -275,6 +315,7 @@ disc=0
 RECONNECT_AFTER="${RECONNECT_AFTER:-8}"   # seconds dropped-but-game-up before we reconnect
 log "director running (connect=${TV_CONNECT}, exclude=${EXCLUDE_NAMES})"
 while true; do
+  touch "${BEAT}"
   kill -0 "${XVFB_PID}"  2>/dev/null || cleanup
   kill -0 "${FFMPEG_PID}" 2>/dev/null || { log "ffmpeg died; restart"; start_ffmpeg; }
 

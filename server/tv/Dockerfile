@@ -63,7 +63,9 @@ RUN set -eux; \
 # matches the server's pure checksum and is present before the spectator even
 # connects. fs_game is racemod (the server switches the client to it on connect),
 # so the pak must live under racemod/. Selected at launch via cg_clientHUD.
-COPY --from=gamedata /warsow/racemod/racemod_ui_v6_local.pk3 ${WARSOW_DIR}/racemod/racemod_ui_v6_local.pk3
+# Glob, not a hardcoded version: the boxes' game images ship different pak
+# versions (EU v6, US v5), and a pak rename must never break this build.
+COPY --from=gamedata /warsow/racemod/racemod_ui_*.pk3 ${WARSOW_DIR}/racemod/
 
 # --- TV scripts + assets -----------------------------------------------------
 COPY tv/entrypoint.sh tv/relay-run.sh tv/capture-run.sh tv/getstatus.sh tv/make-card.sh /opt/tv/
