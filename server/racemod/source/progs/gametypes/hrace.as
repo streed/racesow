@@ -1043,6 +1043,11 @@ void GT_SpawnGametype()
 
 float GT_VotePower( Client@ client, String& votename, bool voted, bool yes )
 {
+    // The TV director spectator is not a participant: zero weight keeps it
+    // out of the voter tally so it can't inflate the votes needed to pass.
+    if ( RACE_IsTvClient( client ) )
+        return 0.0;
+
     Player@ player = @RACE_GetPlayer(client);
     if ( player.best_recordTime.isFinished() && voted && !yes )
     {
