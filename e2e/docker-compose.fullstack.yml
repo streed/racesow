@@ -1,0 +1,67 @@
+# Full-stack end-to-end: the web app, its database, and the REAL game server
+# all wired together on one network, so a booted Warsow race server talks to a
+# live web/API over actual HTTP — not a harness.
+#
+#   sh e2e/fullstack_run.sh            # brings this up, asserts, tears down
+#
+# The game image is expected to already exist as warsow-race:2.1.2 (built by
+# gameserver_smoke.sh or the e2e workflow); `image:` + `build:` means compose
+# reuses it if present and only builds when it is missing.
+name: racesow-fullstack-e2e
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: racesow
+      POSTGRES_PASSWORD: racesow
+      POSTGRES_DB: racesow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U racesow"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build: ../web
+    image: racesow-web:e2e
+    environment:
+      DATABASE_URL: postgres://racesow:racesow@postgres:5432/racesow
+      PORT: "8080"
+      # Shared ingest token: the game server authenticates every POST with it
+      # (server.js honours process.env.INGEST_TOKEN as the shared-token path).
+      INGEST_TOKEN: "e2e-fullstack-token"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  warsow-race:
+    image: warsow-race:2.1.2
+    build: ../server
+    tty: true
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
+    ports:
+      - "44400:44400/udp"
+    environment:
+      SV_HOSTNAME: "racesow-fullstack-e2e"
+      SV_PUBLIC: "0"
+      SV_MAXCLIENTS: "8"
+      MAP_ROTATION: "0"
+      G_GAMETYPE: "hrace"
+      # Point the gametype's reporting + top-scores + blocked-maps + log-ship
+      # traffic at the web service over the compose network.
+      INGEST_URL: "http://web:8080/api/ingest"
+      INGEST_TOKEN: "e2e-fullstack-token"
+      VERSION_NAME: "wsw 2.1"
+      LOG_SHIP: "1"
+      LOG_FLUSH_SECS: "2"
+    volumes:
+      - ../server/mirror-test-maps:/warsow/maps_extra:ro
+    depends_on:
+      web:
+        condition: service_started

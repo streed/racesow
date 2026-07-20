@@ -1,7 +1,11 @@
-# The three test layers documented in AGENT.md, run on every push/PR:
+# Fast test lane, run on every push/PR (no Docker daemon needed):
 #   web unit + HTTP API tests (throwaway PostgreSQL database per test),
-#   the entrypoint env->cfg contract, and the e2e pipeline that compiles the
-#   REAL g_rs_api.cpp natives against the REAL web server (also on Postgres).
+#   the entrypoint env->cfg contract, the e2e pipeline that compiles the REAL
+#   g_rs_api.cpp natives against the REAL web server (also on Postgres), the
+#   mesh parser fuzz (ASan+UBSan), and the WR-demo filename port equivalence.
+#
+# The heavy Docker jobs — building the engine, booting the game server, a real
+# client-connect handshake, and the web+game full-stack — live in e2e.yml.
 name: ci
 on:
   push:
@@ -39,3 +43,7 @@ jobs:
         run: sh server/test/entrypoint.test.sh
       - name: end-to-end pipeline (real natives -> real API)
         run: sh e2e/run.sh
+      - name: mesh parser fuzz (ASan + UBSan)
+        run: sh e2e/mirror_fuzz_run.sh
+      - name: WR-demo filename port equivalence
+        run: node --test server/test/demoname.test.mjs
