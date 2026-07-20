@@ -16,10 +16,13 @@
 # Env:
 #   TV_CONNECT    host:port the spectator connects to (the GAME server)  [required]
 #   STATUS_ADDR   host:port to getstatus for presence (default TV_CONNECT)
-#   TV_NAME       spectator name (also excluded from the watch count)    (RACESOW-TV)
-#   EXCLUDE_NAMES comma list of name prefixes that are NOT watchable      (RACESOW)
+#   TV_NAME       spectator name (ALWAYS excluded from the watch count)   (RACESOW-TV)
+#   EXCLUDE_NAMES extra EXACT infra names excluded from the watch count
+#                 (e.g. the relay), comma list; TV_NAME is always excluded (empty)
 #   WIDTH HEIGHT FPS / VBITRATE VBUF / STREAM_ID / HLS_DIR / SERVER_NAME
 #   POLL          director poll seconds                                   (4)
+#   STREAM_STALL  seconds without a NEW HLS segment (ffmpeg alive but the
+#                 picture is frozen) before ffmpeg is restarted            (20)
 #   WATCHDOG_STALL seconds of stalled director loop before the watchdog
 #                  hard-exits the container (docker restarts it)           (300)
 #   HEARTBEAT_URL HEARTBEAT_TOKEN SERVER_ID   optional registry POST
@@ -29,7 +32,7 @@ WARSOW_DIR="${WARSOW_DIR:-/warsow}"
 : "${TV_CONNECT:?set TV_CONNECT=host:port of the game server}"
 STATUS_ADDR="${STATUS_ADDR:-${TV_CONNECT}}"
 TV_NAME="${TV_NAME:-RACESOW-TV}"
-EXCLUDE_NAMES="${EXCLUDE_NAMES:-RACESOW}"
+EXCLUDE_NAMES="${EXCLUDE_NAMES:-}"    # extra EXACT infra names; TV_NAME is always excluded
 TV_HUD="${TV_HUD-ale_racemod}"        # race HUD applied AFTER connect ("" = keep the default HUD)
 W="${WIDTH:-1280}"; H="${HEIGHT:-720}"; FPS="${FPS:-30}"
 VBITRATE="${VBITRATE:-2500k}"; VBUF="${VBUF:-5000k}"
@@ -38,6 +41,8 @@ SERVER_NAME="${SERVER_NAME:-RACESOW}"
 API_TOP_URL="${API_TOP_URL:-}"        # web /api/game/topscores base; empty => no top-3 on the card
 CARD_REFRESH="${CARD_REFRESH:-20}"    # seconds between idle-card (map + top-3) refreshes
 POLL="${POLL:-4}"
+STREAM_STALL="${STREAM_STALL:-20}"    # s without a new HLS segment => ffmpeg wedged, restart it
+seg_last_mtime=0; seg_last_change=0; seg_stall_restarts=0   # picture-freshness tracker
 DPY="${DISPLAY_NUM:-99}"; GOP=$(( FPS * 2 ))
 export DISPLAY=":${DPY}" SDL_VIDEODRIVER=x11 SDL_AUDIODRIVER=dummy
 export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}" GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
@@ -108,6 +113,15 @@ current_map(){
   # info string (line 2) is \key\value\...; pull the mapname value
   printf '%s\n' "${resp}" | sed -n '2p' | tr '\\' '\n' | awk 'p{print;exit} $0=="mapname"{p=1}'
 }
+# The server-side director publishes the on-stream POV (the followed player's
+# clean name) into serverinfo as rs_tv_pov (see hrace.as RACE_TvDirectorThink);
+# read it from the same info string so the heartbeat can tell the site who we're
+# watching. Empty when the director is free-flying / nobody is racing.
+current_pov(){
+  local resp
+  resp="$(udp_getstatus "${1}")"
+  printf '%s\n' "${resp}" | sed -n '2p' | tr '\\' '\n' | awk 'p{print;exit} $0=="rs_tv_pov"{p=1}'
+}
 fmt_time(){   # ms -> race clock: 12345 -> 12.345, 92560 -> 1:32.560
   local ms="${1:-0}"
   case "${ms}" in ''|*[!0-9]*) echo "--"; return;; esac
@@ -143,6 +157,10 @@ sleep 0.5; FEHWID="$(xdotool search --class feh 2>/dev/null | head -1)"
 log "idle card up (feh win ${FEHWID:-?})"
 
 # --- 3. continuous ffmpeg capture -> HLS ------------------------------------
+# Newest mtime of the HLS manifest; ffmpeg rewrites it on every segment, so it
+# advances every ~hls_time seconds while the encoder is healthy — a frozen mtime
+# with ffmpeg still alive means the picture is wedged (see the main-loop guard).
+manifest_mtime(){ stat -c %Y "${OUT}/index.m3u8" 2>/dev/null || echo 0; }
 start_ffmpeg(){
   ffmpeg -hide_banner -loglevel warning -nostdin \
     -f x11grab -draw_mouse 0 -framerate "${FPS}" -video_size "${W}x${H}" -i ":${DPY}" \
@@ -153,6 +171,9 @@ start_ffmpeg(){
     -hls_segment_type mpegts -hls_segment_filename "${OUT}/seg_%05d.ts" "${OUT}/index.m3u8" \
     >/tmp/ffmpeg.log 2>&1 &
   FFMPEG_PID=$!
+  # reset the picture-freshness tracker so the fresh encoder gets a full
+  # STREAM_STALL window before the main-loop guard may judge it.
+  seg_last_mtime="$(manifest_mtime)"; seg_last_change="$(date +%s)"
 }
 start_ffmpeg
 log "ffmpeg -> ${OUT}/index.m3u8"
@@ -246,7 +267,10 @@ boot_client(){
   last_map="$(current_map "${STATUS_ADDR}" 2>/dev/null)"   # sync so a (re)connect isn't seen as a map change
 }
 
-watchable(){ /opt/tv/getstatus.sh "${STATUS_ADDR}" "${EXCLUDE_NAMES}" 2>/dev/null || echo 0; }
+# Count real players on the game server. Always exclude our own spectator by its
+# EXACT name (the same identity the server-side director matches on), plus any
+# extra exact infra names in EXCLUDE_NAMES (e.g. the relay).
+watchable(){ /opt/tv/getstatus.sh "${STATUS_ADDR}" "${TV_NAME}${EXCLUDE_NAMES:+,${EXCLUDE_NAMES}}" 2>/dev/null || echo 0; }
 
 # Is our spectator ACTUALLY connected to the game right now? getstatus the game
 # and look for our own TV_NAME among the clients. The GL client stays alive at
@@ -259,11 +283,16 @@ tv_connected(){
   [ -z "${resp}" ] && return 2
   printf '%s\n' "${resp}" | grep -qF "\"${TV_NAME}\"" && return 0 || return 1
 }
-heartbeat(){
+heartbeat(){   # status players [pov]
   [ -z "${HEARTBEAT_URL:-}" ] && return
+  # pov (who the director is showing) + map so the site can caption the stream;
+  # JSON-escape by dropping the only chars that could break the literal.
+  local pov_json="null" map_json="null"
+  [ -n "${3:-}" ]        && pov_json="\"$(printf '%s' "$3"          | tr -d '"\\')\""
+  [ -n "${last_map:-}" ] && map_json="\"$(printf '%s' "${last_map}" | tr -d '"\\')\""
   curl -fsS -m 3 -X POST "${HEARTBEAT_URL}" -H "Authorization: Bearer ${HEARTBEAT_TOKEN:-}" \
     -H 'Content-Type: application/json' \
-    -d "{\"stream_id\":\"${STREAM_ID}\",\"server_id\":${SERVER_ID:-null},\"status\":\"$1\",\"players\":$2}" >/dev/null 2>&1 || true
+    -d "{\"stream_id\":\"${STREAM_ID}\",\"server_id\":${SERVER_ID:-null},\"status\":\"$1\",\"players\":$2,\"map\":${map_json},\"pov\":${pov_json}}" >/dev/null 2>&1 || true
 }
 
 # --- 5. director -------------------------------------------------------------
@@ -319,6 +348,28 @@ while true; do
   kill -0 "${XVFB_PID}"  2>/dev/null || cleanup
   kill -0 "${FFMPEG_PID}" 2>/dev/null || { log "ffmpeg died; restart"; start_ffmpeg; }
 
+  # --- picture-freshness guard ------------------------------------------------
+  # ffmpeg grabs the X display continuously (game OR idle card), so index.m3u8 is
+  # rewritten every ~hls_time seconds. If it STOPS advancing while ffmpeg is still
+  # alive, the encoder/X/tmpfs is wedged — the "frozen picture, healthy container"
+  # case the loop-watchdog (which the loop keeps beating) can never see. Restart
+  # ffmpeg; if it stays stalled across restarts, hard-exit for a clean container
+  # (fresh X + client), same policy as the watchdog.
+  now_s="$(date +%s)"; cur_mtime="$(manifest_mtime)"
+  if [ "${cur_mtime}" != "${seg_last_mtime}" ]; then
+    seg_last_mtime="${cur_mtime}"; seg_last_change="${now_s}"; seg_stall_restarts=0
+  elif [ $(( now_s - seg_last_change )) -ge "${STREAM_STALL}" ]; then
+    if [ "${seg_stall_restarts}" -ge 2 ]; then
+      log "stream still stalled after ${seg_stall_restarts} ffmpeg restarts; exiting container for a clean restart"
+      kill -9 "$$" 2>/dev/null
+    fi
+    log "no new HLS segment for >${STREAM_STALL}s (ffmpeg alive but wedged); restarting ffmpeg"
+    kill "${FFMPEG_PID}" 2>/dev/null || true
+    start_ffmpeg
+    seg_stall_restarts=$(( seg_stall_restarts + 1 ))
+    seg_last_change="${now_s}"   # grace: let the fresh ffmpeg fill a window
+  fi
+
   # --- connection management: keep the spectator IN the game -----------------
   rc=2                                     # default: unknown/unreachable this tick
   if [ "${CLIENT_PID}" -eq 0 ] || ! kill -0 "${CLIENT_PID}" 2>/dev/null; then
@@ -357,7 +408,7 @@ while true; do
       raise_client                         # show the game (director drives the cam)
       state="live"; log "LIVE: following (${n} on server)"
     fi
-    heartbeat live "${n}"
+    heartbeat live "${n}" "$(current_pov "${STATUS_ADDR}")"
   else
     if [ "${state}" != "idle" ]; then
       raise_card                           # RACESOW card on top

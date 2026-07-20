@@ -2,9 +2,9 @@
 # Query a Warsow/qfusion server with a connectionless "getstatus" packet and
 # print how many connected clients are *watchable* — i.e. real people on the
 # server, excluding our own infrastructure clients (the wswtv relay and the TV
-# capture spectator, whose names start with a configured prefix).
+# capture spectator), matched by EXACT (color-stripped, case-insensitive) name.
 #
-#   getstatus.sh host:port [excludeCsv]     (excludeCsv default: "RACESOW")
+#   getstatus.sh host:port [excludeCsv]     (excludeCsv: exact names, default none)
 #
 # NOTE: in the race gametype a spawned racer and a spectator are indistinguishable
 # in getstatus (both report score -9999, team 0), so we cannot filter to only
@@ -37,16 +37,19 @@ resp="$(perl -MIO::Socket::INET -MIO::Select -e '
 [ -z "${resp}" ] && { echo 0; exit 0; }
 
 # Player lines start at line 3: <score> <ping> "name" [team]. Count clients whose
-# (color-stripped) name does not start with any excluded prefix.
+# (color-stripped) name is not EXACTLY one of the excluded infra names. Exact,
+# case-insensitive match — mirrors the server-side RACE_IsTvClient identity so a
+# real player merely SHARING a prefix (e.g. "RACESOW-fan") is still counted.
 echo "${resp}" | awk -v excl="${excl}" '
-    BEGIN { n = split(excl, ex, ",") }
+    BEGIN { n = split(tolower(excl), ex, ",") }
     NR > 2 && match($0, /"[^"]*"/) {
         name = substr($0, RSTART + 1, RLENGTH - 2)
         gsub(/\^[0-9]/, "", name)               # strip ^N color codes
+        lname = tolower(name)
         keep = 1
         for (i = 1; i <= n; i++) {
             p = ex[i]
-            if (p != "" && index(name, p) == 1) { keep = 0; break }
+            if (p != "" && lname == p) { keep = 0; break }
         }
         if (keep) c++
     }

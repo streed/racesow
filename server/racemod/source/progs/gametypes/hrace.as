@@ -53,6 +53,11 @@ const uint UINT_MAX = 4294967295;
 // stream follows the action with no client-side input. Empty = disabled (normal
 // servers unaffected); the game box sets it via EXTRA_ARGS / server env.
 Cvar rs_tv_name( "rs_tv_name", "", 0 );
+// The clean name of whoever the director is currently showing, published into
+// serverinfo (CVAR_SERVERINFO) so the capture encoder can read it via getstatus
+// and the website can caption "watching <player>". Empty = free-fly / idle.
+// (Kept < MAX_INFO_VALUE and sanitized via RACE_MeshStatusClean before setting.)
+Cvar rs_tv_pov( "rs_tv_pov", "", CVAR_SERVERINFO );
 bool RACE_IsTvClient( Client@ client )
 {
     if ( @client is null )
@@ -577,7 +582,14 @@ void GT_ThinkRules()
     RACE_GhostThink();
 
     if ( match.getState() >= MATCH_STATE_POSTMATCH )
+    {
+        // Keep the website TV camera managed during the scoreboard window too;
+        // the per-client loop below (which also runs RACE_TvDirectorThink) is
+        // skipped here, so without this the cam would freeze on whoever it last
+        // followed for the whole postmatch/scoreboard state, every map cycle.
+        RACE_TvDirectorThink();
         return;
+    }
 
     GENERIC_Think();
 
@@ -737,11 +749,32 @@ void GT_ThinkRules()
 // (rs_tv_name + RACE_IsTvClient are declared near the top of this file.)
 // ---------------------------------------------------------------------------
 
-// The entnum the TV cam should chase, or 0 when there is nothing worth watching.
+// --- TV director state (persisted across frames for POV hysteresis) ---------
+int tvCurTarget = 0;             // entnum currently shown (0 = free-fly / nobody)
+uint tvTargetSince = 0;          // levelTime we locked onto tvCurTarget
+const uint TV_MIN_DWELL = 2500;  // ms to hold a non-racing subject before switching
+
+// The Client at an entity number (player entities are 1..maxClients), or null.
+Client@ RACE_EntClient( int entNum )
+{
+    if ( entNum <= 0 || entNum > maxClients )
+        return null;
+    Entity@ e = @G_GetEntity( entNum );
+    if ( @e is null )
+        return null;
+    return @e.client;
+}
+
+// The entnum the TV cam should follow, or 0 when there is no REAL player worth
+// showing. Real players ONLY — never the WR ghost or mesh bots (an empty server
+// shows the branded idle card instead). Among live racers, prefer the one
+// deepest into their run (closest to the finish payoff); otherwise any spawned
+// real player so the cam still shows someone waiting at the start line.
 int RACE_TvPickTarget()
 {
     Team@ team = G_GetTeam( TEAM_PLAYERS );
-    int racerEnt = 0;
+    int bestRacer = 0;
+    uint bestRaceTime = 0;
     int anyEnt = 0;
     for ( int i = 0; @team.ent( i ) != null; i++ )
     {
@@ -749,24 +782,44 @@ int RACE_TvPickTarget()
         Client@ c = @e.client;
         if ( @c is null || c.state() < CS_SPAWNED )
             continue;
-        if ( RS_MirrorBotIs( c.playerNum ) )      // ghost/mesh bots considered last
+        if ( RS_MirrorBotIs( c.playerNum ) )      // ghost/mesh bots are never shown
             continue;
         if ( anyEnt == 0 )
             anyEnt = e.entNum;
         Player@ p = RACE_GetPlayer( c );
-        if ( p.inRace && !p.postRace )            // actively racing = best subject
+        if ( p.inRace && !p.postRace )            // actively racing = a real subject
         {
-            racerEnt = e.entNum;
-            break;
+            uint rt = p.raceTime();               // deepest run = closest to finish
+            if ( bestRacer == 0 || rt > bestRaceTime )
+            {
+                bestRacer = e.entNum;
+                bestRaceTime = rt;
+            }
         }
     }
-    if ( racerEnt != 0 )
-        return racerEnt;
-    if ( anyEnt != 0 )
-        return anyEnt;
-    if ( raceGhostBotSlot >= 0 )                  // nobody live -> the WR ghost racer
-        return raceGhostBotSlot + 1;
-    return 0;
+    if ( bestRacer != 0 )
+        return bestRacer;
+    return anyEnt;                                 // 0 when no real player is on
+}
+
+// Is the entnum a valid, still-watchable REAL player right now?
+bool RACE_TvTargetValid( int entNum )
+{
+    Client@ c = RACE_EntClient( entNum );
+    if ( @c is null || c.state() < CS_SPAWNED )
+        return false;
+    if ( RS_MirrorBotIs( c.playerNum ) )
+        return false;
+    return c.team != TEAM_SPECTATOR;
+}
+
+bool RACE_TvTargetRacing( int entNum )
+{
+    Client@ c = RACE_EntClient( entNum );
+    if ( @c is null )
+        return false;
+    Player@ p = RACE_GetPlayer( c );
+    return p.inRace && !p.postRace;
 }
 
 void RACE_TvDirectorThink()
@@ -774,33 +827,68 @@ void RACE_TvDirectorThink()
     if ( rs_tv_name.string.length() == 0 )
         return;
 
+    // Resolve the TV client by exact clean-name match, FIRST match only so a
+    // real player who happens to share the name can't also be commandeered.
+    Client@ tv = null;
     for ( int i = 0; i < maxClients; i++ )
     {
-        Client@ tv = @G_GetClient( i );
-        if ( @tv is null || tv.state() < CS_SPAWNED )
-            continue;
-        if ( !RACE_IsTvClient( tv ) )
-            continue;
+        Client@ c = @G_GetClient( i );
+        if ( @c !is null && c.state() >= CS_SPAWNED && RACE_IsTvClient( c ) )
+        {
+            @tv = @c;
+            break;
+        }
+    }
+    if ( @tv is null )
+    {
+        tvCurTarget = 0;
+        if ( rs_tv_pov.string.length() != 0 )
+            rs_tv_pov.set( "" );
+        return;
+    }
 
-        if ( tv.team != TEAM_SPECTATOR )          // keep the TV client a spectator
-        {
-            tv.team = TEAM_SPECTATOR;
-            tv.respawn( false );
-        }
-        tv.setHUDStat( STAT_MESSAGE_SELF, 0 );
-        tv.setHelpMessage( 0 );                   // no help overlay on the stream
+    if ( tv.team != TEAM_SPECTATOR )              // keep the TV client a spectator
+    {
+        tv.team = TEAM_SPECTATOR;
+        tv.respawn( false );
+    }
+    tv.setHUDStat( STAT_MESSAGE_SELF, 0 );
+    tv.setHelpMessage( 0 );                       // no help overlay on the stream
 
-        int target = RACE_TvPickTarget();
-        if ( target != 0 )
-        {
-            tv.chaseActive = true;
-            tv.chaseTarget = target;
-        }
-        else if ( tv.chaseActive )
-        {
-            tv.chaseActive = false;               // free-fly; unfreeze the camera
-            tv.getEnt().moveType = MOVETYPE_NOCLIP;
-        }
+    int target = RACE_TvPickTarget();
+
+    // Hysteresis: don't strobe between subjects. Stay on the current one while it
+    // is still a valid racer (follow the run to its finish); for a non-racing
+    // subject, hold it until TV_MIN_DWELL has elapsed. Only then adopt the pick.
+    if ( tvCurTarget != 0 && tvCurTarget != target && RACE_TvTargetValid( tvCurTarget ) )
+    {
+        if ( RACE_TvTargetRacing( tvCurTarget )
+             || ( levelTime - tvTargetSince ) < TV_MIN_DWELL )
+            target = tvCurTarget;
+    }
+
+    if ( target != tvCurTarget )
+    {
+        tvCurTarget = target;
+        tvTargetSince = levelTime;
+    }
+
+    if ( target != 0 )
+    {
+        tv.chaseActive = true;
+        tv.chaseTarget = target;
+        // Publish who we're showing so the site can caption "watching <player>".
+        Client@ subj = RACE_EntClient( target );
+        String pov = ( @subj !is null ) ? RACE_MeshStatusClean( subj.name, 31 ) : "";
+        if ( pov != rs_tv_pov.string )
+            rs_tv_pov.set( pov );
+    }
+    else
+    {
+        tv.chaseActive = false;                   // free-fly; unfreeze the camera
+        tv.getEnt().moveType = MOVETYPE_NOCLIP;
+        if ( rs_tv_pov.string.length() != 0 )
+            rs_tv_pov.set( "" );
     }
 }
 
