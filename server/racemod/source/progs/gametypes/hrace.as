@@ -517,7 +517,15 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     // armed at the saved spot (enableReverse sets reverseSetup AFTER its own
     // join-respawn, so this can't clobber a fresh setup).
     if ( player.reversed )
+    {
         player.reverseSetup = false;
+        // Re-derive start-on-exit from the spawn just loaded: if it sits inside a
+        // finish volume, the timer waits for the player to LEAVE (checkReverseStart)
+        // instead of firing on the touch already active at the spawn. (During
+        // enableReverse's own join-respawn this runs before the reverse spawn is
+        // stored, but reverseSetup is set true right after, so it's harmless.)
+        player.reverseAwaitFinishExit = player.insideFinishVolume();
+    }
 
     // Recall delay: freeze a recalled respawn for recallHold frames so
     // walljump/dash starts are timing-consistent (checkRelease unfreezes).
@@ -649,6 +657,7 @@ void GT_ThinkRules()
         player.checkNoclipAction();
         player.checkRelease();
         player.updateMaxSpeed();
+        player.checkReverseStart(); // reverse start-on-exit from a finish volume
 
         // hettoo: force practicemode message on spectators
         if ( client.team == TEAM_SPECTATOR )

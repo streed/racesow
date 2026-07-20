@@ -66,6 +66,13 @@ class Player
     // the prerace slot with the reverse start) and restored on /reverse off.
     Position preReverseMain;
     bool preReverseMainSaved;
+    // Set when the player is armed for a reverse run while standing INSIDE a
+    // finish trigger volume (the reverse start): the timer then must NOT start on
+    // the touch that is already firing — it starts when they LEAVE the volume
+    // (checkReverseStart, per frame). Re-derived from position on every respawn
+    // to the reverse start. When false, the finish is crossed from outside and
+    // the normal touch-to-start path applies.
+    bool reverseAwaitFinishExit;
 
     // /showtriggers: per-player beacon entities marking the start/finish trigger
     // planes, visible only to this client (like /mark). Freed on toggle-off and
@@ -166,6 +173,7 @@ class Player
         this.recalled = false;
         this.reversed = false;
         this.reverseSetup = false;
+        this.reverseAwaitFinishExit = false;
         this.preReverseMainSaved = false;
         this.preReverseMain.clear();
         this.showingTriggers = false;
@@ -596,9 +604,68 @@ class Player
         ent.set_velocity( Vec3() );
         this.release = 0;
         this.storeReverseSpawn();
-        G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse start saved —\ncross the FINISH line to start" );
+        // If this saved spawn sits inside a finish volume, arm start-on-EXIT so
+        // the touch that is already firing here does not start the timer — it
+        // starts when the player LEAVES the volume (checkReverseStart). Outside
+        // the volume, the normal touch-to-start path in target_stoptimer_use runs.
+        this.reverseAwaitFinishExit = this.insideFinishVolume();
+        if ( this.reverseAwaitFinishExit )
+            G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse start saved —\nleave the FINISH volume to start" );
+        else
+            G_CenterPrintMsg( ent, S_COLOR_CYAN + "Reverse start saved —\ncross the FINISH line to start" );
         this.setQuickMenu();
         return true;
+    }
+
+    // True when the player's bounding box currently overlaps ANY finish trigger
+    // volume. Mirrors how the engine's trigger touch works (bbox broadphase), so
+    // it agrees with when target_stoptimer_use fires. Used to decide start-on-exit
+    // vs start-on-touch for a reverse run, and to detect the exit each frame.
+    bool insideFinishVolume()
+    {
+        Entity@ ent = this.client.getEnt();
+        if ( @ent == null )
+            return false;
+        Vec3 pmin = ent.origin + playerMins;
+        Vec3 pmax = ent.origin + playerMaxs;
+        EntityList@ finishes = entityFinder.allEntities( "finish" );
+        for ( uint i = 0; i < finishes.length(); i++ )
+        {
+            Entity@ fin = finishes.getEnt( i );
+            if ( @fin == null )
+                continue;
+            Vec3 fmins, fmaxs;
+            fin.getSize( fmins, fmaxs );
+            Vec3 lo = fin.origin + fmins;
+            Vec3 hi = fin.origin + fmaxs;
+            if ( pmax.x >= lo.x && pmin.x <= hi.x &&
+                 pmax.y >= lo.y && pmin.y <= hi.y &&
+                 pmax.z >= lo.z && pmin.z <= hi.z )
+                return true;
+        }
+        return false;
+    }
+
+    // Per-frame (GT_ThinkRules): for a reverse run armed while standing inside a
+    // finish volume, start the timer the moment the player LEAVES that volume.
+    // No-op unless reverseAwaitFinishExit is set. Keeps the latch on a failed
+    // start (startRace respawns on prejump, back onto the spawn) so it re-arms.
+    void checkReverseStart()
+    {
+        if ( !this.reversed || this.reverseSetup || this.inRace || !this.reverseAwaitFinishExit )
+            return;
+        Entity@ ent = this.client.getEnt();
+        if ( @ent == null || ent.health <= 0 || this.client.team == TEAM_SPECTATOR )
+            return;
+        if ( this.insideFinishVolume() )
+            return; // still inside — keep waiting for the exit
+        if ( this.startRace() )
+        {
+            this.reverseAwaitFinishExit = false;
+            int speed = int( HorizontalSpeed( ent.velocity ) );
+            this.client.setHUDStat( STAT_PROGRESS_OTHER, speed );
+            this.client.printMessage( S_COLOR_ORANGE + "Starting speed: " + S_COLOR_WHITE + speed + "\n" );
+        }
     }
 
     // Compute a reverse-start spot just OUTSIDE the finish trigger, on solid
@@ -689,6 +756,7 @@ class Player
         this.cancelRace();
         this.reversed = false;
         this.reverseSetup = false;
+        this.reverseAwaitFinishExit = false;
         this.resetBestForMode(); // point best_recordTime back at the standard board
 
         if ( this.preReverseMainSaved )
@@ -708,9 +776,11 @@ class Player
         return true;
     }
 
-    // /showtriggers: toggle per-player beacons marking the start & finish trigger
-    // planes. Uses the /mark per-client pattern (SVF_ONLYOWNER) so only this
-    // player sees them; a translucent ghost effect marks them as guides.
+    // /showtriggers: toggle per-player wireframe boxes tracing the exact start &
+    // finish trigger VOLUMES — a GREEN box around each start, a RED box around
+    // each finish. Each box is 12 colored beams (ET_BEAM) along the trigger's
+    // bbox edges; SVF_ONLYOWNER keeps them visible to this client only (like
+    // /mark). Freed on toggle-off and in clear().
     bool toggleTriggerMarkers()
     {
         if ( this.showingTriggers )
@@ -723,30 +793,86 @@ class Player
         }
 
         this.freeTriggerMarkers(); // belt-and-suspenders before repopulating
-        this.spawnTriggerMarkers( entityFinder.allEntities( "start" ) );
-        this.spawnTriggerMarkers( entityFinder.allEntities( "finish" ) );
+        this.spawnTriggerMarkers( entityFinder.allEntities( "start" ), this.rgba( 40, 230, 60, 170 ) );   // green
+        this.spawnTriggerMarkers( entityFinder.allEntities( "finish" ), this.rgba( 235, 45, 45, 170 ) ); // red
         this.showingTriggers = true;
-        G_PrintMsg( this.client.getEnt(), "Trigger markers on: " + S_COLOR_GREEN + "start" + S_COLOR_WHITE + " and " + S_COLOR_RED + "finish" + S_COLOR_WHITE + " planes marked.\n" );
+        G_PrintMsg( this.client.getEnt(), "Trigger markers on: " + S_COLOR_GREEN + "start" + S_COLOR_WHITE + " and " + S_COLOR_RED + "finish" + S_COLOR_WHITE + " volumes outlined.\n" );
         this.setQuickMenu();
         return true;
     }
 
-    void spawnTriggerMarkers( EntityList@ list )
+    // Pack an RGBA colour into the int the engine's ET_BEAM colorRGBA expects
+    // (COLOR_RGBA in q_shared.h: r | g<<8 | b<<16 | a<<24).
+    int rgba( int r, int g, int b, int a )
+    {
+        return ( r & 0xFF ) | ( ( g & 0xFF ) << 8 ) | ( ( b & 0xFF ) << 16 ) | ( ( a & 0xFF ) << 24 );
+    }
+
+    // Outline every trigger in `list` with a colored wireframe box at its exact
+    // world bbox (origin + getSize bounds — the same volume the trigger touch uses).
+    void spawnTriggerMarkers( EntityList@ list, int colorRGBA )
     {
         Entity@ owner = this.client.getEnt();
         uint n = list.length();
         for ( uint i = 0; i < n; i++ )
         {
-            Entity@ beacon = G_SpawnEntity( "dummy" );
-            beacon.modelindex = G_ModelIndex( "models/players/bigvic/tris.iqm" );
-            beacon.svflags |= SVF_ONLYOWNER;   // this client only
-            beacon.svflags &= ~SVF_NOCLIENT;   // ...and actually transmit it
-            beacon.effects |= EF_RACEGHOST_FLAG; // translucent -> reads as a guide
-            beacon.ownerNum = owner.entNum;
-            beacon.origin = list.getPosition( i );
-            beacon.linkEntity();
-            this.triggerMarkers.push_back( beacon );
+            Entity@ trig = list.getEnt( i );
+            if ( @trig == null )
+                continue;
+            Vec3 mins, maxs;
+            trig.getSize( mins, maxs );
+            this.spawnBoxWireframe( trig.origin + mins, trig.origin + maxs, colorRGBA, owner );
         }
+    }
+
+    // Spawn the 12 edges of the AABB [lo,hi] as colored beams owned by `owner`.
+    void spawnBoxWireframe( Vec3 lo, Vec3 hi, int colorRGBA, Entity@ owner )
+    {
+        Vec3 c000 = Vec3( lo.x, lo.y, lo.z );
+        Vec3 c100 = Vec3( hi.x, lo.y, lo.z );
+        Vec3 c110 = Vec3( hi.x, hi.y, lo.z );
+        Vec3 c010 = Vec3( lo.x, hi.y, lo.z );
+        Vec3 c001 = Vec3( lo.x, lo.y, hi.z );
+        Vec3 c101 = Vec3( hi.x, lo.y, hi.z );
+        Vec3 c111 = Vec3( hi.x, hi.y, hi.z );
+        Vec3 c011 = Vec3( lo.x, hi.y, hi.z );
+        // bottom rectangle
+        this.spawnBeam( c000, c100, colorRGBA, owner );
+        this.spawnBeam( c100, c110, colorRGBA, owner );
+        this.spawnBeam( c110, c010, colorRGBA, owner );
+        this.spawnBeam( c010, c000, colorRGBA, owner );
+        // top rectangle
+        this.spawnBeam( c001, c101, colorRGBA, owner );
+        this.spawnBeam( c101, c111, colorRGBA, owner );
+        this.spawnBeam( c111, c011, colorRGBA, owner );
+        this.spawnBeam( c011, c001, colorRGBA, owner );
+        // vertical edges
+        this.spawnBeam( c000, c001, colorRGBA, owner );
+        this.spawnBeam( c100, c101, colorRGBA, owner );
+        this.spawnBeam( c110, c111, colorRGBA, owner );
+        this.spawnBeam( c010, c011, colorRGBA, owner );
+    }
+
+    // One ET_BEAM segment from `from` to `to`, visible only to `owner`. Mirrors
+    // target_laser's beam setup (engine g_target.cpp): ET_BEAM + a non-zero
+    // modelindex + SVF_TRANSMITORIGIN2 so the far endpoint (origin2) is networked.
+    void spawnBeam( Vec3 from, Vec3 to, int colorRGBA, Entity@ owner )
+    {
+        Entity@ beam = G_SpawnEntity( "dummy" );
+        if ( @beam == null )
+            return;
+        beam.type = ET_BEAM;
+        beam.modelindex = 1;                 // ET_BEAM requires a non-zero modelindex
+        beam.frame = 4;                      // beam thickness (diameter in units)
+        beam.colorRGBA = colorRGBA;
+        beam.svflags |= SVF_TRANSMITORIGIN2; // network origin2 (the far endpoint)
+        beam.svflags |= SVF_ONLYOWNER;       // this client only
+        beam.svflags &= ~SVF_NOCLIENT;       // ...and actually transmit it
+        beam.ownerNum = owner.entNum;
+        beam.origin = from;
+        beam.set_origin2( to );
+        beam.linkEntity();
+        this.triggerMarkers.push_back( beam );
     }
 
     void freeTriggerMarkers()

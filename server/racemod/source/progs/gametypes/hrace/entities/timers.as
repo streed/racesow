@@ -31,6 +31,13 @@ void target_stoptimer_use( Entity@ self, Entity@ other, Entity@ activator )
         if ( player.reverseSetup || player.inRace )
             return;
 
+        // Armed while standing INSIDE this finish volume: don't start on the
+        // touch firing here — the timer starts when the player LEAVES the volume
+        // (Player::checkReverseStart, per frame). Only a genuine cross from
+        // OUTSIDE starts on touch.
+        if ( player.reverseAwaitFinishExit )
+            return;
+
         if ( player.startRace() )
         {
             self.useTargets( activator );
