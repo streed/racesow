@@ -10,9 +10,9 @@
 		Cvar cg_specHUD( "cg_specHUD", "default", ::CVAR_ARCHIVE );
 		Cvar racemod_seenintro( "racemod_seenintro", "0", ::CVAR_ARCHIVE | ::CVAR_USERINFO );
 			// Per-client toggle for the in-game world-record ghost racer. USERINFO
-			// so the server (hrace/ghostbot.as) can read it and hide the ghost from
-			// just this player's view; default 1 = shown.
-			Cvar cg_raceShowWorldRecord( "cg_raceShowWorldRecord", "1", ::CVAR_ARCHIVE | ::CVAR_USERINFO );
+			// so the server (hrace/ghostbot.as) can read it and show the ghost to
+			// just this player's view; default 0 = hidden (opt in to see it).
+			Cvar cg_raceShowWorldRecord( "cg_raceShowWorldRecord", "0", ::CVAR_ARCHIVE | ::CVAR_USERINFO );
 
 		void onPlayerLoad( Element@ body, Event@ evt )
 		{

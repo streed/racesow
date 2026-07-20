@@ -228,16 +228,16 @@ In-game, players use **`/who`** to list every peer's roster and
   `rs_wr_ghost_mesh_sync` (default 1) toggles the cross-server WR-ghost re-pull;
   `rs_wr_ghost_smooth` (default 0.35) tunes ghost-playback easing — lower is
   smoother/laggier, higher snappier, `0` disables easing (raw interpolation).
-- **Hiding the WR ghost.** `rs_wr_ghost` (default 1) toggles it server-wide.
-  Each player also controls it for themselves with the client cvar
-  **`cg_raceShowWorldRecord`** (default 1; a checkbox in *Race Options*). Set to
-  0, the server reads it from the client's userinfo and culls the ghost from
-  just that player's snapshot, leaving mesh ghosts, other players' views, and the
-  scoreboard untouched. The cvar is registered by the racemod UI pak
-  (`racemod_ui_v6_local.pk3`); it needs no engine change on the client. (The
-  stock `cg_raceGhostsAlpha 0` also hides it, but hides *all* race ghosts
-  including mesh ones; `cg_raceGhosts` does not affect the player-model ghost at
-  all — it only shells projectiles.)
+- **The WR ghost (hidden by default).** `rs_wr_ghost` (default 1) spawns it
+  server-wide, but each player must opt in to see it with the client cvar
+  **`cg_raceShowWorldRecord`** (default 0; a checkbox in *Race Options*). Left at
+  0 (or unset) the server reads it from the client's userinfo and culls the ghost
+  from just that player's snapshot; set to 1 the ghost is streamed to that client.
+  Either way mesh ghosts, other players' views, and the scoreboard are untouched.
+  The cvar is registered by the racemod UI pak (`racemod_ui_v7_local.pk3`); it
+  needs no engine change on the client. (The stock `cg_raceGhostsAlpha 0` also
+  hides it, but hides *all* race ghosts including mesh ones; `cg_raceGhosts` does
+  not affect the player-model ghost at all — it only shells projectiles.)
 
 ### Security posture
 

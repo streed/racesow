@@ -17,7 +17,7 @@
 # dedicated-server image).
 
 # --- Game image (source of the deterministic racemod UI/HUD pak) -------------
-# The spectator's race HUD (ale_racemod) lives in racemod_ui_v6_local.pk3, built
+# The spectator's race HUD (ale_racemod) lives in racemod_ui_v7_local.pk3, built
 # deterministically by server/Dockerfile. We copy that exact pak from the game
 # image so the checksum matches the running server's (pure-safe) AND the HUD is
 # present at launch — otherwise cg_clientHUD points at a HUD that only arrives

@@ -13,13 +13,15 @@
 // enters a race (startRace refuses fake clients) so it is never timed and
 // never triggers checkpoints.
 //
-// Visibility. rs_wr_ghost (default on) toggles the ghost SERVER-WIDE. Each
-// player also controls it for THEMSELVES with the client cvar
-// cg_raceShowWorldRecord (default 1; registered CVAR_ARCHIVE|CVAR_USERINFO by
-// the racemod UI - ui/porkui/racemod_main.rml - with a checkbox in Race
-// Options). Set to 0, the server reads it from userinfo and culls the ghost
-// from just that client's snapshot (SNAP_SnapCullEntity via RS_SetHideWrGhost),
-// leaving mesh ghosts, other players' views, and the scoreboard untouched.
+// Visibility. rs_wr_ghost (default on) toggles the ghost SERVER-WIDE. The ghost
+// is HIDDEN BY DEFAULT for each player; a player opts in for THEMSELVES with the
+// client cvar cg_raceShowWorldRecord (default 0; registered CVAR_ARCHIVE|
+// CVAR_USERINFO by the racemod UI - ui/porkui/racemod_main.rml - with a "Show
+// world-record ghost" checkbox in Race Options). Left at 0 (or unset), the
+// server reads it from userinfo and culls the ghost from that client's snapshot
+// (SNAP_SnapCullEntity via RS_SetHideWrGhost); set to 1 the ghost is streamed to
+// that client. Mesh ghosts, other players' views, and the scoreboard are always
+// untouched.
 // (The stock cg_raceGhostsAlpha 0 also hides it, but hides ALL race ghosts;
 // cg_raceGhosts does NOT affect the player-model ghost - it only shells
 // projectiles - so "cg_raceGhosts 0" does not hide it.)
@@ -114,16 +116,40 @@ void RACE_GhostInit()
 
 // Push a client's cg_raceShowWorldRecord choice to the engine. The cvar is a
 // CVAR_USERINFO client cvar (registered by the racemod UI), so we read it from
-// userinfo: "0" hides the WR ghost for this player, anything else (including an
-// unset cvar) shows it. RS_SetHideWrGhost culls it from just this client's
-// snapshot. Called on (re)spawn - a level reload zeroes the per-edict flag - and
-// whenever the client toggles the cvar (GT_scoreEvent "userinfochanged").
+// userinfo: "1" shows the WR ghost for this player, anything else (including an
+// unset cvar) hides it - the ghost is HIDDEN BY DEFAULT and a player opts in by
+// ticking "Show world-record ghost" in Race Options. RS_SetHideWrGhost culls it
+// from just this client's snapshot. Called on (re)spawn and whenever the client
+// toggles the cvar (GT_scoreEvent "userinfochanged"), and re-asserted every frame
+// by RACE_GhostApplyAllClientPrefs so no viewer is ever missed.
 void RACE_GhostApplyClientPref( Client@ client )
 {
     if ( @client == null )
         return;
-    bool hide = ( client.getUserInfoKey( "cg_raceShowWorldRecord" ) == "0" );
+    bool hide = ( client.getUserInfoKey( "cg_raceShowWorldRecord" ) != "1" );
     RS_SetHideWrGhost( client.playerNum, hide );
+}
+
+// Hide-by-default backstop. The engine's per-viewer cull flag (rs_hideWrGhost)
+// defaults to "show", so the ghost is hidden from a client only once
+// RS_SetHideWrGhost has run for them. The event-driven RACE_GhostApplyClientPref
+// calls cover the common cases, but a level reload zeroes the flag and not every
+// viewer transition re-fires those events (a pure spectator across a map change,
+// a fresh connect before its first spawn). Re-assert every in-game client's
+// preference each frame so nobody ever sees the ghost without opting in. Cheap:
+// a userinfo lookup + a bool set per client; fake clients (mesh mirror bots and
+// the ghost itself, which never view anything) are skipped.
+void RACE_GhostApplyAllClientPrefs()
+{
+    for ( int i = 0; i < maxClients; i++ )
+    {
+        Client@ client = G_GetClient( i );
+        if ( @client == null || client.state() < CS_SPAWNED )
+            continue;
+        if ( RS_MirrorBotIs( client.playerNum ) )
+            continue;
+        RACE_GhostApplyClientPref( client );
+    }
 }
 
 // Map load: drop any stale bot and arm a fresh fetch of this map's WR ghost.
@@ -218,6 +244,10 @@ void RACE_GhostThink()
         RACE_GhostDespawn();
         return;
     }
+
+    // Re-assert per-viewer visibility every frame so the ghost stays hidden by
+    // default for everyone who hasn't opted in (see RACE_GhostApplyAllClientPrefs).
+    RACE_GhostApplyAllClientPrefs();
 
     // fetch handshake (mirrors hrace/apitop.as)
     int status = RS_ApiPollGhost();

@@ -1077,7 +1077,7 @@ void GT_InitGametype()
     gametype.author = "Warsow Development Team";
 
     // Pure-index a (silent) sound that lives inside the client UI pak
-    // (racemod_ui_v6_local.pk3, built from server/clientdata). This puts the
+    // (racemod_ui_v7_local.pk3, built from server/clientdata). This puts the
     // pak on the sv_pure list as a *referenced* file, so connecting clients
     // download it from this server over the game connection. The pak must NOT
     // be *pure-named: clients only fetch explicit-pure paks from the official
@@ -1196,7 +1196,7 @@ void GT_InitGametype()
 
     // msc: force pk3 download — the marker version MUST match the pak built
     // in server/Dockerfile (asserted there at build time)
-    G_SoundIndex( "racemod_ui_v6.txt", true );
+    G_SoundIndex( "racemod_ui_v7.txt", true );
     G_SoundIndex( "missing_tex.txt", true );
 
     demoRecording = false;
