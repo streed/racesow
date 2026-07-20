@@ -778,9 +778,11 @@ class Player
 
     // /showtriggers: toggle per-player wireframe boxes tracing the exact start &
     // finish trigger VOLUMES — a GREEN box around each start, a RED box around
-    // each finish. Each box is 12 colored beams (ET_BEAM) along the trigger's
-    // bbox edges; SVF_ONLYOWNER keeps them visible to this client only (like
-    // /mark). Freed on toggle-off and in clear().
+    // each finish. Each box is the 12 bbox edges PLUS an X across all 6 faces
+    // (24 ET_BEAM segments) so thin/flat triggers and the inside of a big volume
+    // still read clearly. SVF_ONLYOWNER + SVF_BROADCAST keeps them owner-only but
+    // always transmitted (no PVS cull), so a distant finish still shows. Freed on
+    // toggle-off and in clear().
     bool toggleTriggerMarkers()
     {
         if ( this.showingTriggers )
@@ -793,10 +795,13 @@ class Player
         }
 
         this.freeTriggerMarkers(); // belt-and-suspenders before repopulating
-        this.spawnTriggerMarkers( entityFinder.allEntities( "start" ), this.rgba( 40, 230, 60, 170 ) );   // green
-        this.spawnTriggerMarkers( entityFinder.allEntities( "finish" ), this.rgba( 235, 45, 45, 170 ) ); // red
+        uint ns = this.spawnTriggerMarkers( entityFinder.allEntities( "start" ), this.rgba( 30, 255, 40, 230 ), "start" );   // green
+        uint nf = this.spawnTriggerMarkers( entityFinder.allEntities( "finish" ), this.rgba( 255, 40, 40, 230 ), "finish" ); // red
         this.showingTriggers = true;
-        G_PrintMsg( this.client.getEnt(), "Trigger markers on: " + S_COLOR_GREEN + "start" + S_COLOR_WHITE + " and " + S_COLOR_RED + "finish" + S_COLOR_WHITE + " volumes outlined.\n" );
+        String msg = "Trigger markers on: " + S_COLOR_GREEN + ns + " start" + S_COLOR_WHITE + " / " + S_COLOR_RED + nf + " finish" + S_COLOR_WHITE + " volume(s) outlined.\n";
+        if ( nf == 0 )
+            msg += S_COLOR_YELLOW + "(no finish trigger found on this map)\n";
+        G_PrintMsg( this.client.getEnt(), msg );
         this.setQuickMenu();
         return true;
     }
@@ -809,11 +814,14 @@ class Player
     }
 
     // Outline every trigger in `list` with a colored wireframe box at its exact
-    // world bbox (origin + getSize bounds — the same volume the trigger touch uses).
-    void spawnTriggerMarkers( EntityList@ list, int colorRGBA )
+    // world bbox (origin + getSize bounds — the same volume the trigger touch
+    // uses). Prints each volume's size + centre so a missing/degenerate trigger
+    // is obvious in-game. Returns how many were outlined.
+    uint spawnTriggerMarkers( EntityList@ list, int colorRGBA, String label )
     {
         Entity@ owner = this.client.getEnt();
         uint n = list.length();
+        uint outlined = 0;
         for ( uint i = 0; i < n; i++ )
         {
             Entity@ trig = list.getEnt( i );
@@ -821,11 +829,21 @@ class Player
                 continue;
             Vec3 mins, maxs;
             trig.getSize( mins, maxs );
-            this.spawnBoxWireframe( trig.origin + mins, trig.origin + maxs, colorRGBA, owner );
+            Vec3 lo = trig.origin + mins;
+            Vec3 hi = trig.origin + maxs;
+            Vec3 sz = maxs - mins;
+            Vec3 ctr = trig.origin + 0.5f * ( mins + maxs );
+            this.spawnBoxWireframe( lo, hi, colorRGBA, owner );
+            outlined++;
+            G_PrintMsg( this.client.getEnt(), S_COLOR_WHITE + "  " + label + " #" + ( i + 1 ) + ": " +
+                int( sz.x ) + "x" + int( sz.y ) + "x" + int( sz.z ) + " @ " +
+                int( ctr.x ) + " " + int( ctr.y ) + " " + int( ctr.z ) + "\n" );
         }
+        return outlined;
     }
 
-    // Spawn the 12 edges of the AABB [lo,hi] as colored beams owned by `owner`.
+    // Spawn the AABB [lo,hi] as colored beams: 12 edges + an X (2 diagonals) on
+    // each of the 6 faces, all owned by `owner`.
     void spawnBoxWireframe( Vec3 lo, Vec3 hi, int colorRGBA, Entity@ owner )
     {
         Vec3 c000 = Vec3( lo.x, lo.y, lo.z );
@@ -851,22 +869,42 @@ class Player
         this.spawnBeam( c100, c101, colorRGBA, owner );
         this.spawnBeam( c110, c111, colorRGBA, owner );
         this.spawnBeam( c010, c011, colorRGBA, owner );
+        // an X on each of the 6 faces (2 diagonals each) — makes thin/flat
+        // triggers and the inside of a large volume clearly visible
+        this.spawnBeam( c000, c110, colorRGBA, owner ); // bottom (z=lo)
+        this.spawnBeam( c100, c010, colorRGBA, owner );
+        this.spawnBeam( c001, c111, colorRGBA, owner ); // top (z=hi)
+        this.spawnBeam( c101, c011, colorRGBA, owner );
+        this.spawnBeam( c000, c101, colorRGBA, owner ); // -Y face
+        this.spawnBeam( c100, c001, colorRGBA, owner );
+        this.spawnBeam( c010, c111, colorRGBA, owner ); // +Y face
+        this.spawnBeam( c110, c011, colorRGBA, owner );
+        this.spawnBeam( c000, c011, colorRGBA, owner ); // -X face
+        this.spawnBeam( c010, c001, colorRGBA, owner );
+        this.spawnBeam( c100, c111, colorRGBA, owner ); // +X face
+        this.spawnBeam( c110, c101, colorRGBA, owner );
     }
 
     // One ET_BEAM segment from `from` to `to`, visible only to `owner`. Mirrors
     // target_laser's beam setup (engine g_target.cpp): ET_BEAM + a non-zero
     // modelindex + SVF_TRANSMITORIGIN2 so the far endpoint (origin2) is networked.
+    // SVF_BROADCAST forces transmission even outside the owner's PVS (so a distant
+    // finish still renders); SVF_ONLYOWNER (checked first in the snapshot) keeps
+    // it private to this client.
     void spawnBeam( Vec3 from, Vec3 to, int colorRGBA, Entity@ owner )
     {
+        if ( this.triggerMarkers.length() >= 300 ) // entity-count safety cap
+            return;
         Entity@ beam = G_SpawnEntity( "dummy" );
         if ( @beam == null )
             return;
         beam.type = ET_BEAM;
         beam.modelindex = 1;                 // ET_BEAM requires a non-zero modelindex
-        beam.frame = 4;                      // beam thickness (diameter in units)
+        beam.frame = 8;                      // beam thickness (diameter in units)
         beam.colorRGBA = colorRGBA;
         beam.svflags |= SVF_TRANSMITORIGIN2; // network origin2 (the far endpoint)
-        beam.svflags |= SVF_ONLYOWNER;       // this client only
+        beam.svflags |= SVF_ONLYOWNER;       // this client only...
+        beam.svflags |= SVF_BROADCAST;       // ...but always transmit (bypass PVS cull)
         beam.svflags &= ~SVF_NOCLIENT;       // ...and actually transmit it
         beam.ownerNum = owner.entNum;
         beam.origin = from;
