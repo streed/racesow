@@ -45,6 +45,10 @@ class Checkpoint
         if ( this.type == CheckpointType_Unused )
             return false;
 
+        // Compare against the board matching the player's mode (reverse runs
+        // have their own separate top board).
+        RecordTime[]@ levelRecords = RACE_Records( player.reversed );
+
         if( this.type == CheckpointType_Finish )
             table.addCell( "Finish:" );
         else
@@ -64,6 +68,7 @@ class Checkpoint
 
     void specPrint( Client@ client, Player@ player, uint checkpoint_id ) {
         Player@ spec_player = @RACE_GetPlayer( client );
+        RecordTime[]@ levelRecords = RACE_Records( player.reversed );
         String line1 = "";
         String line2 = "";
 
@@ -99,6 +104,7 @@ class Checkpoint
     }
 
     void print( Player@ player, uint checkpoint_id ) {
+        RecordTime[]@ levelRecords = RACE_Records( player.reversed );
         String str = player.practicing ? S_COLOR_CYAN : S_COLOR_WHITE;
         str += "Current: " + RACE_TimeToString( this.time );
 

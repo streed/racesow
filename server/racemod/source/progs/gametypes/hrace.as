@@ -197,6 +197,10 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_Practicemode( client, cmdString, argsString, argc );
     else if ( cmdString == "noclip" )
         return Cmd_Noclip( client, cmdString, argsString, argc );
+    else if ( cmdString == "reverse" )
+        return Cmd_Reverse( client, cmdString, argsString, argc );
+    else if ( cmdString == "showtriggers" )
+        return Cmd_ShowTriggers( client, cmdString, argsString, argc );
     else if ( cmdString == "position" )
         return Cmd_Position( client, cmdString, argsString, argc );
     else if ( cmdString == "top" )
@@ -515,6 +519,22 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
         player.noclipSpawn = false;
     }
 
+    // Reversed racers spawn at the reverse start: enableReverse()/finalizeReverse
+    // stored that spot in the prerace slot, so the loadPosition("") above already
+    // placed them there. Clear the fine-tune flag so a death mid-setup respawns
+    // armed at the saved spot (enableReverse sets reverseSetup AFTER its own
+    // join-respawn, so this can't clobber a fresh setup).
+    if ( player.reversed )
+    {
+        player.reverseSetup = false;
+        // Re-derive start-on-exit from the spawn just loaded: if it sits inside a
+        // finish volume, the timer waits for the player to LEAVE (checkReverseStart)
+        // instead of firing on the touch already active at the spawn. (During
+        // enableReverse's own join-respawn this runs before the reverse spawn is
+        // stored, but reverseSetup is set true right after, so it's harmless.)
+        player.reverseAwaitFinishExit = player.insideFinishVolume();
+    }
+
     // Recall delay: freeze a recalled respawn for recallHold frames so
     // walljump/dash starts are timing-consistent (checkRelease unfreezes).
     if ( player.recalled )
@@ -645,6 +665,7 @@ void GT_ThinkRules()
         player.checkNoclipAction();
         player.checkRelease();
         player.updateMaxSpeed();
+        player.checkReverseStart(); // reverse start-on-exit from a finish volume
 
         // hettoo: force practicemode message on spectators
         if ( client.team == TEAM_SPECTATOR )
@@ -798,6 +819,7 @@ bool GT_MatchStateFinished( int incomingMatchState )
 
         // ch : also send rest of results
         RACE_WriteTopScores();
+        RACE_WriteTopScores( true ); // persist the reverse-variant board too
         RACE_UpdatePosValues();
         // script globals reset on map change: report uncounted race starts now
         RACE_FlushAllAttempts();
@@ -1014,9 +1036,13 @@ void GT_SpawnGametype()
         players[i].setupArrays( numCheckpoints + 1 );
 
     for ( int i = 0; i < MAX_RECORDS; i++ )
+    {
         levelRecords[i].setupArrays( numCheckpoints + 1 );
+        levelRecordsReversed[i].setupArrays( numCheckpoints + 1 );
+    }
 
     RACE_LoadTopScores();
+    RACE_LoadTopScores( true ); // reverse-variant board ("<map>-reversed")
     lastRecords.fromFile(); // recent-records feed: snapshot this map's current #1
 
     RACE_MirrorSpawnGametype();
@@ -1025,6 +1051,11 @@ void GT_SpawnGametype()
 
 float GT_VotePower( Client@ client, String& votename, bool voted, bool yes )
 {
+    // The TV director spectator is not a participant: zero weight keeps it
+    // out of the voter tally so it can't inflate the votes needed to pass.
+    if ( RACE_IsTvClient( client ) )
+        return 0.0;
+
     Player@ player = @RACE_GetPlayer(client);
     if ( player.best_recordTime.isFinished() && voted && !yes )
     {
@@ -1140,6 +1171,8 @@ void GT_InitGametype()
     G_RegisterCommand( "join" );
     G_RegisterCommand( "practicemode" );
     G_RegisterCommand( "noclip" );
+    G_RegisterCommand( "reverse" );
+    G_RegisterCommand( "showtriggers" );
     G_RegisterCommand( "position" );
     G_RegisterCommand( "top" );
     G_RegisterCommand( "mark" );

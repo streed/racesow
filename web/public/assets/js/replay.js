@@ -225,7 +225,12 @@ export async function mountReplay(root, { mapId, mapName, wr }) {
   try {
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), 12000);
-    const r = await fetch(`/maps/${encodeURIComponent(mapName)}.glb`, { signal: ctrl.signal }).finally(() => clearTimeout(to));
+    // Reversed runs are recorded under "<map>-reversed" but share the base map's
+    // geometry — the mesh is only converted under the base name, so strip the
+    // suffix before fetching the .glb (a reversed replay would otherwise 404 the
+    // mesh and fall back to line-only).
+    const meshMap = mapName.replace(/-reversed$/, "");
+    const r = await fetch(`/maps/${encodeURIComponent(meshMap)}.glb`, { signal: ctrl.signal }).finally(() => clearTimeout(to));
     if (r.ok) {
       const geo = parseGlb(await r.arrayBuffer());
       // The converter ships untextured geometry (Warsow's shader/texture system

@@ -24,6 +24,31 @@ void target_stoptimer_use( Entity@ self, Entity@ other, Entity@ activator )
 
     Player@ player = RACE_GetPlayer( activator.client );
 
+    // Reverse mode: the map's FINISH line is the reverse START. Begin the timed
+    // run here (same path — and prejump gate — as a normal start).
+    if ( player.reversed )
+    {
+        if ( player.reverseSetup || player.inRace )
+            return;
+
+        // Armed while standing INSIDE this finish volume: don't start on the
+        // touch firing here — the timer starts when the player LEAVES the volume
+        // (Player::checkReverseStart, per frame). Only a genuine cross from
+        // OUTSIDE starts on touch.
+        if ( player.reverseAwaitFinishExit )
+            return;
+
+        if ( player.startRace() )
+        {
+            self.useTargets( activator );
+
+            int speed = int( HorizontalSpeed( activator.velocity ) );
+            activator.client.setHUDStat( STAT_PROGRESS_OTHER, speed );
+            activator.client.printMessage( S_COLOR_ORANGE + "Starting speed: " + S_COLOR_WHITE + speed + "\n" );
+        }
+        return;
+    }
+
     if ( !player.inRace && !player.practicing )
         return;
 
@@ -51,6 +76,20 @@ void target_starttimer_use( Entity@ self, Entity@ other, Entity@ activator )
         return;
 
     Player@ player = RACE_GetPlayer( activator.client );
+
+    // Reverse mode: the map's START line is the reverse FINISH. Stop the timer
+    // and bank the reversed run here (same path as a normal finish).
+    if ( player.reversed )
+    {
+        if ( player.reverseSetup )
+            return;
+        if ( !player.inRace && !player.practicing )
+            return;
+
+        player.completeRace();
+        self.useTargets( activator );
+        return;
+    }
 
     if ( player.inRace )
         return;

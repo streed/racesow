@@ -18,10 +18,22 @@ excl="${2:-RACESOW}"
 host="${addr%:*}"
 port="${addr##*:}"
 
-if ! exec 3<>"/dev/udp/${host}/${port}" 2>/dev/null; then echo 0; exit 0; fi
-printf '\xff\xff\xff\xffgetstatus\n' >&3 2>/dev/null || { echo 0; exit 0; }
-resp="$(timeout 1 cat <&3 2>/dev/null | tr -d '\000')"
-exec 3<&- 3>&- 2>/dev/null || true
+# One perl process, select-with-timeout: no child pipeline, no signal-based
+# teardown, guaranteed to exit. (The old `timeout 1 cat </dev/udp/... | tr`
+# pipeline wedged prod: a UDP read never sees EOF, so every poll ended via
+# timeout's signal path, and coreutils 8.28 `timeout` has a lost-SIGCHLD race
+# that left it asleep forever holding the $()-pipe open. Same probe as
+# capture-run.sh udp_getstatus.)
+resp="$(perl -MIO::Socket::INET -MIO::Select -e '
+    my ($host, $port) = @ARGV;
+    my $r = "";
+    my $s = IO::Socket::INET->new(Proto => "udp", PeerAddr => $host, PeerPort => $port);
+    if ($s && defined $s->send("\xff\xff\xff\xffgetstatus\x0a")) {
+        $s->recv($r, 65535) if IO::Select->new($s)->can_read(1.5);
+    }
+    $r =~ tr/\000//d;
+    print $r;
+' "${host}" "${port}" 2>/dev/null)"
 [ -z "${resp}" ] && { echo 0; exit 0; }
 
 # Player lines start at line 3: <score> <ping> "name" [team]. Count clients whose

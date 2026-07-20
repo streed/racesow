@@ -160,6 +160,18 @@
 			window.close();
 		}
 
+		void btn_reverse( Element@ self, Event@ evt )
+		{
+			game.execAppend( "reverse\n" );
+			window.close();
+		}
+
+		void btn_showtriggers( Element@ self, Event@ evt )
+		{
+			game.execAppend( "showtriggers\n" );
+			window.close();
+		}
+
 		void btn_texturepack( Element@ self, Event@ evt )
 		{
 		}
@@ -246,6 +258,10 @@
 							<keyselect bind="position save"/>
 							<div class="title">Noclip mode</div>
 							<keyselect bind="noclip"/>
+							<div class="title">Toggle reverse mode</div>
+							<keyselect bind="reverse"/>
+							<div class="title">Show/hide triggers</div>
+							<keyselect bind="showtriggers"/>
 							<div class="title">Quickmenu</div>
 							<keyselect bind="+quickmenu"/>
 							<div class="title">Open this menu</div>
@@ -274,6 +290,8 @@
 					<button onclick="$btn_recommended">Recommended settings</button>
 					<button onclick="$btn_toplist">Show toplist</button>
 					<button onclick="$btn_randmap">Vote random map</button>
+					<button onclick="$btn_reverse">Race in reverse</button>
+					<button onclick="$btn_showtriggers">Toggle triggers</button>
 				</div>
 				<h2>Help</h2>
 				<div>

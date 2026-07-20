@@ -110,9 +110,24 @@ function rankClass(r) {
   return r === 1 ? "rank-1" : r === 2 ? "rank-2" : r === 3 ? "rank-3" : "";
 }
 
-/* External link to a map's page on padpork.org (map downloads/info). */
+/* Reverse-mode maps are recorded under a "<map>-reversed" name (a separate
+   leaderboard from the normal run of the same BSP — see the About page). These
+   helpers strip/label that suffix for display; the raw name stays intact for
+   search, routing and API calls. */
+const REVERSE_SUFFIX = "-reversed";
+const isReversedMap = (n) => typeof n === "string" && n.endsWith(REVERSE_SUFFIX);
+const baseMapName = (n) => (isReversedMap(n) ? n.slice(0, -REVERSE_SUFFIX.length) : n);
+// Escaped display HTML for a map name: the base name, plus a REVERSE pill for
+// reversed variants. Safe to interpolate directly into markup.
+const mapNameHtml = (n) =>
+  isReversedMap(n)
+    ? `${esc(baseMapName(n))} <span class="pill rev" title="Reverse route — separate leaderboard">REVERSE</span>`
+    : esc(n);
+
+/* External link to a map's page on padpork.org (map downloads/info). Reversed
+   variants have no padpork entry, so link to the base map. */
 function padporkUrl(mapName) {
-  return "https://padpork.org/maps/" + encodeURIComponent(mapName);
+  return "https://padpork.org/maps/" + encodeURIComponent(baseMapName(mapName));
 }
 
 function setActiveNav(path) {
@@ -209,7 +224,7 @@ async function viewOverview() {
               <div class="feeditem clickable" data-nav="#/map/${r.map_id}">
                 <div class="fi-main">
                   ${r.global_rank === 1 ? '<span class="pill wr">WR</span> ' : ""}${wname(r.name)}
-                  <span class="fi-map">${esc(r.map)}</span>
+                  <span class="fi-map">${mapNameHtml(r.map)}</span>
                 </div>
                 <div class="fi-side">
                   <span class="time">${fmtTime(r.time)}</span>
@@ -236,7 +251,7 @@ async function viewOverview() {
             <tbody>
               ${d.topMaps.map((m) => `
                 <tr class="clickable" data-nav="#/map/${m.id}">
-                  <td class="mapname">${esc(m.name)}</td>
+                  <td class="mapname">${mapNameHtml(m.name)}</td>
                   <td class="num">${fmtNum(m.records != null ? m.records : m.races)}</td>
                   <td class="num">${fmtNum(m.finishes != null ? m.finishes : m.races)}</td>
                 </tr>`).join("")}
@@ -340,8 +355,8 @@ async function viewMaps(params) {
         <tbody>
           ${data.rows.map((m) => `
             <tr class="clickable" data-nav="#/map/${m.id}">
-              <td class="mapname">${esc(m.name)}
-                <a class="extlink" href="${padporkUrl(m.name)}" target="_blank" rel="noopener external" title="${esc(m.name)} on padpork.org">↗</a>
+              <td class="mapname">${mapNameHtml(m.name)}
+                <a class="extlink" href="${padporkUrl(m.name)}" target="_blank" rel="noopener external" title="${esc(baseMapName(m.name))} on padpork.org">↗</a>
               </td>
               <td class="num">${fmtNum(m.records != null ? m.records : m.races)}</td>
               <td class="num">${fmtNum(m.finishes != null ? m.finishes : m.races)}</td>
@@ -451,7 +466,7 @@ async function viewMap(id) {
   }
 
   app.innerHTML = `
-    <div class="crumbs"><a data-nav="#/maps">Maps</a> / ${esc(d.name)}</div>
+    <div class="crumbs"><a data-nav="#/maps">Maps</a> / ${esc(baseMapName(d.name))}${isReversedMap(d.name) ? " (reverse)" : ""}</div>
     ${wr ? `
       <div class="wr-banner">
         <div class="kicker">◆ World Record</div>
@@ -470,7 +485,8 @@ async function viewMap(id) {
       </div>` : ""}
     ${perfectHtml}
 
-    <div class="page-title">${esc(d.name)}</div>
+    <div class="page-title">${mapNameHtml(d.name)}</div>
+    ${isReversedMap(d.name) ? `<p class="page-sub reverse-note">Reverse route of <b>${esc(baseMapName(d.name))}</b> — start at the finish line, run the checkpoints backward to the start. Separate leaderboard from the normal map. <a data-nav="#/about">How reverse mode works ↗</a></p>` : ""}
     <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board
       · <a class="extlink" href="${padporkUrl(d.name)}" target="_blank" rel="noopener external">padpork.org ↗</a></p>
 
@@ -679,7 +695,7 @@ async function viewPlayer(id, params) {
         <tbody>
           ${rec.rows.map((r) => `
             <tr class="clickable" data-nav="#/map/${r.map_id}">
-              <td class="mapname">${esc(r.map_name)}</td>
+              <td class="mapname">${mapNameHtml(r.map_name)}</td>
               <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
               <td class="num ${rankClass(r.rank)}">${r.rank === 1 ? '<span class="pill wr">WR</span> ' : ""}#${fmtNum(r.rank)}</td>
               <td><span class="pill ${r.version === 1 ? "v1" : ""}">${esc(r.versionName || "")}</span></td>
@@ -970,6 +986,15 @@ const ABOUT_CMDS = [
     ],
   },
   {
+    title: "Reverse mode",
+    note: "Race the map backwards. Cross the FINISH line to start your timer, run the checkpoints in reverse, and cross the START line to finish. Prejump rules still apply. Your time is saved on a separate “<map>-reversed” leaderboard (shown with a REVERSE badge on this site) and never mixes with the normal times.",
+    rows: [
+      ["/reverse", "Race the map backwards. Teleports you to the finish line (your reverse start) and drops you into noclip to fine-tune the spot; leave noclip (/noclip, or /reverse again) to lock it in as your spawn. Then cross the finish to start."],
+      ["/showtriggers", "Toggle markers at the start and finish trigger planes so you can see where to cross. Only you see them."],
+      ["/reverse off", "Leave reverse mode and go back to a normal run. /kill and restarts return you to your saved reverse start."],
+    ],
+  },
+  {
     title: "Chat & players",
     rows: [
       ["/m <name> <message>", "Private-message a player (partial name matches). Reply with /m + part of their name."],
@@ -1003,6 +1028,8 @@ const ABOUT_FAQ = [
     "This server's mod folder is called <span class=\"mono\">racemod</span>, but the old livesow / mgxrace servers ran under <span class=\"mono\">racemod_2.1</span>. Warsow keeps each mod's binds, configs and texture packs in its own folder, so your old setup doesn't carry over on its own. To bring it across, open your Warsow game folder, go into the old <span class=\"mono\">racemod_2.1</span> folder, and copy your config files (e.g. <span class=\"mono\">config.cfg</span> / autoexec) and any texture or HUD packs into the <span class=\"mono\">racemod</span> folder. Restart Warsow, reconnect, and your binds will be back."],
   ["Why wasn't my time saved?",
     "Times only count in a clean race-mode run. If you toggled <span class=\"mono\">/practicemode</span>, <span class=\"mono\">/noclip</span>, or used <span class=\"mono\">/position</span>, that run won't be recorded. Use <span class=\"mono\">/kill</span> to get back to the start and race it straight through."],
+  ["What is reverse mode?",
+    "Reverse mode lets you race a map <b>backwards</b>. Type <span class=\"mono\">/reverse</span> to turn it on: it teleports you to just outside the map's <b>finish</b> line — your reverse start — and drops you into noclip to fine-tune the exact spot. Leave noclip (<span class=\"mono\">/noclip</span>, or <span class=\"mono\">/reverse</span> again) to lock it in as your spawn — <span class=\"mono\">/kill</span> and restarts return you there. Then run through the finish line to start the clock, run the checkpoints in reverse, and cross the <b>start</b> line to finish. Prejump rules still apply. Use <span class=\"mono\">/showtriggers</span> to see where the planes are. Reverse times live on their own separate leaderboard — the map appears here as <span class=\"mono\">&lt;map&gt;-reversed</span> with a <span class=\"pill rev\">REVERSE</span> badge — and never mix with the normal times. Use <span class=\"mono\">/reverse off</span> to go back to a normal run."],
   ["What are the ghosts I keep seeing?",
     "The EU and US servers are meshed. Players on the other server show up as translucent, non-solid ghosts whenever you're on the same map, so you can race alongside them across the Atlantic. You never collide with them. Use <span class=\"mono\">/who</span> to see who's who, and <span class=\"mono\">/watch</span> to follow one."],
   ["Who's the ghost racing the world record?",
@@ -1197,7 +1224,7 @@ function initGlobalSearch() {
           html += `<div class="rgroup-title">Maps</div>`;
           html += d.maps.map((m) => `
             <div class="ritem" data-nav="#/map/${m.id}">
-              <span class="mapname">${esc(m.name)}</span><small>${fmtNum(m.finishes != null ? m.finishes : m.races)} finishes</small>
+              <span class="mapname">${mapNameHtml(m.name)}</span><small>${fmtNum(m.finishes != null ? m.finishes : m.races)} finishes</small>
             </div>`).join("");
         }
         box.innerHTML = html || `<div class="ritem"><small>No matches.</small></div>`;

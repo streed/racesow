@@ -17,6 +17,25 @@
 
 const String RACELOG_FILE = "racelog/events.log";
 
+// Reverse mode (see /reverse in commands.as): a run raced backwards through the
+// course is a wholly separate record set. It is never distinguished by a flag —
+// instead every map-scoped identity (the API report, the topscores file, the
+// live top board, demos and ghosts) uses this suffixed name, so the stats site
+// auto-creates a distinct "<map>-reversed" level with its own leaderboard. The
+// suffix is deliberately regex-safe (no spaces) so it passes the game-facing
+// read endpoints and the RS_ApiFetchTop native's map-name filter unchanged.
+const String REVERSE_SUFFIX = "-reversed";
+
+// The effective map name for a run: "<map>-reversed" for a reversed run, else
+// the plain lowercased BSP name. Used everywhere a per-run map identity is
+// derived (reporting, attempts, topscores, demos, ghosts).
+String RACE_EffectiveMapName( bool reversed )
+{
+    Cvar mapNameVar( "mapname", "", 0 );
+    String mapName = mapNameVar.string.tolower();
+    return reversed ? mapName + REVERSE_SUFFIX : mapName;
+}
+
 // Direct-to-API reporting (RS_ApiReportRace native, see the deployment repo's
 // server/enginepatches/g_rs_api.cpp). When rs_api_url is set, every finish is
 // POSTed straight to the central /api/ingest with the rs_api_token bearer
@@ -53,9 +72,13 @@ void RACE_FlushAttempts( Client @client )
 
     if ( rsApiUrl.string.length() == 0 )
         return;
-    Cvar mapNameVar( "mapname", "", 0 );
+    // Attribute the flush to the map variant the player is currently racing, so
+    // reverse attempts land on the "<map>-reversed" level. (A run is wholly
+    // reversed-or-not, so the current flag is the right bucket for its starts.)
+    Player@ player = RACE_GetPlayer( client );
+    String mapName = RACE_EffectiveMapName( player !is null && player.reversed );
     RS_ApiReportAttempts( rsApiUrl.string, rsApiToken.string, rsApiVersion.string,
-            mapNameVar.string.tolower(), client.name, client.getMMLogin(), int( n ) );
+            mapName, client.name, client.getMMLogin(), int( n ) );
 }
 
 // Map is ending: flush everyone still holding uncounted starts (the script
@@ -81,9 +104,17 @@ void RACE_LogFinish( Player @player )
     if ( !player.current_recordTime.isFinished() )
         return;
 
-    Cvar mapNameVar( "mapname", "", 0 );
-    String mapName = mapNameVar.string.tolower();
+    String mapName = RACE_EffectiveMapName( player.reversed );
 
+    // Checkpoints are always emitted in physical (spatial id) order — the same
+    // order the local topscores board and the apitop reload use. Keeping ONE
+    // order across all three (local board, API report, API-fetched board) is
+    // what makes the in-game per-checkpoint comparisons align regardless of the
+    // board's source. For a reversed run this means the times run high id ->
+    // low id descending (the finish is crossed first); the finish-time ranking
+    // and the separate "<map>-reversed" leaderboard are unaffected. (A prettier
+    // ascending per-segment split view for reversed maps on the website would be
+    // a web-side follow-up.)
     String cps = "";
     for ( uint i = 0; i < numCheckpoints; i++ )
     {
