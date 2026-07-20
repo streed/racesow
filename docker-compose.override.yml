@@ -9,6 +9,8 @@ services:
     environment:
       PUBLIC_ORIGIN: "https://racesow.org"
       REDIS_URL: "redis://redis:6379"
+      # Live HLS stream per enrolled server id (web/streams.js). Public URLs.
+      STREAM_URLS: "1=https://racesow.org/hls/eu/index.m3u8,2=https://racesow.org/hls/us/index.m3u8"
     ports: !override
       - "127.0.0.1:8080:8080"
 
@@ -41,6 +43,7 @@ services:
       PUBLIC_ORIGIN: "https://racesow.org"
       # Shares the same Redis as the base web replica (see docker-compose.yml).
       REDIS_URL: "redis://redis:6379"
+      STREAM_URLS: "1=https://racesow.org/hls/eu/index.m3u8,2=https://racesow.org/hls/us/index.m3u8"
       INGEST_TOKEN: "${INGEST_TOKEN:-}"
       DEMO_BASE_URL: "${DEMO_BASE_URL:-}"
       GHOST_DIR: "/data/ghosts"
