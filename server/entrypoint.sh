@@ -304,6 +304,11 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # every ~30s so a map blocked in the web admin leaves the vote pool
         # without a restart. Same list the g_maplist build above already drops.
         echo "set rs_api_blocked_url \"${INGEST_URL%/api/ingest}/api/game/blocked-maps\""
+        # Live MOTD (hrace/motd.as): the gametype polls this every ~60s and
+        # feeds sv_MOTDString, so the message admins edit at /admin/motd shows
+        # to connecting players without a restart. Until the first successful
+        # fetch the server.cfg default applies.
+        echo "set rs_api_motd_url \"${INGEST_URL%/api/ingest}/api/game/motd\""
     fi
     # Cross-server player mirroring: the gametype reads these and drives the
     # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.

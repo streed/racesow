@@ -429,6 +429,17 @@ api.get("/game/blocked-maps", cache(30), wrap(async (_req, res) => {
   res.type("text/plain").send(names.length ? names.join("\n") + "\n" : "");
 }));
 
+// Message of the day for the game servers: the gametype polls this (~60s,
+// hrace/motd.as) and sets the engine's sv_MOTDString cvar, so an admin edit
+// reaches newly connecting players without a restart. The "RSMOTD" first line
+// lets the game-side native reject captive-portal / proxy error bodies that
+// answer 200 (same idea as the RSGHOST header). An empty value after the
+// header is a real state — "show no MOTD" — not an error.
+api.get("/game/motd", cache(30), wrap(async (_req, res) => {
+  const s = await race.getSetting("motd");
+  res.type("text/plain").send("RSMOTD\n" + (s ? s.value : ""));
+}));
+
 api.get("/health", (_req, res) => res.json({ ok: true }));
 
 // Metadata for the latest public database backup: size, sha256, when it was
@@ -1309,7 +1320,7 @@ admin.get("/flags", requireAdmin, wrap(async (req, res) => {
   sendAdmin(res, "Flag queue", `
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
-      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a> · <a href="/admin/logs">logs</a> · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/account">account</a></p>
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a> · <a href="/admin/logs">logs</a> · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/motd">motd</a> · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
 }));
 
@@ -1436,6 +1447,49 @@ admin.get("/blocked", requireAdmin, wrap(async (req, res) => {
     <p class="sub">${rows.length} map${rows.length === 1 ? "" : "s"} removed from the vote pool + cycle ·
       served to game servers at <span style="font-family:monospace">/api/game/blocked-maps</span></p>
     ${done}${body}`, req.session);
+}));
+
+// --- Game-server MOTD ---
+// The text travels: site_setting -> /api/game/motd -> sv_MOTDString cvar -> a
+// `motd 1 "<text>"` game command to each connecting client. A double quote
+// would close that quoted argument early, so it becomes a single quote; CRs
+// and other control characters (newline excepted — the MOTD box is
+// multi-line) are dropped. The engine truncates at MAX_MOTD_LEN (1024) — cap
+// below that so what an admin previews here is exactly what ships.
+function sanitizeMotd(raw) {
+  return String(raw || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/"/g, "'")
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, "")
+    .trim()
+    .slice(0, 1000);
+}
+
+admin.get("/motd", requireAdmin, wrap(async (req, res) => {
+  const done = req.query.ok ? `<div class="msg ok">Saved. Game servers pick it up within ~2 minutes; it shows to players connecting after that.</div>` : "";
+  const s = await race.getSetting("motd");
+  const meta = s && s.updated_at
+    ? `<p class="sub">last changed ${fmtWhen(s.updated_at)}${s.updated_by ? ` by ${escHtml(s.updated_by)}` : ""}</p>`
+    : "";
+  sendAdmin(res, "MOTD", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Message of the day</h1>
+    <p class="sub">Shown to every player connecting to a game server ·
+      served at <span style="font-family:monospace">/api/game/motd</span> ·
+      empty = no MOTD popup · Warsow ^colors work · quotes become apostrophes</p>
+    ${done}${meta}
+    <form class="card" method="post" action="/admin/motd" style="max-width:640px">
+      <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+      <label for="motd">MOTD (max 1000 chars, multi-line ok)</label>
+      <textarea id="motd" name="motd" rows="5" maxlength="1000"
+        style="width:100%;box-sizing:border-box;font-family:monospace">${escHtml(s ? s.value : "")}</textarea>
+      <div class="actions"><button class="primary" type="submit">Save</button></div>
+    </form>`, req.session);
+}));
+
+admin.post("/motd", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  await race.setSetting("motd", sanitizeMotd(req.body && req.body.motd), req.session.username);
+  res.redirect(303, "/admin/motd?ok=1");
 }));
 
 // --- Account (self-service password change) ---

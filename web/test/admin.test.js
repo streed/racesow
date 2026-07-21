@@ -344,3 +344,53 @@ test("admin blocks a map: it appears on the game + JSON blocked endpoints, its f
   assert.equal(unblock.status, 303);
   assert.equal((await (await fetch(`${base}/api/game/blocked-maps`)).text()).trim(), "");
 });
+
+test("admin edits the MOTD: sanitized, then served on /api/game/motd", async () => {
+  const login = await fetch(`${base}/admin/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ username: ADMIN_USER, password: ADMIN_PASS }),
+  });
+  const cookie = `rs_admin=${cookieValue(login, "rs_admin")}`;
+
+  // Anonymous access bounces to login; the editor shows the seeded default.
+  const anon = await fetch(`${base}/admin/motd`, { redirect: "manual" });
+  assert.equal(anon.status, 302);
+  const page = await (await fetch(`${base}/admin/motd`, { headers: { cookie } })).text();
+  assert.match(page, /Welcome to a Dockerized Warsow race server/);
+  const csrf = page.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
+  assert.ok(csrf);
+
+  // Missing CSRF -> 403, nothing saved.
+  const forged = await fetch(`${base}/admin/motd`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ motd: "hax" }),
+  });
+  assert.equal(forged.status, 403);
+
+  // Save a messy value: CRLF newlines, a double quote (would break the
+  // `motd 1 "<text>"` game command quoting) and a control char.
+  const save = await fetch(`${base}/admin/motd`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ _csrf: csrf, motd: 'Race night ^2Friday!\r\nSay "hi" in chat\x07' }),
+  });
+  assert.equal(save.status, 303);
+
+  const body = await (await fetch(`${base}/api/game/motd`)).text();
+  assert.equal(body, "RSMOTD\nRace night ^2Friday!\nSay 'hi' in chat");
+
+  // Clearing is a real state (no MOTD popup), not an error.
+  const clear = await fetch(`${base}/admin/motd`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ _csrf: csrf, motd: "" }),
+  });
+  assert.equal(clear.status, 303);
+  assert.equal(await (await fetch(`${base}/api/game/motd`)).text(), "RSMOTD\n");
+});

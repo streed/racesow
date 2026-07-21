@@ -298,6 +298,49 @@ BLOCKED_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, BLOCKED_ENTRY, "asGlobFuncs blocked entry")
 
+# --- 1g. live MOTD: pull the central message of the day -----------------------
+# Adds RS_ApiFetchMotd / RS_ApiPollMotd / RS_MotdText (impl in g_rs_api.cpp).
+# The gametype polls every ~60s (hrace/motd.as) and sets the engine's
+# sv_MOTDString cvar, so an MOTD edited in the web admin shows to newly
+# connecting players without a restart (the engine-side patch-motd-live.py
+# makes SV_MOTD_Get_f re-read the cvar per request). Anchors re-emitted so they
+# stay unique. The Dockerfile asserts on "asFunc_RS_ApiFetchMotd".
+MOTD_WRAPPER = (
+    "// racesow-docker: live message of the day - GETs the central\n"
+    "// /api/game/motd text (an RSMOTD header line, then the message) into\n"
+    "// memory; the gametype polls RS_ApiPollMotd and reads RS_MotdText, then\n"
+    "// sets sv_MOTDString, so an MOTD edited in the web admin shows to newly\n"
+    "// connecting players without a restart.\n"
+    "void RS_ApiFetchMotd( const char *url, const char *token );\n"
+    "int RS_ApiPollMotd( void );\n"
+    "const char *RS_MotdText( void );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchMotd( asstring_t *url, asstring_t *token )\n"
+    "{\n"
+    "\tif( !url || !url->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchMotd( url->buffer, token && token->buffer ? token->buffer : \"\" );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollMotd( void ) { return RS_ApiPollMotd(); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_MotdText( void )\n"
+    "{\n"
+    "\tconst char *s = RS_MotdText();\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, MOTD_WRAPPER, "asFunc motd wrapper")
+
+MOTD_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchMotd( const String &in url, const String &in token )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchMotd), NULL },\n"
+    "\t{ \"int RS_ApiPollMotd()\", asFUNCTION(asFunc_RS_ApiPollMotd), NULL },\n"
+    "\t{ \"const String @RS_MotdText()\", asFUNCTION(asFunc_RS_MotdText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, MOTD_ENTRY, "asGlobFuncs motd entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

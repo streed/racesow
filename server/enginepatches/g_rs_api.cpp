@@ -42,7 +42,8 @@ enum RequestType {
 	REQ_POST_REPORT,   // fire-and-forget race finish -> /api/ingest
 	REQ_GET_TOPSCORES, // live top scores -> swapped into the local topscores file
 	REQ_GET_GHOST,     // WR ghost trajectory -> parsed into memory (RS_ApiPollGhost)
-	REQ_GET_BLOCKED    // live map blocklist -> stored in memory (RS_ApiPollBlocked)
+	REQ_GET_BLOCKED,   // live map blocklist -> stored in memory (RS_ApiPollBlocked)
+	REQ_GET_MOTD       // live message of the day -> stored in memory (RS_ApiPollMotd)
 };
 
 // note: no default member initializers — the game module builds as C++11,
@@ -107,10 +108,22 @@ struct ApiState {
 	std::mutex blockedMutex;
 	std::string blockedText;
 
+	// MOTD fetch handshake (same shape again). motdRaw holds the raw payload
+	// INCLUDING its "RSMOTD\n" header line: empty therefore means "never
+	// fetched", while a bare header means "fetched, admin wants no MOTD" — the
+	// distinction keeps a cleared MOTD from being confused with a failure. The
+	// worker only signals 1 when the payload actually changed, so the gametype
+	// does not rewrite sv_MOTDString every refresh interval. The script thread
+	// reads the header-stripped text with RS_MotdText after a poll of 1.
+	std::atomic<unsigned> fetchMotdGen;
+	std::atomic<int> fetchMotdResult;
+	std::mutex motdMutex;
+	std::string motdRaw;
+
 	ApiState()
 		: stop( false ), fetchGen( 0 ), fetchResult( 0 ), fetchGhostGen( 0 ), fetchGhostResult( 0 ),
-		  fetchBlockedGen( 0 ), fetchBlockedResult( 0 ),
-		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ) {}
+		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ),
+		  fetchBlockedGen( 0 ), fetchBlockedResult( 0 ), fetchMotdGen( 0 ), fetchMotdResult( 0 ) {}
 };
 
 // Script-thread-only accumulator for building a ghost upload body incrementally
@@ -457,6 +470,50 @@ void workerMain( ApiState *s )
 					fprintf( stderr, "rs_api: blocked-maps fetch failed for good, status %ld: %s\n",
 						status, req.url.c_str() );
 				s->fetchBlockedResult.store( -1 );
+				continue;
+			}
+			// transient: fall through to the requeue below
+		} else if( req.type == REQ_GET_MOTD ) {
+			// A fetch queued once shutdown is under way is worthless: nobody
+			// will ever poll the result.
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchMotdGen.load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded while in flight — drop silently
+				// The web always prefixes the text with an "RSMOTD" header
+				// line, so a captive portal / proxy error page answering 200
+				// can never become the message of the day.
+				if( payload.compare( 0, 7, "RSMOTD\n" ) != 0 ) {
+					fprintf( stderr, "rs_api: rejecting non-motd payload from %s\n",
+						req.url.c_str() );
+					s->fetchMotdResult.store( -1 );
+					continue;
+				}
+				{
+					std::lock_guard<std::mutex> lock( s->motdMutex );
+					// Unchanged since the last swap: skip the signal — the
+					// gametype would only rewrite sv_MOTDString with the same
+					// value (same idea as the topscores file compare).
+					if( payload == s->motdRaw )
+						continue;
+					s->motdRaw.swap( payload );
+				}
+				s->fetchMotdResult.store( 1 );
+				continue;
+			}
+			if( !current )
+				continue; // superseded — do not burn retries on a stale fetch
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				if( status != 404 )
+					fprintf( stderr, "rs_api: motd fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchMotdResult.store( -1 );
 				continue;
 			}
 			// transient: fall through to the requeue below
@@ -1114,5 +1171,86 @@ const char *RS_BlockedListText( void )
 	}
 	std::lock_guard<std::mutex> lock( s->blockedMutex );
 	buf = s->blockedText;
+	return buf.c_str();
+}
+
+/*
+ * RS_ApiFetchMotd / RS_ApiPollMotd / RS_MotdText
+ *
+ * Fetch the central message of the day from <url> (the public /api/game/motd
+ * endpoint: an "RSMOTD" header line, then the text verbatim — possibly empty,
+ * meaning "show no MOTD") into memory. RS_ApiPollMotd() returns 1 when a
+ * CHANGED payload has landed (read it with RS_MotdText and set sv_MOTDString),
+ * -1 when the last fetch failed for good, 0 otherwise. The gametype refreshes
+ * this every ~60s so an MOTD edited in the web admin shows to newly connecting
+ * players without a server restart. A newer fetch supersedes an in-flight one;
+ * a failed fetch leaves the last good text (and thus the cvar) in place.
+ * No-op when url is empty.
+ */
+void RS_ApiFetchMotd( const char *url, const char *token )
+{
+	if( !url || !url[0] )
+		return;
+
+	ApiState *s = ensureStarted();
+	unsigned gen = s->fetchMotdGen.fetch_add( 1 ) + 1;
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			// evict another fetch (fully reproducible next interval) before a
+			// one-shot race report
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_MOTD || it->type == REQ_GET_BLOCKED ||
+					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
+			REQ_GET_MOTD, "", gen } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollMotd( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	return s->fetchMotdResult.exchange( 0 );
+}
+
+// Copy out the last-fetched MOTD text (header stripped). Called from the script
+// thread after a poll of 1; the AngelScript wrapper copies the static buffer
+// immediately (no reentrancy on the single script thread). The web already
+// sanitizes on save, but the text ends up inside the quoted argument of the
+// engine's `motd 1 "<text>"` game command, so defend here too: a double quote
+// becomes a single quote and control characters other than newline are
+// dropped. The engine itself truncates at MAX_MOTD_LEN (1024).
+const char *RS_MotdText( void )
+{
+	static std::string buf;
+	buf.clear();
+	ApiState *s = g_state;
+	if( !s )
+		return buf.c_str();
+	std::lock_guard<std::mutex> lock( s->motdMutex );
+	if( s->motdRaw.compare( 0, 7, "RSMOTD\n" ) != 0 )
+		return buf.c_str(); // never fetched
+	buf.reserve( s->motdRaw.size() );
+	for( size_t i = 7; i < s->motdRaw.size(); i++ ) {
+		unsigned char c = (unsigned char)s->motdRaw[i];
+		if( c == '"' )
+			buf += '\'';
+		else if( c == '\n' || c >= 0x20 )
+			buf += (char)c;
+	}
 	return buf.c_str();
 }

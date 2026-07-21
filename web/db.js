@@ -1830,6 +1830,20 @@ class RaceDB {
     );
   }
 
+  // --- Site settings (admin-edited key/value, e.g. the game-server MOTD) -----
+  // Returns null when the key was never set (callers pick their own default).
+  async getSetting(key) {
+    const r = await this.one("SELECT value, updated_at, updated_by FROM site_setting WHERE key = $1", [key]);
+    return r ? { value: r.value, updated_at: num(r.updated_at), updated_by: r.updated_by } : null;
+  }
+  async setSetting(key, value, by, now = Math.floor(Date.now() / 1000)) {
+    await this.pool.query(
+      `INSERT INTO site_setting (key, value, updated_at, updated_by) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by`,
+      [key, value, now, by || null]
+    );
+  }
+
   // --- Admin accounts + sessions ---------------------------------------------
   // Accounts are created out-of-band (admin.js admin-add); there is no public
   // sign-up. Returns null if the username is already taken.

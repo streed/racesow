@@ -255,6 +255,19 @@ test("/api/game/topscores serves the EXACT topscores file format the gametype pa
   assert.equal((await fetch(`${base}/api/game/topscores`)).status, 404);
 });
 
+test("/api/game/motd serves the RSMOTD-prefixed seeded default", async () => {
+  const r = await fetch(`${base}/api/game/motd`);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type"), /text\/plain/);
+  const body = await r.text();
+  // Contract with the game module's RS_ApiFetchMotd native: a fixed "RSMOTD"
+  // header line (so a proxy error page answering 200 can never become the
+  // MOTD), then the text verbatim. The migration seeds the message that used
+  // to be hardcoded in server.cfg.
+  assert.ok(body.startsWith("RSMOTD\n"), `missing RSMOTD header: ${JSON.stringify(body)}`);
+  assert.equal(body.slice("RSMOTD\n".length), "Welcome to a Dockerized Warsow race server - go fast!");
+});
+
 test("/api/live returns the (empty) presence snapshot shape", async () => {
   const live = await get("/live");
   assert.ok(Array.isArray(live.servers));

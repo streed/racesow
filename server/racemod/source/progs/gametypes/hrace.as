@@ -581,6 +581,12 @@ void GT_ThinkRules()
     // drops out of randmap/meshvote/prerandmap without a server restart
     RACE_ApiBlockedThink();
 
+    // live MOTD from the central admin (no-op when rs_api_motd_url is empty);
+    // an edit at /admin/motd shows to newly connecting players without a
+    // restart (feeds sv_MOTDString, which the patched engine re-reads per
+    // connect)
+    RACE_ApiMotdThink();
+
     // in-game WR ghost racer (no-op unless rs_wr_ghost + its URL are set); also
     // before the early-return so the ghost keeps looping while the scoreboard
     // is up

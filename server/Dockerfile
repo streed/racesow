@@ -66,6 +66,7 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "asFunc_RS_ApiFetchGhost" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFlag" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchBlocked" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchMotd" game/g_ascript.cpp \
     && grep -q "curl pthread" game/CMakeLists.txt
 
 # 7. Cross-server player mirroring: the RS_Mirror* natives (UDP mesh on a
@@ -133,6 +134,9 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
     # live map blocklist: the fetch native + its worker log string.
     && strings /libgame_x86_64.so | grep -q "RS_ApiFetchBlocked" \
     && strings /libgame_x86_64.so | grep -q "rs_api: blocked-maps fetch failed" \
+    # live MOTD: the fetch native + its worker log string.
+    && strings /libgame_x86_64.so | grep -q "RS_ApiFetchMotd" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: motd fetch failed" \
     && strings /libgame_x86_64.so | grep -q "racerecord" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: configured" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: bot slot" \
@@ -163,6 +167,13 @@ RUN python3 /tmp/patch-udp-download.py \
 COPY enginepatches/patch-status-hide-bots.py /tmp/patch-status-hide-bots.py
 RUN python3 /tmp/patch-status-hide-bots.py \
     && grep -q "racesow-docker: mirror-bot ghosts" server/sv_oob.c
+# Live MOTD: stock Warsow snapshots sv_MOTDString into svs.motd only at map
+# spawn, but the gametype now sets that cvar at runtime from the central
+# /api/game/motd (hrace/motd.as). Re-read it on every client "svmotd" request
+# so an admin edit shows to the very next connect, not the next map change.
+COPY enginepatches/patch-motd-live.py /tmp/patch-motd-live.py
+RUN python3 /tmp/patch-motd-live.py \
+    && grep -q "racesow-docker: live MOTD" server/sv_motd.c
 RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=OFF -DCMAKE_BUILD_TYPE=Release . \
     && make wsw_server -j"$(nproc)" \
     && cp build/wsw_server.x86_64 /wsw_server.x86_64 \
