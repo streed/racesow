@@ -1283,6 +1283,28 @@ async function viewAbout() {
         </div>
       </div>
 
+      <div class="page-title about-h2">HOW <span class="accent">RANKING</span> WORKS</div>
+      <p class="page-sub">Two standings sit side by side on every leaderboard and profile — <b>Points</b> and <b>Skill Rating</b>. They reward different things, so a name can top one and not the other.</p>
+      <div class="rank-groups">
+        <div class="panel rank-group">
+          <h3><span class="dot"></span> Points — the participation board</h3>
+          <div class="about-body">
+            <p>Points rewards showing up and placing. On every map, your best finish earns race points on a fixed top-15 scale — <b>100</b> for the world record, then 85, 75, 68, 62, 57, 53, 49, 46, 43, 40, 38, 36, 34, down to <b>32</b> for 15th. Finish outside the top 15 and that map scores nothing.</p>
+            <p>Your overall Points is the <b>sum</b> of those placements across every map you've raced, so the board favours breadth: race a lot of maps and place well on each one. Ties are broken by who holds more world records.</p>
+          </div>
+        </div>
+        <div class="panel rank-group">
+          <h3><span class="dot teal"></span> Skill Rating (SR) — the skill board</h3>
+          <div class="about-body">
+            <p>SR asks a different question — not how many maps, but how fast. It's a <b>0–1000</b> skill score built only from your strongest runs.</p>
+            <p>On each map, your personal best is scored against the world record: matching the record is a perfect <b>1.0</b>, and the score curves down steeply the further back you finish (it's the time ratio <b>cubed</b>, so the gap between 1st and 5th weighs far more than the gap between 200th and 300th).</p>
+            <p>Only <b>contested</b> maps count — a map needs at least <b>5 players</b> with a time before it can score, because a run with nobody to beat proves nothing. Busier maps count for more, too: a strong time against a crowded field is weighted above the same time on a quiet one.</p>
+            <p>Your rating is drawn from up to your <b>best 20 maps</b>, choosing whichever set of top runs gives the highest weighted average. A weak run can never drag you down — it simply doesn't count — so racing more maps can only ever help, and a 30-map career competes fairly with a 3000-map one. Thin, barely-contested records are pulled toward the pack until they're proven across a real sample, so a couple of lucky near-record times can't rocket you to the top.</p>
+            <p class="muted about-fineprint">World records and podium finishes are tracked on top of this and shown separately on your profile.</p>
+          </div>
+        </div>
+      </div>
+
       <div class="page-title about-h2">IN-GAME <span class="accent">COMMANDS</span></div>
       <p class="page-sub">Type these in chat or the console. Run <span class="mono">/help</span> in game for the built-in list, or <span class="mono">/help &lt;cmd&gt;</span> for detail on one.</p>
       <div class="cmd-groups">

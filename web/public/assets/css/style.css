@@ -566,6 +566,11 @@ a.replay-badge { text-decoration: none; }
 /* Command tables */
 .cmd-groups { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .cmd-note { padding: 12px 18px 0; margin: 0; font-size: 13px; }
+
+/* How ranking works — two side-by-side explainer panels (Points / SR) */
+.rank-groups { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+.rank-group .about-body { font-size: 14px; }
+.rank-group .about-body p { color: var(--muted); }
 .cmd-table td { vertical-align: top; }
 .cmd-table td.cmd { white-space: nowrap; padding-right: 16px; }
 .cmd-table code.mono { font-size: 12.5px; color: var(--orange-2); }
@@ -590,6 +595,7 @@ a.replay-badge { text-decoration: none; }
 @media (max-width: 720px) {
   .srv-cards { grid-template-columns: 1fr; }
   .cmd-groups { grid-template-columns: 1fr; }
+  .rank-groups { grid-template-columns: 1fr; }
 }
 
 /* ---------- Flag this map for review ---------- */
