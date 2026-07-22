@@ -467,8 +467,17 @@ async function runOnce({ all = false, only = null } = {}) {
 async function runLoop() {
   log(`loop start (interval=${INTERVAL_SECONDS}s, check=${CHECK_SECONDS}s, window=${ACTIVE_WINDOW_SECONDS}s, size=${SIZE}, out=${HEATMAP_DIR})`);
   let stop = false;
-  const nap = (s) => new Promise((r) => { const t = setTimeout(r, s * 1000); t.unref?.(); });
-  for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { log("shutting down"); stop = true; });
+  // The nap timer is deliberately NOT unref'd: between cycles it is the only
+  // handle keeping the event loop alive, so unref'ing it made the daemon exit(0)
+  // right after the first sleep — and `restart: unless-stopped` then re-ran the
+  // whole bootstrap every few seconds. `wake` lets a shutdown signal cut the
+  // current nap short so `docker stop` stays prompt (no waiting out CHECK_SECONDS).
+  let wake = null;
+  const nap = (s) => new Promise((resolve) => {
+    const t = setTimeout(resolve, s * 1000);
+    wake = () => { clearTimeout(t); resolve(); };
+  });
+  for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { log("shutting down"); stop = true; if (wake) wake(); });
 
   let lastFull = 0;
   while (!stop) {
