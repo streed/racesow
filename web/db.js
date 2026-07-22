@@ -1276,6 +1276,124 @@ class RaceDB {
     };
   }
 
+  // Resolve any variant id to its canonical player row + overall standing.
+  // Shared by compare() (and a natural home for any future multi-player view).
+  async playerCard(id) {
+    let canonId = id;
+    const c = await this.one("SELECT canonical_id FROM player WHERE id = $1", [id]);
+    if (c && c.canonical_id != null) canonId = num(c.canonical_id);
+    const player = await this.one("SELECT id, name, simplified, login FROM player WHERE id = $1", [canonId]);
+    if (!player) return null;
+    const standing = (await this.one(
+      "SELECT rank, points, sr, wr, podium, maps FROM standings WHERE player_id = $1",
+      [canonId]
+    )) || { rank: null, points: 0, sr: 0, wr: 0, podium: 0, maps: 0 };
+    if (standing.rank != null) standing.rank = num(standing.rank);
+    return {
+      id: num(player.id),
+      name: player.name,
+      simplified: player.simplified,
+      login: player.login,
+      standing,
+    };
+  }
+
+  // Head-to-head comparison of two players: overall standings side by side plus
+  // the direct record on every map BOTH have a PB for (the truest "who is
+  // faster" signal — same map, same task). Aggregate counts are computed in SQL
+  // over ALL shared maps so the headline verdict stays exact even though the
+  // per-map detail list is capped.
+  async compare(aId, bId, { limit = 1000 } = {}) {
+    const [a, b] = await Promise.all([this.playerCard(aId), this.playerCard(bId)]);
+    if (!a || !b) return null;
+    if (a.id === b.id) return { a, b, same: true, shared: 0, head: [], summary: null };
+
+    // Exact aggregate over the full shared-map set (positive relMargin => A is
+    // faster on average; it's the mean of (b_time-a_time)/midpoint per map).
+    const agg = await this.one(
+      `SELECT COUNT(*)::int AS shared,
+              SUM(CASE WHEN ba.time <  bb.time THEN 1 ELSE 0 END)::int AS a_wins,
+              SUM(CASE WHEN bb.time <  ba.time THEN 1 ELSE 0 END)::int AS b_wins,
+              SUM(CASE WHEN ba.time =  bb.time THEN 1 ELSE 0 END)::int AS ties,
+              AVG((bb.time - ba.time)::float / NULLIF((ba.time + bb.time) / 2.0, 0)) AS a_rel_margin
+       FROM best ba
+       JOIN best bb ON bb.map_id = ba.map_id AND bb.player_id = $2
+       WHERE ba.player_id = $1`,
+      [a.id, b.id]
+    );
+
+    // Per-map detail, most-competitive maps first (both players near the top).
+    const lim = clampLimit(limit, 1000, 5000);
+    const head = (
+      await this.all(
+        `SELECT ba.map_id, m.name,
+                ba.time AS a_time, bb.time AS b_time,
+                ba.rank AS a_rank, bb.rank AS b_rank
+         FROM best ba
+         JOIN best bb ON bb.map_id = ba.map_id AND bb.player_id = $2
+         JOIN map m ON m.id = ba.map_id
+         WHERE ba.player_id = $1
+         ORDER BY LEAST(ba.rank, bb.rank) ASC, lower(m.name) ASC
+         LIMIT $3`,
+        [a.id, b.id, lim]
+      )
+    ).map((r) => {
+      const aTime = r.a_time, bTime = r.b_time;
+      return {
+        mapId: num(r.map_id),
+        name: r.name,
+        aTime,
+        bTime,
+        aRank: r.a_rank,
+        bRank: r.b_rank,
+        delta: Math.abs(aTime - bTime),
+        winner: aTime < bTime ? "a" : bTime < aTime ? "b" : "tie",
+      };
+    });
+
+    const shared = num(agg.shared);
+    const aWins = num(agg.a_wins);
+    const bWins = num(agg.b_wins);
+    const ties = num(agg.ties);
+    const relMargin = agg.a_rel_margin == null ? null : Number(agg.a_rel_margin);
+
+    // Per-metric winners: which player leads each overall dimension. "sr" is the
+    // skill-first tiebreak used for the headline when the head-to-head is level.
+    const metric = (av, bv, higher = true) =>
+      av === bv ? "tie" : (higher ? av > bv : av < bv) ? "a" : "b";
+    const metrics = {
+      points: metric(a.standing.points, b.standing.points),
+      sr: metric(a.standing.sr, b.standing.sr),
+      wr: metric(a.standing.wr, b.standing.wr),
+      podium: metric(a.standing.podium, b.standing.podium),
+      maps: metric(a.standing.maps, b.standing.maps),
+    };
+
+    // Headline verdict: prefer the direct head-to-head (same maps, so it's the
+    // fairest); fall back to Skill Rating when they've never shared a map or
+    // split it evenly.
+    let leader = null;
+    let basis = null;
+    if (aWins !== bWins) {
+      leader = aWins > bWins ? "a" : "b";
+      basis = "head-to-head";
+    } else if (a.standing.sr !== b.standing.sr) {
+      leader = a.standing.sr > b.standing.sr ? "a" : "b";
+      basis = "sr";
+    } else if (a.standing.points !== b.standing.points) {
+      leader = a.standing.points > b.standing.points ? "a" : "b";
+      basis = "points";
+    }
+
+    return {
+      a,
+      b,
+      same: false,
+      summary: { shared, aWins, bWins, ties, relMargin, metrics, leader, basis },
+      head,
+    };
+  }
+
   // Tiered, typo-tolerant search over maps and players (pg_trgm):
   // exact match > prefix > substring > trigram-similar, then popularity.
   async search(q, { limit = 8 } = {}) {

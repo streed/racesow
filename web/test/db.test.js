@@ -190,6 +190,52 @@ test("skill rating (SR) rewards closeness to the WR over breadth of maps", async
   for (let i = 1; i < board.length; i++) assert.ok(board[i - 1] >= board[i], "players sorted by SR desc");
 });
 
+test("compare: head-to-head on shared maps drives the verdict", async (t) => {
+  const race = await freshDb(t);
+
+  // Alpha vs Beta share three maps (Alpha wins 2, Beta wins 1); Alpha has one
+  // extra solo map that must NOT count toward the head-to-head.
+  await race.ingest({ version: VER, map: "d1", source: "racelog", records: [finish("Alpha", 30000), finish("Beta", 32000)] });
+  await race.ingest({ version: VER, map: "d2", source: "racelog", records: [finish("Alpha", 40000), finish("Beta", 35000)] });
+  await race.ingest({ version: VER, map: "d3", source: "racelog", records: [finish("Alpha", 20000), finish("Beta", 25000)] });
+  await race.ingest({ version: VER, map: "solo", source: "racelog", records: [finish("Alpha", 10000)] });
+  await race.refreshAggregates();
+
+  const idOf = async (nick) =>
+    N((await race.one("SELECT canonical_id c FROM player WHERE simplified = $1", [nick])).c);
+  const alpha = await idOf("Alpha");
+  const beta = await idOf("Beta");
+
+  const cmp = await race.compare(alpha, beta);
+  assert.equal(cmp.a.id, alpha);
+  assert.equal(cmp.b.id, beta);
+  assert.equal(cmp.summary.shared, 3, "only the three shared maps count");
+  assert.equal(cmp.summary.aWins, 2);
+  assert.equal(cmp.summary.bWins, 1);
+  assert.equal(cmp.summary.ties, 0);
+  assert.equal(cmp.summary.leader, "a", "Alpha leads the head-to-head");
+  assert.equal(cmp.summary.basis, "head-to-head");
+  assert.equal(cmp.head.length, 3);
+  // Every detail row carries a resolved winner and a non-negative gap.
+  for (const h of cmp.head) {
+    assert.ok(["a", "b", "tie"].includes(h.winner));
+    assert.equal(h.delta, Math.abs(h.aTime - h.bTime));
+  }
+
+  // Order is symmetric: swapping sides swaps the wins and the leader.
+  const rev = await race.compare(beta, alpha);
+  assert.equal(rev.summary.aWins, 1);
+  assert.equal(rev.summary.bWins, 2);
+  assert.equal(rev.summary.leader, "b");
+
+  // Same player on both sides is flagged, not scored.
+  const self = await race.compare(alpha, alpha);
+  assert.equal(self.same, true);
+
+  // Unknown id -> null (the route turns this into a 404).
+  assert.equal(await race.compare(alpha, 999999), null);
+});
+
 test("every finish counts as an attempt; only the best is kept as the PR", async (t) => {
   const race = await freshDb(t);
 
