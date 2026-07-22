@@ -285,13 +285,18 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .map-heat-img img { display: block; max-width: 100%; max-height: 460px; width: auto; height: auto; image-rendering: auto; }
 .map-heat-cap { color: var(--muted); font-size: 13px; margin: 10px 2px 0; }
 
-/* Two-column map hero: title + stats on the left, the map viz alongside on the
-   right. Wraps to a stack on narrow screens. */
-.map-hero { display: flex; gap: 28px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 10px; }
+/* Two-column map hero: the records table on the left, the map viz alongside on
+   the right. The viz is sticky so it keeps you company while a long leaderboard
+   scrolls; on narrow screens the pair stacks with the viz on top (a quick look
+   at the map beats scrolling past 180 records to find it). */
+.map-hero { display: flex; gap: 28px; align-items: flex-start; margin-bottom: 24px; }
 .map-hero-main { flex: 1 1 320px; min-width: 0; }
-.map-hero .map-hero-viz { flex: 0 0 auto; width: 440px; max-width: 100%; margin: 0; }
+.map-hero .map-hero-viz { flex: 0 0 auto; width: 440px; max-width: 100%; margin: 0; position: sticky; top: 16px; }
 .map-hero .map-hero-viz .map-heat-img { max-width: 100%; margin: 0; }
-@media (max-width: 800px) { .map-hero .map-hero-viz { width: 100%; } }
+@media (max-width: 800px) {
+  .map-hero { flex-direction: column; }
+  .map-hero .map-hero-viz { width: 100%; order: -1; position: static; }
+}
 
 /* Player alias chips (collapsed name variants) */
 .aliases { color: var(--muted); font-size: 13px; margin: -12px 0 18px; }

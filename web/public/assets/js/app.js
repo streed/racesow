@@ -489,12 +489,29 @@ async function viewMap(id) {
       </div>` : ""}
     ${perfectHtml}
 
+    <div class="page-title">${mapNameHtml(d.name)}</div>
+    ${isReversedMap(d.name) ? `<p class="page-sub reverse-note">Reverse route of <b>${esc(baseMapName(d.name))}</b> — start at the finish line, run the checkpoints backward to the start. Separate leaderboard from the normal map. <a data-nav="#/about">How reverse mode works ↗</a></p>` : ""}
+    <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board
+      · <a class="extlink" href="${padporkUrl(d.name)}" target="_blank" rel="noopener external">padpork.org ↗</a></p>
+
     <div class="map-hero">
       <div class="map-hero-main">
-        <div class="page-title">${mapNameHtml(d.name)}</div>
-        ${isReversedMap(d.name) ? `<p class="page-sub reverse-note">Reverse route of <b>${esc(baseMapName(d.name))}</b> — start at the finish line, run the checkpoints backward to the start. Separate leaderboard from the normal map. <a data-nav="#/about">How reverse mode works ↗</a></p>` : ""}
-        <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board
-          · <a class="extlink" href="${padporkUrl(d.name)}" target="_blank" rel="noopener external">padpork.org ↗</a></p>
+        <div class="table-wrap"><div class="tscroll">
+          <table class="data">
+            <thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">Behind</th><th class="num">Gap</th><th>Version</th></tr></thead>
+            <tbody>
+              ${d.leaderboard.map((r, i) => `
+                <tr class="clickable" data-nav="#/player/${r.playerId}">
+                  <td class="rankcell ${rankClass(r.pos)}">${r.pos}</td>
+                  <td>${wname(r.name)}${r.ghost ? ` <span class="replay-badge" data-nav="#/replay/${id}/${r.playerId}" title="Watch this run in the browser">▶ replay</span>` : ""}${r.demo && r.demo.url ? ` <a class="replay-badge demo" href="${esc(r.demo.url)}" download rel="noopener" title="Download this run's demo">⬇ demo</a>` : ""}</td>
+                  <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
+                  <td class="num"><span class="time">${r.pos === 1 ? "—" : "+" + fmtTime(r.time - d.leaderboard[0].time)}</span></td>
+                  <td class="num"><span class="time muted">${i === 0 ? "—" : "+" + fmtTime(r.time - d.leaderboard[i - 1].time)}</span></td>
+                  <td><span class="pill ${r.version === 1 ? "v1" : ""}">${esc(r.versionName || "")}</span></td>
+                </tr>`).join("") || `<tr><td colspan="6" class="empty">No runs recorded.</td></tr>`}
+            </tbody>
+          </table>
+        </div></div>
       </div>
       ${d.heatmap ? `
       <div class="map-heat map-hero-viz">
@@ -505,23 +522,6 @@ async function viewMap(id) {
           ${fmtNum(d.heatmap.players)} run${d.heatmap.players === 1 ? "" : "s"} · refreshed nightly.</p>
       </div>` : ""}
     </div>
-
-    <div class="table-wrap"><div class="tscroll">
-      <table class="data">
-        <thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">Behind</th><th class="num">Gap</th><th>Version</th></tr></thead>
-        <tbody>
-          ${d.leaderboard.map((r, i) => `
-            <tr class="clickable" data-nav="#/player/${r.playerId}">
-              <td class="rankcell ${rankClass(r.pos)}">${r.pos}</td>
-              <td>${wname(r.name)}${r.ghost ? ` <span class="replay-badge" data-nav="#/replay/${id}/${r.playerId}" title="Watch this run in the browser">▶ replay</span>` : ""}${r.demo && r.demo.url ? ` <a class="replay-badge demo" href="${esc(r.demo.url)}" download rel="noopener" title="Download this run's demo">⬇ demo</a>` : ""}</td>
-              <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
-              <td class="num"><span class="time">${r.pos === 1 ? "—" : "+" + fmtTime(r.time - d.leaderboard[0].time)}</span></td>
-              <td class="num"><span class="time muted">${i === 0 ? "—" : "+" + fmtTime(r.time - d.leaderboard[i - 1].time)}</span></td>
-              <td><span class="pill ${r.version === 1 ? "v1" : ""}">${esc(r.versionName || "")}</span></td>
-            </tr>`).join("") || `<tr><td colspan="6" class="empty">No runs recorded.</td></tr>`}
-        </tbody>
-      </table>
-    </div></div>
 
     ${d.recentFinishes && d.recentFinishes.length ? `
     <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> every run</div>
