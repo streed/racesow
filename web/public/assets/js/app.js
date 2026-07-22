@@ -368,6 +368,7 @@ async function viewPlayers(params) {
           ${th("WRs", "wr", state, "num")}
           ${th("Podiums", "podium", state, "num")}
           ${th("Maps", "maps", state, "num")}
+          ${th("Last raced", "active", state, "num")}
         </tr></thead>
         <tbody>
           ${data.rows.map((p) => `
@@ -379,7 +380,8 @@ async function viewPlayers(params) {
               <td class="num">${fmtNum(p.wr)}</td>
               <td class="num">${fmtNum(p.podium)}</td>
               <td class="num">${fmtNum(p.maps)}</td>
-            </tr>`).join("") || `<tr><td colspan="7" class="empty">No players match “${esc(state.q)}”.</td></tr>`}
+              <td class="num">${p.last_active != null ? fmtAgo(p.last_active) : "—"}</td>
+            </tr>`).join("") || `<tr><td colspan="8" class="empty">No players match “${esc(state.q)}”.</td></tr>`}
         </tbody>
       </table>
     </div>${pager(state, data, "#/players")}</div>`;

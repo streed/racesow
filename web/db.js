@@ -308,7 +308,10 @@ async function buildAggregates(client) {
                    COALESCE(SUM((mm.wr_time::float / NULLIF(b.time, 0)) * mm.fw), 0)
                    + ${SR_KAPPA} * ${SR_MU}
                  ) / (COALESCE(SUM(mm.fw), 0) + ${SR_KAPPA})
-               )::int                                         AS sr
+               )::int                                         AS sr,
+               -- Most recent attempt-or-finish across all of this canonical
+               -- player's maps; NULL (never active) when no tally exists yet.
+               MAX(la.last_active)                            AS last_active
         FROM best_new b
         JOIN (
           SELECT map_id,
@@ -316,12 +319,20 @@ async function buildAggregates(client) {
                  log(2.0, (1 + COUNT(*))::numeric)::float AS fw
           FROM best_new GROUP BY map_id
         ) mm ON mm.map_id = b.map_id
+        LEFT JOIN (
+          SELECT pl.canonical_id AS player_id,
+                 NULLIF(MAX(GREATEST(COALESCE(rt.last_finish, 0),
+                                     COALESCE(rt.last_attempt, 0))), 0) AS last_active
+          FROM run_tally rt JOIN player pl ON pl.id = rt.player_id
+          GROUP BY pl.canonical_id
+        ) la ON la.player_id = b.player_id
         GROUP BY b.player_id
       ) s;
     CREATE INDEX ON standings_new(player_id);
     CREATE INDEX ON standings_new(points DESC);
     CREATE INDEX ON standings_new(sr DESC);
     CREATE INDEX ON standings_new(rank);
+    CREATE INDEX ON standings_new(last_active DESC NULLS LAST);
 
     CREATE UNLOGGED TABLE map_index_new AS
       SELECT m.id AS map_id, m.name AS name,
@@ -375,6 +386,7 @@ const PLAYER_SORTS = Object.assign(Object.create(null), {
   maps: "maps",
   rank: "rank",
   name: "lower(p.simplified)",
+  active: "s.last_active",
 });
 const RECORD_SORTS = Object.assign(Object.create(null), {
   // Reference the underlying column, not the SELECT alias: Postgres allows a
@@ -1115,6 +1127,9 @@ class RaceDB {
   async players({ q = "", sort = "points", order, limit, offset } = {}) {
     const col = PLAYER_SORTS[sort] || PLAYER_SORTS.points;
     const direction = dir(order, sort === "name" || sort === "rank" ? "ASC" : "DESC");
+    // Players with no recorded activity yet (last_active NULL) sort last in
+    // either direction, so the "last raced" ordering never leads with blanks.
+    const nulls = col === PLAYER_SORTS.active ? " NULLS LAST" : "";
     const lim = clampLimit(limit);
     const off = toOffset(offset);
     // Match a search against ANY name variant (trgm-indexed), then map to its
@@ -1132,14 +1147,19 @@ class RaceDB {
     const rows = (
       await this.all(
         `SELECT s.rank, s.player_id AS id, p.name, p.simplified, p.login,
-                s.points, s.sr, s.wr, s.podium, s.maps
+                s.points, s.sr, s.wr, s.podium, s.maps, s.last_active
          FROM standings s JOIN player p ON p.id = s.player_id
          ${where}
-         ORDER BY ${col} ${direction}, s.rank ASC
+         ORDER BY ${col} ${direction}${nulls}, s.rank ASC
          LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
         [...args, lim, off]
       )
-    ).map((r) => ({ ...r, rank: num(r.rank), id: num(r.id) }));
+    ).map((r) => ({
+      ...r,
+      rank: num(r.rank),
+      id: num(r.id),
+      last_active: r.last_active != null ? num(r.last_active) : null,
+    }));
     return { total, limit: lim, offset: off, rows };
   }
 
@@ -1926,11 +1946,12 @@ class RaceDB {
 
       const bumpAttempts = (playerId, count) =>
         client.query(
-          `INSERT INTO run_tally (player_id, map_id, version_id, finishes, attempts)
-           VALUES ($1, $2, $3, 0, $4)
+          `INSERT INTO run_tally (player_id, map_id, version_id, finishes, attempts, last_attempt)
+           VALUES ($1, $2, $3, 0, $4, $5)
            ON CONFLICT (player_id, map_id, version_id)
-           DO UPDATE SET attempts = run_tally.attempts + EXCLUDED.attempts`,
-          [playerId, mapRow.id, versionRow.id, count]
+           DO UPDATE SET attempts = run_tally.attempts + EXCLUDED.attempts,
+                         last_attempt = EXCLUDED.last_attempt`,
+          [playerId, mapRow.id, versionRow.id, count, now]
         );
 
       if (tally) {

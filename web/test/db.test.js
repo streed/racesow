@@ -277,6 +277,59 @@ test("topscores source backfills bests without inflating the attempt tally", asy
   assert.equal(N((await race.one("SELECT COUNT(*) c FROM race")).c), 1);
 });
 
+test("a finish stamps both last_finish and last_attempt (every finish is an attempt)", async (t) => {
+  const race = await freshDb(t);
+  const before = Math.floor(Date.now() / 1000);
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova", 50000)] });
+  const row = await race.one("SELECT last_finish, last_attempt FROM run_tally");
+  assert.ok(row.last_finish != null && row.last_finish >= before, "last_finish stamped");
+  assert.ok(row.last_attempt != null && row.last_attempt >= before, "last_attempt stamped");
+});
+
+test("standings expose last_active and players sort=active orders by recency", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({ version: VER, map: "m1", source: "racelog", records: [finish("Older", 50000)] });
+  await race.ingest({ version: VER, map: "m2", source: "racelog", records: [finish("Newer", 50000)] });
+
+  // ingest stamps "now" for both; force distinct activity times so ordering is
+  // deterministic. last_active = max(last_finish, last_attempt) per player.
+  await race.pool.query(
+    "UPDATE run_tally SET last_finish = 1000, last_attempt = 1000 WHERE player_id IN (SELECT id FROM player WHERE name = 'Older')"
+  );
+  await race.pool.query(
+    "UPDATE run_tally SET last_finish = 2000, last_attempt = 2000 WHERE player_id IN (SELECT id FROM player WHERE name = 'Newer')"
+  );
+  await race.refreshAggregates();
+
+  // Descending (the default for this sort) leads with the most recently active.
+  const desc = await race.players({ sort: "active" });
+  assert.deepEqual(desc.rows.map((r) => r.name), ["Newer", "Older"]);
+  assert.equal(desc.rows[0].last_active, 2000);
+  assert.equal(desc.rows[1].last_active, 1000);
+
+  // Ascending flips it.
+  const asc = await race.players({ sort: "active", order: "asc" });
+  assert.deepEqual(asc.rows.map((r) => r.name), ["Older", "Newer"]);
+});
+
+test("players with no tally (last_active NULL) sort last, never first", async (t) => {
+  const race = await freshDb(t);
+  // topscores source backfills a best WITHOUT tallying, so this player has a
+  // standing but no activity timestamp.
+  await race.ingest({ version: VER, map: "m1", source: "topscores", records: [finish("Ghost", 50000)] });
+  await race.ingest({ version: VER, map: "m2", source: "racelog", records: [finish("Active", 50000)] });
+  await race.refreshAggregates();
+
+  const desc = await race.players({ sort: "active" });
+  assert.equal(desc.rows[0].name, "Active", "active player leads");
+  assert.equal(desc.rows[desc.rows.length - 1].name, "Ghost", "NULL activity sorts last");
+  assert.equal(desc.rows.find((r) => r.name === "Ghost").last_active, null);
+
+  // NULLS still sort last even ascending — blanks never lead the list.
+  const asc = await race.players({ sort: "active", order: "asc" });
+  assert.equal(asc.rows[asc.rows.length - 1].name, "Ghost");
+});
+
 test("colour/spelling variants of one player collapse to one canonical identity", async (t) => {
   const race = await freshDb(t);
   await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("^8EL^9chupa^7", 50000)] });
