@@ -17,6 +17,17 @@ const int RECALL_ACTION_JUMP = 5;
 // timing-consistent ("/position recall delay").
 const int RECALL_HOLD = 20;
 
+// Movement-event detection (Player.detectMovementEvents). Wall jumps and dashes
+// are both triggered by the +Special key; the engine exposes no counter for
+// them, so we infer each from a rising edge of Key_Special and split by the
+// vertical velocity at the press — the same heuristic the replay viewer uses
+// (web/public/assets/js/replay.js). A strong vertical kick means a wall jump,
+// otherwise a ground dash. The per-type debounce approximates the real
+// walljump/dash cooldowns so a held/spammed +Special isn't counted repeatedly.
+const float WALLJUMP_VZ = 100;         // |velocity.z| above this at +Special => wall jump
+const uint WALLJUMP_DEBOUNCE = 1100;   // ms between counted wall jumps (approx cooldown)
+const uint DASH_DEBOUNCE = 500;        // ms between counted dashes (approx cooldown)
+
 // Noclip point-pull ("grapple"): in practice-mode noclip, holding Attack+Special
 // eases the player toward whatever surface they are aiming at. POINT_PULL is the
 // per-ms pull fraction; PULL_MARGIN keeps it from snapping onto a point-blank
@@ -140,6 +151,13 @@ class Player
     int[] bestGhostCp;
     int bestGhostCpCount;
 
+    // Movement-event detection state (see detectMovementEvents). Edge-detects
+    // +Special against the previous frame; the debounce timers are uCmdTimeStamp
+    // milliseconds of the last counted wall jump / dash.
+    bool prevSpecial;
+    uint lastWallJumpTime;
+    uint lastDashTime;
+
     void setupArrays( int size )
     {
         this.messageTimes.resize( MAX_FLOOD_MESSAGES );
@@ -212,6 +230,9 @@ class Player
         this.ghostCpCount = 0;
         this.bestGhostCount = 0;
         this.bestGhostCpCount = 0;
+        this.prevSpecial = false;
+        this.lastWallJumpTime = 0;
+        this.lastDashTime = 0;
         this.pos = -1;
         this.noclipSpawn = false;
 
@@ -1542,6 +1563,7 @@ class Player
         if ( RS_QueryPjState( this.client.playerNum )  )
         {
           this.client.addAward( S_COLOR_RED + "Prejumped!" );
+          RACE_PrejumpFailed( this ); // player metric: a start rejected for prejumping
 
             // for accuracy, reset scores.
             target_score_init( this.client );
@@ -1636,6 +1658,53 @@ class Player
     uint getSpeed()
     {
         return uint( HorizontalSpeed( this.client.getEnt().velocity ) );
+    }
+
+    // Per-frame (GT_ThinkRules): count wall jumps and dashes during a race.
+    // Both are +Special moves the engine gives no counter for, so infer each
+    // from a rising edge of Key_Special and split by vertical velocity (a wall
+    // jump kicks the player up/off a wall; a dash is a ground burst). Mirrors the
+    // replay viewer's classifier so in-game and replay counts stay consistent.
+    // Only genuine races are tracked, matching how attempts are counted. Feeds
+    // the per-client tallies in racelog.as (RACE_WallJump / RACE_Dash).
+    void detectMovementEvents()
+    {
+        if ( !this.inRace )
+        {
+            this.prevSpecial = false;
+            return;
+        }
+
+        Entity@ ent = this.client.getEnt();
+        if ( @ent == null )
+            return;
+
+        bool special = ( this.client.pressedKeys & Key_Special ) != 0;
+        if ( special && !this.prevSpecial ) // rising edge of +Special
+        {
+            uint now = this.timeStamp();
+            float vz = ent.velocity.z;
+            if ( vz < 0 )
+                vz = -vz;
+
+            if ( vz > WALLJUMP_VZ )
+            {
+                if ( now - this.lastWallJumpTime >= WALLJUMP_DEBOUNCE )
+                {
+                    RACE_WallJump( this );
+                    this.lastWallJumpTime = now;
+                }
+            }
+            else
+            {
+                if ( now - this.lastDashTime >= DASH_DEBOUNCE )
+                {
+                    RACE_Dash( this );
+                    this.lastDashTime = now;
+                }
+            }
+        }
+        this.prevSpecial = special;
     }
 
     void checkNoclipAction()

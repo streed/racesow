@@ -37,15 +37,23 @@ async function until(desc, fn, timeoutMs = 30000) {
   }
 }
 
+// Movement metrics carried on the harness lines / flush (run.sh):
+//   Nova finishes wj/da/pj/rs = 5/3/1/0 + 4/2/0/1 + 6/4/0/2 = 15/9/1/3
+//   Wave finish 7/1/2/0 + standalone flush 1/0/0/3        =  8/1/2/3
+// Phase B's retried Wave finish carries no metric fields, so totals are
+// unchanged from phase A.
+const novaMetrics = { wallJumps: 15, dashes: 9, prejumpFailures: 1, restarts: 3 };
+const waveMetrics = { wallJumps: 8, dashes: 1, prejumpFailures: 2, restarts: 3 };
+
 const expected =
   phase === "phaseA"
     ? { finishes: 4, wr: 48000, wrHolder: "Nova", wrSplits: [10000, 28000], perfect: 47500, board: [["Nova", 48000], ["Wave", 49000]],
         // starts: Nova 2+1+3 riding her finish reports; Wave 2 + a 4-start
         // standalone flush (run.sh curls it after the harness)
-        novaAttempts: 6, waveAttempts: 6 }
+        novaAttempts: 6, waveAttempts: 6, novaMetrics, waveMetrics }
     : { finishes: 5, wr: 47000, wrHolder: "Wave", wrSplits: [9500, 27000], perfect: 47000, board: [["Wave", 47000], ["Nova", 48000]],
         // phase B: Wave's retried finish carries the default 1 attempt
-        novaAttempts: 6, waveAttempts: 7 };
+        novaAttempts: 6, waveAttempts: 7, novaMetrics, waveMetrics };
 
 // 1. Every finish is recorded as an attempt (run tally, straight from the DB).
 const ov = await until(`overview.finishes == ${expected.finishes}`, async () => {
@@ -91,11 +99,13 @@ assert.equal(pd.records.rows[0].time, 48000, "Nova's PR");
 assert.equal(pd.finishes, 3, "Nova's finish count");
 assert.equal(pd.attempts, expected.novaAttempts, "Nova's total attempts (race starts)");
 assert.equal(pd.records.rows[0].attempts, expected.novaAttempts, "per-map attempts on the profile");
+assert.deepEqual(pd.metrics, expected.novaMetrics, "Nova's lifetime movement metrics");
 
 // 3b. Wave's total includes the standalone (finish-less) attempt flush.
 const wave = d.leaderboard.find((r) => r.simplified === "Wave");
 const wd = await get(`/players/${wave.playerId}`);
 assert.equal(wd.attempts, expected.waveAttempts, "Wave's attempts include the standalone flush");
+assert.deepEqual(wd.metrics, expected.waveMetrics, "Wave's metrics include the finish + standalone flush");
 
 // 4. Colour codes survive to the API for rendering (name vs simplified).
 assert.ok(nova.name.includes("^"), "raw colour-coded name preserved");

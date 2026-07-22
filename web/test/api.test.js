@@ -194,6 +194,41 @@ test("attempts accumulate: per-record counts, standalone flushes, old-server fal
   );
 });
 
+test("movement metrics ride finishes and standalone flushes into player totals", async () => {
+  // A finish carrying movement metrics — the exact JSON RS_ApiReportRace builds.
+  assert.equal(
+    (await ingest(
+      `{"version":"wsw 2.1","map":"movemap","source":"racelog","records":[{"name":"Strafer",` +
+        `"login":"","time":30000,"attempts":2,"checkpoints":[],"wall_jumps":10,"dashes":4,` +
+        `"prejump_failures":1,"restarts":2}]}`
+    )).status,
+    200
+  );
+  // A standalone flush (RS_ApiReportAttempts) carrying metrics: a lone /kill can
+  // even ride with count 0 but real restarts.
+  assert.equal(
+    (await ingest(
+      `{"version":"wsw 2.1","map":"movemap","source":"racelog","attempts":[{"name":"Strafer",` +
+        `"login":"","count":0,"wall_jumps":0,"dashes":0,"prejump_failures":0,"restarts":3}]}`
+    )).status,
+    200
+  );
+
+  await new Promise((r) => setTimeout(r, 3600)); // aggregate debounce for /search
+  const found = await get("/players?q=Strafer");
+  const pd = await get(`/players/${found.rows[0].id}`);
+  assert.deepEqual(pd.metrics, { wallJumps: 10, dashes: 4, prejumpFailures: 1, restarts: 2 + 3 });
+
+  // A flush with neither starts nor any metric is nothing to record -> rejected.
+  assert.equal(
+    (await ingest(
+      `{"version":"wsw 2.1","map":"movemap","source":"racelog","attempts":[{"name":"Strafer",` +
+        `"count":0,"wall_jumps":0,"dashes":0,"prejump_failures":0,"restarts":0}]}`
+    )).status,
+    400
+  );
+});
+
 test("re-sending the same finish is idempotent for records", async () => {
   const body = gameBody({ map: "testmap2", name: "Rep", time: 30000, cps: [15000] });
   const first = await ingest(body);

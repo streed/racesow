@@ -607,6 +607,17 @@ async function authenticateIngest(req) {
 // buggy or hostile server inflating a counter.
 const MAX_ATTEMPTS_PER_ENTRY = 10000;
 
+// Movement/behaviour metrics (wall jumps, dashes, prejump-rejected starts,
+// restarts) ride along on a finish or attempt flush. Each is a non-negative
+// count since the player's last flush; absent/invalid -> 0. The cap mirrors
+// MAX_ATTEMPTS_PER_ENTRY's intent — a movement event per frame for a long run
+// still stays well under it; anything larger is a buggy/hostile server.
+const MAX_METRIC_PER_ENTRY = 1000000;
+function sanitizeMetric(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? Math.min(n, MAX_METRIC_PER_ENTRY) : 0;
+}
+
 function sanitizeRecord(r) {
   if (!r || typeof r.name !== "string" || r.name.length === 0) return null;
   const time = Number(r.time);
@@ -626,6 +637,10 @@ function sanitizeRecord(r) {
       const n = Number(t);
       return Number.isInteger(n) && n > 0 ? n : 0;
     }),
+    wall_jumps: sanitizeMetric(r.wall_jumps),
+    dashes: sanitizeMetric(r.dashes),
+    prejump_failures: sanitizeMetric(r.prejump_failures),
+    restarts: sanitizeMetric(r.restarts),
   };
 }
 
@@ -692,12 +707,25 @@ function sanitizeGhost(body) {
 // to ride on — the player disconnected or the map ended mid-run.
 function sanitizeAttempt(a) {
   if (!a || typeof a.name !== "string" || a.name.length === 0) return null;
-  const count = Number(a.count);
-  if (!Number.isInteger(count) || count <= 0) return null;
+  const countRaw = Number(a.count);
+  const count =
+    Number.isInteger(countRaw) && countRaw > 0 ? Math.min(countRaw, MAX_ATTEMPTS_PER_ENTRY) : 0;
+  const wall_jumps = sanitizeMetric(a.wall_jumps);
+  const dashes = sanitizeMetric(a.dashes);
+  const prejump_failures = sanitizeMetric(a.prejump_failures);
+  const restarts = sanitizeMetric(a.restarts);
+  // A metrics-only flush (e.g. a lone /kill) carries count 0 but real metrics —
+  // keep it. Drop only when there is genuinely nothing to record.
+  if (count === 0 && wall_jumps === 0 && dashes === 0 && prejump_failures === 0 && restarts === 0)
+    return null;
   return {
     name: a.name.slice(0, MAX_NAME_LEN),
     login: typeof a.login === "string" ? a.login.slice(0, MAX_NAME_LEN) : "",
-    count: Math.min(count, MAX_ATTEMPTS_PER_ENTRY),
+    count,
+    wall_jumps,
+    dashes,
+    prejump_failures,
+    restarts,
   };
 }
 

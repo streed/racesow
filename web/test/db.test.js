@@ -269,6 +269,65 @@ test("player detail returns the player's PRs across maps plus attempt count", as
   assert.deepEqual(byMap, { map_a: 48000, map_b: 61000 });
 });
 
+test("player detail sums movement metrics across maps and flush types", async (t) => {
+  const race = await freshDb(t);
+  // A finish carries per-flush movement metrics the same way it carries attempts.
+  await race.ingest({
+    version: VER,
+    map: "map_a",
+    source: "racelog",
+    records: [
+      { name: "Nova", login: "", time: 50000, checkpoints: [], attempts: 3,
+        wall_jumps: 12, dashes: 5, prejump_failures: 1, restarts: 2 },
+    ],
+  });
+  // A finish on another map adds to the lifetime totals.
+  await race.ingest({
+    version: VER,
+    map: "map_b",
+    source: "racelog",
+    records: [
+      { name: "Nova", login: "", time: 61000, checkpoints: [], attempts: 1,
+        wall_jumps: 8, dashes: 3, prejump_failures: 0, restarts: 4 },
+    ],
+  });
+  // A finish-less attempt flush (disconnect / map end) carries metrics too.
+  await race.ingest({
+    version: VER,
+    map: "map_a",
+    source: "racelog",
+    attempts: [
+      { name: "Nova", login: "", count: 2, wall_jumps: 1, dashes: 1, prejump_failures: 3, restarts: 1 },
+    ],
+  });
+  await race.refreshAggregates();
+
+  const pid = N((await race.one("SELECT id FROM player LIMIT 1")).id);
+  const d = await race.playerDetail(pid);
+  assert.deepEqual(d.metrics, {
+    wallJumps: 12 + 8 + 1,
+    dashes: 5 + 3 + 1,
+    prejumpFailures: 1 + 0 + 3,
+    restarts: 2 + 4 + 1,
+  });
+});
+
+test("movement metrics are racelog-only (topscores ingest never counts them)", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({
+    version: VER,
+    map: "map_a",
+    source: "topscores",
+    records: [
+      { name: "Nova", login: "", time: 50000, checkpoints: [],
+        wall_jumps: 12, dashes: 5, prejump_failures: 1, restarts: 2 },
+    ],
+  });
+  const pid = N((await race.one("SELECT id FROM player LIMIT 1")).id);
+  const d = await race.playerDetail(pid);
+  assert.deepEqual(d.metrics, { wallJumps: 0, dashes: 0, prejumpFailures: 0, restarts: 0 });
+});
+
 test("player detail exposes game version per record and filters by map + version", async (t) => {
   const race = await freshDb(t);
   // Nova sets PRs on three maps across two game versions.

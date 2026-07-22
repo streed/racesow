@@ -643,6 +643,14 @@ async function viewPlayer(id, params) {
       ${d.attempts != null ? `<div class="s"><div class="n">${fmtNum(d.attempts)}</div><div class="l">Attempts</div></div>` : ""}
     </div>
 
+    ${d.metrics ? `
+    <div class="statrow" title="Movement events counted during races (approximate)">
+      <div class="s"><div class="n">${fmtNum(d.metrics.wallJumps)}</div><div class="l">Wall Jumps</div></div>
+      <div class="s"><div class="n">${fmtNum(d.metrics.dashes)}</div><div class="l">Dashes</div></div>
+      <div class="s"><div class="n">${fmtNum(d.metrics.prejumpFailures)}</div><div class="l">Prejump Fails</div></div>
+      <div class="s"><div class="n">${fmtNum(d.metrics.restarts)}</div><div class="l">Restarts</div></div>
+    </div>` : ""}
+
     <div class="page-title" style="font-size:20px">RECORDS <span class="accent">·</span> ${fmtNum(rec.total)}</div>
     <div class="toolbar">
       <input class="filter" id="rfilter" placeholder="Search this player's maps…" value="${esc(state.q)}">
