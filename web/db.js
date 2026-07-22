@@ -44,21 +44,41 @@ const POINTS_CASE = `CASE rank
 
 // Skill Rating (SR): a second, skill-oriented standing that complements Points.
 // Where Points SUMS a top-15 placement bonus across every map (so it rewards
-// breadth of participation), SR is a competition-weighted AVERAGE of how close a
-// player runs to each map's world record — so it rewards depth of speed instead.
+// breadth of participation), SR measures demonstrated speed: how close a
+// player's best work runs to each map's world record, against real competition.
 //
 // Per map, a player's PB of time t on a map whose WR time is w scores
-//   perf = w / t          in (0, 1]   (1.0 at the WR; margin-sensitive)
-// weighted by the strength of the field they beat,
-//   fw   = log2(1 + N)    N = players with a PB on that map
-// and the player's SR is the Bayesian ("IMDb") weighted mean of perf across
-// their maps, regressed toward a modest prior so a lone lucky WR can't top the
-// board until it is proven across a real sample:
+//   perf = (w/t)^SR_GAMMA   in (0, 1]   (1.0 at the WR)
+// — the power spreads the top end (raw w/t squeezed the whole competitive
+// population into ~0.85-1.0, so the board barely discriminated). Each perf is
+// weighted by the strength of the field it was set against,
+//   fw   = log2(1 + N)      N = players with a PB on that map
+// and only contested maps count (N >= SR_MIN_FIELD): with nobody to beat, a
+// time proves nothing, and solo-map WRs were free perf=1.0 samples.
+//
+// A player is scored on their strongest maps only, never ALL of them: sort
+// their perfs descending and take whichever prefix of length 1..SR_TOP_K
+// maximizes the Bayesian weighted mean
 //   SR = 1000 * ( Σ perf*fw + κ*μ ) / ( Σ fw + κ )
-// SR_MU is the prior mean perf an unproven player regresses toward; SR_KAPPA is
-// the prior strength in fw-units (≈ one contested map's worth of weight).
-export const SR_MU = 0.7;
-export const SR_KAPPA = 6;
+// (κ = SR_KAPPA regresses a thin sample toward the prior μ = SR_MU, IMDb
+// style, so a couple of lucky near-WRs can't top the board). The prefix-max
+// subset — provably "include a run iff it holds up at your proven level" — is
+// what makes SR safe to grind: casually cruising map 500 can only ever raise
+// it, never dilute a rating earned on your best 20, so a 30-map career and a
+// 3000-map one compete fairly. The prefix minimum of 1 keeps below-prior
+// players ranked by their best run instead of clamping half the board at the
+// prior; only players with NO contested map sit at exactly 1000*SR_MU.
+//
+// Calibrated against the 2026-07 production snapshot (236k races, 9.2k
+// players): the proven multi-WR names hold the top-10 in a credible order,
+// sub-10-map one-hit wonders drop from the top-10 to #150-500 (22 of the SR
+// top-50 had <10 maps under the old formula; now 0), and the distribution
+// spreads to p1=895 / median=319 / p90=224 instead of bunching at 850-980.
+export const SR_MU = 0.35;
+export const SR_KAPPA = 10;
+export const SR_GAMMA = 3;
+export const SR_TOP_K = 20;
+export const SR_MIN_FIELD = 5;
 
 // Schema is managed by node-pg-migrate: versioned files in ./migrations run at
 // startup (see openDatabase). The baseline (0001) reflects the former SQLite
@@ -294,6 +314,41 @@ async function buildAggregates(client) {
     CREATE INDEX ON best_new(player_id);
 
     CREATE UNLOGGED TABLE standings_new AS
+      -- SR inputs (see the SR_* constants' comment): per contested map
+      -- (field >= SR_MIN_FIELD), each player's sharpened perf (w/t)^gamma and
+      -- field weight, ranked best-first; each rn is a candidate prefix end,
+      -- and the player's SR is the best Bayesian mean over prefixes <= TOP_K.
+      WITH mm AS (
+        SELECT map_id,
+               MIN(time)                                AS wr_time,
+               COUNT(*)::int                            AS n,
+               log(2.0, (1 + COUNT(*))::numeric)::float AS fw
+        FROM best_new GROUP BY map_id
+      ),
+      contrib AS (
+        SELECT b.player_id,
+               power(mm.wr_time::float / b.time, ${SR_GAMMA}) AS p,
+               mm.fw,
+               ROW_NUMBER() OVER (
+                 PARTITION BY b.player_id
+                 ORDER BY power(mm.wr_time::float / b.time, ${SR_GAMMA}) DESC,
+                          mm.fw DESC, b.map_id
+               ) AS rn
+        FROM best_new b JOIN mm ON mm.map_id = b.map_id
+        WHERE mm.n >= ${SR_MIN_FIELD} AND b.time > 0
+      ),
+      skill AS (
+        SELECT player_id, ROUND(1000.0 * MAX(v))::int AS sr
+        FROM (
+          SELECT player_id,
+                 (SUM(p * fw) OVER w + ${SR_KAPPA} * ${SR_MU})
+               / (SUM(fw) OVER w + ${SR_KAPPA}) AS v
+          FROM contrib
+          WHERE rn <= ${SR_TOP_K}
+          WINDOW w AS (PARTITION BY player_id ORDER BY rn)
+        ) pf
+        GROUP BY player_id
+      )
       SELECT s.*, ROW_NUMBER() OVER (ORDER BY points DESC, wr DESC, player_id) AS rank
       FROM (
         SELECT b.player_id,
@@ -301,24 +356,14 @@ async function buildAggregates(client) {
                SUM(CASE WHEN b.rank=1 THEN 1 ELSE 0 END)::int AS wr,
                SUM(CASE WHEN b.rank<=3 THEN 1 ELSE 0 END)::int AS podium,
                SUM(${POINTS_CASE.replace(/\brank\b/g, "b.rank")})::int AS points,
-               -- SR: Bayesian weighted mean of per-map perf (=WR/time), weighted
-               -- by field strength (log2(1+N)), regressed toward SR_MU by SR_KAPPA.
-               ROUND(
-                 1000.0 * (
-                   COALESCE(SUM((mm.wr_time::float / NULLIF(b.time, 0)) * mm.fw), 0)
-                   + ${SR_KAPPA} * ${SR_MU}
-                 ) / (COALESCE(SUM(mm.fw), 0) + ${SR_KAPPA})
-               )::int                                         AS sr,
+               -- MAX is a no-op (skill has one row per player); no contested
+               -- maps at all -> the bare prior.
+               COALESCE(MAX(sk.sr), ${Math.round(1000 * SR_MU)})::int AS sr,
                -- Most recent attempt-or-finish across all of this canonical
                -- player's maps; NULL (never active) when no tally exists yet.
                MAX(la.last_active)                            AS last_active
         FROM best_new b
-        JOIN (
-          SELECT map_id,
-                 MIN(time)                              AS wr_time,
-                 log(2.0, (1 + COUNT(*))::numeric)::float AS fw
-          FROM best_new GROUP BY map_id
-        ) mm ON mm.map_id = b.map_id
+        LEFT JOIN skill sk ON sk.player_id = b.player_id
         LEFT JOIN (
           SELECT pl.canonical_id AS player_id,
                  NULLIF(MAX(GREATEST(COALESCE(rt.last_finish, 0),

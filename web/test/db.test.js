@@ -6,7 +6,7 @@
 // so tests are independent and order-free.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { openDatabase, simplifyName, normToken, identKey, canonKey, rebuildCanonical, sha256 } from "../db.js";
+import { openDatabase, simplifyName, normToken, identKey, canonKey, rebuildCanonical, sha256, SR_MU } from "../db.js";
 import { createTestDb } from "./pg-util.js";
 
 async function freshDb(t) {
@@ -185,9 +185,51 @@ test("skill rating (SR) rewards closeness to the WR over breadth of maps", async
   assert.ok(breadth.points > ace.points, `Breadth points ${breadth.points} > Ace points ${ace.points}`);
   assert.ok(ace.sr > breadth.sr, `Ace SR ${ace.sr} > Breadth SR ${breadth.sr}`);
 
+  // Breadth's 12 maps are all two-player fields — below SR_MIN_FIELD they
+  // prove nothing, so he sits at exactly the bare prior.
+  assert.equal(breadth.sr, Math.round(1000 * SR_MU), `Breadth SR ${breadth.sr} is the prior`);
+
   // sort=sr actually orders the board by SR descending.
   const board = (await race.players({ sort: "sr", limit: 200 })).rows.map((r) => r.sr);
   for (let i = 1; i < board.length; i++) assert.ok(board[i - 1] >= board[i], "players sorted by SR desc");
+});
+
+test("SR counts only your strongest maps: no tourist tops, no grind dilution", async (t) => {
+  const race = await freshDb(t);
+
+  // 12 contested maps (12-strong fields). Champ WRs every one; Clone matches
+  // his times exactly but races nothing else; Tourist takes a razor-thin 2nd
+  // on just four of them.
+  for (let m = 0; m < 12; m++) {
+    const field = [finish("Champ", 30000), finish("Clone", 30000)];
+    if (m < 4) field.push(finish("Tourist", 30300));
+    for (let i = 0; i < 10; i++) field.push(finish(`pack${i}`, 45000 + i * 500));
+    await race.ingest({ version: VER, map: `comp${m}`, source: "racelog", records: field });
+  }
+  // Champ ALSO cruises 20 more contested maps far off the pace. Under the old
+  // all-maps average these diluted his WR-laden rating to below the tourist's
+  // (~590 vs ~900); under prefix-max they simply don't count.
+  for (let m = 0; m < 20; m++) {
+    const field = [finish("CruiseWr", 20000), finish("Champ", 60000)];
+    for (let i = 0; i < 10; i++) field.push(finish(`pack${i}`, 25000 + i * 500));
+    await race.ingest({ version: VER, map: `cruise${m}`, source: "racelog", records: field });
+  }
+  await race.refreshAggregates();
+
+  const byName = new Map(
+    (await race.players({ sort: "sr", limit: 200 })).rows.map((r) => [r.simplified, r])
+  );
+  const champ = byName.get("Champ");
+  const clone = byName.get("Clone");
+  const tourist = byName.get("Tourist");
+
+  // Twelve WRs against real fields outrank four near-WRs: a thin sample
+  // regresses toward the prior until it's proven.
+  assert.ok(champ.sr > tourist.sr, `Champ SR ${champ.sr} > Tourist SR ${tourist.sr}`);
+
+  // Racing 20 extra maps casually changed nothing: Champ's SR equals his
+  // stay-at-home twin's. Grinding can never lower a rating.
+  assert.equal(champ.sr, clone.sr, `Champ SR ${champ.sr} = Clone SR ${clone.sr}`);
 });
 
 test("compare: head-to-head on shared maps drives the verdict", async (t) => {
