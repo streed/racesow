@@ -216,6 +216,7 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .pill.v1 { color: var(--cyan); border-color: rgba(34,211,238,.4); }
 .pill.wr { color: var(--gold); border-color: rgba(255,210,74,.4); background: rgba(255,210,74,.08); }
 .pill.rev { color: var(--orange); border-color: rgba(255,106,26,.45); background: rgba(255,106,26,.08); }
+.pill.pb { color: #7ee787; border-color: rgba(126,231,135,.4); background: rgba(126,231,135,.08); }
 
 /* pagination */
 .pager { display: flex; gap: 8px; align-items: center; justify-content: center; padding: 16px; }

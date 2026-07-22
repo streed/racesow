@@ -466,6 +466,7 @@ class RaceDB {
       )
     ).map((r) => ({ ...r, rank: num(r.rank), id: num(r.id) }));
     const recent = await this.recentRecords(8);
+    const recentFinishes = await this.recentFinishes({ limit: 10 });
     const lastUpdate = await this.one("SELECT value FROM config WHERE key='last_update'");
     return {
       lastUpdate: lastUpdate ? parseInt(lastUpdate.value, 10) : null,
@@ -473,6 +474,7 @@ class RaceDB {
       versions,
       hallOfFame,
       recent,
+      recentFinishes,
       servers: await this.servers(),
     };
   }
@@ -501,6 +503,51 @@ class RaceDB {
       player_id: num(r.player_id),
       created_at: num(r.created_at),
       versionName: null,
+    }));
+  }
+
+  // Recent finishes from the full finish log (every completed run, not just PBs
+  // — those are `race`/recentRecords). Optionally scoped to one map or one
+  // player (canonical id). Carries each run's checkpoint splits so the map/
+  // player pages can show per-run split breakdowns, and `pb` marks the run that
+  // equals the player's current best on that map. Powers the recent-finishes
+  // feed and the per-map / per-player finish history.
+  async recentFinishes({ limit = 12, mapId = null, playerId = null } = {}) {
+    return (
+      await this.all(
+        `SELECT f.id, f.time, f.created_at, f.map_id, m.name AS map,
+                pl.canonical_id AS player_id, disp.name, disp.simplified,
+                sv.name AS server,
+                (b.time IS NOT NULL AND f.time <= b.time) AS pb,
+                COALESCE(
+                  (SELECT array_agg(fc.time ORDER BY fc.number)
+                     FROM finish_checkpoint fc WHERE fc.finish_id = f.id),
+                  ARRAY[]::integer[]
+                ) AS checkpoints
+         FROM finish f
+         JOIN player pl ON pl.id = f.player_id
+         JOIN map m ON m.id = f.map_id
+         JOIN player disp ON disp.id = pl.canonical_id
+         LEFT JOIN server sv ON sv.id = f.server_id
+         LEFT JOIN best b ON b.map_id = f.map_id AND b.player_id = pl.canonical_id
+         WHERE ($1::bigint IS NULL OR f.map_id = $1)
+           AND ($2::bigint IS NULL OR pl.canonical_id = $2)
+         ORDER BY f.created_at DESC, f.id DESC
+         LIMIT $3`,
+        [mapId, playerId, limit]
+      )
+    ).map((r) => ({
+      id: num(r.id),
+      time: num(r.time),
+      created_at: num(r.created_at),
+      map_id: num(r.map_id),
+      map: r.map,
+      player_id: num(r.player_id),
+      name: r.name,
+      simplified: r.simplified,
+      server: r.server,
+      pb: !!r.pb,
+      checkpoints: (r.checkpoints || []).map(num),
     }));
   }
 
@@ -1014,6 +1061,7 @@ class RaceDB {
       records: idx ? idx.records : 0,
       races: idx ? idx.records : 0, // legacy alias
       finishes: idx ? idx.finishes : 0,
+      recentFinishes: await this.recentFinishes({ limit: 20, mapId: num(map.id) }),
       players: idx ? idx.players : leaderboard.length,
       wr,
       perfect: await this.perfectRun(num(map.id), wr),
@@ -1308,6 +1356,7 @@ class RaceDB {
       finishes,
       attempts,
       metrics,
+      recentFinishes: await this.recentFinishes({ limit: 20, playerId: canonId }),
       versions,
       records: { total, limit: lim, offset: off, rows: records },
     };
@@ -2016,6 +2065,23 @@ class RaceDB {
             [playerId, mapRow.id, versionRow.id, now]
           );
           await bumpTally(playerId, rec.attempts != null ? rec.attempts : 1, rec);
+
+          // Log EVERY finish, not just the PB that lands in `race` below, so the
+          // full run history (each run + its splits) is kept. Guarded by `tally`
+          // (source=racelog live finishes): a topscores re-sync resends the whole
+          // top-50 each interval and would otherwise duplicate the log every run.
+          const fin = await q1(
+            `INSERT INTO finish (player_id, map_id, version_id, time, server_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [playerId, mapRow.id, versionRow.id, rec.time, serverId, now]
+          );
+          const cps = Array.isArray(rec.checkpoints) ? rec.checkpoints : [];
+          for (let i = 0; i < cps.length; i++) {
+            await client.query(
+              "INSERT INTO finish_checkpoint (finish_id, number, time) VALUES ($1, $2, $3)",
+              [fin.id, i, cps[i]]
+            );
+          }
         }
 
         const existing = await q1(

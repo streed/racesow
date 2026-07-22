@@ -588,3 +588,41 @@ test("trigram search: exact beats prefix beats substring beats fuzzy", async (t)
   const fuzzy = (await race.search("elchpa")).players.map((p) => p.simplified);
   assert.ok(fuzzy.includes("ELchupa"), `fuzzy match failed: ${JSON.stringify(fuzzy)}`);
 });
+
+test("finish log records every finish (not just PBs), with splits, and skips topscores syncs", async (t) => {
+  const race = await freshDb(t);
+  const cnt = async (sql) => N((await race.one(sql)).c);
+
+  // First finish (a PB): stored in race AND logged with its splits.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova", 50000, [10000, 30000])] });
+  assert.equal(await cnt("SELECT COUNT(*) c FROM race"), 1);
+  assert.equal(await cnt("SELECT COUNT(*) c FROM finish"), 1);
+  assert.equal(await cnt("SELECT COUNT(*) c FROM finish_checkpoint"), 2, "splits logged");
+
+  // Slower finish (NOT a PB): race unchanged, but the finish is still logged —
+  // this is the whole point of the finish log.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova", 60000, [12000, 36000])] });
+  assert.equal(await cnt("SELECT COUNT(*) c FROM race"), 1, "non-PB adds no race row");
+  assert.equal(await cnt("SELECT COUNT(*) c FROM finish"), 2, "but the non-PB finish IS logged");
+
+  // Faster finish (new PB): race improves AND it is logged.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova", 40000, [8000, 24000])] });
+  assert.equal(N((await race.one("SELECT time FROM race")).time), 40000, "race holds the faster PB");
+  assert.equal(await cnt("SELECT COUNT(*) c FROM finish"), 3);
+
+  await race.refreshAggregates(); // build `best` so the recentFinishes pb flag resolves
+
+  const pid = N((await race.one("SELECT id FROM player WHERE name = 'Nova'")).id);
+  const feed = await race.recentFinishes({ playerId: pid });
+  assert.equal(feed.length, 3, "all three finishes surface");
+  assert.deepEqual(feed.map((f) => f.time), [40000, 60000, 50000], "newest first");
+  assert.deepEqual(feed[0].checkpoints, [8000, 24000], "splits carried through");
+  assert.equal(feed.find((f) => f.time === 40000).pb, true, "the current-best run is flagged pb");
+  assert.equal(feed.find((f) => f.time === 60000).pb, false, "a slower run is not");
+
+  // A topscores re-sync resends the whole top-50 every interval — it must NOT
+  // duplicate the finish log (only live racelog finishes are logged).
+  const before = await cnt("SELECT COUNT(*) c FROM finish");
+  await race.ingest({ version: VER, map: MAP, source: "topscores", records: [finish("Nova", 40000, [8000, 24000])] });
+  assert.equal(await cnt("SELECT COUNT(*) c FROM finish"), before, "topscores source is not logged");
+});

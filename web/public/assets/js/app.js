@@ -241,6 +241,10 @@ async function viewOverview() {
           <div class="muted" style="padding:8px 2px">No records set recently &mdash; a run only appears here when it beats the player's existing best on a map.</div>`}
         </div>
         <div class="panel" style="margin-bottom:20px">
+          <h3><span class="dot orange"></span> Recent Finishes</h3>
+          ${finishFeed(d.recentFinishes, { emptyMsg: "No finishes recorded yet — every completed run (not just personal bests) shows here." })}
+        </div>
+        <div class="panel" style="margin-bottom:20px">
           <h3><span class="dot"></span> Finishes by Version</h3>
           <div class="vbars">
             ${d.versions.map((v) => { const n = v.records != null ? v.records : v.races; return `
@@ -281,6 +285,32 @@ function fmtAgo(ts) {
 
 function tile(num, lbl, variant = "") {
   return `<div class="tile ${variant}"><div class="num">${fmtNum(num)}</div><div class="lbl">${esc(lbl)}</div></div>`;
+}
+
+/* ---- finish feed: every completed run from the finish log (not just PBs). ----
+ * Shared by the overview feed and the per-player / per-map finish history.
+ * showMap/showPlayer toggle which side is redundant on a scoped page; a run's
+ * checkpoint splits ride along in the time cell's tooltip. */
+function finishFeed(list, { showMap = true, showPlayer = true, emptyMsg } = {}) {
+  if (!list || !list.length)
+    return `<div class="muted" style="padding:8px 2px">${esc(emptyMsg || "No finishes recorded yet.")}</div>`;
+  return `<div class="feed">${list
+    .map((f) => {
+      const nav = showMap ? `#/map/${f.map_id}` : `#/player/${f.player_id}`;
+      const splits = f.checkpoints && f.checkpoints.length ? ` title="splits: ${f.checkpoints.map(fmtTime).join(" / ")}"` : "";
+      return `
+      <div class="feeditem clickable" data-nav="${nav}">
+        <div class="fi-main">
+          ${f.pb ? '<span class="pill pb" title="the player\'s current best on this map">PB</span> ' : ""}${showPlayer ? wname(f.name) : ""}${showMap ? `<span class="fi-map">${mapNameHtml(f.map)}</span>` : ""}
+        </div>
+        <div class="fi-side">
+          <span class="time"${splits}>${fmtTime(f.time)}</span>
+          <span class="muted">${fmtAgo(f.created_at)}</span>
+          ${f.server ? `<span class="pill srv">${esc(f.server)}</span>` : ""}
+        </div>
+      </div>`;
+    })
+    .join("")}</div>`;
 }
 
 /* ---- generic sortable header ---- */
@@ -488,6 +518,10 @@ async function viewMap(id) {
       </table>
     </div></div>
 
+    ${d.recentFinishes && d.recentFinishes.length ? `
+    <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> every run</div>
+    <div class="panel" style="margin-bottom:24px">${finishFeed(d.recentFinishes, { showMap: false, showPlayer: true })}</div>` : ""}
+
     <div class="mapflag" id="mapflag">
       <button class="flag-toggle" type="button">⚑ Flag this map for review</button>
       <form class="flag-form" hidden>
@@ -665,6 +699,10 @@ async function viewPlayer(id, params) {
       <div class="s"><div class="n">${fmtNum(d.metrics.prejumpFailures)}</div><div class="l">Prejump Fails</div></div>
       <div class="s"><div class="n">${fmtNum(d.metrics.restarts)}</div><div class="l">Restarts</div></div>
     </div>` : ""}
+
+    ${d.recentFinishes && d.recentFinishes.length ? `
+    <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> every run</div>
+    <div class="panel" style="margin-bottom:24px">${finishFeed(d.recentFinishes, { showMap: true, showPlayer: false })}</div>` : ""}
 
     <div class="page-title" style="font-size:20px">RECORDS <span class="accent">·</span> ${fmtNum(rec.total)}</div>
     <div class="toolbar">
