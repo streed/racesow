@@ -307,6 +307,26 @@ test("client routes serve the shell directly — no directory 301, slashes toler
   }
 });
 
+test("/api/compare puts two players head-to-head over their shared maps", async () => {
+  // Nova (48000) and Wave (49000) both raced testmap1 in the earlier finish
+  // test — Nova is faster, so the head-to-head verdict favours Nova.
+  const nova = (await get("/players?q=Nova")).rows[0].id;
+  const wave = (await get("/players?q=Wave")).rows[0].id;
+
+  const cmp = await get(`/compare?a=${nova}&b=${wave}`);
+  assert.equal(cmp.a.id, nova);
+  assert.equal(cmp.b.id, wave);
+  assert.ok(cmp.summary.shared >= 1, "at least the shared testmap1");
+  assert.equal(cmp.summary.aWins >= cmp.summary.bWins, true);
+  assert.equal(cmp.summary.leader, "a", "Nova (faster on the shared map) leads");
+  assert.ok(cmp.head.some((h) => h.name === "testmap1"), "shared map appears in the detail");
+
+  // Missing ids -> 400; unknown id -> 404.
+  assert.equal((await fetch(`${base}/api/compare?a=${nova}`)).status, 400);
+  assert.equal((await fetch(`${base}/api/compare`)).status, 400);
+  assert.equal((await fetch(`${base}/api/compare?a=${nova}&b=99999999`)).status, 404);
+});
+
 test("names are truncated and checkpoint garbage is normalised, not fatal", async () => {
   const longName = "N".repeat(200);
   const { status } = await ingest(

@@ -206,13 +206,14 @@ async function viewOverview() {
       <div class="panel hof">
         <h3><span class="dot"></span> Hall of Fame</h3>
         <div class="tscroll"><table class="data">
-          <thead><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num">WRs</th><th class="num">Maps</th></tr></thead>
+          <thead><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num" title="Skill Rating — competition-weighted closeness to each map's world record">SR</th><th class="num">WRs</th><th class="num">Maps</th></tr></thead>
           <tbody>
             ${d.hallOfFame.map((p) => `
               <tr class="clickable" data-nav="#/player/${p.id}">
                 <td class="rankcell ${rankClass(p.rank)}">${p.rank}</td>
                 <td>${wname(p.name)}</td>
                 <td class="num">${fmtNum(p.points)}</td>
+                <td class="num">${fmtNum(p.sr)}</td>
                 <td class="num">${fmtNum(p.wr)}</td>
                 <td class="num">${fmtNum(p.maps)}</td>
               </tr>`).join("")}
@@ -352,7 +353,7 @@ async function viewPlayers(params) {
 
   app.innerHTML = `
     <div class="page-title"><span class="accent">PLAYER</span> RANKINGS</div>
-    <p class="page-sub">Ranked by race points (top-15 finish on each map). Search by name and sort by any column.</p>
+    <p class="page-sub">Ranked by race points (top-15 finish on each map). Sort by <b>SR</b> for the skill-weighted board — closeness to each map's world record against the strength of the field. Search by name and sort by any column, or <a data-nav="#/compare">compare two players head-to-head ⚔</a>.</p>
     <div class="toolbar">
       <input class="filter" id="pfilter" placeholder="Search players by name…" value="${esc(state.q)}">
       <span class="count">${fmtNum(data.total)} players</span>
@@ -363,9 +364,11 @@ async function viewPlayers(params) {
           ${th("#", "rank", state)}
           ${th("Player", "name", state)}
           ${th("Points", "points", state, "num")}
+          ${th("SR", "sr", state, "num")}
           ${th("WRs", "wr", state, "num")}
           ${th("Podiums", "podium", state, "num")}
           ${th("Maps", "maps", state, "num")}
+          ${th("Last raced", "active", state, "num")}
         </tr></thead>
         <tbody>
           ${data.rows.map((p) => `
@@ -373,10 +376,12 @@ async function viewPlayers(params) {
               <td class="rankcell ${rankClass(p.rank)}">${p.rank}</td>
               <td>${wname(p.name)}</td>
               <td class="num">${fmtNum(p.points)}</td>
+              <td class="num">${fmtNum(p.sr)}</td>
               <td class="num">${fmtNum(p.wr)}</td>
               <td class="num">${fmtNum(p.podium)}</td>
               <td class="num">${fmtNum(p.maps)}</td>
-            </tr>`).join("") || `<tr><td colspan="6" class="empty">No players match “${esc(state.q)}”.</td></tr>`}
+              <td class="num">${p.last_active != null ? fmtAgo(p.last_active) : "—"}</td>
+            </tr>`).join("") || `<tr><td colspan="8" class="empty">No players match “${esc(state.q)}”.</td></tr>`}
         </tbody>
       </table>
     </div>${pager(state, data, "#/players")}</div>`;
@@ -630,12 +635,13 @@ async function viewPlayer(id, params) {
 
   app.innerHTML = `
     <div class="crumbs"><a data-nav="#/players">Players</a> / ${esc(d.simplified)}</div>
-    <div class="page-title" style="font-size:34px">${wname(d.name)}</div>
+    <div class="page-title" style="font-size:34px">${wname(d.name)}<span class="cmp-cta" data-nav="#/compare?a=${d.id}" title="Compare this player head-to-head with another">⚔ Compare</span></div>
     <p class="page-sub">${s.rank ? "Overall rank #" + s.rank : "Unranked"}${d.login ? " · login: " + esc(d.login) : ""}</p>
     ${aliasHtml}
 
     <div class="statrow">
       <div class="s hl"><div class="n">${fmtNum(s.points)}</div><div class="l">Points</div></div>
+      <div class="s hl" title="Skill Rating — competition-weighted closeness to each map's world record (0–1000)"><div class="n">${fmtNum(s.sr)}</div><div class="l">Skill Rating</div></div>
       <div class="s"><div class="n">${fmtNum(s.wr)}</div><div class="l">World Records</div></div>
       <div class="s"><div class="n">${fmtNum(s.podium)}</div><div class="l">Podiums</div></div>
       <div class="s"><div class="n">${fmtNum(s.maps)}</div><div class="l">Maps Raced</div></div>
@@ -690,6 +696,178 @@ async function viewPlayer(id, params) {
   wireSort(`#/player/${id}`, state, ["map", "time", "rank", "attempts"]);
   // (The address bar is already the clean /player/<id> path from pushState —
   // where the server-rendered OG tags for Discord/social unfurls live.)
+}
+
+/* ---------------------------- compare view ------------------------------- */
+// Head-to-head: two players side by side. Deep-linkable as /compare?a=&b=; each
+// slot is a search-picker so either player can be swapped without losing the
+// other. The "who's better" call leans on the direct record on shared maps.
+async function viewCompare(params) {
+  loading();
+  const aId = parseInt(params.a, 10) || null;
+  const bId = parseInt(params.b, 10) || null;
+
+  // Both slots chosen -> fetch the comparison; otherwise just render the
+  // pickers (with whichever slot is already filled shown as its card).
+  let cmp = null;
+  if (aId && bId) {
+    try { cmp = await api(`/compare${buildQuery({ a: aId, b: bId })}`); }
+    catch (e) { return errorView(e); }
+  }
+
+  // A slot's current player label for the picker's filled state. When we have a
+  // comparison its own a/b are authoritative (they're already canonical);
+  // otherwise resolve the lone filled slot from the player endpoint.
+  async function slotName(id) {
+    if (!id) return null;
+    try { const d = await api(`/players/${id}?limit=1`); return { id: d.id, name: d.name, simplified: d.simplified }; }
+    catch { return null; }
+  }
+  const [aCard, bCard] = cmp && !cmp.same
+    ? [cmp.a, cmp.b]
+    : await Promise.all([slotName(aId), slotName(bId)]);
+
+  const picker = (slot, card, other) => `
+    <div class="cmp-slot">
+      <div class="cmp-slot-head">Player ${slot.toUpperCase()}</div>
+      ${card
+        ? `<div class="cmp-picked" data-nav="#/player/${card.id}">${wname(card.name)}</div>`
+        : `<div class="cmp-picked empty">— pick a player —</div>`}
+      <div class="gsearch cmp-search">
+        <input id="cmp-${slot}" placeholder="Search a player…" autocomplete="off">
+        <div class="results" id="cmp-${slot}-res"></div>
+      </div>
+    </div>`;
+
+  const cmpHtml = cmp && !cmp.same ? renderCompare(cmp) : cmp && cmp.same
+    ? `<div class="empty">That's the same player on both sides — pick two different players.</div>`
+    : `<div class="empty cmp-hint">Pick a player on each side to see who comes out ahead — overall standings and their record on every map they've both raced.</div>`;
+
+  app.innerHTML = `
+    <div class="crumbs"><a data-nav="#/players">Players</a> / Compare</div>
+    <div class="page-title"><span class="accent">COMPARE</span> PLAYERS</div>
+    <p class="page-sub">Put two racers head to head: overall Points &amp; Skill Rating, world records, and their direct record on every shared map.</p>
+    <div class="cmp-pickers">
+      ${picker("a", aCard, bId)}
+      <div class="cmp-vs">vs</div>
+      ${picker("b", bCard, aId)}
+    </div>
+    ${cmpHtml}`;
+
+  wireComparePicker("a", { a: aId, b: bId });
+  wireComparePicker("b", { a: aId, b: bId });
+}
+
+// The A-side is coloured `a`, B-side `b`; a cell wins by carrying the .win class.
+function renderCompare(cmp) {
+  const { a, b, summary: sm, head } = cmp;
+  const nameA = `<span class="cmp-name a">${wname(a.name)}</span>`;
+  const nameB = `<span class="cmp-name b">${wname(b.name)}</span>`;
+
+  const verdict = sm.leader
+    ? `<div class="cmp-verdict ${sm.leader}">
+         ${sm.leader === "a" ? nameA : nameB} <b>comes out ahead</b>
+         <span class="cmp-basis">${
+           sm.basis === "head-to-head"
+             ? `faster on ${sm.leader === "a" ? sm.aWins : sm.bWins} of ${sm.shared} shared map${sm.shared === 1 ? "" : "s"}`
+             : sm.basis === "sr" ? "higher Skill Rating (no head-to-head split it)"
+             : "more Points (dead heat everywhere else)"
+         }</span>
+       </div>`
+    : `<div class="cmp-verdict tie">Dead even — nothing separates these two.</div>`;
+
+  const row = (label, av, bv, winner, fmt = fmtNum, hint = "") => `
+    <tr>
+      <td class="num cmp-a ${winner === "a" ? "win" : ""}">${fmt(av)}</td>
+      <td class="cmp-metric">${label}${hint ? ` <span class="cmp-mhint">${hint}</span>` : ""}</td>
+      <td class="num cmp-b ${winner === "b" ? "win" : ""}">${fmt(bv)}</td>
+    </tr>`;
+
+  const statTable = `
+    <div class="panel cmp-stats">
+      <table class="data cmp-table">
+        <thead><tr><th class="num">${nameA}</th><th class="cmp-metric">Metric</th><th class="num">${nameB}</th></tr></thead>
+        <tbody>
+          ${row("Points", a.standing.points, b.standing.points, sm.metrics.points)}
+          ${row("Skill Rating", a.standing.sr, b.standing.sr, sm.metrics.sr)}
+          ${row("World Records", a.standing.wr, b.standing.wr, sm.metrics.wr)}
+          ${row("Podiums", a.standing.podium, b.standing.podium, sm.metrics.podium)}
+          ${row("Maps Raced", a.standing.maps, b.standing.maps, sm.metrics.maps)}
+          <tr class="cmp-h2h">
+            <td class="num cmp-a ${sm.aWins > sm.bWins ? "win" : ""}">${fmtNum(sm.aWins)}</td>
+            <td class="cmp-metric">Head-to-head wins <span class="cmp-mhint">${fmtNum(sm.shared)} shared${sm.ties ? ` · ${fmtNum(sm.ties)} tied` : ""}</span></td>
+            <td class="num cmp-b ${sm.bWins > sm.aWins ? "win" : ""}">${fmtNum(sm.bWins)}</td>
+          </tr>
+        </tbody>
+      </table>
+      ${sm.shared && sm.relMargin != null
+        ? `<div class="cmp-margin">On shared maps, ${Math.abs(sm.relMargin) < 0.0005
+             ? "the two are level on average."
+             : `${(sm.relMargin > 0 ? nameA : nameB)} is <b>${(Math.abs(sm.relMargin) * 100).toFixed(1)}%</b> faster on average.`}</div>`
+        : ""}
+    </div>`;
+
+  const h2hTable = sm.shared
+    ? `<div class="page-title" style="font-size:20px">SHARED MAPS <span class="accent">·</span> ${fmtNum(sm.shared)}</div>
+       <p class="page-sub">Most competitive first (both near the top). ${head.length < sm.shared ? `Showing the top ${fmtNum(head.length)}.` : ""}</p>
+       <div class="table-wrap"><div class="tscroll">
+         <table class="data cmp-maps">
+           <thead><tr>
+             <th>Map</th>
+             <th class="num">${nameA}</th>
+             <th class="num">${nameB}</th>
+             <th class="num">Gap</th>
+           </tr></thead>
+           <tbody>
+             ${head.map((h) => `
+               <tr class="clickable" data-nav="#/map/${h.mapId}">
+                 <td class="mapname">${mapNameHtml(h.name)}</td>
+                 <td class="num cmp-a ${h.winner === "a" ? "win" : ""}"><span class="time">${fmtTime(h.aTime)}</span> <span class="cmp-rk ${rankClass(h.aRank)}">#${fmtNum(h.aRank)}</span></td>
+                 <td class="num cmp-b ${h.winner === "b" ? "win" : ""}"><span class="time">${fmtTime(h.bTime)}</span> <span class="cmp-rk ${rankClass(h.bRank)}">#${fmtNum(h.bRank)}</span></td>
+                 <td class="num"><span class="time muted">${h.winner === "tie" ? "—" : "+" + fmtTime(h.delta)}</span></td>
+               </tr>`).join("")}
+           </tbody>
+         </table>
+       </div></div>`
+    : `<div class="empty">These two have no maps in common yet — the verdict above is based on overall standings.</div>`;
+
+  return verdict + statTable + h2hTable;
+}
+
+// One compare slot's search-picker. Selecting a result re-navigates to
+// /compare with that slot updated, preserving the other slot.
+function wireComparePicker(slot, cur) {
+  const input = document.getElementById(`cmp-${slot}`);
+  const box = document.getElementById(`cmp-${slot}-res`);
+  if (!input || !box) return;
+  let timer, inflight;
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) { box.classList.remove("show"); box.innerHTML = ""; inflight?.abort(); return; }
+    timer = setTimeout(async () => {
+      try {
+        inflight?.abort();
+        inflight = new AbortController();
+        const res = await fetch("/api/search?q=" + encodeURIComponent(q), { signal: inflight.signal });
+        if (!res.ok) return;
+        const d = await res.json();
+        box.innerHTML = d.players.length
+          ? d.players.map((p) => `
+              <div class="ritem" data-cmp-pick="${p.id}">
+                <span>${wname(p.name)}</span><small>#${p.rank} · ${fmtNum(p.points)} pts</small>
+              </div>`).join("")
+          : `<div class="ritem"><small>No players match.</small></div>`;
+        box.classList.add("show");
+      } catch (e) { /* aborted / network — ignore */ }
+    }, 250);
+  });
+  box.addEventListener("click", (e) => {
+    const item = e.target.closest("[data-cmp-pick]");
+    if (!item) return;
+    const picked = parseInt(item.getAttribute("data-cmp-pick"), 10);
+    go("#/compare" + buildQuery({ ...cur, [slot]: picked }));
+  });
 }
 
 /* ------------------------------- live view ------------------------------- */
@@ -1014,7 +1192,7 @@ const ABOUT_FAQ = [
   ["Can I watch a record?",
     "Yes. Open any map and look for a <b>▶ replay</b> badge to watch the ghost right in your browser, or <b>⬇ demo</b> to download it. To play a demo back in Warsow, drop the file in your <span class=\"mono\">racemod/demos</span> folder and run <span class=\"mono\">demo &lt;file&gt;</span> in the console."],
   ["How is the ranking worked out?",
-    "You earn points for a top-15 finish on each map; your overall rank is the sum of those points across every map you've raced. World records and podium finishes are tracked separately on your profile."],
+    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: for each map it measures how close your time is to the world record (WR ÷ your time) and weights it by how many people you beat, then <b>averages</b> that across your maps on a 0–1000 scale — so it rewards being fast against strong fields rather than simply racing more maps. A lone lucky record won't top the SR board until it's backed up across a real sample. World records and podium finishes are tracked separately on your profile."],
   ["A map is broken or shouldn't be here — what do I do?",
     "Flag it for review. In-game, type <span class=\"mono\">/flag</span> while you're on the map (add a reason if you like, e.g. <span class=\"mono\">/flag broken</span>). Or open the map on this site and hit <b>⚑ Flag this map for review</b>. Moderators check flagged maps and can pull a bad one from the vote pool and map cycle."],
 ];
@@ -1268,6 +1446,7 @@ async function router() {
     if (path === "/") await viewOverview();
     else if (path === "/maps") await viewMaps(params);
     else if (path === "/players") await viewPlayers(params);
+    else if (path === "/compare") await viewCompare(params);
     else if (path === "/live") await viewLive();
     else if (path === "/about") await viewAbout();
     else if (path.startsWith("/server/")) await viewServer(parseInt(path.split("/")[2], 10));
