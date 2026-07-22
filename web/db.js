@@ -42,6 +42,24 @@ const POINTS_CASE = `CASE rank
   WHEN 11 THEN 40 WHEN 12 THEN 38 WHEN 13 THEN 36 WHEN 14 THEN 34 WHEN 15 THEN 32
   ELSE 0 END`;
 
+// Skill Rating (SR): a second, skill-oriented standing that complements Points.
+// Where Points SUMS a top-15 placement bonus across every map (so it rewards
+// breadth of participation), SR is a competition-weighted AVERAGE of how close a
+// player runs to each map's world record — so it rewards depth of speed instead.
+//
+// Per map, a player's PB of time t on a map whose WR time is w scores
+//   perf = w / t          in (0, 1]   (1.0 at the WR; margin-sensitive)
+// weighted by the strength of the field they beat,
+//   fw   = log2(1 + N)    N = players with a PB on that map
+// and the player's SR is the Bayesian ("IMDb") weighted mean of perf across
+// their maps, regressed toward a modest prior so a lone lucky WR can't top the
+// board until it is proven across a real sample:
+//   SR = 1000 * ( Σ perf*fw + κ*μ ) / ( Σ fw + κ )
+// SR_MU is the prior mean perf an unproven player regresses toward; SR_KAPPA is
+// the prior strength in fw-units (≈ one contested map's worth of weight).
+export const SR_MU = 0.7;
+export const SR_KAPPA = 6;
+
 // Schema is managed by node-pg-migrate: versioned files in ./migrations run at
 // startup (see openDatabase). The baseline (0001) reflects the former SQLite
 // era's final shape and adopts the existing production DB idempotently; future
@@ -278,15 +296,31 @@ async function buildAggregates(client) {
     CREATE UNLOGGED TABLE standings_new AS
       SELECT s.*, ROW_NUMBER() OVER (ORDER BY points DESC, wr DESC, player_id) AS rank
       FROM (
-        SELECT player_id,
-               COUNT(*)::int                                AS maps,
-               SUM(CASE WHEN rank=1 THEN 1 ELSE 0 END)::int AS wr,
-               SUM(CASE WHEN rank<=3 THEN 1 ELSE 0 END)::int AS podium,
-               SUM(${POINTS_CASE})::int                     AS points
-        FROM best_new GROUP BY player_id
+        SELECT b.player_id,
+               COUNT(*)::int                                  AS maps,
+               SUM(CASE WHEN b.rank=1 THEN 1 ELSE 0 END)::int AS wr,
+               SUM(CASE WHEN b.rank<=3 THEN 1 ELSE 0 END)::int AS podium,
+               SUM(${POINTS_CASE.replace(/\brank\b/g, "b.rank")})::int AS points,
+               -- SR: Bayesian weighted mean of per-map perf (=WR/time), weighted
+               -- by field strength (log2(1+N)), regressed toward SR_MU by SR_KAPPA.
+               ROUND(
+                 1000.0 * (
+                   COALESCE(SUM((mm.wr_time::float / NULLIF(b.time, 0)) * mm.fw), 0)
+                   + ${SR_KAPPA} * ${SR_MU}
+                 ) / (COALESCE(SUM(mm.fw), 0) + ${SR_KAPPA})
+               )::int                                         AS sr
+        FROM best_new b
+        JOIN (
+          SELECT map_id,
+                 MIN(time)                              AS wr_time,
+                 log(2.0, (1 + COUNT(*))::numeric)::float AS fw
+          FROM best_new GROUP BY map_id
+        ) mm ON mm.map_id = b.map_id
+        GROUP BY b.player_id
       ) s;
     CREATE INDEX ON standings_new(player_id);
     CREATE INDEX ON standings_new(points DESC);
+    CREATE INDEX ON standings_new(sr DESC);
     CREATE INDEX ON standings_new(rank);
 
     CREATE UNLOGGED TABLE map_index_new AS
@@ -335,6 +369,7 @@ const MAP_SORTS = Object.assign(Object.create(null), {
 });
 const PLAYER_SORTS = Object.assign(Object.create(null), {
   points: "points",
+  sr: "sr",
   wr: "wr",
   podium: "podium",
   maps: "maps",
@@ -413,7 +448,7 @@ class RaceDB {
     }));
     const hallOfFame = (
       await this.all(
-        `SELECT s.rank, s.player_id id, p.name, p.simplified, s.points, s.wr, s.podium, s.maps
+        `SELECT s.rank, s.player_id id, p.name, p.simplified, s.points, s.sr, s.wr, s.podium, s.maps
          FROM standings s JOIN player p ON p.id = s.player_id
          ORDER BY s.rank LIMIT 20`
       )
@@ -1097,7 +1132,7 @@ class RaceDB {
     const rows = (
       await this.all(
         `SELECT s.rank, s.player_id AS id, p.name, p.simplified, p.login,
-                s.points, s.wr, s.podium, s.maps
+                s.points, s.sr, s.wr, s.podium, s.maps
          FROM standings s JOIN player p ON p.id = s.player_id
          ${where}
          ORDER BY ${col} ${direction}, s.rank ASC
@@ -1122,9 +1157,9 @@ class RaceDB {
     );
 
     const standing = (await this.one(
-      "SELECT rank, points, wr, podium, maps FROM standings WHERE player_id = $1",
+      "SELECT rank, points, sr, wr, podium, maps FROM standings WHERE player_id = $1",
       [canonId]
-    )) || { rank: null, points: 0, wr: 0, podium: 0, maps: 0 };
+    )) || { rank: null, points: 0, sr: 0, wr: 0, podium: 0, maps: 0 };
     if (standing.rank != null) standing.rank = num(standing.rank);
 
     const groupWhere = "player_id IN (SELECT id FROM player WHERE canonical_id = $1)";

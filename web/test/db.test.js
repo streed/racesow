@@ -144,6 +144,52 @@ test("inherited Object.prototype sort keys fall back to default, never error", a
   assert.equal((await race.maps({ sort: "constructor" })).rows.length, 1);
 });
 
+test("skill rating (SR) rewards closeness to the WR over breadth of maps", async (t) => {
+  const race = await freshDb(t);
+
+  // One well-contested map: Ace sets the WR, Slow finishes twice as slow.
+  const field = [finish("Ace", 30000), finish("Slow", 60000)];
+  for (let i = 0; i < 10; i++) field.push(finish(`pack${i}`, 45000 + i * 500));
+  await race.ingest({ version: VER, map: "arena", source: "racelog", records: field });
+
+  // A breadth player who is mediocre on many small maps: never near a WR, but
+  // racks up Points by placing in the top-15 of lots of sparse leaderboards.
+  for (let m = 0; m < 12; m++) {
+    await race.ingest({
+      version: VER,
+      map: `filler${m}`,
+      source: "racelog",
+      records: [finish("Leader", 20000), finish("Breadth", 40000)],
+    });
+  }
+  await race.refreshAggregates();
+
+  const byName = new Map(
+    (await race.players({ sort: "sr", limit: 200 })).rows.map((r) => [r.simplified, r])
+  );
+  const ace = byName.get("Ace");
+  const slow = byName.get("Slow");
+  const breadth = byName.get("Breadth");
+
+  // SR is present, integer, and bounded to the 0–1000 scale.
+  for (const p of [ace, slow, breadth]) {
+    assert.ok(Number.isInteger(p.sr), `${p.name} sr is an integer`);
+    assert.ok(p.sr >= 0 && p.sr <= 1000, `${p.name} sr in range`);
+  }
+
+  // The WR holder outranks the twice-as-slow racer on the SAME field.
+  assert.ok(ace.sr > slow.sr, `Ace SR ${ace.sr} > Slow SR ${slow.sr}`);
+
+  // Breadth beats Ace on POINTS (12 second-places worth of top-15 bonuses beat
+  // one WR) but NOT on SR — being consistently half-speed can't out-skill a WR.
+  assert.ok(breadth.points > ace.points, `Breadth points ${breadth.points} > Ace points ${ace.points}`);
+  assert.ok(ace.sr > breadth.sr, `Ace SR ${ace.sr} > Breadth SR ${breadth.sr}`);
+
+  // sort=sr actually orders the board by SR descending.
+  const board = (await race.players({ sort: "sr", limit: 200 })).rows.map((r) => r.sr);
+  for (let i = 1; i < board.length; i++) assert.ok(board[i - 1] >= board[i], "players sorted by SR desc");
+});
+
 test("every finish counts as an attempt; only the best is kept as the PR", async (t) => {
   const race = await freshDb(t);
 

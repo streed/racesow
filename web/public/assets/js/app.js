@@ -206,13 +206,14 @@ async function viewOverview() {
       <div class="panel hof">
         <h3><span class="dot"></span> Hall of Fame</h3>
         <div class="tscroll"><table class="data">
-          <thead><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num">WRs</th><th class="num">Maps</th></tr></thead>
+          <thead><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num" title="Skill Rating — competition-weighted closeness to each map's world record">SR</th><th class="num">WRs</th><th class="num">Maps</th></tr></thead>
           <tbody>
             ${d.hallOfFame.map((p) => `
               <tr class="clickable" data-nav="#/player/${p.id}">
                 <td class="rankcell ${rankClass(p.rank)}">${p.rank}</td>
                 <td>${wname(p.name)}</td>
                 <td class="num">${fmtNum(p.points)}</td>
+                <td class="num">${fmtNum(p.sr)}</td>
                 <td class="num">${fmtNum(p.wr)}</td>
                 <td class="num">${fmtNum(p.maps)}</td>
               </tr>`).join("")}
@@ -352,7 +353,7 @@ async function viewPlayers(params) {
 
   app.innerHTML = `
     <div class="page-title"><span class="accent">PLAYER</span> RANKINGS</div>
-    <p class="page-sub">Ranked by race points (top-15 finish on each map). Search by name and sort by any column.</p>
+    <p class="page-sub">Ranked by race points (top-15 finish on each map). Sort by <b>SR</b> for the skill-weighted board — closeness to each map's world record against the strength of the field. Search by name and sort by any column.</p>
     <div class="toolbar">
       <input class="filter" id="pfilter" placeholder="Search players by name…" value="${esc(state.q)}">
       <span class="count">${fmtNum(data.total)} players</span>
@@ -363,6 +364,7 @@ async function viewPlayers(params) {
           ${th("#", "rank", state)}
           ${th("Player", "name", state)}
           ${th("Points", "points", state, "num")}
+          ${th("SR", "sr", state, "num")}
           ${th("WRs", "wr", state, "num")}
           ${th("Podiums", "podium", state, "num")}
           ${th("Maps", "maps", state, "num")}
@@ -373,10 +375,11 @@ async function viewPlayers(params) {
               <td class="rankcell ${rankClass(p.rank)}">${p.rank}</td>
               <td>${wname(p.name)}</td>
               <td class="num">${fmtNum(p.points)}</td>
+              <td class="num">${fmtNum(p.sr)}</td>
               <td class="num">${fmtNum(p.wr)}</td>
               <td class="num">${fmtNum(p.podium)}</td>
               <td class="num">${fmtNum(p.maps)}</td>
-            </tr>`).join("") || `<tr><td colspan="6" class="empty">No players match “${esc(state.q)}”.</td></tr>`}
+            </tr>`).join("") || `<tr><td colspan="7" class="empty">No players match “${esc(state.q)}”.</td></tr>`}
         </tbody>
       </table>
     </div>${pager(state, data, "#/players")}</div>`;
@@ -636,6 +639,7 @@ async function viewPlayer(id, params) {
 
     <div class="statrow">
       <div class="s hl"><div class="n">${fmtNum(s.points)}</div><div class="l">Points</div></div>
+      <div class="s hl" title="Skill Rating — competition-weighted closeness to each map's world record (0–1000)"><div class="n">${fmtNum(s.sr)}</div><div class="l">Skill Rating</div></div>
       <div class="s"><div class="n">${fmtNum(s.wr)}</div><div class="l">World Records</div></div>
       <div class="s"><div class="n">${fmtNum(s.podium)}</div><div class="l">Podiums</div></div>
       <div class="s"><div class="n">${fmtNum(s.maps)}</div><div class="l">Maps Raced</div></div>
@@ -1006,7 +1010,7 @@ const ABOUT_FAQ = [
   ["Can I watch a record?",
     "Yes. Open any map and look for a <b>▶ replay</b> badge to watch the ghost right in your browser, or <b>⬇ demo</b> to download it. To play a demo back in Warsow, drop the file in your <span class=\"mono\">racemod/demos</span> folder and run <span class=\"mono\">demo &lt;file&gt;</span> in the console."],
   ["How is the ranking worked out?",
-    "You earn points for a top-15 finish on each map; your overall rank is the sum of those points across every map you've raced. World records and podium finishes are tracked separately on your profile."],
+    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: for each map it measures how close your time is to the world record (WR ÷ your time) and weights it by how many people you beat, then <b>averages</b> that across your maps on a 0–1000 scale — so it rewards being fast against strong fields rather than simply racing more maps. A lone lucky record won't top the SR board until it's backed up across a real sample. World records and podium finishes are tracked separately on your profile."],
   ["A map is broken or shouldn't be here — what do I do?",
     "Flag it for review. In-game, type <span class=\"mono\">/flag</span> while you're on the map (add a reason if you like, e.g. <span class=\"mono\">/flag broken</span>). Or open the map on this site and hit <b>⚑ Flag this map for review</b>. Moderators check flagged maps and can pull a bad one from the vote pool and map cycle."],
 ];
