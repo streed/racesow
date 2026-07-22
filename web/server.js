@@ -262,6 +262,18 @@ api.get("/players/:id", cache(60, { edge: true }), wrap(async (req, res) => {
   res.json(detail);
 }));
 
+// Head-to-head comparison of two players (a vs b): overall standings plus the
+// direct record on every shared map. Both ids may be any name variant; the DB
+// resolves them to canonical.
+api.get("/compare", cache(60, { edge: true }), wrap(async (req, res) => {
+  const a = asInt(req.query.a);
+  const b = asInt(req.query.b);
+  if (a == null || b == null) return res.status(400).json({ error: "compare needs player ids a and b" });
+  const cmp = await race.compare(a, b);
+  if (!cmp) return res.status(404).json({ error: "player not found" });
+  res.json(cmp);
+}));
+
 api.get("/search", cache(60), wrap(async (req, res) => res.json(await race.search(req.query.q || "", { limit: 8 }))));
 
 // New records after a race id — the Discord announcer polls this (it has no

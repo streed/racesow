@@ -144,6 +144,98 @@ test("inherited Object.prototype sort keys fall back to default, never error", a
   assert.equal((await race.maps({ sort: "constructor" })).rows.length, 1);
 });
 
+test("skill rating (SR) rewards closeness to the WR over breadth of maps", async (t) => {
+  const race = await freshDb(t);
+
+  // One well-contested map: Ace sets the WR, Slow finishes twice as slow.
+  const field = [finish("Ace", 30000), finish("Slow", 60000)];
+  for (let i = 0; i < 10; i++) field.push(finish(`pack${i}`, 45000 + i * 500));
+  await race.ingest({ version: VER, map: "arena", source: "racelog", records: field });
+
+  // A breadth player who is mediocre on many small maps: never near a WR, but
+  // racks up Points by placing in the top-15 of lots of sparse leaderboards.
+  for (let m = 0; m < 12; m++) {
+    await race.ingest({
+      version: VER,
+      map: `filler${m}`,
+      source: "racelog",
+      records: [finish("Leader", 20000), finish("Breadth", 40000)],
+    });
+  }
+  await race.refreshAggregates();
+
+  const byName = new Map(
+    (await race.players({ sort: "sr", limit: 200 })).rows.map((r) => [r.simplified, r])
+  );
+  const ace = byName.get("Ace");
+  const slow = byName.get("Slow");
+  const breadth = byName.get("Breadth");
+
+  // SR is present, integer, and bounded to the 0–1000 scale.
+  for (const p of [ace, slow, breadth]) {
+    assert.ok(Number.isInteger(p.sr), `${p.name} sr is an integer`);
+    assert.ok(p.sr >= 0 && p.sr <= 1000, `${p.name} sr in range`);
+  }
+
+  // The WR holder outranks the twice-as-slow racer on the SAME field.
+  assert.ok(ace.sr > slow.sr, `Ace SR ${ace.sr} > Slow SR ${slow.sr}`);
+
+  // Breadth beats Ace on POINTS (12 second-places worth of top-15 bonuses beat
+  // one WR) but NOT on SR — being consistently half-speed can't out-skill a WR.
+  assert.ok(breadth.points > ace.points, `Breadth points ${breadth.points} > Ace points ${ace.points}`);
+  assert.ok(ace.sr > breadth.sr, `Ace SR ${ace.sr} > Breadth SR ${breadth.sr}`);
+
+  // sort=sr actually orders the board by SR descending.
+  const board = (await race.players({ sort: "sr", limit: 200 })).rows.map((r) => r.sr);
+  for (let i = 1; i < board.length; i++) assert.ok(board[i - 1] >= board[i], "players sorted by SR desc");
+});
+
+test("compare: head-to-head on shared maps drives the verdict", async (t) => {
+  const race = await freshDb(t);
+
+  // Alpha vs Beta share three maps (Alpha wins 2, Beta wins 1); Alpha has one
+  // extra solo map that must NOT count toward the head-to-head.
+  await race.ingest({ version: VER, map: "d1", source: "racelog", records: [finish("Alpha", 30000), finish("Beta", 32000)] });
+  await race.ingest({ version: VER, map: "d2", source: "racelog", records: [finish("Alpha", 40000), finish("Beta", 35000)] });
+  await race.ingest({ version: VER, map: "d3", source: "racelog", records: [finish("Alpha", 20000), finish("Beta", 25000)] });
+  await race.ingest({ version: VER, map: "solo", source: "racelog", records: [finish("Alpha", 10000)] });
+  await race.refreshAggregates();
+
+  const idOf = async (nick) =>
+    N((await race.one("SELECT canonical_id c FROM player WHERE simplified = $1", [nick])).c);
+  const alpha = await idOf("Alpha");
+  const beta = await idOf("Beta");
+
+  const cmp = await race.compare(alpha, beta);
+  assert.equal(cmp.a.id, alpha);
+  assert.equal(cmp.b.id, beta);
+  assert.equal(cmp.summary.shared, 3, "only the three shared maps count");
+  assert.equal(cmp.summary.aWins, 2);
+  assert.equal(cmp.summary.bWins, 1);
+  assert.equal(cmp.summary.ties, 0);
+  assert.equal(cmp.summary.leader, "a", "Alpha leads the head-to-head");
+  assert.equal(cmp.summary.basis, "head-to-head");
+  assert.equal(cmp.head.length, 3);
+  // Every detail row carries a resolved winner and a non-negative gap.
+  for (const h of cmp.head) {
+    assert.ok(["a", "b", "tie"].includes(h.winner));
+    assert.equal(h.delta, Math.abs(h.aTime - h.bTime));
+  }
+
+  // Order is symmetric: swapping sides swaps the wins and the leader.
+  const rev = await race.compare(beta, alpha);
+  assert.equal(rev.summary.aWins, 1);
+  assert.equal(rev.summary.bWins, 2);
+  assert.equal(rev.summary.leader, "b");
+
+  // Same player on both sides is flagged, not scored.
+  const self = await race.compare(alpha, alpha);
+  assert.equal(self.same, true);
+
+  // Unknown id -> null (the route turns this into a 404).
+  assert.equal(await race.compare(alpha, 999999), null);
+});
+
 test("every finish counts as an attempt; only the best is kept as the PR", async (t) => {
   const race = await freshDb(t);
 
