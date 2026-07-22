@@ -372,6 +372,33 @@ test("players with no tally (last_active NULL) sort last, never first", async (t
   assert.equal(asc.rows[asc.rows.length - 1].name, "Ghost");
 });
 
+test("maps sort=played orders by most recent activity, never-played last", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({ version: VER, map: "old", source: "racelog", records: [finish("Nova", 50000)] });
+  await race.ingest({ version: VER, map: "hot", source: "racelog", records: [finish("Nova", 50000)] });
+  // topscores backfill writes no tally -> the map has records but no
+  // last_played, and must trail the list in either direction.
+  await race.ingest({ version: VER, map: "archived", source: "topscores", records: [finish("Ghost", 40000)] });
+
+  // Both racelog ingests stamped the same "now"; force distinct times.
+  await race.pool.query(
+    "UPDATE run_tally SET last_finish = 1000, last_attempt = 1000 WHERE map_id = (SELECT id FROM map WHERE name = 'old')"
+  );
+  await race.pool.query(
+    "UPDATE run_tally SET last_finish = 2000, last_attempt = 2000 WHERE map_id = (SELECT id FROM map WHERE name = 'hot')"
+  );
+  await race.refreshAggregates();
+
+  const desc = await race.maps({ sort: "played" });
+  assert.deepEqual(desc.rows.map((r) => r.name), ["hot", "old", "archived"]);
+  assert.equal(desc.rows[0].last_played, 2000);
+  assert.equal(desc.rows[1].last_played, 1000);
+  assert.equal(desc.rows[2].last_played, null);
+
+  const asc = await race.maps({ sort: "played", order: "asc" });
+  assert.deepEqual(asc.rows.map((r) => r.name), ["old", "hot", "archived"]);
+});
+
 test("colour/spelling variants of one player collapse to one canonical identity", async (t) => {
   const race = await freshDb(t);
   await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("^8EL^9chupa^7", 50000)] });

@@ -384,12 +384,19 @@ async function buildAggregates(client) {
              COALESCE(rc.records, 0)::int AS records,
              COALESCE(ft.finishes, rc.records, 0)::int AS finishes,
              COALESCE(pc.players, 0)::int AS players,
+             ft.last_played,
              wr.wr_time, wr.wr_pid, wr.wr_version, wr.wr_race_id
       FROM map m
       LEFT JOIN (SELECT map_id, COUNT(*) records FROM race GROUP BY map_id) rc
              ON rc.map_id = m.id
-      LEFT JOIN (SELECT map_id, SUM(finishes) finishes FROM run_tally GROUP BY map_id) ft
-             ON ft.map_id = m.id
+      -- last_played: most recent attempt-or-finish by ANYONE on the map; NULL
+      -- when no tally exists (e.g. topscores-only history, never played live).
+      LEFT JOIN (
+        SELECT map_id, SUM(finishes) finishes,
+               NULLIF(MAX(GREATEST(COALESCE(last_finish, 0),
+                                   COALESCE(last_attempt, 0))), 0) AS last_played
+        FROM run_tally GROUP BY map_id
+      ) ft ON ft.map_id = m.id
       LEFT JOIN (SELECT map_id, COUNT(*) players FROM best_new GROUP BY map_id) pc
              ON pc.map_id = m.id
       LEFT JOIN (
@@ -405,6 +412,7 @@ async function buildAggregates(client) {
     CREATE INDEX ON map_index_new(name);
     CREATE INDEX ON map_index_new(records DESC);
     CREATE INDEX ON map_index_new(wr_time);
+    CREATE INDEX ON map_index_new(last_played DESC NULLS LAST);
     CREATE INDEX ON map_index_new USING gin (name gin_trgm_ops);
 
     DROP TABLE IF EXISTS best, standings, map_index;
@@ -422,6 +430,7 @@ const MAP_SORTS = Object.assign(Object.create(null), {
   races: "mi.records", // legacy alias
   finishes: "mi.finishes",
   wr_time: "mi.wr_time",
+  played: "mi.last_played",
 });
 const PLAYER_SORTS = Object.assign(Object.create(null), {
   points: "points",
@@ -963,7 +972,7 @@ class RaceDB {
     const rows = (
       await this.all(
         `SELECT mi.map_id AS id, mi.name, mi.records, mi.finishes, mi.players, mi.wr_time,
-                mi.wr_pid, mi.wr_version, p.name AS wr_name, p.simplified AS wr_simplified
+                mi.last_played, mi.wr_pid, mi.wr_version, p.name AS wr_name, p.simplified AS wr_simplified
          FROM map_index mi
          LEFT JOIN player p ON p.id = mi.wr_pid
          ${where}
@@ -977,6 +986,7 @@ class RaceDB {
       wr_pid: num(r.wr_pid),
       wr_version: num(r.wr_version),
       races: r.records,
+      last_played: r.last_played != null ? num(r.last_played) : null,
       wr_version_name: this.versions[num(r.wr_version)] || null,
     }));
     return { total, limit: lim, offset: off, rows };
