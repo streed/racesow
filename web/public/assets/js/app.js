@@ -349,6 +349,7 @@ async function viewMaps(params) {
           ${th("Finishes", "finishes", state, "num")}
           ${th("World Record", "wr_time", state, "num")}
           <th>Record Holder</th>
+          ${th("Last Played", "played", state, "num")}
         </tr></thead>
         <tbody>
           ${data.rows.map((m) => `
@@ -360,7 +361,8 @@ async function viewMaps(params) {
               <td class="num">${fmtNum(m.finishes != null ? m.finishes : m.races)}</td>
               <td class="num"><span class="time">${m.wr_time != null ? fmtTime(m.wr_time) : "—"}</span></td>
               <td>${m.wr_name ? wname(m.wr_name) : '<span class="pill">no runs</span>'}</td>
-            </tr>`).join("") || `<tr><td colspan="5" class="empty">No maps match “${esc(state.q)}”.</td></tr>`}
+              <td class="num"><span class="muted">${m.last_played != null ? fmtAgo(m.last_played) : "—"}</span></td>
+            </tr>`).join("") || `<tr><td colspan="6" class="empty">No maps match “${esc(state.q)}”.</td></tr>`}
         </tbody>
       </table>
     </div>${pager(state, data, "#/maps")}</div>`;
@@ -487,10 +489,22 @@ async function viewMap(id) {
       </div>` : ""}
     ${perfectHtml}
 
-    <div class="page-title">${mapNameHtml(d.name)}</div>
-    ${isReversedMap(d.name) ? `<p class="page-sub reverse-note">Reverse route of <b>${esc(baseMapName(d.name))}</b> — start at the finish line, run the checkpoints backward to the start. Separate leaderboard from the normal map. <a data-nav="#/about">How reverse mode works ↗</a></p>` : ""}
-    <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board
-      · <a class="extlink" href="${padporkUrl(d.name)}" target="_blank" rel="noopener external">padpork.org ↗</a></p>
+    <div class="map-hero">
+      <div class="map-hero-main">
+        <div class="page-title">${mapNameHtml(d.name)}</div>
+        ${isReversedMap(d.name) ? `<p class="page-sub reverse-note">Reverse route of <b>${esc(baseMapName(d.name))}</b> — start at the finish line, run the checkpoints backward to the start. Separate leaderboard from the normal map. <a data-nav="#/about">How reverse mode works ↗</a></p>` : ""}
+        <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board
+          · <a class="extlink" href="${padporkUrl(d.name)}" target="_blank" rel="noopener external">padpork.org ↗</a></p>
+      </div>
+      ${d.heatmap ? `
+      <div class="map-heat map-hero-viz">
+        <div class="kicker orange">◭ ${d.heatmap.mapBase ? "Map + traffic heatmap" : "Traffic heatmap"} · top-down</div>
+        <div class="map-heat-img"><img src="${esc(d.heatmap.url)}" width="${d.heatmap.width || ""}" height="${d.heatmap.height || ""}"
+          alt="Top-down ${d.heatmap.mapBase ? "map of " : "heatmap of where players have raced on "}${esc(baseMapName(d.name))}${d.heatmap.mapBase ? " with a traffic heatmap of where players have raced" : ""}" loading="lazy"></div>
+        <p class="map-heat-cap">Every ranked player's fastest line through <b>${esc(baseMapName(d.name))}</b>, seen from above${d.heatmap.mapBase ? " over the map's layout, with the start ⬤, checkpoints ①② and finish ▣ marked" : ""} — brighter means busier.
+          ${fmtNum(d.heatmap.players)} run${d.heatmap.players === 1 ? "" : "s"} · refreshed nightly.</p>
+      </div>` : ""}
+    </div>
 
     <div class="table-wrap"><div class="tscroll">
       <table class="data">
@@ -508,15 +522,6 @@ async function viewMap(id) {
         </tbody>
       </table>
     </div></div>
-
-    ${d.heatmap ? `
-    <div class="map-heat">
-      <div class="kicker orange">◭ ${d.heatmap.mapBase ? "Map + traffic heatmap" : "Traffic heatmap"} · top-down</div>
-      <div class="map-heat-img"><img src="${esc(d.heatmap.url)}" width="${d.heatmap.width || ""}" height="${d.heatmap.height || ""}"
-        alt="Top-down ${d.heatmap.mapBase ? "map of " : "heatmap of where players have raced on "}${esc(baseMapName(d.name))}${d.heatmap.mapBase ? " with a traffic heatmap of where players have raced" : ""}" loading="lazy"></div>
-      <p class="map-heat-cap">Every ranked player's fastest line through <b>${esc(baseMapName(d.name))}</b>, seen from above${d.heatmap.mapBase ? " over the map's layout, with the start ⬤, checkpoints ①② and finish ▣ marked" : ""} — brighter means busier.
-        ${fmtNum(d.heatmap.players)} run${d.heatmap.players === 1 ? "" : "s"} · refreshed nightly.</p>
-    </div>` : ""}
 
     ${d.recentFinishes && d.recentFinishes.length ? `
     <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> every run</div>
