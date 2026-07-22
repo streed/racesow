@@ -126,6 +126,10 @@ services:
       # (served at /backup/racesow-db-latest.zip). It lives under the ./data
       # mount below, so no extra volume is needed.
       BACKUP_DIR: "/data/backups"
+      # Directory the heatmaps sidecar renders per-map top-down heatmap PNGs into
+      # (served at /api/maps/:id/heatmap.png). Also under ./data, shared by both
+      # web replicas; the sidecar writes, the web only reads.
+      HEATMAP_DIR: "/data/heatmaps"
     volumes:
       # Legacy SQLite location — only read by migrate-sqlite-to-pg.js now; also
       # holds the WR ghost files (GHOST_DIR=/data/ghosts above), shared by both
@@ -164,6 +168,34 @@ services:
       # Same host dir the web service sees at /data/backups (./data:/data),
       # so the published zip is downloadable without an extra web mount.
       - ./data/backups:/backups
+
+  # Nightly top-down map heatmaps (see web/heatmap.js + web/README.md). A
+  # self-scheduling sidecar — no host cron — that aggregates every player's
+  # fastest-line ghost trajectory per map into a transparent density PNG under
+  # ./data/heatmaps, which the web serves at /api/maps/:id/heatmap.png. Runs the
+  # same racesow-web image (it already has pg + the ghost files on /data); the
+  # renderer is a zero-dependency PNG encoder. On boot it bootstraps any missing
+  # map, then each cycle refreshes the maps that saw a finish in the past day.
+  heatmaps:
+    build: ./web
+    image: racesow-web:latest
+    container_name: racesow-heatmaps
+    init: true
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://racesow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/racesow"
+      # Reads the per-(map,player) ghost trajectories the web/game write here …
+      GHOST_DIR: "/data/ghosts"
+      # … and writes <mapId>.png + <mapId>.json here, both under the shared ./data
+      # mount so the web service (BACKUP_DIR/HEATMAP_DIR above) can serve them.
+      HEATMAP_DIR: "/data/heatmaps"
+      HEATMAP_INTERVAL_SECONDS: "86400"   # nightly full refresh (re-checks hourly)
+    volumes:
+      - ./data:/data
+    command: ["node", "heatmap.js", "--loop"]
 
   discord:
     build: ./discord

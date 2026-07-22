@@ -47,6 +47,8 @@ docker compose up -d --build
 | `DATABASE_URL`  | `postgres://racesow:racesow@127.0.0.1:5432/racesow` | PostgreSQL connection    |
 | `PG_POOL_SIZE`  | `10`                                             | pg connection pool size     |
 | `BACKUP_DIR`    | `/data/backups`                                  | where the `db-backup` sidecar publishes the [public backup](#public-database-backup) this server serves |
+| `HEATMAP_DIR`   | `/data/heatmaps`                                 | where the `heatmaps` sidecar renders per-map [top-down heatmaps](#map-heatmaps) this server serves |
+| `GHOST_DIR`     | `./ghosts` (`/data/ghosts` in Docker)            | per-(map, player) ghost trajectory files; also the source the heatmap generator reads |
 | `ADMIN_COOKIE_INSECURE` | *(unset)*                                | Set to `1` to drop the `Secure` flag on the admin session cookie for plain-HTTP local dev. Never set in production (the edge terminates TLS, so `req.secure` already adds `Secure`). |
 
 ## Schema migrations
@@ -256,6 +258,38 @@ IPs (`server.address`), and moderation data (`map_flag`, `map_block`). Mesh keys
 and `INGEST_TOKEN` live in env/config and are never in the database. See
 [`../backup/README.md`](../backup/README.md) for restore steps.
 
+## Map heatmaps
+
+A nightly, top-down "where people have been" density image per map, shown on the
+map page and available directly:
+
+| URL | Purpose |
+| --- | --- |
+| `GET /api/maps/:id/heatmap.png` | the heatmap PNG (transparent RGBA). 404 until the map has been rendered |
+| `GET /api/maps/:id`             | folds heatmap metadata into `heatmap: { url, width, height, players, points, generatedAt }` (or `null`) |
+
+Every player's *fastest* recorded run on a map is stored as a ghost trajectory
+(`GHOST_DIR/<mapId>/<playerId>.json.gz` — a fixed-rate list of `[x, y, z, …]`
+frames in Quake units). The `heatmaps` sidecar ([`heatmap.js`](heatmap.js),
+wired in the top-level `docker-compose.yml`) projects all of a map's ghosts onto
+the X/Y plane (top-down, north up), accumulates a blurred density grid, applies
+an inferno colormap over a transparent background, and writes
+`HEATMAP_DIR/<mapId>.png` + `<mapId>.json`. Each **player** is weighted equally
+(a frame counts `1/frameCount`), so the image shows where people *go*, not how
+long they linger — brighter means busier.
+
+Like `db-backup` it is a self-scheduling container (no host cron): it bootstraps
+any missing map on boot, then each cycle refreshes the maps that saw a finish in
+the past day, guaranteeing at least one full pass per `HEATMAP_INTERVAL_SECONDS`
+(default nightly). The PNG encoder is dependency-free (`zlib` only), and the
+rendering path is pure — `node --test test/heatmap.test.js` covers it without a
+database. Regenerate on demand with:
+
+```bash
+docker compose run --rm heatmaps node heatmap.js --all   # every map with ghosts
+docker compose run --rm heatmaps node heatmap.js 42       # just map id 42
+```
+
 ## Files
 
 - `server.js` — Express app: API routes + static hosting + SPA fallback + OG cards.
@@ -267,4 +301,6 @@ and `INGEST_TOKEN` live in env/config and are never in the database. See
   canonical player groups, manage moderator accounts (`admin-add`/`-list`/
   `-passwd`/`-remove`) and review map flags (`flags`/`resolve`/`dismiss`).
 - `seed-topscores.js` — write the game server's topscores files from the DB.
+- `heatmap.js` — nightly [map heatmap](#map-heatmaps) generator + self-scheduling
+  sidecar (dependency-free PNG encoder; pure rendering path).
 - `public/` — the frontend (`index.html`, `assets/css`, `assets/js`).

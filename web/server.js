@@ -37,6 +37,14 @@ const BACKUP_DIR = process.env.BACKUP_DIR || "/data/backups";
 const BACKUP_LATEST_ZIP = path.join(BACKUP_DIR, "racesow-db-latest.zip");
 const BACKUP_LATEST_META = path.join(BACKUP_DIR, "racesow-db-latest.json");
 
+// Top-down map heatmaps, generated nightly by the heatmaps sidecar (see
+// web/heatmap.js + docker-compose.yml) into HEATMAP_DIR under the shared ./data
+// mount: <mapId>.png (transparent RGBA density image) + <mapId>.json (bounds,
+// player/point counts, generatedAt). The image is served at
+// /api/maps/:id/heatmap.png and its metadata is folded into /api/maps/:id; both
+// degrade to "absent" until the sidecar has rendered a map.
+const HEATMAP_DIR = process.env.HEATMAP_DIR || "/data/heatmaps";
+
 // Legacy single-server token (optional). Per-server tokens live in the DB
 // `server` table and are the recommended path for multi-server deploys.
 const PLACEHOLDER_TOKEN = "change-me-ingest-token";
@@ -202,13 +210,46 @@ api.get("/maps/blocked", cache(60), wrap(async (_req, res) => {
   });
 }));
 
+// Metadata for a map's nightly top-down heatmap (web/heatmap.js): { url, width,
+// height, players, points, generatedAt } or null when the sidecar hasn't
+// rendered this map yet. Read from the sibling <mapId>.json the generator writes
+// next to the PNG. Never throws — a missing/corrupt file just means "no heatmap".
+function heatmapMeta(id) {
+  try {
+    const m = JSON.parse(readFileSync(path.join(HEATMAP_DIR, `${id}.json`), "utf8"));
+    return {
+      url: `/api/maps/${id}/heatmap.png?v=${m.generatedAt || 0}`,
+      width: m.width,
+      height: m.height,
+      players: m.players,
+      points: m.points,
+      generatedAt: m.generatedAt || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 api.get("/maps/:id", cache(60, { edge: true }), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid map id" });
   const detail = await race.mapDetail(id, req.query);
   if (!detail) return res.status(404).json({ error: "map not found" });
+  detail.heatmap = heatmapMeta(id);
   res.json(detail);
 }));
+
+// The heatmap PNG itself (transparent RGBA). A numeric :id so there is no path
+// -traversal surface; the callback turns a not-yet-generated map into a clean
+// 404. Cache-busted by the ?v=generatedAt the API hands the client, so a long
+// browser cache is safe.
+api.get("/maps/:id/heatmap.png", (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).json({ error: "invalid map id" });
+  res.sendFile(path.join(HEATMAP_DIR, `${id}.png`), { maxAge: "1h", headers: { "Content-Type": "image/png" } }, (err) => {
+    if (err && !res.headersSent) res.status(404).json({ error: "no heatmap for this map yet" });
+  });
+});
 
 // Ghost trajectory for the in-browser replay viewer (gzipped JSON). Served with
 // Content-Encoding: gzip so the stored bytes go straight to the client.
