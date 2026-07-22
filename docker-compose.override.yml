@@ -48,6 +48,7 @@ services:
       DEMO_BASE_URL: "${DEMO_BASE_URL:-}"
       GHOST_DIR: "/data/ghosts"
       BACKUP_DIR: "/data/backups"
+      HEATMAP_DIR: "/data/heatmaps"
     volumes:
       - ./data:/data
       # Same read-only replay-mesh mount as `web` — without it this replica
