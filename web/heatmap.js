@@ -27,6 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { loadMapGeometry, renderMapBase } from "./bsp.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -34,6 +35,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // local `node heatmap.js` and the sidecar read/write the same files.
 const GHOST_DIR = process.env.GHOST_DIR || path.join(__dirname, "ghosts");
 const HEATMAP_DIR = process.env.HEATMAP_DIR || path.join(__dirname, "heatmaps");
+// Directory of map .pk3 packs, so each heatmap can be drawn over a top-down
+// render of the map geometry (see bsp.js). Empty/unset = heatmap-only, no base.
+const MAPS_DIR = process.env.MAPS_DIR || "";
 
 // Longest side of the output image in pixels (the shorter side follows the map's
 // aspect ratio). Clamped so a hostile env var can't ask for a gigapixel canvas.
@@ -247,12 +251,28 @@ export function buildHeatmap(ghosts, opts = {}) {
 
   return {
     png: encodePNG(W, H, rgba),
+    rgba, // raw heatmap layer, so callers can composite it over a map base
     width: W,
     height: H,
     players: usable,
     points: totalPoints,
     bounds: { minX, minY, maxX, maxY },
   };
+}
+
+// Composite the transparent heatmap layer OVER an (opaque-ish) map-base layer,
+// in place on `base`. Straight source-over alpha blend; where the heatmap is
+// transparent the map shows through, where it's hot the traffic colours win.
+function compositeOver(base, over) {
+  for (let p = 0; p < base.length; p += 4) {
+    const a = over[p + 3];
+    if (!a) continue;
+    const ia = a / 255, na = 1 - ia;
+    base[p] = over[p] * ia + base[p] * na;
+    base[p + 1] = over[p + 1] * ia + base[p + 1] * na;
+    base[p + 2] = over[p + 2] * ia + base[p + 2] * na;
+    base[p + 3] = Math.max(base[p + 3], a);
+  }
 }
 
 function splat(grid, w, h, x, y, v) {
@@ -343,7 +363,7 @@ export function loadGhostsForMap(mapId, ghostDir = GHOST_DIR) {
 // Regenerate one map's heatmap files. Returns metadata, or null if the map has no
 // usable ghost data (in which case any stale image is removed so a de-populated
 // map doesn't keep serving an outdated heatmap).
-export function generateMap(mapId, name = null, { ghostDir = GHOST_DIR, outDir = HEATMAP_DIR, size = SIZE } = {}) {
+export function generateMap(mapId, name = null, { ghostDir = GHOST_DIR, outDir = HEATMAP_DIR, size = SIZE, mapsDir = MAPS_DIR } = {}) {
   const ghosts = loadGhostsForMap(mapId, ghostDir);
   const pngPath = path.join(outDir, `${mapId}.png`);
   const metaPath = path.join(outDir, `${mapId}.json`);
@@ -352,6 +372,26 @@ export function generateMap(mapId, name = null, { ghostDir = GHOST_DIR, outDir =
   if (!built) {
     for (const p of [pngPath, metaPath]) try { fs.unlinkSync(p); } catch {}
     return null;
+  }
+
+  // Draw the heatmap on top of a top-down render of the map geometry when the
+  // map's .pk3 is available and parses (bsp.js) — so you see WHERE the traffic
+  // is. Any failure (missing pack, unknown BSP) falls back to the heatmap alone.
+  let png = built.png;
+  let mapBase = false;
+  if (mapsDir && name) {
+    try {
+      const geom = loadMapGeometry(mapsDir, name);
+      if (geom) {
+        const base = new Uint8Array(built.width * built.height * 4);
+        renderMapBase(base, built.width, built.height, built.bounds, geom);
+        compositeOver(base, built.rgba);
+        png = encodePNG(built.width, built.height, base);
+        mapBase = true;
+      }
+    } catch (e) {
+      log(`map-base render failed for ${mapId} (${name}): ${e.message}`);
+    }
   }
 
   fs.mkdirSync(outDir, { recursive: true });
@@ -363,11 +403,12 @@ export function generateMap(mapId, name = null, { ghostDir = GHOST_DIR, outDir =
     players: built.players,
     points: built.points,
     bounds: built.bounds,
+    mapBase,
     generatedAt: Math.floor(Date.now() / 1000),
   };
   // Atomic publish (write temp + rename) so the web never serves a half-written
   // PNG mid-regeneration.
-  writeAtomic(pngPath, built.png);
+  writeAtomic(pngPath, png);
   writeAtomic(metaPath, Buffer.from(JSON.stringify(meta)));
   return meta;
 }

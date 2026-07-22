@@ -193,8 +193,12 @@ services:
       # mount so the web service (BACKUP_DIR/HEATMAP_DIR above) can serve them.
       HEATMAP_DIR: "/data/heatmaps"
       HEATMAP_INTERVAL_SECONDS: "86400"   # nightly full refresh (re-checks hourly)
+      # Map .pk3 packs (read-only) so each heatmap is drawn over a top-down render
+      # of the map geometry (bsp.js). Same packs the game server serves.
+      MAPS_DIR: "/maps"
     volumes:
       - ./data:/data
+      - ./server/maps:/maps:ro
     command: ["node", "heatmap.js", "--loop"]
 
   discord:

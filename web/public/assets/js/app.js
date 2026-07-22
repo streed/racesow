@@ -206,7 +206,7 @@ async function viewOverview() {
       <div class="panel hof">
         <h3><span class="dot"></span> Hall of Fame</h3>
         <div class="tscroll"><table class="data">
-          <thead><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num" title="Skill Rating — competition-weighted closeness to each map's world record">SR</th><th class="num">WRs</th><th class="num">Maps</th></tr></thead>
+          <thead><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num" title="Skill Rating — how close your strongest runs get to the world record, against real fields">SR</th><th class="num">WRs</th><th class="num">Maps</th></tr></thead>
           <tbody>
             ${d.hallOfFame.map((p) => `
               <tr class="clickable" data-nav="#/player/${p.id}">
@@ -383,7 +383,7 @@ async function viewPlayers(params) {
 
   app.innerHTML = `
     <div class="page-title"><span class="accent">PLAYER</span> RANKINGS</div>
-    <p class="page-sub">Ranked by race points (top-15 finish on each map). Sort by <b>SR</b> for the skill-weighted board — closeness to each map's world record against the strength of the field. Search by name and sort by any column, or <a data-nav="#/compare">compare two players head-to-head ⚔</a>.</p>
+    <p class="page-sub">Ranked by race points (top-15 finish on each map). Sort by <b>SR</b> for the skill board — how close your strongest runs get to each world record, against the strength of the field. Search by name and sort by any column, or <a data-nav="#/compare">compare two players head-to-head ⚔</a>.</p>
     <div class="toolbar">
       <input class="filter" id="pfilter" placeholder="Search players by name…" value="${esc(state.q)}">
       <span class="count">${fmtNum(data.total)} players</span>
@@ -494,10 +494,10 @@ async function viewMap(id) {
 
     ${d.heatmap ? `
     <div class="map-heat">
-      <div class="kicker orange">◭ Traffic heatmap · top-down</div>
+      <div class="kicker orange">◭ ${d.heatmap.mapBase ? "Map + traffic heatmap" : "Traffic heatmap"} · top-down</div>
       <div class="map-heat-img"><img src="${esc(d.heatmap.url)}" width="${d.heatmap.width || ""}" height="${d.heatmap.height || ""}"
-        alt="Top-down heatmap of where players have raced on ${esc(baseMapName(d.name))}" loading="lazy"></div>
-      <p class="map-heat-cap">Every ranked player's fastest line through <b>${esc(baseMapName(d.name))}</b>, seen from above — brighter means busier.
+        alt="Top-down ${d.heatmap.mapBase ? "map of " : "heatmap of where players have raced on "}${esc(baseMapName(d.name))}${d.heatmap.mapBase ? " with a traffic heatmap of where players have raced" : ""}" loading="lazy"></div>
+      <p class="map-heat-cap">Every ranked player's fastest line through <b>${esc(baseMapName(d.name))}</b>, seen from above${d.heatmap.mapBase ? " over the map's layout" : ""} — brighter means busier.
         ${fmtNum(d.heatmap.players)} run${d.heatmap.players === 1 ? "" : "s"} · refreshed nightly.</p>
     </div>` : ""}
 
@@ -684,7 +684,7 @@ async function viewPlayer(id, params) {
 
     <div class="statrow">
       <div class="s hl"><div class="n">${fmtNum(s.points)}</div><div class="l">Points</div></div>
-      <div class="s hl" title="Skill Rating — competition-weighted closeness to each map's world record (0–1000)"><div class="n">${fmtNum(s.sr)}</div><div class="l">Skill Rating</div></div>
+      <div class="s hl" title="Skill Rating — how close your strongest runs get to the world record, against real fields (0–1000)"><div class="n">${fmtNum(s.sr)}</div><div class="l">Skill Rating</div></div>
       <div class="s"><div class="n">${fmtNum(s.wr)}</div><div class="l">World Records</div></div>
       <div class="s"><div class="n">${fmtNum(s.podium)}</div><div class="l">Podiums</div></div>
       <div class="s"><div class="n">${fmtNum(s.maps)}</div><div class="l">Maps Raced</div></div>
@@ -1239,7 +1239,7 @@ const ABOUT_FAQ = [
   ["Can I watch a record?",
     "Yes. Open any map and look for a <b>▶ replay</b> badge to watch the ghost right in your browser, or <b>⬇ demo</b> to download it. To play a demo back in Warsow, drop the file in your <span class=\"mono\">racemod/demos</span> folder and run <span class=\"mono\">demo &lt;file&gt;</span> in the console."],
   ["How is the ranking worked out?",
-    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: for each map it measures how close your time is to the world record (WR ÷ your time) and weights it by how many people you beat, then <b>averages</b> that across your maps on a 0–1000 scale — so it rewards being fast against strong fields rather than simply racing more maps. A lone lucky record won't top the SR board until it's backed up across a real sample. World records and podium finishes are tracked separately on your profile."],
+    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: on each map it measures how close your time is to the world record, weighted by how many players you beat, and your rating is built from up to <b>20 of your strongest maps</b> on a 0–1000 scale — weaker runs simply don't count, so racing more can only ever raise it, and a 30-map career competes fairly with a 3000-map one. Only contested maps count (5+ players with a time), and a thin record won't reach the top until it's proven across a real sample. World records and podium finishes are tracked separately on your profile."],
   ["A map is broken or shouldn't be here — what do I do?",
     "Flag it for review. In-game, type <span class=\"mono\">/flag</span> while you're on the map (add a reason if you like, e.g. <span class=\"mono\">/flag broken</span>). Or open the map on this site and hit <b>⚑ Flag this map for review</b>. Moderators check flagged maps and can pull a bad one from the vote pool and map cycle."],
 ];

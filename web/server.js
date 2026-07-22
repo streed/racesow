@@ -223,6 +223,7 @@ function heatmapMeta(id) {
       height: m.height,
       players: m.players,
       points: m.points,
+      mapBase: m.mapBase || false,
       generatedAt: m.generatedAt || null,
     };
   } catch {
