@@ -222,6 +222,7 @@ export async function openDatabase(connectionString) {
   await race._loadVersions();
   await race.refreshAggregates();
   await race._relayoutGhostFiles();
+  await race.syncGhostPayloads(); // durable ghosts: backfill payloads + restore any lost files
   console.log(`Database ready in ${Date.now() - t0}ms`);
   return race;
 }
@@ -861,13 +862,13 @@ class RaceDB {
       fs.writeFileSync(file, gz);
 
       await client.query(
-        `INSERT INTO player_ghost (map_id, player_id, version_id, time, hz, frames, bytes, server_id, captured_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `INSERT INTO player_ghost (map_id, player_id, version_id, time, hz, frames, bytes, server_id, captured_at, payload)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (map_id, player_id) DO UPDATE SET
            version_id = EXCLUDED.version_id, time = EXCLUDED.time, hz = EXCLUDED.hz,
            frames = EXCLUDED.frames, bytes = EXCLUDED.bytes, server_id = EXCLUDED.server_id,
-           captured_at = EXCLUDED.captured_at`,
-        [ids.mapId, ids.playerId, ids.versionId, time, hz, frames.length, gz.length, serverId, Math.floor(Date.now() / 1000)]
+           captured_at = EXCLUDED.captured_at, payload = EXCLUDED.payload`,
+        [ids.mapId, ids.playerId, ids.versionId, time, hz, frames.length, gz.length, serverId, Math.floor(Date.now() / 1000), gz]
       );
       return true;
     });
@@ -888,11 +889,58 @@ class RaceDB {
     } else if (!(await this.one("SELECT 1 FROM player_ghost WHERE map_id = $1 AND player_id = $2", [mapId, pid]))) {
       return null;
     }
+    const file = this._ghostPath(mapId, pid);
     try {
-      return fs.readFileSync(this._ghostPath(mapId, pid));
+      return fs.readFileSync(file);
     } catch {
-      return null; // row without a file (e.g. volume reset): treat as absent
+      // File missing (volume reset / lost pre-shared-mount): fall back to the
+      // durable DB payload and restore the file so later reads + the heatmap are
+      // served locally again. Only null when we truly never stored the payload.
+      const row = await this.one("SELECT payload FROM player_ghost WHERE map_id = $1 AND player_id = $2", [mapId, pid]);
+      if (!row || !row.payload) return null;
+      const buf = Buffer.isBuffer(row.payload) ? row.payload : Buffer.from(row.payload);
+      try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, buf); } catch { /* read-only fs: still serve */ }
+      return buf;
     }
+  }
+
+  // Reconcile the ghost files on disk with the durable DB payloads: backfill a
+  // payload from any file that predates the payload column, and restore any file
+  // lost to a volume reset from its stored payload. Idempotent; run on startup so
+  // the shared /data mount holds every ghost we can prove we captured. Rows with
+  // neither a file nor a payload are unrecoverable (lost before this fix).
+  async syncGhostPayloads() {
+    const rows = (await this.pool.query(
+      "SELECT map_id, player_id, (payload IS NOT NULL) AS has_payload FROM player_ghost"
+    )).rows;
+    let backfilled = 0, restored = 0, lost = 0;
+    for (const r of rows) {
+      const file = this._ghostPath(r.map_id, r.player_id);
+      const onDisk = fs.existsSync(file);
+      if (!r.has_payload && onDisk) {
+        try {
+          const buf = fs.readFileSync(file);
+          await this.pool.query(
+            "UPDATE player_ghost SET payload = $1 WHERE map_id = $2 AND player_id = $3 AND payload IS NULL",
+            [buf, r.map_id, r.player_id]
+          );
+          backfilled++;
+        } catch { /* unreadable file — skip */ }
+      } else if (r.has_payload && !onDisk) {
+        const pr = (await this.pool.query(
+          "SELECT payload FROM player_ghost WHERE map_id = $1 AND player_id = $2", [r.map_id, r.player_id]
+        )).rows[0];
+        if (pr && pr.payload) {
+          const buf = Buffer.isBuffer(pr.payload) ? pr.payload : Buffer.from(pr.payload);
+          try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, buf); restored++; } catch { /* skip */ }
+        }
+      } else if (!r.has_payload && !onDisk) {
+        lost++;
+      }
+    }
+    if (backfilled || restored || lost)
+      console.log(`ghost sync: backfilled ${backfilled} payload(s), restored ${restored} file(s)${lost ? `, ${lost} unrecoverable` : ""}`);
+    return { backfilled, restored, lost };
   }
 
   // One-time, idempotent migration of legacy one-per-map ghost files

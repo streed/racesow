@@ -249,3 +249,34 @@ test("a faster record without a replay still surfaces the best captured replay (
   assert.ok(detail.wr.demo, "demo still surfaced");
   assert.equal(detail.wr.demo.isWr, false);
 });
+
+test("ghost durability: a lost file is served + restored from the DB payload", async () => {
+  const frames = [
+    [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [10, 0, 5, 0, 90, 0, 400, 0, 50],
+    [20, 5, 8, 0, 92, 0, 420, 10, 20],
+  ];
+  assert.equal((await ingest(finishBody({ map: "durmap", name: "Dur", time: 20000, cps: [8000] }))).status, 200);
+  await new Promise((r) => setTimeout(r, 3600));
+  const mapId = (await getJson("/maps?q=durmap")).rows[0].id;
+  assert.deepEqual(
+    (await ingest(JSON.stringify({ version: "wsw 2.1", map: "durmap", name: "Dur", login: "", time: 20000, hz: 25, frames, cps: [1] }), TOKEN, "/ingest/ghost")).json,
+    { ok: true, stored: true }
+  );
+
+  // The ghost file was written to disk...
+  const dir = path.join(ghostDir, String(mapId));
+  const file = path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith(".json.gz")));
+  assert.ok(fs.existsSync(file), "ghost file written");
+
+  // ...now simulate losing it (a volume reset). The DB payload must survive.
+  fs.rmSync(file);
+  assert.ok(!fs.existsSync(file), "file removed");
+
+  // The browser endpoint still serves the ghost (from the DB payload)...
+  const gr = await fetch(`${base}/api/maps/${mapId}/ghost`);
+  assert.equal(gr.status, 200, "served from DB payload after file loss");
+  assert.equal((await gr.json()).frames.length, frames.length);
+  // ...and the file has been restored on disk for subsequent reads + the heatmap.
+  assert.ok(fs.existsSync(file), "ghost file restored from the DB payload");
+});
