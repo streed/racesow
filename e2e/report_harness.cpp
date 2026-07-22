@@ -8,9 +8,12 @@
  * Each stdin line is one finish, tab-separated, mirroring the arguments
  * racelog.as passes to RS_ApiReportRace:
  *
- *   map \t playerName \t login \t timeMs \t cp1,cp2,...
+ *   map \t playerName \t login \t timeMs \t cp1,cp2,... [\t attempts
+ *       [\t wallJumps \t dashes \t prejumpFails \t restarts]]
  *
- * (login and the checkpoint list may be empty). lingerSeconds keeps the
+ * (login and the checkpoint list may be empty; the trailing counters are
+ * optional and default to "omitted", so existing inputs are unchanged).
+ * lingerSeconds keeps the
  * process alive after EOF, standing in for the game server staying up — the
  * sender's paced 2s retry backoff only applies while the module is loaded; at
  * shutdown the remaining retries drain unpaced. The process exits after the
@@ -26,7 +29,8 @@
 
 void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	const char *mapname, const char *player, const char *login,
-	int timeMs, int attemptsSinceLast, const char *cpsCsv );
+	int timeMs, int attemptsSinceLast, const char *cpsCsv,
+	int wallJumps, int dashes, int prejumpFails, int restarts );
 
 // Split on single tabs, preserving empty fields (strtok would collapse them).
 static std::vector<std::string> splitTabs( const char *line )
@@ -58,16 +62,22 @@ int main( int argc, char **argv )
 		if( line[0] == '\0' || line[0] == '\n' || line[0] == '#' )
 			continue;
 		std::vector<std::string> f = splitTabs( line );
-		if( f.size() != 5 && f.size() != 6 ) {
-			fprintf( stderr, "harness: bad line (want 5-6 tab-separated fields): %s", line );
+		if( f.size() < 5 || f.size() > 10 ) {
+			fprintf( stderr, "harness: bad line (want 5-10 tab-separated fields): %s", line );
 			return 2;
 		}
 		// optional 6th field: attempts since the player's last flush
 		// (racelog.as counts starts and attaches them the same way)
-		int attempts = f.size() == 6 ? atoi( f[5].c_str() ) : 1;
+		int attempts = f.size() >= 6 ? atoi( f[5].c_str() ) : 1;
+		// optional 7th-10th fields: movement metrics; -1 => omit from the payload
+		int wallJumps   = f.size() >= 7  ? atoi( f[6].c_str() ) : -1;
+		int dashes      = f.size() >= 8  ? atoi( f[7].c_str() ) : -1;
+		int prejumpFails= f.size() >= 9  ? atoi( f[8].c_str() ) : -1;
+		int restarts    = f.size() >= 10 ? atoi( f[9].c_str() ) : -1;
 		RS_ApiReportRace( argv[1], argv[2], argv[3],
 			f[0].c_str(), f[1].c_str(), f[2].c_str(),
-			atoi( f[3].c_str() ), attempts, f[4].c_str() );
+			atoi( f[3].c_str() ), attempts, f[4].c_str(),
+			wallJumps, dashes, prejumpFails, restarts );
 		queued++;
 	}
 	int linger = argc == 5 ? atoi( argv[4] ) : 0;

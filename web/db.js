@@ -1193,6 +1193,22 @@ class RaceDB {
       finishes || 0
     );
 
+    // Lifetime movement / behaviour metrics summed across every map/version this
+    // player (all nick variants) has raced. Rows written before these columns
+    // existed contribute 0.
+    const mrow = await this.one(
+      `SELECT COALESCE(SUM(wall_jumps),0) wj, COALESCE(SUM(dashes),0) da,
+              COALESCE(SUM(prejump_failures),0) pj, COALESCE(SUM(restarts),0) rs
+       FROM run_tally WHERE ${groupWhere}`,
+      [canonId]
+    );
+    const metrics = {
+      wallJumps: num(mrow.wj),
+      dashes: num(mrow.da),
+      prejumpFailures: num(mrow.pj),
+      restarts: num(mrow.rs),
+    };
+
     const col = RECORD_SORTS[sort] || RECORD_SORTS.time;
     const direction = dir(order, "ASC");
     const lim = clampLimit(limit, 50, 500);
@@ -1291,6 +1307,7 @@ class RaceDB {
       standing,
       finishes,
       attempts,
+      metrics,
       versions,
       records: { total, limit: lim, offset: off, rows: records },
     };
@@ -1944,20 +1961,32 @@ class RaceDB {
 
       const counts = { inserted: 0, improved: 0, unchanged: 0 };
 
-      const bumpAttempts = (playerId, count) =>
+      // Bump the per-(player,map,version) counters: race starts plus the
+      // movement/behaviour metrics (wall jumps, dashes, prejump-rejected starts,
+      // restarts) the game module attaches to the same flush. Missing metric
+      // fields (older servers) default to 0, so this stays backward-compatible.
+      const bumpTally = (playerId, count, m = {}) =>
         client.query(
-          `INSERT INTO run_tally (player_id, map_id, version_id, finishes, attempts, last_attempt)
-           VALUES ($1, $2, $3, 0, $4, $5)
+          `INSERT INTO run_tally (player_id, map_id, version_id, finishes, attempts, last_attempt,
+                                  wall_jumps, dashes, prejump_failures, restarts)
+           VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9)
            ON CONFLICT (player_id, map_id, version_id)
            DO UPDATE SET attempts = run_tally.attempts + EXCLUDED.attempts,
-                         last_attempt = EXCLUDED.last_attempt`,
-          [playerId, mapRow.id, versionRow.id, count, now]
+                         last_attempt = EXCLUDED.last_attempt,
+                         wall_jumps = run_tally.wall_jumps + EXCLUDED.wall_jumps,
+                         dashes = run_tally.dashes + EXCLUDED.dashes,
+                         prejump_failures = run_tally.prejump_failures + EXCLUDED.prejump_failures,
+                         restarts = run_tally.restarts + EXCLUDED.restarts`,
+          [
+            playerId, mapRow.id, versionRow.id, count, now,
+            m.wall_jumps || 0, m.dashes || 0, m.prejump_failures || 0, m.restarts || 0,
+          ]
         );
 
       if (tally) {
         for (const a of attempts) {
           const playerId = await this._resolvePlayer(client, a);
-          await bumpAttempts(playerId, a.count);
+          await bumpTally(playerId, a.count, a);
         }
       }
 
@@ -1972,7 +2001,7 @@ class RaceDB {
              DO UPDATE SET finishes = run_tally.finishes + 1, last_finish = $4`,
             [playerId, mapRow.id, versionRow.id, now]
           );
-          await bumpAttempts(playerId, rec.attempts != null ? rec.attempts : 1);
+          await bumpTally(playerId, rec.attempts != null ? rec.attempts : 1, rec);
         }
 
         const existing = await q1(

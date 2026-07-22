@@ -682,6 +682,7 @@ void GT_ThinkRules()
         player.checkNoclipAction();
         player.checkRelease();
         player.updateMaxSpeed();
+        player.detectMovementEvents(); // count wall jumps / dashes during a race
         player.checkReverseStart(); // reverse start-on-exit from a finish volume
 
         // hettoo: force practicemode message on spectators

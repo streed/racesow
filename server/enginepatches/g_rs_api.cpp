@@ -558,7 +558,8 @@ __attribute__(( destructor )) void rsApiShutdown()
  */
 void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	const char *mapname, const char *player, const char *login,
-	int timeMs, int attemptsSinceLast, const char *cpsCsv )
+	int timeMs, int attemptsSinceLast, const char *cpsCsv,
+	int wallJumps, int dashes, int prejumpFails, int restarts )
 {
 	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] || timeMs <= 0 )
 		return;
@@ -597,7 +598,15 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
 		if( *end != ',' )
 			break;
 	}
-	body += "]}]}";
+	body += "]"; // close the checkpoints array
+
+	// Movement / behaviour metrics accumulated since this player's last flush
+	// (negative = omit; the API treats a missing field as zero).
+	if( wallJumps >= 0 ) { body += ",\"wall_jumps\":"; body += std::to_string( wallJumps ); }
+	if( dashes >= 0 ) { body += ",\"dashes\":"; body += std::to_string( dashes ); }
+	if( prejumpFails >= 0 ) { body += ",\"prejump_failures\":"; body += std::to_string( prejumpFails ); }
+	if( restarts >= 0 ) { body += ",\"restarts\":"; body += std::to_string( restarts ); }
+	body += "}]}";
 
 	ApiState *s = ensureStarted();
 	{
@@ -621,9 +630,14 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
  * bounded retries, dropped on permanent failure.
  */
 void RS_ApiReportAttempts( const char *url, const char *token, const char *version,
-	const char *mapname, const char *player, const char *login, int count )
+	const char *mapname, const char *player, const char *login, int count,
+	int wallJumps, int dashes, int prejumpFails, int restarts )
 {
-	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] || count <= 0 )
+	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] )
+		return;
+	// A flush is worth sending if there are starts to report OR any movement
+	// metric to carry (a lone /kill leaves restarts with no accompanying start).
+	if( count <= 0 && wallJumps <= 0 && dashes <= 0 && prejumpFails <= 0 && restarts <= 0 )
 		return;
 
 	std::string body;
@@ -637,7 +651,11 @@ void RS_ApiReportAttempts( const char *url, const char *token, const char *versi
 	body += "\",\"login\":\"";
 	jsonEscapeInto( body, login ? login : "" );
 	body += "\",\"count\":";
-	body += std::to_string( count );
+	body += std::to_string( count > 0 ? count : 0 );
+	if( wallJumps >= 0 ) { body += ",\"wall_jumps\":"; body += std::to_string( wallJumps ); }
+	if( dashes >= 0 ) { body += ",\"dashes\":"; body += std::to_string( dashes ); }
+	if( prejumpFails >= 0 ) { body += ",\"prejump_failures\":"; body += std::to_string( prejumpFails ); }
+	if( restarts >= 0 ) { body += ",\"restarts\":"; body += std::to_string( restarts ); }
 	body += "}]}";
 
 	ApiState *s = ensureStarted();

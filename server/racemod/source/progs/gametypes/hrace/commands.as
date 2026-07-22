@@ -178,6 +178,13 @@ bool Cmd_RaceRestart( Client@ client, const String &cmdString, const String &arg
 
     player.cancelRace();
 
+    // Player metric: a deliberate run reset. Only the explicit restart commands
+    // by a racer count — a spectator's /join (which also routes here) is a team
+    // change, not a restart.
+    if ( ( cmdString == "kill" || cmdString == "racerestart" )
+            && client.team != TEAM_SPECTATOR )
+        RACE_Restarted( client );
+
     if ( player.practicing && client.team != TEAM_SPECTATOR )
     {
         Entity@ ent = client.getEnt();
