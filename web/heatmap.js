@@ -27,7 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
-import { loadMapGeometry, renderMapBase } from "./bsp.js";
+import { loadMapGeometry, renderMapBase, makeProject, fillBg, drawGrid, drawMarkers, THEME } from "./bsp.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -193,18 +193,17 @@ export function buildHeatmap(ghosts, opts = {}) {
   const worldW = maxX - minX;
   const worldH = maxY - minY;
 
-  // Grid dimensions: longest side = `size`, other side by aspect. Min 64 so a
-  // very thin map still has resolution across its narrow axis.
-  let W, H;
-  if (worldW >= worldH) {
-    W = size;
-    H = Math.max(64, Math.round(size * (worldH / worldW)));
-  } else {
-    H = size;
-    W = Math.max(64, Math.round(size * (worldW / worldH)));
-  }
-  const sx = (W - 1) / worldW;
-  const sy = (H - 1) / worldH;
+  // Standardized SQUARE canvas so every map's image is the same size; the map is
+  // fit-centred (aspect preserved) inside it. fw/fh = the fit rectangle, ox/oy
+  // its offset — the map base + markers reuse these (via the returned `fit`) so
+  // they align with the traffic.
+  const W = size, H = size;
+  let fw, fh;
+  if (worldW >= worldH) { fw = size; fh = Math.max(64, Math.round(size * (worldH / worldW))); }
+  else { fh = size; fw = Math.max(64, Math.round(size * (worldW / worldH))); }
+  const ox = Math.round((size - fw) / 2), oy = Math.round((size - fh) / 2);
+  const sx = (fw - 1) / worldW;
+  const sy = (fh - 1) / worldH;
 
   // Pass 2: accumulate density with a bilinear splat, each player weighted 1
   // total (1/frameCount per frame) so presence — not run length — drives heat.
@@ -215,8 +214,8 @@ export function buildHeatmap(ghosts, opts = {}) {
     for (const f of g.frames) {
       const x = +f[0], y = +f[1];
       if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-      const fx = (x - minX) * sx;
-      const fy = (H - 1) - (y - minY) * sy; // flip: +Y world is up in the image
+      const fx = ox + (x - minX) * sx;
+      const fy = oy + (fh - 1) - (y - minY) * sy; // flip: +Y world is up in the image
       const x0 = Math.floor(fx), y0 = Math.floor(fy);
       const dx = fx - x0, dy = fy - y0;
       splat(grid, W, H, x0, y0, wgt * (1 - dx) * (1 - dy));
@@ -254,6 +253,7 @@ export function buildHeatmap(ghosts, opts = {}) {
     rgba, // raw heatmap layer, so callers can composite it over a map base
     width: W,
     height: H,
+    fit: { ox, oy, fw, fh }, // fit rectangle inside the square, for base+markers
     players: usable,
     points: totalPoints,
     bounds: { minX, minY, maxX, maxY },
@@ -374,25 +374,40 @@ export function generateMap(mapId, name = null, { ghostDir = GHOST_DIR, outDir =
     return null;
   }
 
-  // Draw the heatmap on top of a top-down render of the map geometry when the
-  // map's .pk3 is available and parses (bsp.js) — so you see WHERE the traffic
-  // is. Any failure (missing pack, unknown BSP) falls back to the heatmap alone.
-  let png = built.png;
+  // Compose the final SQUARE image: themed background + blueprint grid, the map's
+  // top-down geometry (when its .pk3 parses), the traffic heatmap over it, and
+  // start / finish / checkpoint markers taken from the fastest run. Any map-base
+  // failure (missing pack / unknown BSP) just leaves the heatmap on the themed bg.
+  const S = built.width;
+  const canvas = new Uint8Array(S * S * 4);
+  fillBg(canvas, THEME.bg[0], THEME.bg[1], THEME.bg[2]);
+  drawGrid(canvas, S);
   let mapBase = false;
   if (mapsDir && name) {
     try {
       const geom = loadMapGeometry(mapsDir, name);
-      if (geom) {
-        const base = new Uint8Array(built.width * built.height * 4);
-        renderMapBase(base, built.width, built.height, built.bounds, geom);
-        compositeOver(base, built.rgba);
-        png = encodePNG(built.width, built.height, base);
-        mapBase = true;
-      }
+      if (geom) { renderMapBase(canvas, S, built.bounds, built.fit, geom); mapBase = true; }
     } catch (e) {
       log(`map-base render failed for ${mapId} (${name}): ${e.message}`);
     }
   }
+  compositeOver(canvas, built.rgba); // traffic heatmap over the map
+  try {
+    const P = makeProject(built.bounds, built.fit);
+    const fast = ghosts
+      .filter((g) => g && Array.isArray(g.frames) && g.frames.length)
+      .sort((a, b) => (a.time || Infinity) - (b.time || Infinity))[0];
+    if (fast) {
+      const fr = fast.frames, at = (i) => P(+fr[i][0], +fr[i][1]);
+      const cps = (Array.isArray(fast.cps) ? fast.cps : [])
+        .filter((i) => Number.isInteger(i) && i >= 0 && i < fr.length)
+        .map(at);
+      drawMarkers(canvas, S, { start: at(0), finish: at(fr.length - 1), cps });
+    }
+  } catch (e) {
+    log(`marker render failed for ${mapId} (${name}): ${e.message}`);
+  }
+  const png = encodePNG(S, S, canvas);
 
   fs.mkdirSync(outDir, { recursive: true });
   const meta = {

@@ -492,15 +492,6 @@ async function viewMap(id) {
     <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board
       · <a class="extlink" href="${padporkUrl(d.name)}" target="_blank" rel="noopener external">padpork.org ↗</a></p>
 
-    ${d.heatmap ? `
-    <div class="map-heat">
-      <div class="kicker orange">◭ ${d.heatmap.mapBase ? "Map + traffic heatmap" : "Traffic heatmap"} · top-down</div>
-      <div class="map-heat-img"><img src="${esc(d.heatmap.url)}" width="${d.heatmap.width || ""}" height="${d.heatmap.height || ""}"
-        alt="Top-down ${d.heatmap.mapBase ? "map of " : "heatmap of where players have raced on "}${esc(baseMapName(d.name))}${d.heatmap.mapBase ? " with a traffic heatmap of where players have raced" : ""}" loading="lazy"></div>
-      <p class="map-heat-cap">Every ranked player's fastest line through <b>${esc(baseMapName(d.name))}</b>, seen from above${d.heatmap.mapBase ? " over the map's layout" : ""} — brighter means busier.
-        ${fmtNum(d.heatmap.players)} run${d.heatmap.players === 1 ? "" : "s"} · refreshed nightly.</p>
-    </div>` : ""}
-
     <div class="table-wrap"><div class="tscroll">
       <table class="data">
         <thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">Behind</th><th class="num">Gap</th><th>Version</th></tr></thead>
@@ -517,6 +508,15 @@ async function viewMap(id) {
         </tbody>
       </table>
     </div></div>
+
+    ${d.heatmap ? `
+    <div class="map-heat">
+      <div class="kicker orange">◭ ${d.heatmap.mapBase ? "Map + traffic heatmap" : "Traffic heatmap"} · top-down</div>
+      <div class="map-heat-img"><img src="${esc(d.heatmap.url)}" width="${d.heatmap.width || ""}" height="${d.heatmap.height || ""}"
+        alt="Top-down ${d.heatmap.mapBase ? "map of " : "heatmap of where players have raced on "}${esc(baseMapName(d.name))}${d.heatmap.mapBase ? " with a traffic heatmap of where players have raced" : ""}" loading="lazy"></div>
+      <p class="map-heat-cap">Every ranked player's fastest line through <b>${esc(baseMapName(d.name))}</b>, seen from above${d.heatmap.mapBase ? " over the map's layout, with the start ⬤, checkpoints ①② and finish ▣ marked" : ""} — brighter means busier.
+        ${fmtNum(d.heatmap.players)} run${d.heatmap.players === 1 ? "" : "s"} · refreshed nightly.</p>
+    </div>` : ""}
 
     ${d.recentFinishes && d.recentFinishes.length ? `
     <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> every run</div>

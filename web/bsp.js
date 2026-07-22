@@ -1,7 +1,8 @@
 // Top-down map geometry for the heatmaps: pull a map's .bsp out of its .pk3,
-// parse the walkable geometry, and render a floor-plan base that the heatmap
-// draws on top of (so you see WHERE on the map the traffic is). Zero external
-// deps — a .pk3 is a zip, and Node's zlib inflates the entries.
+// parse the walkable geometry, and render a "blueprint" floor-plan base that the
+// heatmap draws on top of (so you see WHERE on the map the traffic is), plus
+// start/finish/checkpoint markers. Zero external deps — a .pk3 is a zip, and
+// Node's zlib inflates the entries.
 //
 // Two BSP formats appear in the map pool and share everything we touch (the
 // 17-lump directory, and the face fields type@8 / firstvert@12 / numverts@16 /
@@ -111,79 +112,169 @@ export function parseBsp(buf) {
   return { vx, vy, vz, tris, kinds };
 }
 
-// --- render the map base into an RGBA buffer, aligned to given bounds --------
-// Draws a height-shaded floor (z-buffered so upper platforms win) plus dark wall
-// edges that trace rooms/corridors, using the SAME bounds + size the heatmap
-// used — so the traffic composited on top lands in the right place. Mutates
-// `rgba` in place (expected transparent on entry).
-export function renderMapBase(rgba, W, H, bounds, geom) {
-  const { minX, minY, maxX, maxY } = bounds;
-  const { vx, vy, vz, tris, kinds } = geom;
-  const sx = (W - 1) / (maxX - minX), sy = (H - 1) / (maxY - minY);
-  const px = (x) => (x - minX) * sx;
-  const py = (y) => (H - 1) - (y - minY) * sy;
+// --- theme + drawing primitives ---------------------------------------------
+// Site palette (style.css :root), each [r,g,b]. Dark near-black with an orange
+// accent + cyan; markers use green/gold. Shared so the image matches the site.
+export const THEME = {
+  bg: [10, 11, 15], panel: [21, 24, 36], panel2: [28, 32, 48], line: [38, 43, 61],
+  cyan: [34, 211, 238], orange: [255, 106, 26], green: [169, 242, 106], gold: [255, 210, 74],
+};
 
+// All primitives take (rgba, S) where S is the (square) canvas side, and clip.
+function blend(rgba, S, x, y, r, g, b, a) {
+  if (x < 0 || y < 0 || x >= S || y >= S || a <= 0) return;
+  const p = (y * S + x) * 4, ia = a / 255, na = 1 - ia;
+  rgba[p] = r * ia + rgba[p] * na; rgba[p + 1] = g * ia + rgba[p + 1] * na;
+  rgba[p + 2] = b * ia + rgba[p + 2] * na; rgba[p + 3] = Math.max(rgba[p + 3], a);
+}
+function disc(rgba, S, cx, cy, rad, r, g, b, a = 255) {
+  cx = Math.round(cx); cy = Math.round(cy);
+  for (let y = -rad; y <= rad; y++) for (let x = -rad; x <= rad; x++) {
+    const d = Math.hypot(x, y);
+    if (d <= rad) blend(rgba, S, cx + x, cy + y, r, g, b, a * Math.min(1, rad - d + 0.5));
+  }
+}
+function ring(rgba, S, cx, cy, rad, th, r, g, b, a = 255) {
+  cx = Math.round(cx); cy = Math.round(cy);
+  for (let y = -rad - th; y <= rad + th; y++) for (let x = -rad - th; x <= rad + th; x++) {
+    const d = Math.hypot(x, y);
+    if (d >= rad - th && d <= rad + th) blend(rgba, S, cx + x, cy + y, r, g, b, a);
+  }
+}
+function line(rgba, S, x0, y0, x1, y1, r, g, b, a) {
+  x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+  const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let e = dx - dy;
+  for (;;) {
+    blend(rgba, S, x0, y0, r, g, b, a);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * e;
+    if (e2 > -dy) { e -= dy; x0 += sx; }
+    if (e2 < dx) { e += dx; y0 += sy; }
+  }
+}
+function fillTriZ(rgba, S, zbuf, ax, ay, bx, by, cx, cy, z, r, g, b, a) {
+  const x0 = Math.max(0, Math.floor(Math.min(ax, bx, cx))), x1 = Math.min(S - 1, Math.ceil(Math.max(ax, bx, cx)));
+  const y0 = Math.max(0, Math.floor(Math.min(ay, by, cy))), y1 = Math.min(S - 1, Math.ceil(Math.max(ay, by, cy)));
+  const d = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+  if (Math.abs(d) < 1e-6) return;
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const w0 = ((bx - x) * (cy - y) - (cx - x) * (by - y)) / d;
+    const w1 = ((cx - x) * (ay - y) - (ax - x) * (cy - y)) / d;
+    if (w0 < -0.001 || w1 < -0.001 || 1 - w0 - w1 < -0.001) continue;
+    const i = y * S + x;
+    if (z <= zbuf[i]) continue;
+    zbuf[i] = z;
+    blend(rgba, S, x, y, r, g, b, a);
+  }
+}
+
+// World -> pixel projection into the fit rectangle {ox,oy,fw,fh} centred in the
+// square canvas. Shared by the map base and the markers so they align with the
+// heatmap (which uses the same bounds + fit).
+export function makeProject(bounds, fit) {
+  const sx = (fit.fw - 1) / (bounds.maxX - bounds.minX);
+  const sy = (fit.fh - 1) / (bounds.maxY - bounds.minY);
+  return (x, y) => [fit.ox + (x - bounds.minX) * sx, fit.oy + (fit.fh - 1) - (y - bounds.minY) * sy];
+}
+
+// Fill the whole (opaque) themed background, then a subtle blueprint grid.
+export function fillBg(rgba, r, g, b) {
+  for (let i = 0; i < rgba.length; i += 4) { rgba[i] = r; rgba[i + 1] = g; rgba[i + 2] = b; rgba[i + 3] = 255; }
+}
+export function drawGrid(rgba, S, step = 50) {
+  const [lr, lg, lb] = THEME.line;
+  for (let x = 0; x <= S; x += step) for (let y = 0; y < S; y++) blend(rgba, S, x, y, lr, lg, lb, x % 200 === 0 ? 26 : 14);
+  for (let y = 0; y <= S; y += step) for (let x = 0; x < S; x++) blend(rgba, S, x, y, lr, lg, lb, y % 200 === 0 ? 26 : 14);
+}
+
+// Blueprint map base: faint dark-panel floor (height-shaded, z-buffered so upper
+// platforms read on top) + crisp thin cyan wall strokes. Draws into `rgba`
+// (assumed already background-filled), aligned to the heatmap's bounds + fit.
+export function renderMapBase(rgba, S, bounds, fit, geom) {
+  const { vx, vy, vz, tris, kinds } = geom;
+  const P = makeProject(bounds, fit);
+  const zbuf = new Float32Array(S * S).fill(-1e9);
   let minZ = Infinity, maxZ = -Infinity;
   for (let i = 0; i < tris.length; i++) {
     if (kinds[i] === "wall") continue;
-    for (const idx of tris[i]) { if (vz[idx] < minZ) minZ = vz[idx]; if (vz[idx] > maxZ) maxZ = vz[idx]; }
+    const [a, b, c] = tris[i]; const z = (vz[a] + vz[b] + vz[c]) / 3;
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
   }
-  const zbuf = new Float32Array(W * H).fill(-Infinity);
-  const ramp = (t) => {
-    t = Math.max(0, Math.min(1, t));
-    return [70 + 80 * t, 82 + 83 * t, 104 + 91 * t];
-  };
-  const blend = (p, r, g, b, a) => {
-    const ia = a / 255, na = 1 - ia;
-    rgba[p] = r * ia + rgba[p] * na; rgba[p + 1] = g * ia + rgba[p + 1] * na;
-    rgba[p + 2] = b * ia + rgba[p + 2] * na; rgba[p + 3] = Math.max(rgba[p + 3], a);
-  };
-  const fillTri = (ax, ay, bx, by, cx, cy, z, r, g, b) => {
-    const x0 = Math.max(0, Math.floor(Math.min(ax, bx, cx))), x1 = Math.min(W - 1, Math.ceil(Math.max(ax, bx, cx)));
-    const y0 = Math.max(0, Math.floor(Math.min(ay, by, cy))), y1 = Math.min(H - 1, Math.ceil(Math.max(ay, by, cy)));
-    const d = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
-    if (Math.abs(d) < 1e-6) return;
-    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
-      const w0 = ((bx - x) * (cy - y) - (cx - x) * (by - y)) / d;
-      const w1 = ((cx - x) * (ay - y) - (ax - x) * (cy - y)) / d;
-      if (w0 < -0.001 || w1 < -0.001 || 1 - w0 - w1 < -0.001) continue;
-      const i = y * W + x;
-      if (z <= zbuf[i]) continue;
-      zbuf[i] = z;
-      const p = i * 4;
-      rgba[p] = r; rgba[p + 1] = g; rgba[p + 2] = b; rgba[p + 3] = 235;
-    }
-  };
-  const line = (x0, y0, x1, y1) => {
-    x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
-    const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0), sxg = x0 < x1 ? 1 : -1, syg = y0 < y1 ? 1 : -1;
-    let err = dx - dy;
-    for (;;) {
-      if (x0 >= 0 && x0 < W && y0 >= 0 && y0 < H) blend((y0 * W + x0) * 4, 12, 16, 24, 70);
-      if (x0 === x1 && y0 === y1) break;
-      const e2 = 2 * err;
-      if (e2 > -dy) { err -= dy; x0 += sxg; }
-      if (e2 < dx) { err += dx; y0 += syg; }
-    }
-  };
-
+  const zr = maxZ - minZ || 1, T = THEME;
   for (let i = 0; i < tris.length; i++) {
     if (kinds[i] === "wall") continue;
     const [a, b, c] = tris[i];
-    const zc = (vz[a] + vz[b] + vz[c]) / 3;
-    const [r, g, bl] = ramp((zc - minZ) / Math.max(maxZ - minZ, 1));
-    fillTri(px(vx[a]), py(vy[a]), px(vx[b]), py(vy[b]), px(vx[c]), py(vy[c]), zc, r | 0, g | 0, bl | 0);
+    const [ax, ay] = P(vx[a], vy[a]), [bx, by] = P(vx[b], vy[b]), [cx, cy] = P(vx[c], vy[c]);
+    const z = (vz[a] + vz[b] + vz[c]) / 3, h = (z - minZ) / zr;
+    const r = T.panel[0] + (T.panel2[0] - T.panel[0]) * h;
+    const g = T.panel[1] + (T.panel2[1] - T.panel[1]) * h;
+    const bl = T.panel[2] + (T.panel2[2] - T.panel[2]) * h;
+    fillTriZ(rgba, S, zbuf, ax, ay, bx, by, cx, cy, z, r | 0, g | 0, bl | 0, 235);
   }
   for (let i = 0; i < tris.length; i++) {
     if (kinds[i] !== "wall") continue;
     const [a, b, c] = tris[i];
-    const ax = px(vx[a]), ay = py(vy[a]), bx = px(vx[b]), by = py(vy[b]), cx = px(vx[c]), cy = py(vy[c]);
-    line(ax, ay, bx, by); line(bx, by, cx, cy); line(cx, cy, ax, ay);
+    const [ax, ay] = P(vx[a], vy[a]), [bx, by] = P(vx[b], vy[b]), [cx, cy] = P(vx[c], vy[c]);
+    line(rgba, S, ax, ay, bx, by, T.cyan[0], T.cyan[1], T.cyan[2], 150);
+    line(rgba, S, bx, by, cx, cy, T.cyan[0], T.cyan[1], T.cyan[2], 150);
+    line(rgba, S, cx, cy, ax, ay, T.cyan[0], T.cyan[1], T.cyan[2], 150);
   }
 }
 
-// Convenience: pk3 path + map name -> rendered map-base geometry, or null.
-// Strips a "-reversed" suffix (reverse maps reuse the base map's .bsp/.pk3).
+// --- markers: start / finish / checkpoints ----------------------------------
+// tiny 3x5 pixel font for marker labels (S, F, and digits).
+const FONT = {
+  S: ["111", "100", "111", "001", "111"], F: ["111", "100", "110", "100", "100"],
+  0: ["111", "101", "101", "101", "111"], 1: ["010", "110", "010", "010", "111"],
+  2: ["111", "001", "111", "100", "111"], 3: ["111", "001", "111", "001", "111"],
+  4: ["101", "101", "111", "001", "001"], 5: ["111", "100", "111", "001", "111"],
+  6: ["111", "100", "111", "101", "111"], 7: ["111", "001", "010", "010", "010"],
+  8: ["111", "101", "111", "101", "111"], 9: ["111", "101", "111", "001", "111"],
+};
+function glyph(rgba, S, ch, cx, cy, px, r, g, b, a = 255) {
+  const rows = FONT[ch]; if (!rows) return;
+  const x0 = Math.round(cx - (3 * px) / 2), y0 = Math.round(cy - (5 * px) / 2);
+  for (let ry = 0; ry < 5; ry++) for (let rx = 0; rx < 3; rx++) if (rows[ry][rx] === "1")
+    for (let dy = 0; dy < px; dy++) for (let dx = 0; dx < px; dx++) blend(rgba, S, x0 + rx * px + dx, y0 + ry * px + dy, r, g, b, a);
+}
+function label(rgba, S, str, cx, cy, px, r, g, b, a = 255) {
+  const gw = 3 * px, gap = px, total = str.length * gw + (str.length - 1) * gap;
+  let x = cx - total / 2 + gw / 2;
+  for (const ch of str) { glyph(rgba, S, ch, x, cy, px, r, g, b, a); x += gw + gap; }
+}
+// markers = { start:[px,py], finish:[px,py], cps:[[px,py],...] } in canvas pixels.
+export function drawMarkers(rgba, S, markers) {
+  const T = THEME, clamp = (p) => [Math.max(14, Math.min(S - 14, p[0])), Math.max(14, Math.min(S - 14, p[1]))];
+  (markers.cps || []).forEach((cp, idx) => {
+    const [x, y] = clamp(cp);
+    disc(rgba, S, x, y, 11, T.bg[0], T.bg[1], T.bg[2], 235);
+    ring(rgba, S, x, y, 11, 1, T.gold[0], T.gold[1], T.gold[2], 255);
+    disc(rgba, S, x, y, 9, T.gold[0], T.gold[1], T.gold[2], 235);
+    label(rgba, S, String(idx + 1), x, y, 3, T.bg[0], T.bg[1], T.bg[2], 255);
+  });
+  if (markers.start) {
+    const [x, y] = clamp(markers.start);
+    disc(rgba, S, x, y, 13, T.bg[0], T.bg[1], T.bg[2], 255);
+    ring(rgba, S, x, y, 13, 2, T.green[0], T.green[1], T.green[2], 255);
+    disc(rgba, S, x, y, 10, T.green[0], T.green[1], T.green[2], 235);
+    label(rgba, S, "S", x, y, 3, T.bg[0], T.bg[1], T.bg[2], 255);
+  }
+  if (markers.finish) {
+    const [x, y] = clamp(markers.finish), rad = 13;
+    disc(rgba, S, x, y, 13, T.bg[0], T.bg[1], T.bg[2], 255);
+    for (let ang = 0; ang < 360; ang += 12) { // checkered accent ring
+      const rc = x + Math.cos((ang * Math.PI) / 180) * rad, rs = y + Math.sin((ang * Math.PI) / 180) * rad;
+      const col = Math.floor(ang / 12) % 2 === 0 ? [235, 238, 245] : T.orange;
+      disc(rgba, S, rc, rs, 2, col[0], col[1], col[2], 255);
+    }
+    disc(rgba, S, x, y, 10, T.orange[0], T.orange[1], T.orange[2], 235);
+    label(rgba, S, "F", x, y, 3, T.bg[0], T.bg[1], T.bg[2], 255);
+  }
+}
+
+// Convenience: pk3 path + map name -> parsed map geometry, or null. Strips a
+// "-reversed" suffix (reverse maps reuse the base map's .bsp/.pk3).
 export function loadMapGeometry(mapsDir, mapName) {
   const base = String(mapName || "").replace(/-reversed$/, "");
   if (!base || !/^[a-z0-9_.-]+$/i.test(base)) return null;
