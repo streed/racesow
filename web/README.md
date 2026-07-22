@@ -93,7 +93,7 @@ All responses are JSON. List endpoints accept `q`, `sort`, `order`
 | `GET /api/overview`      | Totals, per-version run counts, hall of fame.                    |
 | `GET /api/maps`          | Maps with race count + world-record holder. Sort: `name`, `races`, `wr_time`. Filter with `q`. |
 | `GET /api/maps/:id`      | Map detail: world record + split times, full leaderboard.        |
-| `GET /api/players`       | Player standings. Sort: `points`, `wr`, `podium`, `maps`, `rank`, `name`. Filter with `q`. |
+| `GET /api/players`       | Player standings. Sort: `points`, `wr`, `podium`, `maps`, `rank`, `name`, `active` (last raced). Filter with `q`. |
 | `GET /api/players/:id`   | Player detail: standing + every map record (with per-map attempts/finishes). Sort: `map`, `time`, `rank`, `attempts`. |
 | `GET /api/search?q=`     | Combined quick search across maps and players (typo-tolerant trigram). |
 | `GET /api/live`          | Who is playing now, per enrolled server with a query address.    |
