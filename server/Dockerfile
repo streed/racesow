@@ -311,8 +311,12 @@ RUN chmod +x /entrypoint.sh
 # Run as a non-root user. /pakshare is the export point for the optional HTTP
 # pak mirror (docker-compose.yml pakserver); pre-owning it makes the named
 # volume writable by the server user when this container initializes it.
+# racemod/demos must exist warsow-owned IN THE IMAGE: the agent tier mounts a
+# named volume there, and docker initializes a fresh volume from this path's
+# content+ownership — without it the volume comes up root-owned and every
+# race-demo write fails ("Couldn't open file: demos/server/...").
 RUN useradd -r -m -d /home/warsow warsow \
-    && mkdir -p /pakshare \
+    && mkdir -p /pakshare "${WARSOW_DIR}/racemod/demos" \
     && chown -R warsow:warsow "${WARSOW_DIR}" /pakshare
 USER warsow
 WORKDIR ${WARSOW_DIR}
