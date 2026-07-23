@@ -24,6 +24,11 @@ if (REDIS_URL) {
       // Redis blip; errors below just mark it not-ready in the meantime.
       reconnectStrategy: (retries) => Math.min(retries * 200, 5000),
     },
+    // A stalled-but-connected Redis would otherwise queue commands without
+    // bound (every request enqueues a GET + SET). Excess commands reject,
+    // which every call site already treats as a miss.
+    commandsQueueMaxLength: 1000,
+    disableOfflineQueue: true,
   });
   client.on("error", () => { ready = false; }); // swallow — a down cache is not an error
   client.on("ready", () => { ready = true; console.log("Redis cache connected"); });
@@ -65,6 +70,16 @@ function defaultKey(req) {
 // the path eligible (JSON isn't a default-cacheable type); it is harmless
 // otherwise. Only set on 200s so 404s (unknown :id) stay fresh. opts may also
 // be a keyFn for backward compatibility.
+// In-process single-flight: while one request ("leader") is re-running the
+// handler for a missed key, concurrent requests for the same key wait for the
+// leader's body instead of re-executing the (possibly expensive) handler once
+// each. Per-process, so worst case across the two replicas is 2 concurrent
+// rebuilds of a hot key instead of one per queued request. Entries settle (and
+// are deleted) when the leader's response finishes for ANY reason, so a
+// crashed or non-200 leader releases the followers to run the handler solo.
+const inflight = new Map(); // cacheKey -> Promise<{ct, b} | null>
+const FOLLOW_TIMEOUT_MS = 10_000; // heaviest handler bound; past this, go solo
+
 export function cache(ttlSeconds, opts = {}) {
   const { key = defaultKey, edge = false } =
     typeof opts === "function" ? { key: opts } : opts;
@@ -78,39 +93,79 @@ export function cache(ttlSeconds, opts = {}) {
     // Wrap res.send so the edge header is applied on ANY 200 this request emits
     // (and, when Redis is up, the 200 body is stored). Used on the store path
     // and when Redis is unavailable, so edge-caching never depends on Redis.
-    const installStore = () => {
+    // `settle` (leader mode) reports the outcome to waiting followers: the
+    // cacheable body, or null when there is nothing for them to reuse.
+    const installStore = (settle) => {
       const orig = res.send.bind(res);
+      let settled = false;
+      const finish = (val) => {
+        if (settle && !settled) { settled = true; settle(val); }
+      };
       res.send = (body) => {
         try {
           if (res.statusCode === 200) {
             if (edgeCC) res.set("Cache-Control", edgeCC);
-            if (ready && typeof body === "string") {
+            if (typeof body === "string") {
               const ct = res.get("Content-Type") || "application/json; charset=utf-8";
-              // Fire-and-forget; a failed SET must not affect the response.
-              client.set(cacheKey, JSON.stringify({ ct, b: body }), { EX: ttlSeconds }).catch(() => {});
+              finish({ ct, b: body });
+              if (ready) {
+                // Fire-and-forget; a failed SET must not affect the response.
+                client.set(cacheKey, JSON.stringify({ ct, b: body }), { EX: ttlSeconds }).catch(() => {});
+              }
             }
           }
         } catch { /* never let caching break the response */ }
+        finish(null);
         res.set("X-Cache", "MISS");
         return orig(body);
       };
+      // Errored/aborted requests never reach send — release followers anyway.
+      res.on("close", () => finish(null));
     };
 
-    if (!client || !ready) { installStore(); return next(); }
+    // Run the handler ourselves as the shared leader for this key.
+    const lead = () => {
+      let resolve;
+      const p = new Promise((r) => { resolve = r; });
+      inflight.set(cacheKey, p);
+      installStore((val) => {
+        inflight.delete(cacheKey);
+        resolve(val);
+      });
+      next();
+    };
+
+    const serve = (obj) => {
+      res.set("Content-Type", obj.ct || "application/json; charset=utf-8");
+      if (edgeCC) res.set("Cache-Control", edgeCC); // always a stored/shared 200
+      res.set("X-Cache", "HIT");
+      res.send(obj.b);
+    };
+
+    // Coalesce onto an in-flight rebuild of the same key if one exists.
+    const joined = inflight.get(cacheKey);
+    if (joined) {
+      withTimeout(joined, FOLLOW_TIMEOUT_MS)
+        .then((obj) => {
+          if (obj) return serve(obj);
+          installStore(null); // leader produced nothing reusable — go solo
+          next();
+        })
+        .catch(() => { installStore(null); next(); });
+      return;
+    }
+
+    if (!client || !ready) return lead();
 
     withTimeout(client.get(cacheKey), GET_TIMEOUT_MS)
       .then((hit) => {
         if (typeof hit === "string") {
           let obj;
-          try { obj = JSON.parse(hit); } catch { installStore(); return next(); }
-          res.set("Content-Type", obj.ct || "application/json; charset=utf-8");
-          if (edgeCC) res.set("Cache-Control", edgeCC); // a HIT is always a stored 200
-          res.set("X-Cache", "HIT");
-          return res.send(obj.b);
+          try { obj = JSON.parse(hit); } catch { return lead(); }
+          return serve(obj);
         }
-        installStore();
-        next();
+        lead();
       })
-      .catch(() => { installStore(); next(); });
+      .catch(() => lead());
   };
 }

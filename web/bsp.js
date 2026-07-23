@@ -43,6 +43,9 @@ export function extractBsp(pk3Path, mapName) {
     const fname = buf.toString("latin1", p + 46, p + 46 + nameLen).toLowerCase();
     if (fname === want) {
       // Local file header: recompute the data start from ITS name+extra lengths.
+      // The offset comes from the (untrusted) central directory — bounds-check
+      // it before reading or a corrupt pk3 throws RangeError instead of null.
+      if (localOff + 30 > buf.length) return null;
       if (buf.readUInt32LE(localOff) !== 0x04034b50) return null;
       const lNameLen = buf.readUInt16LE(localOff + 26);
       const lExtraLen = buf.readUInt16LE(localOff + 28);
@@ -72,10 +75,15 @@ export function parseBsp(buf) {
   const L_VERTS = 10, L_ELEMS = 11, L_FACES = 13;
 
   const lv = lump(L_VERTS), le = lump(L_ELEMS), lf = lump(L_FACES);
+  // Lump directory is untrusted (corrupt/truncated pk3s exist in the pool):
+  // every lump we read must lie fully inside the buffer, and offsets can be
+  // negative in a corrupt header — readFloatLE on those throws RangeError.
+  const lumpOk = (l) => l.offset >= 0 && l.length >= 0 && l.offset + l.length <= buf.length;
+  if (!lumpOk(lv) || !lumpOk(le) || !lumpOk(lf)) return null;
   const nVerts = Math.floor(lv.length / V_STRIDE);
   const nElems = Math.floor(le.length / 4);
   const nFaces = Math.floor(lf.length / F_STRIDE);
-  if (nVerts < 3 || nFaces < 1 || lv.offset + lv.length > buf.length || lf.offset + lf.length > buf.length) return null;
+  if (nVerts < 3 || nFaces < 1) return null;
 
   const vx = new Float32Array(nVerts), vy = new Float32Array(nVerts), vz = new Float32Array(nVerts);
   for (let i = 0; i < nVerts; i++) {
@@ -93,6 +101,9 @@ export function parseBsp(buf) {
     const firstVert = buf.readInt32LE(o + 12);
     const firstElem = buf.readInt32LE(o + 20);
     const nElem = buf.readInt32LE(o + 24);
+    // A face pointing outside the elems lump would index the typed array out
+    // of range (yielding NaN vertices, drawn as garbage) — skip it instead.
+    if (firstElem < 0 || nElem < 0 || firstElem + nElem > nElems) continue;
     for (let m = 0; m + 2 < nElem; m += 3) {
       const a = firstVert + elem[firstElem + m];
       const b = firstVert + elem[firstElem + m + 1];

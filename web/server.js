@@ -377,7 +377,7 @@ api.get("/streams", cache(10), wrap(async (_req, res) => {
 // POV here every few seconds. Per-server bearer token (same as /ingest); the
 // token's server must match the :id. The URL is never taken from the body — it
 // stays trusted config — so a compromised token can't redirect viewers.
-api.post("/streams/:id/health", wrap(async (req, res) => {
+api.post("/streams/:id/health", express.json({ limit: "8kb" }), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid server id" });
   const ident = await authenticateIngest(req);
@@ -1828,7 +1828,12 @@ app.use("/admin", admin);
 // the SPA shell, so a broken POST doesn't render a 200 HTML page.
 app.use("/admin", (err, _req, res, _next) => {
   if (err && err.type === "entity.too.large") return res.status(413).type("text/plain").send("too large");
-  res.status(400).type("text/plain").send("bad request");
+  // Body-parser/client faults carry a 4xx status; anything else is a server
+  // fault — log it and say so instead of masking it as the client's fault.
+  const clientFault = err && Number.isInteger(err.status) && err.status >= 400 && err.status < 500;
+  if (!clientFault) console.error("admin route error:", err);
+  if (clientFault) return res.status(400).type("text/plain").send("bad request");
+  res.status(500).type("text/plain").send("server error");
 });
 
 // --- Server-rendered Open Graph tags -----------------------------------------
@@ -2145,14 +2150,20 @@ app.get("*", (req, res, next) => {
 
 const server = app.listen(PORT, async () => {
   console.log(`Race stats server listening on http://0.0.0.0:${PORT}`);
-  const servers = await race.servers();
-  const modes = [];
-  if (INGEST_TOKEN_HASH) modes.push("shared-token");
-  modes.push(`${servers.length} enrolled server(s)`);
-  console.log(`Ingest: ${modes.join(" + ")}`);
+  // The status lines are informational — a DB blip here must not become an
+  // unhandled rejection that kills a freshly-booted replica.
+  try {
+    const servers = await race.servers();
+    const modes = [];
+    if (INGEST_TOKEN_HASH) modes.push("shared-token");
+    modes.push(`${servers.length} enrolled server(s)`);
+    console.log(`Ingest: ${modes.join(" + ")}`);
+    const liveTargets = servers.filter((s) => s.address).length;
+    console.log(`Live poller: ${liveTargets} server(s) with a query address`);
+  } catch (e) {
+    console.error("boot status check failed (continuing):", e?.message ?? e);
+  }
   if (!shuttingDown) live.start(); // a signal may land during the await above
-  const liveTargets = servers.filter((s) => s.address).length;
-  console.log(`Live poller: ${liveTargets} server(s) with a query address`);
   // Maintenance mode: load persisted state and keep it (and the re-broadcast
   // timer) reconciled from the DB so both web replicas agree.
   await refreshMaintenance();

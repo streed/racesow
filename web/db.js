@@ -29,8 +29,14 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import zlib from "node:zlib";
 import path from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { runner as pgMigrateRunner } from "node-pg-migrate";
+
+// Async (thread-pool) compression for the request/ingest paths — the sync
+// variants block the event loop for the duration of an 8MB trajectory.
+const gzipAsync = promisify(zlib.gzip);
+const gunzipAsync = promisify(zlib.gunzip);
 
 // Points a player scores for their best rank on a map (top-15 scoring). Kept in
 // sync with the CASE expression used to build the standings table.
@@ -199,6 +205,16 @@ export async function openDatabase(connectionString) {
   const pool = new pg.Pool({
     connectionString,
     max: parseInt(process.env.PG_POOL_SIZE || "10", 10),
+    // A wedged/unreachable Postgres surfaces as a per-request error instead of
+    // queueing callers forever.
+    connectionTimeoutMillis: parseInt(process.env.PG_CONNECT_TIMEOUT_MS || "5000", 10),
+  });
+  // pg-pool re-emits idle-client backend errors (Postgres restart, network
+  // reset) as an 'error' event; with no listener that is an uncaught exception
+  // that kills the process. The broken client is already discarded before the
+  // emit, so logging is the whole job — later queries reconnect on demand.
+  pool.on("error", (e) => {
+    console.error("pg pool idle-client error (client discarded):", e?.message ?? e);
   });
   // Fail fast (and loudly) if the server is unreachable/misconfigured.
   const probe = await pool.connect();
@@ -288,7 +304,7 @@ export async function rebuildCanonical(pool) {
     }
     await client.query("COMMIT");
   } catch (e) {
-    await client.query("ROLLBACK");
+    try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
     throw e;
   } finally {
     client.release();
@@ -568,6 +584,15 @@ class RaceDB {
   // equals the player's current best on that map. Powers the recent-finishes
   // feed and the per-map / per-player finish history.
   async recentFinishes({ limit = 12, mapId = null, playerId = null } = {}) {
+    // Build the filters dynamically: the `$n IS NULL OR col = $n` form forces
+    // the generic plan to cover both shapes, which keeps Postgres off the
+    // scoped indexes ((map_id, created_at), (player_id, created_at)).
+    const conds = [];
+    const args = [];
+    if (mapId != null) { args.push(mapId); conds.push(`f.map_id = $${args.length}`); }
+    if (playerId != null) { args.push(playerId); conds.push(`pl.canonical_id = $${args.length}`); }
+    const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+    args.push(limit);
     return (
       await this.all(
         `SELECT f.id, f.time, f.created_at, f.map_id, m.name AS map,
@@ -585,11 +610,10 @@ class RaceDB {
          JOIN player disp ON disp.id = pl.canonical_id
          LEFT JOIN server sv ON sv.id = f.server_id
          LEFT JOIN best b ON b.map_id = f.map_id AND b.player_id = pl.canonical_id
-         WHERE ($1::bigint IS NULL OR f.map_id = $1)
-           AND ($2::bigint IS NULL OR pl.canonical_id = $2)
+         ${where}
          ORDER BY f.created_at DESC, f.id DESC
-         LIMIT $3`,
-        [mapId, playerId, limit]
+         LIMIT $${args.length}`,
+        args
       )
     ).map((r) => ({
       id: num(r.id),
@@ -761,13 +785,25 @@ class RaceDB {
     );
     const sanitize = (n) => String(n).replace(/["\r\n\t]/g, "").slice(0, 64);
 
+    // All 50 rows' checkpoints in one round trip (was one query per row).
+    const rids = top.map((r) => num(r.rid));
+    const cpsByRace = new Map();
+    if (rids.length) {
+      for (const c of await this.all(
+        "SELECT race_id, time FROM checkpoint WHERE race_id = ANY($1) ORDER BY race_id, number",
+        [rids]
+      )) {
+        const rid = num(c.race_id);
+        if (!cpsByRace.has(rid)) cpsByRace.set(rid, []);
+        cpsByRace.get(rid).push(c.time | 0);
+      }
+    }
+
     let body = `//${name} top scores\n\n`;
     for (const r of top) {
       const cleanName = sanitize(r.name);
       if (!cleanName) continue; // empty token would truncate the loader
-      const sectors = (
-        await this.all("SELECT time FROM checkpoint WHERE race_id = $1 ORDER BY number", [r.rid])
-      ).map((c) => c.time | 0);
+      const sectors = cpsByRace.get(num(r.rid)) || [];
       let line = `"${r.time}" "${cleanName}" "${sectors.length}" `;
       for (const s of sectors) line += `"${s}" `;
       body += line + "\n";
@@ -848,18 +884,18 @@ class RaceDB {
   // slower upload never overwrites a faster file; the file is written only when
   // we actually take the row.
   async upsertPlayerGhost({ version, map, name, login = "", time, hz, frames, cps = [], serverId = null }) {
-    return this._withReplayIds({ version, map, name, login }, async (client, ids) => {
+    // Compress BEFORE the transaction (and off the event loop): gzipping a
+    // multi-MB trajectory while holding the FOR UPDATE row lock stalled every
+    // concurrent upload for that (map, player) and blocked the whole process.
+    const payload = { v: 1, map, player: name, login, time, hz, cps, frames };
+    const gz = await gzipAsync(Buffer.from(JSON.stringify(payload)));
+
+    const taken = await this._withReplayIds({ version, map, name, login }, async (client, ids) => {
       const existing = (await client.query(
         "SELECT time FROM player_ghost WHERE map_id = $1 AND player_id = $2 FOR UPDATE",
         [ids.mapId, ids.playerId]
       )).rows[0];
-      if (existing && existing.time <= time) return false;
-
-      const payload = { v: 1, map, player: name, login, time, hz, cps, frames };
-      const gz = zlib.gzipSync(Buffer.from(JSON.stringify(payload)));
-      const file = this._ghostPath(ids.mapId, ids.playerId);
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, gz);
+      if (existing && existing.time <= time) return null;
 
       await client.query(
         `INSERT INTO player_ghost (map_id, player_id, version_id, time, hz, frames, bytes, server_id, captured_at, payload)
@@ -870,8 +906,21 @@ class RaceDB {
            captured_at = EXCLUDED.captured_at, payload = EXCLUDED.payload`,
         [ids.mapId, ids.playerId, ids.versionId, time, hz, frames.length, gz.length, serverId, Math.floor(Date.now() / 1000), gz]
       );
-      return true;
+      return ids;
     });
+    if (!taken) return false;
+
+    // Write the local file only after the row is committed: a rollback can no
+    // longer leave a file newer than the DB. If the write fails the DB payload
+    // is still durable — ghostGzip() restores the file on the next read.
+    const file = this._ghostPath(taken.mapId, taken.playerId);
+    try {
+      await fs.promises.mkdir(path.dirname(file), { recursive: true });
+      await fs.promises.writeFile(file, gz);
+    } catch (e) {
+      console.error(`ghost file write failed (payload is in the DB): ${file}:`, e?.message ?? e);
+    }
+    return true;
   }
 
   // Raw gzipped ghost JSON for a (map, player), served with Content-Encoding:
@@ -891,7 +940,7 @@ class RaceDB {
     }
     const file = this._ghostPath(mapId, pid);
     try {
-      return fs.readFileSync(file);
+      return await fs.promises.readFile(file);
     } catch {
       // File missing (volume reset / lost pre-shared-mount): fall back to the
       // durable DB payload and restore the file so later reads + the heatmap are
@@ -993,7 +1042,7 @@ class RaceDB {
     if (!buf) return null;
     let g;
     try {
-      g = JSON.parse(zlib.gunzipSync(buf).toString("utf8"));
+      g = JSON.parse((await gunzipAsync(buf)).toString("utf8"));
     } catch {
       return null;
     }
@@ -1655,7 +1704,7 @@ class RaceDB {
       await buildAggregates(client);
       await client.query("COMMIT");
     } catch (e) {
-      await client.query("ROLLBACK");
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
       throw e;
     } finally {
       client.release();
@@ -1950,7 +1999,7 @@ class RaceDB {
       await client.query("COMMIT");
       return { ok: true, resolvedFlags: flags.rowCount };
     } catch (e) {
-      await client.query("ROLLBACK");
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
       if (e && e.code === "23503") return { ok: false, error: "map not found" };
       throw e;
     } finally {

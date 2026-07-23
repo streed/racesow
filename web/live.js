@@ -147,11 +147,25 @@ export function createLivePoller(race, { intervalMs = POLL_INTERVAL_MS, timeoutM
   let timer = null;
   let polling = false;
 
+  // Bound a promise that may never settle (e.g. a query on a wedged-but-open
+  // DB connection). Without this, one hung round would leave `polling` latched
+  // true forever and every future tick would no-op — a silent permanent freeze.
+  function withTimeout(promise, ms, what) {
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+      if (t.unref) t.unref();
+      promise.then(
+        (v) => { clearTimeout(t); resolve(v); },
+        (e) => { clearTimeout(t); reject(e); }
+      );
+    });
+  }
+
   async function poll() {
     if (polling) return snapshot; // a slow round must not stack another
     polling = true;
     try {
-      const targets = (await race.servers()).filter(
+      const targets = (await withTimeout(race.servers(), 15_000, "live poll servers()")).filter(
         (s) => s.status !== "revoked" && s.address && parseAddress(s.address)
       );
       const results = await Promise.all(
