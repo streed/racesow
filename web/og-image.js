@@ -319,42 +319,48 @@ export async function renderServerCardPng(data) {
   return img.asPng();
 }
 
+// Cache the render PROMISE, not the finished buffer: a burst of concurrent
+// cold misses for the same key (crawler fan-out on a fresh Discord post)
+// then coalesces onto ONE render instead of each spawning its own. Failed or
+// null renders evict themselves so the next request retries.
+function cachedRender(map, key, ttlMs, max, render) {
+  const hit = map.get(key);
+  if (hit && hit.exp > Date.now()) return hit.p;
+  const p = render();
+  if (map.size >= max) map.delete(map.keys().next().value); // drop oldest
+  map.set(key, { p, exp: Date.now() + ttlMs });
+  const evict = () => { if (map.get(key)?.p === p) map.delete(key); };
+  p.then((v) => { if (v == null) evict(); }, evict);
+  return p;
+}
+
 // Per-server cards change with the roster; brief cache keyed by server id.
-const serverCache = new Map(); // id -> { buf, exp }
+const serverCache = new Map(); // id -> { p, exp }
 export async function serverCardCached(id, makeData) {
-  const hit = serverCache.get(id);
-  if (hit && hit.exp > Date.now()) return hit.buf;
-  const data = makeData();
-  if (!data) return null;
-  const buf = await renderServerCardPng(data);
-  if (serverCache.size >= 100) serverCache.delete(serverCache.keys().next().value);
-  serverCache.set(id, { buf, exp: Date.now() + 30_000 });
-  return buf;
+  return cachedRender(serverCache, id, 30_000, 100, async () => {
+    const data = makeData();
+    if (!data) return null;
+    return renderServerCardPng(data);
+  });
 }
 
 // The live card changes as players join/leave, so cache it only briefly
 // (roughly the live-poll cadence) — enough to absorb a crawler burst.
-let liveCache = { buf: null, exp: 0 };
+const liveCache = new Map(); // single "live" key -> { p, exp }
 export async function liveCardCached(makeData) {
-  if (liveCache.buf && liveCache.exp > Date.now()) return liveCache.buf;
-  const buf = await renderLiveCardPng(makeData());
-  liveCache = { buf, exp: Date.now() + 30_000 };
-  return buf;
+  return cachedRender(liveCache, "live", 30_000, 1, async () => renderLiveCardPng(makeData()));
 }
 
 // Small TTL cache so a burst of crawler hits (or a popular Discord message)
 // renders each player at most once every few minutes.
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX = 300;
-const cache = new Map(); // id -> { buf, exp }
+const cache = new Map(); // id -> { p, exp }
 
 export async function playerCardCached(id, makeData) {
-  const hit = cache.get(id);
-  if (hit && hit.exp > Date.now()) return hit.buf;
-  const data = makeData();
-  if (!data) return null;
-  const buf = await renderPlayerCardPng(data);
-  if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value); // drop oldest
-  cache.set(id, { buf, exp: Date.now() + CACHE_TTL_MS });
-  return buf;
+  return cachedRender(cache, id, CACHE_TTL_MS, CACHE_MAX, async () => {
+    const data = makeData();
+    if (!data) return null;
+    return renderPlayerCardPng(data);
+  });
 }

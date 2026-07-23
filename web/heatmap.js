@@ -442,12 +442,20 @@ async function withPg(fn) {
   const { default: pg } = await import("pg");
   const client = new pg.Client({
     connectionString: process.env.DATABASE_URL || "postgres://racesow:racesow@127.0.0.1:5432/racesow",
+    // Bounded waits: a hung (packet-dropping) Postgres must stall one cycle,
+    // not wedge the daemon forever. The queries here are all tiny.
+    connectionTimeoutMillis: 10_000,
+    query_timeout: 60_000,
+    statement_timeout: 60_000,
   });
   await client.connect();
+  // The connection stays open across minutes of CPU-bound rendering; a backend
+  // error in that window emits 'error', which is fatal without a listener.
+  client.on("error", (e) => log(`pg connection error (cycle will retry): ${e?.message ?? e}`));
   try {
     return await fn(client);
   } finally {
-    await client.end();
+    await client.end().catch(() => {});
   }
 }
 
@@ -467,10 +475,20 @@ async function mapsToRegenerate(client, { all = false, windowSecs = ACTIVE_WINDO
   } else {
     const since = Math.floor(Date.now() / 1000) - windowSecs;
     const r = await client.query(
-      "SELECT DISTINCT map_id FROM race WHERE created_at IS NOT NULL AND created_at >= $1",
+      "SELECT map_id, MAX(created_at) AS last_pb FROM race WHERE created_at IS NOT NULL AND created_at >= $1 GROUP BY map_id",
       [since]
     );
-    for (const row of r.rows) ids.add(Number(row.map_id));
+    for (const row of r.rows) {
+      // Re-render only when a PB landed since the image was last written —
+      // re-rendering every active map every cycle burned CPU for identical
+      // output (the heatmap's inputs only change on a new PB/ghost). The
+      // 5-minute slack covers a PB that arrived mid-render.
+      let renderedAt = 0;
+      try {
+        renderedAt = Math.floor(fs.statSync(path.join(HEATMAP_DIR, `${row.map_id}.png`)).mtimeMs / 1000);
+      } catch { /* no image yet -> render */ }
+      if (Number(row.last_pb) >= renderedAt - 300) ids.add(Number(row.map_id));
+    }
     // Bootstrap: any map with ghosts but no rendered image yet.
     for (const id of ghostDirMapIds()) {
       if (!fs.existsSync(path.join(HEATMAP_DIR, `${id}.png`))) ids.add(id);
@@ -540,7 +558,7 @@ async function runLoop() {
     const now = Math.floor(Date.now() / 1000);
     try {
       const full = now - lastFull >= INTERVAL_SECONDS;
-      await runOnce({ all: false });
+      await runOnce({ all: full });
       if (full) lastFull = now;
     } catch (e) {
       log(`cycle FAILED (will retry): ${e.stack || e.message}`);
@@ -558,7 +576,10 @@ if (invokedDirectly) {
   if (args.includes("--loop")) {
     runLoop();
   } else if (args.includes("--all")) {
-    runOnce({ all: true }).then((n) => process.exit(n >= 0 ? 0 : 1));
+    runOnce({ all: true }).then(
+      (n) => process.exit(n >= 0 ? 0 : 1),
+      (e) => { log(e.stack || e.message); process.exit(1); }
+    );
   } else {
     const ids = args.map((a) => parseInt(a, 10)).filter((n) => Number.isInteger(n));
     runOnce(ids.length ? { only: ids } : {}).then(() => process.exit(0), (e) => { log(e.stack || e.message); process.exit(1); });
