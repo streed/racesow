@@ -1109,21 +1109,46 @@ async function currentSession(req) {
   return sess ? { ...sess, raw } : null;
 }
 
-// Gate: attach req.session or bounce. GET -> redirect to the login page;
-// state-changing verbs -> 401 (the form will 302 the user to login on reload).
-async function requireAdmin(req, res, next) {
-  try {
-    const sess = await currentSession(req);
-    if (!sess) {
-      if (req.method === "GET") return res.redirect(302, "/admin/login");
-      return res.status(401).type("text/plain").send("Not signed in.");
+// Gate factory: attach req.session or bounce. Not signed in -> GET redirects to
+// the login page, state-changing verbs -> 401 (the form 302s the user to login
+// on reload). When `role` is "admin", a signed-in moderator is refused (403) so
+// the admin-only surface (MOTD, RCON console, maintenance, broadcast, logs) is
+// reachable only by full admins. `requireAuth` (role=null) admits any signed-in
+// user — used for the flag/map-block/restart routes moderators share.
+function requireRole(role) {
+  return async (req, res, next) => {
+    try {
+      const sess = await currentSession(req);
+      if (!sess) {
+        if (req.method === "GET") return res.redirect(302, "/admin/login");
+        return res.status(401).type("text/plain").send("Not signed in.");
+      }
+      req.session = sess;
+      if (role === "admin" && sess.role !== "admin") {
+        // Signed in, but lacks the tier. Defence in depth: the UI already hides
+        // these controls from moderators; this refuses a hand-crafted request.
+        if (req.method === "GET")
+          return res
+            .status(403)
+            .type("html")
+            .send(
+              adminShell(
+                "Forbidden",
+                `<h1>Admins only</h1><p class="sub">This page is available to full admins only.</p>
+                 <p><a href="/admin/flags">← back to the flag queue</a></p>`,
+                sess
+              )
+            );
+        return res.status(403).type("text/plain").send("Admins only.");
+      }
+      next();
+    } catch (e) {
+      next(e);
     }
-    req.session = sess;
-    next();
-  } catch (e) {
-    next(e);
-  }
+  };
 }
+const requireAuth = requireRole(null); // any signed-in user (admin or moderator)
+const requireAdmin = requireRole("admin"); // full-admin tier only
 
 // True when a request is an explicit cross-site submission. Sec-Fetch-Site is
 // browser-set and not forgeable by page script; the Origin host check is the
@@ -1214,9 +1239,16 @@ th{color:#b7ada2;font-weight:600}
 .src-console .ls{color:#8fb0d6}.src-event .ls{color:#9a9088}.src-rcon .ls{color:#ff8a3c}.src-maintenance .ls{color:#e6b0ff}.src-system .ls{color:#9a9088}
 `;
 
+// True for a full-admin session; false for moderators (and unauthenticated).
+// The single source of truth for the UI's "hide admin-only controls" gating.
+function isAdminSession(session) {
+  return Boolean(session) && session.role === "admin";
+}
+
 function adminShell(title, bodyHtml, session, headExtra = "") {
   const logout = session
     ? `<span class="who">${escHtml(session.username)} ·
+         <span title="account tier">${escHtml(session.role || "admin")}</span> ·
          <form class="inline" method="post" action="/admin/logout">
            <input type="hidden" name="_csrf" value="${escHtml(session.csrf)}">
            <button type="submit" style="padding:2px 8px;font-size:12px">sign out</button>
@@ -1297,7 +1329,7 @@ admin.post("/login", loginLimiter, wrap(async (req, res) => {
   res.redirect(303, "/admin/flags");
 }));
 
-admin.post("/logout", requireAdmin, wrap(async (req, res) => {
+admin.post("/logout", requireAuth, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   await race.deleteSession(sha256(req.session.raw));
   clearSessionCookie(req, res);
@@ -1305,9 +1337,9 @@ admin.post("/logout", requireAdmin, wrap(async (req, res) => {
 }));
 
 // --- Flag review ---
-admin.get("/", requireAdmin, (req, res) => res.redirect(302, "/admin/flags"));
+admin.get("/", requireAuth, (req, res) => res.redirect(302, "/admin/flags"));
 
-admin.get("/flags", requireAdmin, wrap(async (req, res) => {
+admin.get("/flags", requireAuth, wrap(async (req, res) => {
   const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
   const groups = await race.openFlagSummary();
   const csrf = escHtml(req.session.csrf);
@@ -1345,11 +1377,11 @@ admin.get("/flags", requireAdmin, wrap(async (req, res) => {
   sendAdmin(res, "Flag queue", `
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
-      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a> · <a href="/admin/logs">logs</a> · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/motd">motd</a> · <a href="/admin/account">account</a></p>
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a>${isAdminSession(req.session) ? ` · <a href="/admin/motd">motd</a>` : ""} · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
 }));
 
-admin.get("/flags/all", requireAdmin, wrap(async (req, res) => {
+admin.get("/flags/all", requireAuth, wrap(async (req, res) => {
   const rows = await race.listFlags({ status: "all", limit: 500 });
   const body = rows.length
     ? `<table><thead><tr><th>Map</th><th>Reason</th><th>Status</th><th>Note</th><th>By</th><th>Reported</th><th>Closed by</th></tr></thead>
@@ -1367,7 +1399,7 @@ admin.get("/flags/all", requireAdmin, wrap(async (req, res) => {
     <h1>Flag history</h1><p class="sub">Most recent ${rows.length} report(s).</p>${body}`, req.session);
 }));
 
-admin.get("/flags/map/:id", requireAdmin, wrap(async (req, res) => {
+admin.get("/flags/map/:id", requireAuth, wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).type("text/plain").send("bad map id");
   const map = await race.mapDetail(id, { limit: 1 });
@@ -1417,8 +1449,8 @@ async function closeOneFlag(req, res, status) {
   await race.setFlagStatus(id, status, req.session.username);
   res.redirect(303, flag ? `/admin/flags/map/${flag.map_id}` : "/admin/flags");
 }
-admin.post("/flags/:id/resolve", requireAdmin, wrap((req, res) => closeOneFlag(req, res, "resolved")));
-admin.post("/flags/:id/dismiss", requireAdmin, wrap((req, res) => closeOneFlag(req, res, "dismissed")));
+admin.post("/flags/:id/resolve", requireAuth, wrap((req, res) => closeOneFlag(req, res, "resolved")));
+admin.post("/flags/:id/dismiss", requireAuth, wrap((req, res) => closeOneFlag(req, res, "dismissed")));
 
 async function closeMapFlags(req, res, status) {
   if (!checkCsrf(req, res)) return;
@@ -1427,12 +1459,12 @@ async function closeMapFlags(req, res, status) {
   const n = await race.resolveMapFlags(id, status, req.session.username);
   res.redirect(303, `/admin/flags?done=${encodeURIComponent(`${status === "resolved" ? "Resolved" : "Dismissed"} ${n} flag(s).`)}`);
 }
-admin.post("/flags/map/:id/resolve-all", requireAdmin, wrap((req, res) => closeMapFlags(req, res, "resolved")));
-admin.post("/flags/map/:id/dismiss-all", requireAdmin, wrap((req, res) => closeMapFlags(req, res, "dismissed")));
+admin.post("/flags/map/:id/resolve-all", requireAuth, wrap((req, res) => closeMapFlags(req, res, "resolved")));
+admin.post("/flags/map/:id/dismiss-all", requireAuth, wrap((req, res) => closeMapFlags(req, res, "dismissed")));
 
 // Block a map (remove from the vote pool + cycle) — also resolves its open
 // flags. Unblock reverses it. Both CSRF-guarded.
-admin.post("/flags/map/:id/block", requireAdmin, wrap(async (req, res) => {
+admin.post("/flags/map/:id/block", requireAuth, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).type("text/plain").send("bad map id");
@@ -1440,7 +1472,7 @@ admin.post("/flags/map/:id/block", requireAdmin, wrap(async (req, res) => {
   if (!r.ok) return res.status(404).type("text/plain").send("map not found");
   res.redirect(303, `/admin/flags?done=${encodeURIComponent("Blocked the map and closed its open flags. It will drop from rotation on the game servers' next restart.")}`);
 }));
-admin.post("/maps/:id/unblock", requireAdmin, wrap(async (req, res) => {
+admin.post("/maps/:id/unblock", requireAuth, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).type("text/plain").send("bad map id");
@@ -1448,7 +1480,7 @@ admin.post("/maps/:id/unblock", requireAdmin, wrap(async (req, res) => {
   res.redirect(303, `/admin/blocked?done=${encodeURIComponent("Unblocked. It returns to rotation on the game servers' next restart.")}`);
 }));
 
-admin.get("/blocked", requireAdmin, wrap(async (req, res) => {
+admin.get("/blocked", requireAuth, wrap(async (req, res) => {
   const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
   const rows = await race.blockedMaps();
   const csrf = escHtml(req.session.csrf);
@@ -1518,7 +1550,7 @@ admin.post("/motd", requireAdmin, wrap(async (req, res) => {
 }));
 
 // --- Account (self-service password change) ---
-admin.get("/account", requireAdmin, (req, res) => {
+admin.get("/account", requireAuth, (req, res) => {
   const msg = req.query.ok
     ? `<div class="msg ok">Password changed. Other sessions were signed out.</div>`
     : req.query.error === "mismatch"
@@ -1542,7 +1574,7 @@ admin.get("/account", requireAdmin, (req, res) => {
     </form>`, req.session);
 });
 
-admin.post("/account/password", requireAdmin, wrap(async (req, res) => {
+admin.post("/account/password", requireAuth, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   const current = String((req.body && req.body.current) || "");
   const next = String((req.body && req.body.next) || "");
@@ -1582,12 +1614,14 @@ function isDangerousRcon(command) {
     .some((seg) => DANGEROUS_RCON.test(seg));
 }
 
-admin.get("/servers", requireAdmin, wrap(async (req, res) => {
+admin.get("/servers", requireAuth, wrap(async (req, res) => {
   const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
   const err = req.query.error ? `<div class="msg err">${escHtml(String(req.query.error))}</div>` : "";
   const servers = await race.serversAdmin();
   const snap = live.getLive();
   const csrf = escHtml(req.session.csrf);
+  // Moderators get a restart-only view: no maintenance/broadcast/RCON/logs.
+  const isAdmin = isAdminSession(req.session);
   const everyMin = Math.round(MAINT_REBROADCAST_SECS / 60);
   const maintBox = maintenance.active
     ? `<div class="msg err">🛠 <b>Maintenance mode ACTIVE</b>${maintenance.since ? ` since ${fmtWhen(maintenance.since)}` : ""}${maintenance.by ? ` (by ${escHtml(maintenance.by)})` : ""} —
@@ -1618,17 +1652,21 @@ admin.get("/servers", requireAdmin, wrap(async (req, res) => {
           <td>${s.rcon ? '<span class="st-resolved">yes</span>' : '<span class="st-dismissed">no</span>'}</td>
           <td>${state}</td>
           <td class="meta">${fmtWhen(s.last_seen_at)}</td>
-          <td>${s.rcon ? `<a class="btn" href="/admin/servers/${s.id}/rcon">Console</a> <a class="btn danger" href="/admin/servers/${s.id}/restart">Restart</a> ` : ""}<a class="btn" href="/admin/logs?server=${s.id}">Logs</a></td>
+          <td>${
+            isAdmin
+              ? `${s.rcon ? `<a class="btn" href="/admin/servers/${s.id}/rcon">Console</a> <a class="btn danger" href="/admin/servers/${s.id}/restart">Restart</a> ` : ""}<a class="btn" href="/admin/logs?server=${s.id}">Logs</a>`
+              : (s.rcon ? `<a class="btn danger" href="/admin/servers/${s.id}/restart">Restart</a>` : `<span class="meta">—</span>`)
+          }</td>
         </tr>`;
       }).join("")
     : `<tr><td colspan="6" class="empty">No servers enrolled.</td></tr>`;
   sendAdmin(res, "Servers", `
     <h1>Servers &amp; operations</h1>
-    <p class="sub"><a href="/admin/flags">← flag queue</a> · <a href="/admin/logs">logs</a> ·
-      RCON is enabled per server with <span style="font-family:monospace">node admin.js rcon &lt;id&gt; &lt;password&gt;</span></p>
+    <p class="sub"><a href="/admin/flags">← flag queue</a>${isAdmin ? ` · <a href="/admin/logs">logs</a> ·
+      RCON is enabled per server with <span style="font-family:monospace">node admin.js rcon &lt;id&gt; &lt;password&gt;</span>` : ` · restart-only moderator view (a server needs RCON enabled to be restartable)`}</p>
     ${done}${err}
-    <h2>Maintenance mode</h2>${maintBox}
-    <h2>Broadcast</h2>${bcast}
+    ${isAdmin ? `<h2>Maintenance mode</h2>${maintBox}
+    <h2>Broadcast</h2>${bcast}` : ""}
     <h2>Enrolled servers</h2>
     <table><thead><tr><th>Name</th><th>Address</th><th>RCON</th><th>Live</th><th>Last seen</th><th></th></tr></thead>
       <tbody>${rows}</tbody></table>`, req.session);
@@ -1734,7 +1772,7 @@ admin.post("/servers/:id/rcon", requireAdmin, wrap(async (req, res) => {
 // env.cfg so a fresh map rotation / blocked-map list / MOTD takes effect. GET
 // renders a confirmation interstitial: the page CSP forbids inline JS, so a
 // mis-click guard has to be a real page, not a confirm() dialog.
-admin.get("/servers/:id/restart", requireAdmin, wrap(async (req, res) => {
+admin.get("/servers/:id/restart", requireAuth, wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).type("text/plain").send("bad server id");
   const s = await race.serverById(id);
@@ -1766,7 +1804,7 @@ admin.get("/servers/:id/restart", requireAdmin, wrap(async (req, res) => {
     </div>`, req.session);
 }));
 
-admin.post("/servers/:id/restart", requireAdmin, wrap(async (req, res) => {
+admin.post("/servers/:id/restart", requireAuth, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).type("text/plain").send("bad server id");

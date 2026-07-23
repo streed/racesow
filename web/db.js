@@ -2103,25 +2103,32 @@ class RaceDB {
   // --- Admin accounts + sessions ---------------------------------------------
   // Accounts are created out-of-band (admin.js admin-add); there is no public
   // sign-up. Returns null if the username is already taken.
-  async createAdmin(username, passwordHash, now = Math.floor(Date.now() / 1000)) {
+  async createAdmin(username, passwordHash, role = "admin", now = Math.floor(Date.now() / 1000)) {
     const r = await this.one(
-      `INSERT INTO admin_user (username, password_hash, created_at) VALUES ($1, $2, $3)
+      `INSERT INTO admin_user (username, password_hash, role, created_at) VALUES ($1, $2, $3, $4)
        ON CONFLICT (username) DO NOTHING RETURNING id`,
-      [username, passwordHash, now]
+      [username, passwordHash, role, now]
     );
-    return r ? { id: num(r.id), username } : null;
+    return r ? { id: num(r.id), username, role } : null;
   }
   async getAdminByUsername(username) {
     const r = await this.one(
-      "SELECT id, username, password_hash, last_login_at FROM admin_user WHERE username = $1",
+      "SELECT id, username, password_hash, role, last_login_at FROM admin_user WHERE username = $1",
       [username]
     );
     return r ? { ...r, id: num(r.id) } : null;
   }
   async listAdmins() {
     return (
-      await this.all("SELECT id, username, created_at, last_login_at FROM admin_user ORDER BY username ASC")
+      await this.all("SELECT id, username, role, created_at, last_login_at FROM admin_user ORDER BY username ASC")
     ).map((r) => ({ ...r, id: num(r.id) }));
+  }
+  // Change an account's tier ('admin' | 'moderator'). Returns rows updated (0 =
+  // no such account). Existing sessions pick up the new role on their next
+  // request (requireRole re-reads it from admin_user via getSession).
+  async setAdminRole(username, role) {
+    const r = await this.pool.query("UPDATE admin_user SET role = $1 WHERE username = $2", [role, username]);
+    return r.rowCount;
   }
   async countAdmins() {
     return num((await this.one("SELECT COUNT(*) c FROM admin_user")).c);
@@ -2149,10 +2156,12 @@ class RaceDB {
     );
   }
   // Live session by cookie-hash; an expired row is treated as absent AND deleted
-  // so the table self-cleans on access. Returns { adminId, username, csrf } | null.
+  // so the table self-cleans on access. Returns { adminId, username, role, csrf } | null.
+  // The role is read fresh from admin_user on every request, so a tier change
+  // (node admin.js admin-role) takes effect without re-login.
   async getSession(tokenHash, now = Math.floor(Date.now() / 1000)) {
     const r = await this.one(
-      `SELECT s.admin_id, s.csrf, s.expires_at, a.username
+      `SELECT s.admin_id, s.csrf, s.expires_at, a.username, a.role
        FROM admin_session s JOIN admin_user a ON a.id = s.admin_id
        WHERE s.token_hash = $1`,
       [tokenHash]
@@ -2162,7 +2171,7 @@ class RaceDB {
       await this.pool.query("DELETE FROM admin_session WHERE token_hash = $1", [tokenHash]);
       return null;
     }
-    return { adminId: num(r.admin_id), username: r.username, csrf: r.csrf, expiresAt: num(r.expires_at) };
+    return { adminId: num(r.admin_id), username: r.username, role: r.role, csrf: r.csrf, expiresAt: num(r.expires_at) };
   }
   async deleteSession(tokenHash) {
     await this.pool.query("DELETE FROM admin_session WHERE token_hash = $1", [tokenHash]);

@@ -394,3 +394,106 @@ test("admin edits the MOTD: sanitized, then served on /api/game/motd", async () 
   assert.equal(clear.status, 303);
   assert.equal(await (await fetch(`${base}/api/game/motd`)).text(), "RSMOTD\n");
 });
+
+// --- Admin / moderator role tiers ---
+test("moderator tier: flags + map-block + restart allowed; admin-only surface is 403", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const MOD_USER = "modtester";
+  const MOD_PASS = "mod-password-123";
+  await db.query(
+    "INSERT INTO admin_user (username, password_hash, role, created_at) VALUES ($1,$2,'moderator',$3)",
+    [MOD_USER, hashPassword(MOD_PASS), now]
+  );
+  const modMapId = Number(
+    (await db.query("INSERT INTO map (name) VALUES ($1) RETURNING id", ["modblockmap"])).rows[0].id
+  );
+
+  const login = async (u, p) => {
+    const r = await fetch(`${base}/admin/login`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: u, password: p }),
+    });
+    const token = cookieValue(r, "rs_admin");
+    assert.ok(token, `login failed for ${u}`);
+    return `rs_admin=${token}`;
+  };
+  const pageText = async (cookie, p) => (await fetch(`${base}${p}`, { headers: { cookie } })).text();
+
+  const mod = await login(MOD_USER, MOD_PASS);
+
+  // Allowed pages: flag review, blocked maps, servers (reduced), own account.
+  for (const p of ["/admin/flags", "/admin/flags/all", "/admin/blocked", "/admin/servers", "/admin/account"]) {
+    assert.equal(
+      (await fetch(`${base}${p}`, { headers: { cookie: mod }, redirect: "manual" })).status,
+      200,
+      `moderator GET ${p} should be allowed`
+    );
+  }
+
+  // The moderator's /servers is the reduced view: no maintenance / broadcast /
+  // RCON console; and the flag-queue nav hides the admin-only links.
+  const serversHtml = await pageText(mod, "/admin/servers");
+  assert.ok(!/action="\/admin\/maintenance"/.test(serversHtml), "no maintenance form for moderator");
+  assert.ok(!/action="\/admin\/broadcast"/.test(serversHtml), "no broadcast form for moderator");
+  assert.ok(!/\/rcon"/.test(serversHtml), "no RCON console link for moderator");
+  const flagsHtml = await pageText(mod, "/admin/flags");
+  assert.ok(!/href="\/admin\/motd"/.test(flagsHtml), "no MOTD link for moderator");
+  assert.ok(!/href="\/admin\/logs"/.test(flagsHtml), "no logs link for moderator");
+
+  // Allowed action: block then unblock a map (CSRF from any moderator page).
+  const csrf = flagsHtml.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
+  assert.ok(csrf, "moderator page carries a CSRF token");
+  const form = (cookie, extra = {}) => ({
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ _csrf: csrf, ...extra }),
+  });
+
+  assert.equal((await fetch(`${base}/admin/flags/map/${modMapId}/block`, form(mod))).status, 303, "moderator can block");
+  assert.match(await pageText(mod, "/admin/blocked"), /modblockmap/, "blocked map shows on the list");
+  assert.equal((await fetch(`${base}/admin/maps/${modMapId}/unblock`, form(mod))).status, 303, "moderator can unblock");
+  assert.doesNotMatch(await pageText(mod, "/admin/blocked"), /modblockmap/, "unblocked map is gone");
+
+  // Restart passes the gate: a bogus id 404s (handler ran), it is NOT a 403.
+  assert.equal(
+    (await fetch(`${base}/admin/servers/987654/restart`, { headers: { cookie: mod }, redirect: "manual" })).status,
+    404,
+    "moderator is allowed through the restart gate"
+  );
+
+  // Denied (admin-only) GETs -> 403 "Admins only".
+  for (const p of ["/admin/motd", "/admin/logs", "/admin/servers/987654/rcon"]) {
+    assert.equal(
+      (await fetch(`${base}${p}`, { headers: { cookie: mod }, redirect: "manual" })).status,
+      403,
+      `moderator GET ${p} should be forbidden`
+    );
+  }
+  // Denied (admin-only) POSTs -> 403 (the role gate runs before CSRF/handler,
+  // so a valid CSRF token does not help a moderator here).
+  for (const p of ["/admin/motd", "/admin/maintenance", "/admin/broadcast", "/admin/servers/987654/rcon"]) {
+    assert.equal(
+      (await fetch(`${base}${p}`, form(mod, { action: "on", message: "x", motd: "x", command: "status" }))).status,
+      403,
+      `moderator POST ${p} should be forbidden`
+    );
+  }
+
+  // The admin tier (ADMIN_USER was seeded WITHOUT a role column -> DEFAULT
+  // 'admin', proving backward compatibility) keeps the full admin-only surface.
+  const adm = await login(ADMIN_USER, ADMIN_PASS);
+  for (const p of ["/admin/motd", "/admin/logs"]) {
+    assert.equal(
+      (await fetch(`${base}${p}`, { headers: { cookie: adm }, redirect: "manual" })).status,
+      200,
+      `admin GET ${p} should be allowed`
+    );
+  }
+  // And the admin's /servers shows the full console (maintenance + broadcast).
+  const admServers = await pageText(adm, "/admin/servers");
+  assert.match(admServers, /action="\/admin\/maintenance"/, "admin sees the maintenance form");
+  assert.match(admServers, /action="\/admin\/broadcast"/, "admin sees the broadcast form");
+});

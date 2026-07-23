@@ -12,11 +12,13 @@
 //   node admin.js delete-map <id>             # remove a map (and its races) + rerank
 //   node admin.js rebuild-canonical           # recompute player identity groups
 //
-//   # Moderator accounts for the /admin flag-review area (unlinked from the site):
-//   node admin.js admin-add <username> [pw]   # create an admin (random pw printed if omitted)
-//   node admin.js admin-list                  # list admins + last login
+//   # Accounts for the /admin area (unlinked from the site). Two tiers:
+//   #   admin     = full access;  moderator = map blocking, flags, restart only.
+//   node admin.js admin-add <user> [pw] [--role admin|moderator]  # create (default admin; random pw printed if omitted)
+//   node admin.js admin-list                  # list accounts + tier + last login
+//   node admin.js admin-role <user> <admin|moderator>  # change an account's tier
 //   node admin.js admin-passwd <user> [pw]    # reset a password (revokes sessions)
-//   node admin.js admin-remove <username>     # delete an admin (revokes sessions)
+//   node admin.js admin-remove <username>     # delete an account (revokes sessions)
 //
 //   # Map review flags:
 //   node admin.js flags [open|all|resolved|dismissed]   # list flags (default open)
@@ -41,6 +43,21 @@ const DATABASE_URL =
 
 function fmtTime(ts) {
   return ts ? new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z" : "never";
+}
+
+// Pull a "--role <val>" / "--role=<val>" flag out of an arg list, returning the
+// role (or null) and the remaining positional args. Lets admin-add take the tier
+// without disturbing the existing <username> [password] positions.
+function extractRoleFlag(argv) {
+  const rest = [];
+  let role = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--role") role = (argv[++i] || "").trim();
+    else if (a.startsWith("--role=")) role = a.slice("--role=".length).trim();
+    else rest.push(a);
+  }
+  return { role, rest };
 }
 
 const [cmd, ...args] = process.argv.slice(2);
@@ -189,9 +206,13 @@ try {
     // --- Moderator accounts ---
     case "admin-add":
     case "admin-passwd": {
-      const username = (args[0] || "").trim();
-      if (!username) throw new Error(`usage: node admin.js ${cmd} <username> [password]`);
-      let password = args[1];
+      const { role: roleFlag, rest } = extractRoleFlag(args);
+      const username = (rest[0] || "").trim();
+      if (!username)
+        throw new Error(
+          `usage: node admin.js ${cmd} <username> [password]${cmd === "admin-add" ? " [--role admin|moderator]" : ""}`
+        );
+      let password = rest[1];
       let generated = false;
       if (!password) {
         password = crypto.randomBytes(12).toString("base64url"); // ~16 chars, URL-safe
@@ -200,10 +221,16 @@ try {
       if (password.length < 10) throw new Error("password must be at least 10 characters");
       const hash = hashPassword(password);
       if (cmd === "admin-add") {
-        const created = await race.createAdmin(username, hash);
-        if (!created) throw new Error(`admin "${username}" already exists — use admin-passwd to reset it`);
-        console.log(`Created admin #${created.id}: ${username}`);
+        const role = roleFlag || "admin";
+        if (role !== "admin" && role !== "moderator")
+          throw new Error("role must be 'admin' or 'moderator'");
+        const created = await race.createAdmin(username, hash, role);
+        if (!created)
+          throw new Error(`admin "${username}" already exists — use admin-passwd to reset it, or admin-role to change tier`);
+        console.log(`Created ${role} #${created.id}: ${username}`);
       } else {
+        if (roleFlag)
+          throw new Error("admin-passwd does not take --role; change tiers with: node admin.js admin-role <username> <admin|moderator>");
         const n = await race.setAdminPassword(username, hash);
         if (!n) throw new Error(`no admin "${username}"`);
         // A password reset revokes every existing session for that admin.
@@ -225,12 +252,21 @@ try {
         console.log("No admins. Create one: node admin.js admin-add <username>");
         break;
       }
-      console.log("id   username                      created              last login");
+      console.log("id   username                      tier       created              last login");
       for (const a of rows) {
         console.log(
-          `${String(a.id).padEnd(4)} ${a.username.padEnd(29)} ${fmtTime(a.created_at).padEnd(20)} ${fmtTime(a.last_login_at)}`
+          `${String(a.id).padEnd(4)} ${a.username.padEnd(29)} ${String(a.role || "admin").padEnd(10)} ${fmtTime(a.created_at).padEnd(20)} ${fmtTime(a.last_login_at)}`
         );
       }
+      break;
+    }
+    case "admin-role": {
+      const username = (args[0] || "").trim();
+      const role = (args[1] || "").trim();
+      if (!username || (role !== "admin" && role !== "moderator"))
+        throw new Error("usage: node admin.js admin-role <username> <admin|moderator>");
+      const n = await race.setAdminRole(username, role);
+      console.log(n ? `"${username}" now has the ${role} tier.` : `No admin "${username}".`);
       break;
     }
     case "admin-remove": {
