@@ -11,6 +11,14 @@
 #
 # See AGENT.md for the full walkthrough (including the stock-server, no-fork
 # "topscores only" tier).
+# Bounded container logs (json-file has no cap by default; the engine console
+# is chatty). Applied on the next container recreate.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   warsow-race:
     build:
@@ -18,6 +26,7 @@ services:
     image: warsow-race:2.1.2
     container_name: warsow-race
     restart: unless-stopped
+    logging: *default-logging
     # Line-buffer the engine's stdout so `docker logs` isn't frozen mid-startup
     # (glibc block-buffers a pipe); entrypoint.sh also wraps launch in stdbuf.
     tty: true
@@ -62,6 +71,11 @@ services:
       # across container rebuilds.
       - racelog:/warsow/racemod/racelog
       - topscores:/warsow/racemod/topscores
+      # WR replay demos (.wd files under demos/server/<map>/). Without this
+      # volume they land in the container's overlay layer: lost on every
+      # recreate and growing that layer without bound (the full-tier compose
+      # has always mounted ./demos for exactly this reason).
+      - demos:/warsow/racemod/demos
       # Downloadable pk3s are exported here at startup for the pakserver below.
       - pakshare:/pakshare
 
@@ -76,6 +90,7 @@ services:
     image: nginx:alpine
     container_name: racesow-pakserver
     restart: unless-stopped
+    logging: *default-logging
     profiles: ["httpdl"]
     ports:
       - "${PAK_HTTP_PORT:-44445}:80"
@@ -94,4 +109,5 @@ services:
 volumes:
   racelog:
   topscores:
+  demos:
   pakshare:

@@ -99,6 +99,15 @@ for entry in "${REPLICAS[@]}"; do
 done
 
 say "building the web image"
+# Keep the currently-running image reachable as :prev BEFORE the build retags
+# :latest — otherwise a bad roll has nothing to roll back to. Recover with:
+#   docker tag racesow-web:prev racesow-web:latest
+#   FORCE=1 scripts/rolling-deploy.sh   # (skipping the build) or
+#   docker compose up -d --no-deps --force-recreate web web2 heatmaps
+if docker image inspect racesow-web:latest >/dev/null 2>&1; then
+    docker tag racesow-web:latest racesow-web:prev
+    say "tagged current image as racesow-web:prev (rollback point)"
+fi
 docker compose build web
 
 first=1
@@ -113,5 +122,13 @@ for entry in "${REPLICAS[@]}"; do
     docker compose up -d --no-deps --force-recreate "${svc}"
     wait_health "${port}" "${svc}"
 done
+
+# The heatmaps sidecar runs the SAME racesow-web image; without this it keeps
+# running the previous image until something else recreates it. Not part of
+# the serving path, so a plain recreate (brief gap between cycles) is fine.
+if docker compose config --services 2>/dev/null | grep -qx heatmaps; then
+    say "recreating the heatmaps sidecar on the new image"
+    docker compose up -d --no-deps --force-recreate heatmaps
+fi
 
 say "rolling deploy complete — both replicas on the new image, no downtime"

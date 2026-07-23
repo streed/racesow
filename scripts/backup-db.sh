@@ -26,6 +26,9 @@ docker inspect -f '{{.State.Running}}' racesow-postgres 2>/dev/null | grep -qx t
 
 mkdir -p "${OUT_DIR}"
 
+# A failed run must not strand .tmp files that accumulate forever.
+trap 'rm -f "${OUT}.tmp"' EXIT
+
 # -Fc = custom format (compressed, selective restore). Pipe straight to gzip on
 # the host so nothing large is written inside the container. pg_dump takes a
 # consistent snapshot, so this is safe against concurrent ingest writes.
@@ -34,6 +37,14 @@ docker exec racesow-postgres pg_dump -U racesow -d racesow -Fc \
 mv "${OUT}.tmp" "${OUT}"
 
 [ -s "${OUT}" ] || die "backup produced no file at ${OUT}"
+
+# Verify the snapshot is actually restorable before pruning anything older:
+# the gzip stream must be intact AND pg_restore must be able to read the
+# archive's table of contents (catches truncated/corrupt dumps, not just
+# empty files). A backup that only fails at restore time is not a backup.
+gzip -t "${OUT}" || die "backup failed gzip integrity check: ${OUT}"
+gunzip -c "${OUT}" | docker exec -i racesow-postgres pg_restore --list >/dev/null \
+    || die "backup is not a readable pg_restore archive: ${OUT}"
 
 find "${OUT_DIR}" -name 'db-*.dump.gz' -mtime +"${RETENTION_DAYS}" -delete
 

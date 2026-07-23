@@ -10,11 +10,21 @@
 #
 # The Warsow *game server* is a separate, much heavier image; run it from
 # ./server (see server/README.md).
+# Bounded container logs everywhere: the docker default json-file driver has
+# NO size cap, so a chatty (or crash-looping) service grows its log until the
+# disk fills. Applied on the next `up -d` recreate of each service.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   postgres:
     image: postgres:16-alpine
     container_name: racesow-postgres
     restart: unless-stopped
+    logging: *default-logging
     # Parallel-query workers pass data through POSIX shared memory (/dev/shm),
     # which Docker defaults to a cramped 64MB — too small once shared_buffers is
     # large and parallel plans kick in ("could not resize shared memory"). Give
@@ -79,6 +89,7 @@ services:
     image: redis:7-alpine
     container_name: racesow-redis
     restart: unless-stopped
+    logging: *default-logging
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -95,6 +106,7 @@ services:
     # adds tini for zombie reaping; a web2 override replica works without it.
     init: true
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -156,6 +168,7 @@ services:
     image: racesow-db-backup:latest
     container_name: racesow-db-backup
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -182,6 +195,7 @@ services:
     container_name: racesow-heatmaps
     init: true
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -206,6 +220,7 @@ services:
     image: racesow-discord:latest
     container_name: racesow-discord
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - web
     environment:

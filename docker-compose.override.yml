@@ -32,6 +32,12 @@ services:
     # handler in web/server.js (mirrors the base `web` service).
     init: true
     restart: unless-stopped
+    # Mirrors the base compose's bounded-log default (anchors don't cross files).
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     depends_on:
       postgres:
         condition: service_healthy

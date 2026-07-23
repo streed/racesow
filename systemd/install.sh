@@ -64,9 +64,17 @@ done
 
 sudo systemctl daemon-reload
 
-# Catch template/syntax mistakes before enabling anything.
+# Catch template/syntax mistakes before enabling anything. The "is not
+# executable" line is known noise (binary paths differ per box); anything else
+# from verify is a real problem — enabling broken units would leave the box
+# without its services on next boot, so stop here instead.
 # shellcheck disable=SC2086
-sudo systemd-analyze verify ${ENABLE} 2>&1 | grep -v "Command .* is not executable" || true
+verify_out="$(sudo systemd-analyze verify ${ENABLE} 2>&1 || true)"
+real_problems="$(printf '%s\n' "${verify_out}" | grep -v "Command .* is not executable" | grep -v '^[[:space:]]*$' || true)"
+if [ -n "${real_problems}" ]; then
+    printf '%s\n' "${verify_out}" >&2
+    die "systemd-analyze verify reported problems — units NOT enabled"
+fi
 
 # shellcheck disable=SC2086
 sudo systemctl enable --now ${ENABLE}
