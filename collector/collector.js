@@ -136,10 +136,15 @@ async function pumpRacelog(state) {
     return;
   }
 
+  // Bounded read: a huge backlog (first run against months of events, or a
+  // long web outage) is drained 8MB per tick instead of one giant allocation
+  // that could wedge the process. Offset math still advances only past
+  // complete lines, so the next tick simply continues where this one stopped.
+  const READ_CAP = 8 * 1024 * 1024;
   const fh = await open(CFG.racelogFile, "r");
   let buf;
   try {
-    buf = Buffer.alloc(st.size - state.racelogOffset);
+    buf = Buffer.alloc(Math.min(st.size - state.racelogOffset, READ_CAP));
     await fh.read(buf, 0, buf.length, state.racelogOffset);
   } finally {
     await fh.close();
@@ -199,11 +204,12 @@ export function parseTopscores(content) {
 }
 
 async function scanTopscores(state) {
+  let hadTransient = false;
   let files;
   try {
     files = (await readdir(CFG.topscoresDir)).filter((f) => f.endsWith(".txt"));
   } catch {
-    return; // no records written yet
+    return hadTransient; // no records written yet
   }
   for (const file of files) {
     const full = path.join(CFG.topscoresDir, file);
@@ -221,15 +227,14 @@ async function scanTopscores(state) {
       state.topscores[file] = st.mtimeMs;
       await saveState(state);
     } catch (e) {
-      if (e instanceof PermanentError) {
-        log(`topscores ${file}: ${e.message}`);
-        state.topscores[file] = st.mtimeMs; // don't loop on a bad file
-        await saveState(state);
-      } else {
-        throw e; // transient: retry this file next scan
-      }
+      // Per-file isolation: one file's failure must not abort the rest of the
+      // scan. The mtime is NOT advanced, so this file retries next rescan.
+      // (4xx poison chunks are already dropped inside postRecords.)
+      hadTransient = true;
+      log(`topscores ${file} (will retry): ${e.message}`);
     }
   }
+  return hadTransient;
 }
 
 // --- Main loop ---------------------------------------------------------------
@@ -253,7 +258,7 @@ async function main() {
     }
     if (Date.now() - lastScan >= CFG.rescanSeconds * 1000) {
       try {
-        await scanTopscores(state);
+        if (await scanTopscores(state)) transientFailure = true;
         lastScan = Date.now();
       } catch (e) {
         transientFailure = true;
@@ -273,6 +278,15 @@ async function main() {
 
 // Only run the loop when executed directly (so tests can import the parsers).
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+  // Container PID 1: without a handler every `docker stop` hangs the 10s grace
+  // then SIGKILLs. State saves are atomic and the offset only advances after a
+  // successful post, so exiting between (or even during) ticks is safe.
+  for (const sig of ["SIGTERM", "SIGINT"]) {
+    process.on(sig, () => {
+      log(`${sig} received, exiting`);
+      process.exit(0);
+    });
+  }
   main().catch((e) => {
     log("fatal:", e);
     process.exit(1);

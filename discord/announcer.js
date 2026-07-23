@@ -13,9 +13,13 @@
 // new records with the margin-to-#2 and version name precomputed. (The old
 // better-sqlite3 + REMOTE_DB_URL snapshot mode died with the move to
 // PostgreSQL — see git history.)
-import { writeFile, readFile } from "node:fs/promises";
+import { writeFile, readFile, rename, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+
+// Every network wait is bounded: a stalled API or webhook must fail the poll,
+// not wedge it (the poll loop skips ticks while one is in flight).
+const FETCH_TIMEOUT_MS = 30_000;
 
 const CFG = {
   webhook: process.env.DISCORD_WEBHOOK_URL || "",
@@ -65,8 +69,13 @@ async function loadState() {
 async function saveState(state) {
   try {
     const dir = path.dirname(CFG.statePath);
-    if (!existsSync(dir)) return log(`state dir ${dir} missing; not persisting`);
-    await writeFile(CFG.statePath, JSON.stringify(state), "utf8");
+    await mkdir(dir, { recursive: true });
+    // Atomic write (tmp + rename): a kill mid-write must never leave truncated
+    // JSON — loadState would fall back to a fresh baseline and silently skip
+    // every record set while the file was broken.
+    const tmp = `${CFG.statePath}.tmp-${process.pid}`;
+    await writeFile(tmp, JSON.stringify(state), "utf8");
+    await rename(tmp, CFG.statePath);
   } catch (e) {
     log("could not write state:", e.message);
   }
@@ -76,7 +85,7 @@ async function fetchRecords(afterId) {
   const url =
     `${CFG.apiUrl}/api/records?after_id=${afterId}` +
     `&max_rank=${CFG.maxRank}&limit=${CFG.maxPerPoll}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`GET /api/records ${res.status}`);
   return res.json(); // { maxId, records: [...] }
 }
@@ -107,23 +116,33 @@ function buildEmbed(rec) {
   return embed;
 }
 
-async function postEmbeds(embeds) {
-  // Discord allows up to 10 embeds per message.
-  for (let i = 0; i < embeds.length; i += 10) {
-    const batch = embeds.slice(i, i + 10);
-    const res = await fetch(CFG.webhook, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: CFG.username, embeds: batch }),
-    });
-    if (res.status === 429) {
-      const retry = Number(res.headers.get("retry-after")) || 2;
-      log(`rate limited, waiting ${retry}s`);
-      await new Promise((r) => setTimeout(r, retry * 1000));
-      i -= 10; // retry this batch
-      continue;
+// Post records in Discord's 10-embed batches. After each batch lands,
+// `onBatchPosted(lastRecordId)` runs so the caller can advance its cursor
+// incrementally — a failure partway through then re-announces nothing.
+async function postEmbeds(recs, onBatchPosted) {
+  for (let i = 0; i < recs.length; i += 10) {
+    const batch = recs.slice(i, i + 10);
+    let rateLimits = 0;
+    for (;;) {
+      const res = await fetch(CFG.webhook, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: CFG.username, embeds: batch.map(buildEmbed) }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (res.status === 429) {
+        // Bounded: repeated 429s abort the poll (cursor stays put, so the
+        // batch is retried next tick) instead of blocking it indefinitely.
+        if (++rateLimits > 5) throw new Error("webhook rate-limited 5x, giving up this poll");
+        const retry = Math.min(Number(res.headers.get("retry-after")) || 2, 60);
+        log(`rate limited, waiting ${retry}s`);
+        await new Promise((r) => setTimeout(r, retry * 1000));
+        continue;
+      }
+      if (!res.ok) throw new Error(`webhook POST ${res.status}: ${await res.text()}`);
+      break;
     }
-    if (!res.ok) throw new Error(`webhook POST ${res.status}: ${await res.text()}`);
+    if (onBatchPosted) await onBatchPosted(batch[batch.length - 1].id);
     await new Promise((r) => setTimeout(r, 400)); // gentle pacing
   }
 }
@@ -160,16 +179,23 @@ async function poll(state) {
     }
 
     log(`announcing ${recs.length} new record(s)`);
-    const embeds = recs.map(buildEmbed);
     if (CFG.webhook) {
-      await postEmbeds(embeds);
+      await postEmbeds(recs, async (lastPostedId) => {
+        state.lastId = lastPostedId;
+        await saveState(state);
+      });
     } else {
-      log("DISCORD_WEBHOOK_URL not set — would post:", JSON.stringify(embeds, null, 2));
+      log("DISCORD_WEBHOOK_URL not set — would post:", JSON.stringify(recs.map(buildEmbed), null, 2));
     }
 
-    // Advance the cursor to the highest id we processed (or the true max if
-    // the threshold filtered out the tail).
-    state.lastId = Math.max(data.maxId, recs[recs.length - 1].id);
+    // A full page means more qualifying records may exist between the last
+    // posted id and maxId — leave the cursor on the last posted id so the next
+    // poll picks them up instead of silently skipping them. A short page saw
+    // everything, so jump to the true max.
+    state.lastId =
+      recs.length >= CFG.maxPerPoll
+        ? recs[recs.length - 1].id
+        : Math.max(data.maxId, recs[recs.length - 1].id);
     await saveState(state);
   } catch (e) {
     log("poll error:", e.message);
@@ -184,11 +210,27 @@ async function main() {
   log(`announcer starting: api=${CFG.apiUrl} poll=${CFG.pollSeconds}s maxRank=${CFG.maxRank}`);
 
   let state = await loadState();
+  let ticking = false;
   const tick = async () => {
-    state = await poll(state);
+    if (ticking) return; // a slow poll must not stack a concurrent one
+    ticking = true;
+    try {
+      state = await poll(state);
+    } finally {
+      ticking = false;
+    }
   };
   await tick();
   setInterval(tick, CFG.pollSeconds * 1000);
+
+  // Container PID 1: without a handler every `docker stop` hangs the 10s grace
+  // then SIGKILLs mid-poll. State saves are atomic, so exiting promptly is safe.
+  for (const sig of ["SIGTERM", "SIGINT"]) {
+    process.on(sig, () => {
+      log(`${sig} received, exiting`);
+      process.exit(0);
+    });
+  }
 }
 
 main().catch((e) => {
