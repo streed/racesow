@@ -122,7 +122,10 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
     # ONLY in g_rs_api.cpp — present iff the implementation was compiled in —
     # plus the registration string from the g_ascript patch.
     && strings /libgame_x86_64.so | grep -q "RS_ApiReportRace" \
-    && strings /libgame_x86_64.so | grep -q "rs_api: dropping report" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: dropping rejected report" \
+    # report durability: the undeliverable-report spool compiled in.
+    && strings /libgame_x86_64.so | grep -q "rs_api: spooled undeliverable report" \
+    && strings /libgame_x86_64.so | grep -q "pending-reports.log" \
     && strings /libgame_x86_64.so | grep -q "rs_api: top-scores fetch failed" \
     # replay feature: WR demo pointer + ghost upload/fetch natives, and the
     # per-client race-demo binding (racerecord) the demo capture calls.
