@@ -70,8 +70,18 @@ void trigger_push_velocity_think( Entity @ent )
         origin = mins + maxs;
         origin *= 0.5;
 
+        // A target level with or below the pad (legit in defrag conversions)
+        // would make the radicand negative — sqrt then returns NaN, which
+        // passes the `time != 0` check below and poisons the pushed player's
+        // velocity. Clamp to 0: the else-branch and the touch handler's
+        // zero-speed fallback already degrade that case gracefully.
         float height = target.origin.z - origin.z;
-        float time = sqrt( height / (0.5 * g_gravity.value) );
+        if ( height < 0 )
+            height = 0;
+        float grav = g_gravity.value;
+        if ( grav <= 0 )
+            grav = 850;
+        float time = sqrt( height / (0.5 * grav) );
 
         velocity = target.origin - origin;
         velocity.z = 0;
@@ -82,7 +92,7 @@ void trigger_push_velocity_think( Entity @ent )
         else
             velocity *= 0;
 
-        velocity.z = time * g_gravity.value;
+        velocity.z = time * grav;
         ent.origin2 = velocity;
     }
 }

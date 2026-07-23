@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +60,9 @@ struct ApiRequest {
 };
 
 constexpr size_t QUEUE_MAX = 256;
+// Fetches only: they are fully reproducible on the next refresh interval, so
+// burning retries on them is pointless. POST reports are never attempt-capped
+// — a report is delivered, or it lands in the on-disk spool (see below).
 constexpr int MAX_ATTEMPTS = 3;
 
 // All mutable state lives on the heap behind a raw pointer, NOT in static
@@ -233,6 +237,86 @@ bool writeFileAtomic( const std::string &path, const std::string &data )
 	return true;
 }
 
+// ---- undeliverable-report spool ---------------------------------------------
+// A report the worker cannot deliver (shutdown drain against a dead API, or
+// queue overflow) is appended here — one "<url>\t<body>" line — and re-queued
+// on the next boot, so a web outage or a deploy can no longer permanently lose
+// finishes. Bodies are single-line JSON (jsonEscapeInto escapes control chars)
+// so the line framing is safe. Lives in the racelog bind mount next to
+// events.log, which already persists across container rebuilds.
+constexpr size_t SPOOL_LINE_MAX = 256 * 1024; // skips multi-MB ghost uploads
+constexpr size_t SPOOL_LOAD_MAX = 128;        // per boot; keeps QUEUE_MAX headroom
+
+std::string spoolPath()
+{
+	const char *base = getenv( "WARSOW_DIR" );
+	if( !base || !base[0] )
+		base = "/warsow";
+	const char *fsgame = getenv( "FS_GAME" );
+	if( !fsgame || !fsgame[0] )
+		fsgame = "racemod";
+	return std::string( base ) + "/" + fsgame + "/racelog/pending-reports.log";
+}
+
+// Append one undeliverable report (worker or script thread; O_APPEND keeps
+// concurrent line appends whole at these sizes). Fetches pass through here
+// from the shared eviction paths — their empty body makes this a no-op.
+void spoolReport( const ApiRequest &req )
+{
+	if( req.url.empty() || req.body.empty() )
+		return;
+	if( req.url.size() + req.body.size() + 2 > SPOOL_LINE_MAX ) {
+		fprintf( stderr, "rs_api: not spooling oversized report (%zu bytes)\n", req.body.size() );
+		return;
+	}
+	FILE *f = fopen( spoolPath().c_str(), "ab" );
+	if( !f ) {
+		fprintf( stderr, "rs_api: cannot open report spool %s — report lost\n", spoolPath().c_str() );
+		return;
+	}
+	fprintf( f, "%s\t%s\n", req.url.c_str(), req.body.c_str() );
+	fclose( f );
+	fprintf( stderr, "rs_api: spooled undeliverable report for redelivery next boot\n" );
+}
+
+// Load (and remove) the spool left by a previous run. The auth token is NOT
+// persisted to disk; redelivery uses the container's INGEST_TOKEN env, which
+// is the same secret the gametype passes on live reports.
+std::vector<ApiRequest> loadSpool()
+{
+	std::vector<ApiRequest> out;
+	std::string path = spoolPath();
+	FILE *f = fopen( path.c_str(), "rb" );
+	if( !f )
+		return out;
+	const char *token = getenv( "INGEST_TOKEN" );
+	std::string line;
+	size_t skipped = 0;
+	int c;
+	while( ( c = fgetc( f ) ) != EOF ) {
+		if( c != '\n' ) {
+			if( line.size() < SPOOL_LINE_MAX )
+				line += (char)c; // oversized lines saturate and are rejected below
+			continue;
+		}
+		size_t tab = line.find( '\t' );
+		if( tab != std::string::npos && tab > 0 && tab + 1 < line.size() &&
+			line.size() < SPOOL_LINE_MAX && out.size() < SPOOL_LOAD_MAX ) {
+			out.push_back( ApiRequest{ line.substr( 0, tab ), token ? token : "",
+				line.substr( tab + 1 ), 0, REQ_POST_REPORT, "", 0 } );
+		} else if( !line.empty() ) {
+			skipped++;
+		}
+		line.clear();
+	}
+	fclose( f );
+	remove( path.c_str() );
+	if( !out.empty() || skipped )
+		fprintf( stderr, "rs_api: re-queued %zu spooled report(s), skipped %zu\n",
+			out.size(), skipped );
+	return out;
+}
+
 // -1 = transport error (retryable), otherwise the HTTP status.
 long doPost( const ApiRequest &req )
 {
@@ -322,6 +406,17 @@ bool parseGhostPayload( const std::string &payload, std::vector<int> &frames,
 		if( sscanf( line.c_str(), "%f %f %f %f %f %f %f %f %f",
 				&f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6], &f[7], &f[8] ) != 9 )
 			break;
+		// float->int of inf/NaN/out-of-range is UB — reject the frame line
+		// (world coordinates and velocities fit comfortably inside +/-1e9).
+		bool finite = true;
+		for( int k = 0; k < 9; k++ ) {
+			if( !std::isfinite( f[k] ) || f[k] < -1e9f || f[k] > 1e9f ) {
+				finite = false;
+				break;
+			}
+		}
+		if( !finite )
+			break;
 		for( int k = 0; k < 9; k++ )
 			frames.push_back( (int)f[k] );
 		got++;
@@ -332,6 +427,22 @@ bool parseGhostPayload( const std::string &payload, std::vector<int> &frames,
 
 void workerMain( ApiState *s )
 {
+	// Redeliver anything a previous run had to spool (deploy/outage overlap).
+	{
+		std::vector<ApiRequest> spooled = loadSpool();
+		if( !spooled.empty() ) {
+			std::lock_guard<std::mutex> lock( s->mutex );
+			for( size_t i = 0; i < spooled.size(); i++ )
+				s->queue.push_back( std::move( spooled[i] ) );
+		}
+	}
+
+	// Once one drain attempt fails during shutdown, the API is presumed down
+	// for the rest of the drain: every remaining report is spooled without a
+	// network attempt, so a dead API costs ONE curl timeout instead of one per
+	// queued report (which could blow the container's stop grace entirely).
+	bool stopDrainFailed = false;
+
 	for( ;; ) {
 		ApiRequest req;
 		{
@@ -518,20 +629,35 @@ void workerMain( ApiState *s )
 			}
 			// transient: fall through to the requeue below
 		} else {
+			if( s->stop.load() && stopDrainFailed ) {
+				spoolReport( req );
+				continue;
+			}
 			status = doPost( req );
 			if( status >= 200 && status < 300 )
 				continue;
 
-			bool permanent = status >= 400 && status < 500;
 			req.attempts++;
-			// During shutdown a report gets exactly the attempt it just had:
-			// endless retry rounds against a dead API would stall the drain
-			// far past any container stop grace, losing the reports anyway.
-			if( permanent || req.attempts >= MAX_ATTEMPTS || s->stop.load() ) {
-				fprintf( stderr, "rs_api: dropping report after %d attempt(s), status %ld: %s\n",
-					req.attempts, status, req.body.c_str() );
+			if( status >= 400 && status < 500 ) {
+				// The API rejected the body — retrying or spooling an
+				// identical payload can never succeed. Log it whole.
+				fprintf( stderr, "rs_api: dropping rejected report, status %ld: %s\n",
+					status, req.body.c_str() );
 				continue;
 			}
+			if( s->stop.load() ) {
+				stopDrainFailed = true;
+				spoolReport( req );
+				continue;
+			}
+			// Transient failure with the server still running: retry without
+			// an attempt cap — a report is delivered exactly once or spooled,
+			// never dropped. The queue is bounded (QUEUE_MAX; overflow spools
+			// the evictee) and the pause below keeps the loop cold. Log the
+			// first failure, then sparingly.
+			if( req.attempts == 1 || req.attempts % 30 == 0 )
+				fprintf( stderr, "rs_api: report attempt %d failed, status %ld (will keep retrying): %s\n",
+					req.attempts, status, req.url.c_str() );
 		}
 
 		// Brief pause, then requeue at the back. The pause is a cv wait so
@@ -582,7 +708,9 @@ void jsonEscapeInto( std::string &out, const char *s )
 }
 
 // Stop and join the worker before the library is unloaded, draining whatever
-// is still queued (bounded by MAX_ATTEMPTS, so this cannot hang forever).
+// is still queued. The drain is bounded: fetches are skipped outright, and
+// after one failed POST the rest go straight to the on-disk spool — so a dead
+// API costs a single curl timeout, not one per queued report.
 __attribute__(( destructor )) void rsApiShutdown()
 {
 	ApiState *s = g_state;
@@ -602,6 +730,36 @@ __attribute__(( destructor )) void rsApiShutdown()
 }
 
 } // namespace
+
+// Enqueue any fire-and-forget POST (shared by all the report natives). When
+// the queue is full, evict a fetch first — fetches are fully reproducible on
+// the next refresh interval — and only then the oldest report, which goes to
+// the on-disk spool instead of being silently dropped.
+static void rsQueuePost( const char *url, const char *token, std::string &&body )
+{
+	ApiState *s = ensureStarted();
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type != REQ_POST_REPORT ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
+			REQ_POST_REPORT, "", 0 } );
+	}
+	s->cv.notify_one();
+}
 
 /*
  * RS_ApiReportRace
@@ -665,17 +823,7 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	if( restarts >= 0 ) { body += ",\"restarts\":"; body += std::to_string( restarts ); }
 	body += "}]}";
 
-	ApiState *s = ensureStarted();
-	{
-		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
-			s->queue.pop_front();
-		}
-		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
-			REQ_POST_REPORT, "", 0 } );
-	}
-	s->cv.notify_one();
+	rsQueuePost( url, token, std::move( body ) );
 }
 
 /*
@@ -715,17 +863,7 @@ void RS_ApiReportAttempts( const char *url, const char *token, const char *versi
 	if( restarts >= 0 ) { body += ",\"restarts\":"; body += std::to_string( restarts ); }
 	body += "}]}";
 
-	ApiState *s = ensureStarted();
-	{
-		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
-			s->queue.pop_front();
-		}
-		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
-			REQ_POST_REPORT, "", 0 } );
-	}
-	s->cv.notify_one();
+	rsQueuePost( url, token, std::move( body ) );
 }
 
 /*
@@ -755,17 +893,7 @@ void RS_ApiFlag( const char *url, const char *token, const char *mapname,
 	jsonEscapeInto( body, login ? login : "" );
 	body += "\"}";
 
-	ApiState *s = ensureStarted();
-	{
-		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
-			s->queue.pop_front();
-		}
-		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
-			REQ_POST_REPORT, "", 0 } );
-	}
-	s->cv.notify_one();
+	rsQueuePost( url, token, std::move( body ) );
 }
 
 /*
@@ -826,7 +954,10 @@ void RS_ApiFetchTop( const char *url, const char *token, const char *mapname )
 				}
 			}
 			if( !evicted ) {
-				fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+				// No fetch to evict: the whole queue is reports. Spool the
+				// oldest instead of silently losing a finish.
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
 				s->queue.pop_front();
 			}
 		}
@@ -850,22 +981,6 @@ int RS_ApiPollTop( void )
 	if( !s )
 		return 0;
 	return s->fetchResult.exchange( 0 );
-}
-
-// Enqueue any fire-and-forget POST (shared by the report natives below).
-static void rsQueuePost( const char *url, const char *token, std::string &&body )
-{
-	ApiState *s = ensureStarted();
-	{
-		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
-			s->queue.pop_front();
-		}
-		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
-			REQ_POST_REPORT, "", 0 } );
-	}
-	s->cv.notify_one();
 }
 
 /*
@@ -1016,7 +1131,10 @@ void RS_ApiFetchGhost( const char *url, const char *token, const char *mapname )
 				}
 			}
 			if( !evicted ) {
-				fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+				// No fetch to evict: the whole queue is reports. Spool the
+				// oldest instead of silently losing a finish.
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
 				s->queue.pop_front();
 			}
 		}
@@ -1140,7 +1258,10 @@ void RS_ApiFetchBlocked( const char *url, const char *token )
 				}
 			}
 			if( !evicted ) {
-				fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+				// No fetch to evict: the whole queue is reports. Spool the
+				// oldest instead of silently losing a finish.
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
 				s->queue.pop_front();
 			}
 		}
@@ -1209,7 +1330,10 @@ void RS_ApiFetchMotd( const char *url, const char *token )
 				}
 			}
 			if( !evicted ) {
-				fprintf( stderr, "rs_api: queue full, dropping oldest report\n" );
+				// No fetch to evict: the whole queue is reports. Spool the
+				// oldest instead of silently losing a finish.
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
 				s->queue.pop_front();
 			}
 		}

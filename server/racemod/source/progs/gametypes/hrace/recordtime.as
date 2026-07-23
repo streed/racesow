@@ -194,7 +194,6 @@ void RACE_LoadTopScores( bool reversed = false )
                 break;
 
             uint numSectors = uint( sectorToken.toInt() );
-            // TODO: should probably check if numSectors == numCheckpoints
 
             // Sanity-clamp: a corrupt/hostile line (huge or negative-as-uint
             // sector count) would otherwise drive a gigabyte-scale resize()
@@ -203,9 +202,17 @@ void RACE_LoadTopScores( bool reversed = false )
             if ( numSectors > 512 )
                 break;
 
-            // store this one
+            // Normalize the record to the LIVE map's checkpoint count. The
+            // file/API payload can carry records from another version of this
+            // map with a different sector count (the API serves sectors across
+            // all versions of a map name); code all over indexes these arrays
+            // with this map's checkpoint ids, so a mismatched size throws
+            // Index Out of Bounds on every CP touch and board write. Extra
+            // sectors are dropped, missing ones stay Unused (the comparison
+            // code already handles that); every one of the line's numSectors
+            // tokens is still consumed so the token stream stays in sync.
             RecordTime record;
-            record.setupArrays( numSectors + 1 );
+            record.setupArrays( numCheckpoints + 1 );
             for ( uint j = 0; j < numSectors; j++ )
             {
                 sectorToken = topScores.getToken( count++ );
@@ -213,7 +220,7 @@ void RACE_LoadTopScores( bool reversed = false )
                     break;
 
                 uint sectorTime = uint( sectorToken.toInt() );
-                if( sectorTime != 0 )
+                if( sectorTime != 0 && j < numCheckpoints )
                     record.checkpoints[ j ] = Checkpoint( sectorTime, CheckpointType_Normal );
             }
 
@@ -221,7 +228,7 @@ void RACE_LoadTopScores( bool reversed = false )
             record.type = RecordTimeType_Finished;
 
             uint finishTime = uint( timeToken.toInt() );
-            record.checkpoints[ numSectors ] = Checkpoint( finishTime, CheckpointType_Finish );
+            record.checkpoints[ numCheckpoints ] = Checkpoint( finishTime, CheckpointType_Finish );
             record.deduceCheckpointOrder();
 
             RACE_AddTopScore( record, reversed, false );
@@ -347,7 +354,11 @@ void RACE_WriteTopScores( bool reversed = false )
         }
     }
 
-    G_WriteFile( "topscores/race/" + mapName + ".txt", topScores );
+    // Surface a failed write like racelog.as does — an unwritable topscores
+    // dir (wrong uid on the bind mount) otherwise loses the board silently on
+    // the next map load.
+    if ( !G_WriteFile( "topscores/race/" + mapName + ".txt", topScores ) )
+        G_Print( S_COLOR_RED + "topscores: FAILED to write topscores/race/" + mapName + ".txt - records will be lost on map change (check topscores dir permissions/uid)\n" );
 }
 
 uint RACE_AddTopScore( RecordTime record, bool reversed = false, bool take_priority = true )

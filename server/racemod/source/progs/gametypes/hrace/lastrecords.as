@@ -108,7 +108,8 @@ class LastRecords
         for ( uint i = 0; i < bound; i++ )
             result += this.recs[i].format();
 
-        G_WriteFile( this.fileName, result );
+        if ( !G_WriteFile( this.fileName, result ) )
+            G_Print( S_COLOR_RED + "lastrecords: FAILED to write " + this.fileName + " (check dir permissions/uid)\n" );
     }
 
     bool show( Entity@ ent )

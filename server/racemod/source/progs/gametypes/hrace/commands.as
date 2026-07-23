@@ -139,13 +139,21 @@ bool Cmd_PrivateMessage( Client@ client, const String &cmdString, const String &
 
     Cvar maxMessages( "g_floodprotection_messages", "", 0 );
     Cvar maxMessageTime( "g_floodprotection_seconds", "", 0 );
-    uint ref = player.messageTimes[MAX_FLOOD_MESSAGES - maxMessages.integer];
-    if ( ref > 0 && ref + uint( maxMessageTime.integer * 1000 ) > realTime )
+    // 0 disables flood protection (stock engine semantics) and anything above
+    // the window size would index messageTimes out of bounds — clamp both.
+    int floodCount = maxMessages.integer;
+    if ( floodCount > int( MAX_FLOOD_MESSAGES ) )
+        floodCount = int( MAX_FLOOD_MESSAGES );
+    if ( floodCount > 0 )
     {
-        Cvar lockTime( "g_floodprotection_delay", "", 0 );
-        player.messageLock = realTime + lockTime.integer * 1000;
-        G_PrintMsg( client.getEnt(), "Flood protection: You can't talk for " + lockTime.integer + " seconds.\n" );
-        return false;
+        uint ref = player.messageTimes[MAX_FLOOD_MESSAGES - floodCount];
+        if ( ref > 0 && ref + uint( maxMessageTime.integer * 1000 ) > realTime )
+        {
+            Cvar lockTime( "g_floodprotection_delay", "", 0 );
+            player.messageLock = realTime + lockTime.integer * 1000;
+            G_PrintMsg( client.getEnt(), "Flood protection: You can't talk for " + lockTime.integer + " seconds.\n" );
+            return false;
+        }
     }
 
     G_PrintMsg( matches[0].client.getEnt(), client.name + S_COLOR_MAGENTA + " >>> " + S_COLOR_WHITE + message + "\n" );

@@ -1942,7 +1942,11 @@ class Player
             this.client.setRaceTime( -1, finishTime );
 
         this.current_recordTime.checkpoints[ numCheckpoints ] = Checkpoint( finishTime, this.getSpeed(), this.maxSpeed, CheckpointType_Finish );
-        this.current_recordTime.checkpoint_order[ this.currentCheckpoint ] = numCheckpoints;
+        // Same bound as touchCheckPoint: a recalled/loaded Position can seed
+        // currentCheckpoint one past the end (report()/deduceCheckpointOrder
+        // tolerate the missing order entry).
+        if ( this.currentCheckpoint < this.current_recordTime.checkpoint_order.length() )
+            this.current_recordTime.checkpoint_order[ this.currentCheckpoint ] = numCheckpoints;
         this.current_recordTime.type = RecordTimeType_Finished;
 
         this.current_recordTime.checkpoints[ numCheckpoints ].print( this, numCheckpoints );

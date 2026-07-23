@@ -392,6 +392,12 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
                 leaver.marker.freeEntity();
                 @leaver.marker = null;
             }
+            // Same reasoning for the /showtriggers wireframe: up to 300 beam
+            // edicts per player that Player.clear() only frees when the NEXT
+            // occupant enters — on a long map session leavers would strand
+            // them against the engine's fixed edict budget.
+            leaver.freeTriggerMarkers();
+            leaver.showingTriggers = false;
         }
     }
     else if ( score_event == "userinfochanged" )
