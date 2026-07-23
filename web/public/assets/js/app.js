@@ -223,7 +223,7 @@ async function viewOverview() {
 
       <div>
         <div class="panel" style="margin-bottom:20px">
-          <h3><span class="dot teal"></span> Recent Records</h3>
+          <h3><span class="dot teal"></span> Recent PBs</h3>
           ${d.recent && d.recent.length ? `
           <div class="feed">
             ${d.recent.map((r) => `

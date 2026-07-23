@@ -1163,8 +1163,9 @@ button,.btn{font:inherit;cursor:pointer;border-radius:7px;border:1px solid #3a35
 button.primary{background:#ff6a1a;border-color:#ff6a1a;color:#1a1206;font-weight:600}
 button.ok{border-color:#3a6b3a;color:#bfe6bf}
 button.warn{border-color:#6b5a2a;color:#e6d6a0}
-button.danger{border-color:#6b2f22;color:#ffb4a0}
-button:hover{filter:brightness(1.12)}
+button.danger,a.btn.danger{border-color:#6b2f22;color:#ffb4a0}
+button:hover,.btn:hover{filter:brightness(1.12)}
+button:disabled{opacity:.55;cursor:not-allowed;filter:none}
 label{display:block;margin:12px 0 4px;font-size:13px;color:#cdbfae}
 input,select,textarea{width:100%;font:inherit;background:#12100e;color:#eee;border:1px solid #3a352d;border-radius:7px;padding:9px 11px}
 .login{max-width:360px;margin:8vh auto 0}
@@ -1594,7 +1595,7 @@ admin.get("/servers", requireAdmin, wrap(async (req, res) => {
           <td>${s.rcon ? '<span class="st-resolved">yes</span>' : '<span class="st-dismissed">no</span>'}</td>
           <td>${state}</td>
           <td class="meta">${fmtWhen(s.last_seen_at)}</td>
-          <td>${s.rcon ? `<a class="btn" href="/admin/servers/${s.id}/rcon">Console</a> ` : ""}<a class="btn" href="/admin/logs?server=${s.id}">Logs</a></td>
+          <td>${s.rcon ? `<a class="btn" href="/admin/servers/${s.id}/rcon">Console</a> <a class="btn danger" href="/admin/servers/${s.id}/restart">Restart</a> ` : ""}<a class="btn" href="/admin/logs?server=${s.id}">Logs</a></td>
         </tr>`;
       }).join("")
     : `<tr><td colspan="6" class="empty">No servers enrolled.</td></tr>`;
@@ -1702,6 +1703,77 @@ admin.post("/servers/:id/rcon", requireAdmin, wrap(async (req, res) => {
     result.ok ? null : "warn"
   );
   await renderRconConsole(res, req, s, result, command);
+}));
+
+// Restart a single game server. There is no engine "restart" command — instead
+// we send RCON `quit`, which exits the engine cleanly; the container's
+// supervisor loop (server/entrypoint.sh) relaunches it ~5s later, re-exec'ing
+// env.cfg so a fresh map rotation / blocked-map list / MOTD takes effect. GET
+// renders a confirmation interstitial: the page CSP forbids inline JS, so a
+// mis-click guard has to be a real page, not a confirm() dialog.
+admin.get("/servers/:id/restart", requireAdmin, wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad server id");
+  const s = await race.serverById(id);
+  if (!s) return res.status(404).type("text/plain").send("server not found");
+  const csrf = escHtml(req.session.csrf);
+  const ready = !!(s.rcon_password && s.address);
+  const warn = !ready
+    ? `<div class="msg err">No RCON ${s.rcon_password ? "address" : "password"} set, so this server can't be restarted remotely.</div>`
+    : "";
+  const li = (live.getLive().servers || []).find((x) => x.id === s.id) || null;
+  const playing = li && li.online && Array.isArray(li.players) ? li.players.length : 0;
+  const impact = playing
+    ? `<b>${playing}</b> player${playing === 1 ? " is" : "s are"} connected right now and will be dropped.`
+    : "No players are connected right now.";
+  sendAdmin(res, `Restart · ${s.name}`, `
+    <div class="crumbs"><a href="/admin/servers">← servers</a></div>
+    <h1>Restart ${escHtml(s.name)}?</h1>
+    <p class="sub">${s.address ? escHtml(s.address) : "no address"}</p>
+    ${warn}
+    <div class="card">
+      <p>This sends <span style="font-family:monospace">quit</span> over RCON. The engine exits and the
+         server's supervisor relaunches it in about 5&nbsp;seconds, reloading the current config
+         (map rotation, blocked maps, MOTD). ${impact}</p>
+      <form class="inline" method="post" action="/admin/servers/${s.id}/restart">
+        <input type="hidden" name="_csrf" value="${csrf}">
+        <button class="danger" type="submit"${ready ? "" : " disabled"}>Restart now</button>
+        <a class="btn" href="/admin/servers" style="margin-left:8px">Cancel</a>
+      </form>
+    </div>`, req.session);
+}));
+
+admin.post("/servers/:id/restart", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad server id");
+  const s = await race.serverById(id);
+  if (!s) return res.status(404).type("text/plain").send("server not found");
+  if (!s.rcon_password || !s.address) {
+    recordEvent(s.id, `restart by ${req.session.username} BLOCKED (no RCON configured)`, "rcon", "warn");
+    return res.redirect(303, "/admin/servers?error=" + encodeURIComponent(`${s.name}: no RCON configured — can't restart.`));
+  }
+  const parsed = parseAddress(s.address);
+  const result = parsed
+    ? await sendRcon(parsed.host, parsed.port, s.rcon_password, "quit")
+    : { ok: false, error: "bad address", replied: false, reply: "" };
+  recordEvent(
+    s.id,
+    `restart by ${req.session.username} → ${result.ok ? "quit sent (relaunch ~5s)" : "FAIL (" + (result.error || (result.authFailed ? "auth" : "no reply")) + ")"}`,
+    "rcon",
+    result.ok ? null : "warn"
+  );
+  // `quit` is fire-and-forget: the engine exits without echoing, so a silent
+  // server is ok=true whether it was up or already down (only a socket error or
+  // an auth refusal fails). Condition the copy on the live snapshot the servers
+  // page already shows rather than promising a restart we can't confirm.
+  const wasOnline = !!((live.getLive().servers || []).find((x) => x.id === s.id)?.online);
+  const summary = result.ok
+    ? wasOnline
+      ? `Restarting ${s.name} — it should be back in a few seconds.`
+      : `Sent restart to ${s.name}. It wasn't showing as online, but if it was up it'll relaunch within a few seconds.`
+    : `Couldn't restart ${s.name}: ${result.error || (result.authFailed ? "bad rcon password" : "no reply")}.`;
+  res.redirect(303, `/admin/servers?${result.ok ? "done" : "error"}=` + encodeURIComponent(summary));
 }));
 
 admin.get("/logs", requireAdmin, wrap(async (req, res) => {

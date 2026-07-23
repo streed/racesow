@@ -287,6 +287,41 @@ test("rcon console runs benign commands and guards dangerous ones behind confirm
   assert.ok(rconRx.some((x) => x.cmd === "quit"), "quit sent with confirm");
 });
 
+test("per-server restart sends RCON quit behind a confirmation page + CSRF", async () => {
+  const { cookie, csrf } = await login();
+
+  // The servers list offers a Restart action for the rcon-enabled server.
+  const list = await (await fetch(`${base}/admin/servers`, { headers: { cookie } })).text();
+  assert.match(list, new RegExp(`/admin/servers/${serverId}/restart`));
+
+  // GET renders a confirmation interstitial (no side effect) with a POST form.
+  rconRx.length = 0;
+  const confirmPage = await fetch(`${base}/admin/servers/${serverId}/restart`, { headers: { cookie } });
+  assert.equal(confirmPage.status, 200);
+  const confirmHtml = await confirmPage.text();
+  assert.match(confirmHtml, /Restart now/);
+  assert.match(confirmHtml, new RegExp(`action="/admin/servers/${serverId}/restart"`));
+  assert.ok(!rconRx.some((x) => x.cmd === "quit"), "GET must not send quit");
+
+  // Invalid CSRF is rejected — no quit sent.
+  rconRx.length = 0;
+  const bad = await postForm(`/admin/servers/${serverId}/restart`, cookie, { _csrf: "deadbeef" });
+  assert.equal(bad.status, 403);
+  assert.ok(!rconRx.some((x) => x.cmd === "quit"), "no quit on CSRF failure");
+
+  // POST with CSRF actually sends `quit` and redirects with a success notice.
+  rconRx.length = 0;
+  const done = await postForm(`/admin/servers/${serverId}/restart`, cookie, { _csrf: csrf });
+  assert.equal(done.status, 303);
+  assert.match(done.headers.get("location"), /done=/);
+  await new Promise((res) => setTimeout(res, 200));
+  assert.ok(rconRx.some((x) => x.cmd === "quit"), "restart sent quit over rcon");
+
+  // ...and it is audit-logged as a restart.
+  const logged = (await race.pool.query("SELECT line FROM server_log WHERE source='rcon' ORDER BY id DESC LIMIT 5")).rows;
+  assert.ok(logged.some((l) => /restart by .*quit sent/.test(l.line)), "restart audit-logged");
+});
+
 test("rcon/broadcast POSTs require a valid CSRF token", async () => {
   const { cookie } = await login();
   const bad = await postForm("/admin/broadcast", cookie, { _csrf: "deadbeef", message: "nope" });
