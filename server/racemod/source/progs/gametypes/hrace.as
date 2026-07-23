@@ -409,24 +409,13 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
             RACE_GhostApplyClientPref( client );
 
             Player@ player = RACE_GetPlayer( client );
-            String login = client.getMMLogin();
-            if ( login != "" )
-            {
-                // find out if he holds a record better than his current time
-                for ( int i = 0; i < MAX_RECORDS; i++ )
-                {
-                    if ( !levelRecords[ i ].isFinished() )
-                        break;
-                    if ( levelRecords[ i ].ident.login == login
-                            && ( !player.best_recordTime.isFinished() || levelRecords[ i ].getFinishTime() < player.best_recordTime.getFinishTime() ) )
-                    {
-                        player.setBestTime( levelRecords[ i ].getFinishTime(), 0 );
-                        player.updatePos();
-                        player.best_recordTime = levelRecords[ i ];
-                        break;
-                    }
-                }
-            }
+            // Restore this player's record + rank from the board by CLEAN NAME.
+            // (The old seed here matched by getMMLogin(), which is always empty
+            // now that the Warsow auth servers are gone, so it never fired and a
+            // returning player showed a blank scoreboard "Pos" / time until they
+            // re-finished this session.) Then stamp the true global rank.
+            player.seedBestFromBoard();
+            RACE_ApplyGlobalRankTo( player );
             player.setName();
         }
     }
@@ -469,7 +458,14 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     player.setQuickMenu();
     player.updateScore();
     if ( old_team != TEAM_PLAYERS && new_team == TEAM_PLAYERS )
+    {
+        // A spectator joining the race: restore their record + rank from the
+        // board by clean name so their scoreboard "Pos"/time shows immediately,
+        // without waiting for a finish this session.
+        player.seedBestFromBoard();
         player.updatePos();
+        RACE_ApplyGlobalRankTo( player );
+    }
 
     if ( ent.isGhosting() )
     {
@@ -592,6 +588,11 @@ void GT_ThinkRules()
     // restart (feeds sv_MOTDString, which the patched engine re-reads per
     // connect)
     RACE_ApiMotdThink();
+
+    // live per-map global ranks from the central DB (no-op when rs_api_ranks_url
+    // is empty); gives every connected player a true scoreboard "Pos" — even
+    // those ranked past the local top-50 board
+    RACE_ApiRanksThink();
 
     // in-game WR ghost racer (no-op unless rs_wr_ghost + its URL are set); also
     // before the early-return so the ghost keeps looping while the scoreboard

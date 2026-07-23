@@ -44,7 +44,8 @@ enum RequestType {
 	REQ_GET_TOPSCORES, // live top scores -> swapped into the local topscores file
 	REQ_GET_GHOST,     // WR ghost trajectory -> parsed into memory (RS_ApiPollGhost)
 	REQ_GET_BLOCKED,   // live map blocklist -> stored in memory (RS_ApiPollBlocked)
-	REQ_GET_MOTD       // live message of the day -> stored in memory (RS_ApiPollMotd)
+	REQ_GET_MOTD,      // live message of the day -> stored in memory (RS_ApiPollMotd)
+	REQ_GET_RANKS      // live per-map global ranks -> stored in memory (RS_ApiPollRanks)
 };
 
 // note: no default member initializers — the game module builds as C++11,
@@ -124,10 +125,21 @@ struct ApiState {
 	std::mutex motdMutex;
 	std::string motdRaw;
 
+	// Ranks fetch handshake (same shape as the blocked/motd ones). ranksText
+	// holds the raw payload ("//ranks <total>\n<rank> <name>\n..."); the script
+	// thread copies it out with RS_RanksText after RS_ApiPollRanks reports 1.
+	// Deduped on change like MOTD so the gametype only re-parses the (possibly
+	// large) blob when the ranks actually moved.
+	std::atomic<unsigned> fetchRanksGen;
+	std::atomic<int> fetchRanksResult;
+	std::mutex ranksMutex;
+	std::string ranksText;
+
 	ApiState()
 		: stop( false ), fetchGen( 0 ), fetchResult( 0 ), fetchGhostGen( 0 ), fetchGhostResult( 0 ),
 		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ),
-		  fetchBlockedGen( 0 ), fetchBlockedResult( 0 ), fetchMotdGen( 0 ), fetchMotdResult( 0 ) {}
+		  fetchBlockedGen( 0 ), fetchBlockedResult( 0 ), fetchMotdGen( 0 ), fetchMotdResult( 0 ),
+		  fetchRanksGen( 0 ), fetchRanksResult( 0 ) {}
 };
 
 // Script-thread-only accumulator for building a ghost upload body incrementally
@@ -625,6 +637,52 @@ void workerMain( ApiState *s )
 					fprintf( stderr, "rs_api: motd fetch failed for good, status %ld: %s\n",
 						status, req.url.c_str() );
 				s->fetchMotdResult.store( -1 );
+				continue;
+			}
+			// transient: fall through to the requeue below
+		} else if( req.type == REQ_GET_RANKS ) {
+			// A fetch queued once shutdown is under way is worthless: nobody
+			// will ever poll the result.
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchRanksGen.load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded while in flight - drop silently
+				// The ranks payload always starts with its "//ranks" header;
+				// reject anything else (captive portal / proxy error page
+				// answering 200) so the gametype never parses garbage into
+				// player ranks.
+				if( payload.compare( 0, 2, "//" ) != 0 ) {
+					fprintf( stderr, "rs_api: rejecting non-ranks payload from %s\n",
+						req.url.c_str() );
+					s->fetchRanksResult.store( -1 );
+					continue;
+				}
+				{
+					std::lock_guard<std::mutex> lock( s->ranksMutex );
+					// Unchanged since the last swap: skip the signal so the
+					// gametype doesn't re-parse an identical blob every
+					// interval (same idea as the topscores/motd compare).
+					if( payload == s->ranksText )
+						continue;
+					s->ranksText.swap( payload );
+				}
+				s->fetchRanksResult.store( 1 );
+				continue;
+			}
+			if( !current )
+				continue; // superseded - do not burn retries on a stale fetch
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				// 404 is the expected "no central records for this map yet".
+				if( status != 404 )
+					fprintf( stderr, "rs_api: ranks fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchRanksResult.store( -1 );
 				continue;
 			}
 			// transient: fall through to the requeue below
@@ -1376,5 +1434,91 @@ const char *RS_MotdText( void )
 		else if( c == '\n' || c >= 0x20 )
 			buf += (char)c;
 	}
+	return buf.c_str();
+}
+
+/*
+ * RS_ApiFetchRanks / RS_ApiPollRanks / RS_RanksText
+ *
+ * Fetch the map's live global ranks from <url> (the central /api/game/ranks
+ * endpoint; ?map=<mapname> is appended) into memory. Unlike topscores (top-50),
+ * this lists EVERY finisher so the in-game scoreboard can show a true rank for
+ * players ranked past 50. RS_ApiPollRanks() returns 1 when a CHANGED payload has
+ * landed (read it with RS_RanksText and re-apply it to the connected players),
+ * -1 when the last fetch failed for good (404 = no records for this map yet), 0
+ * otherwise. The gametype (hrace/ranks.as) refreshes this ~60s. A newer fetch
+ * supersedes an in-flight one; a failed fetch leaves the last good blob in
+ * place. No-op when url is empty.
+ */
+void RS_ApiFetchRanks( const char *url, const char *token, const char *mapname )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] )
+		return;
+
+	// The map name rides in the query string - accept the same character set the
+	// stats API allows and refuse anything else outright.
+	for( const char *p = mapname; *p; p++ ) {
+		char c = *p;
+		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
+			c == '_' || c == '.' || c == '-';
+		if( !ok ) {
+			fprintf( stderr, "rs_api: refusing ranks fetch for unsafe map name\n" );
+			return;
+		}
+	}
+
+	std::string full = std::string( url ) + "?map=" + mapname;
+	ApiState *s = ensureStarted();
+	unsigned gen = s->fetchRanksGen.fetch_add( 1 ) + 1;
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			// evict another fetch (fully reproducible next interval) before a
+			// one-shot race report
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD ||
+					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
+					it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				// No fetch to evict: the whole queue is reports. Spool the
+				// oldest instead of silently losing a finish.
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
+			REQ_GET_RANKS, "", gen } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollRanks( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	return s->fetchRanksResult.exchange( 0 );
+}
+
+// Copy out the last-fetched ranks blob. Called from the script thread after a
+// poll of 1; the AngelScript wrapper copies the static buffer immediately (no
+// reentrancy on the single script thread).
+const char *RS_RanksText( void )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->ranksMutex );
+	buf = s->ranksText;
 	return buf.c_str();
 }

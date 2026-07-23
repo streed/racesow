@@ -67,6 +67,7 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "asFunc_RS_ApiFlag" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchBlocked" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchMotd" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchRanks" game/g_ascript.cpp \
     && grep -q "curl pthread" game/CMakeLists.txt
 
 # 7. Cross-server player mirroring: the RS_Mirror* natives (UDP mesh on a

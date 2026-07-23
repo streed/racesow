@@ -169,3 +169,14 @@ export function cache(ttlSeconds, opts = {}) {
       .catch(() => lead());
   };
 }
+
+// Explicit invalidation for the rare key that can't wait out its TTL: the
+// game-facing ranks blob must reflect a new record immediately, so the ingest
+// path evicts its key here. `keyString` MUST equal the value the cache()
+// middleware stored (i.e. the same string the route's key fn produced — the
+// "resp:" prefix is added here). No-op when Redis is absent/unready, so a down
+// cache is never an error — the short TTL still bounds staleness.
+export function invalidate(keyString) {
+  if (!client || !ready) return;
+  client.del("resp:" + keyString).catch(() => {});
+}

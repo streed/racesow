@@ -341,6 +341,52 @@ MOTD_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, MOTD_ENTRY, "asGlobFuncs motd entry")
 
+# --- 1h. live per-map global ranks: pull every finisher's rank ---------------
+# Adds RS_ApiFetchRanks / RS_ApiPollRanks / RS_RanksText (impl in g_rs_api.cpp).
+# The gametype (hrace/ranks.as) polls this ~60s and applies each connected
+# player's true global rank to the scoreboard "Pos" column, so a player ranked
+# past the local top-50 board still sees their position. The fetch native takes
+# a map name (like RS_ApiFetchTop) and returns text to the script (like the
+# blocked/motd trio). Anchors re-emitted so they stay unique. The Dockerfile
+# asserts on "asFunc_RS_ApiFetchRanks".
+RANKS_WRAPPER = (
+    "// racesow-docker: live per-map global ranks - GETs the central\n"
+    "// /api/game/ranks text (a \"//ranks <total>\" header, then \"<rank> <name>\"\n"
+    "// lines for EVERY finisher) into memory; the gametype polls RS_ApiPollRanks\n"
+    "// and reads RS_RanksText, then shows each connected player's true rank in the\n"
+    "// scoreboard - including players ranked past the local top-50 board.\n"
+    "void RS_ApiFetchRanks( const char *url, const char *token, const char *mapname );\n"
+    "int RS_ApiPollRanks( void );\n"
+    "const char *RS_RanksText( void );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchRanks( asstring_t *url, asstring_t *token, asstring_t *mapname )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !mapname || !mapname->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchRanks( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tmapname->buffer );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollRanks( void ) { return RS_ApiPollRanks(); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_RanksText( void )\n"
+    "{\n"
+    "\tconst char *s = RS_RanksText();\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, RANKS_WRAPPER, "asFunc ranks wrapper")
+
+RANKS_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchRanks( const String &in url, const String &in token, "
+    "const String &in map )\", asFUNCTION(asFunc_RS_ApiFetchRanks), NULL },\n"
+    "\t{ \"int RS_ApiPollRanks()\", asFUNCTION(asFunc_RS_ApiPollRanks), NULL },\n"
+    "\t{ \"const String @RS_RanksText()\", asFUNCTION(asFunc_RS_RanksText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, RANKS_ENTRY, "asGlobFuncs ranks entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

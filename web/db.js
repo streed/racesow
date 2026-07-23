@@ -811,6 +811,61 @@ class RaceDB {
     return body;
   }
 
+  // Live per-map global ranks for game servers (GET /api/game/ranks?map=).
+  // Unlike gameTopscoresText (top-50 only), this returns EVERY finisher so the
+  // in-game scoreboard can show a true "Pos" for players ranked past 50.
+  // Deduped by canonical_id (a player's nick-variants collapse to their single
+  // best) and ranked by time with dense ties — matching how the site and
+  // race.global_rank rank a map. Computed LIVE from `race` (whose global_rank
+  // the ingest keeps current, db.js ingest UPDATE ... RANK() OVER) rather than
+  // the batch-built `best` table, so a rank is correct the moment a record
+  // lands and the cache is evicted.
+  //
+  // Format mirrors the other game payloads' leading "//" so the fetch native can
+  // reject a captive-portal / proxy error page answering 200:
+  //   //ranks <total_finishers>
+  //   <rank> <raw display name>
+  // The raw (colour-coded) representative name is emitted verbatim; the game
+  // applies the SAME removeColorTokens().tolower() to it AND to each client name
+  // before matching, so normalisation can never drift between the two sides. A
+  // player racing under a different nick than their canonical representative
+  // won't match — identical to how the local top-50 board already matches by the
+  // name a record was set under.
+  async gameRanksText(mapName) {
+    const name = String(mapName || "").toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
+    const map = await this.one("SELECT id FROM map WHERE name = $1", [name]);
+    if (!map) return null;
+
+    const rows = await this.all(
+      `WITH bests AS (
+         SELECT pl.canonical_id AS cid, MIN(r.time) AS t
+         FROM race r JOIN player pl ON pl.id = r.player_id
+         WHERE r.map_id = $1
+         GROUP BY pl.canonical_id
+       )
+       SELECT rep.name AS name, RANK() OVER (ORDER BY b.t) AS rank
+       FROM bests b JOIN player rep ON rep.id = b.cid
+       ORDER BY rank, rep.name`,
+      [map.id]
+    );
+
+    // Strip only line/field separators so a name can't break the line framing;
+    // colour codes and spaces are kept (the game cleans them itself). Cap the
+    // length for parity with the topscores payload.
+    const sanitize = (n) => String(n).replace(/[\r\n\t]/g, "").slice(0, 64);
+
+    // Header carries the TRUE total-finisher count (rows.length) even if a rare
+    // empty-name row is skipped from the body below.
+    let body = `//ranks ${rows.length}\n`;
+    for (const r of rows) {
+      const nm = sanitize(r.name);
+      if (!nm) continue; // an empty name would be an unmatchable, malformed line
+      body += `${num(r.rank)} ${nm}\n`;
+    }
+    return body;
+  }
+
   // --------------------------------------------------------------------------
   // Replays: per-player demo metadata + ghost trajectories ------------------
   // One row per (player, map) = that player's fastest recorded run; the map WR

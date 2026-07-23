@@ -50,6 +50,11 @@ class Player
 
     RecordTime best_recordTime;
     int pos;
+    // True global rank on the current map from the central DB (hrace/ranks.as),
+    // or -1 when unknown (API off/unreachable, no finish, or a reversed player).
+    // Preferred over `pos` in the scoreboard because it covers players ranked
+    // past the local top-50 board.
+    int globalRank;
     RecordTime current_recordTime;
     uint currentCheckpoint;
 
@@ -234,6 +239,7 @@ class Player
         this.lastWallJumpTime = 0;
         this.lastDashTime = 0;
         this.pos = -1;
+        this.globalRank = -1;
         this.noclipSpawn = false;
 
         this.practicePositionStore.clear();
@@ -306,6 +312,33 @@ class Player
         }
     }
 
+    // Restore best_recordTime (+ score + local pos) from the record board by
+    // CLEAN NAME, so a returning player sees their time/rank without having to
+    // re-finish this session. The old board->best seed (hrace.as userinfochanged)
+    // was login-keyed and is dead code now that the Warsow auth servers are gone
+    // (getMMLogin() is always empty). Guarded so a better in-session best is
+    // never clobbered. Mirrors resetBestForMode()'s clean-name seed, but for the
+    // current mode's board only and without clearing an existing best.
+    void seedBestFromBoard()
+    {
+        RecordTime[]@ board = RACE_Records( this.reversed );
+        String cleanName = this.client.name.removeColorTokens().tolower();
+        for ( int i = 0; i < MAX_RECORDS; i++ )
+        {
+            if ( !board[ i ].isFinished() )
+                break;
+            if ( board[ i ].ident.cleanName == cleanName
+                    && ( !this.best_recordTime.isFinished() || board[ i ].getFinishTime() < this.best_recordTime.getFinishTime() ) )
+            {
+                this.best_recordTime = board[ i ];
+                this.bestMaxSpeed = 0; // the board carries no per-run max speed
+                this.updateScore();
+                this.updatePos();
+                break;
+            }
+        }
+    }
+
     void updateScore()
     {
         this.client.stats.setScore( this.best_recordTime.getFinishTime() / 10 );
@@ -319,6 +352,15 @@ class Player
         String racing;
         String pos = "\u00A0";
         String speed;
+
+        // Scoreboard rank ("Pos"): prefer the true global rank from the central
+        // DB (hrace/ranks.as), which covers players ranked past the local top-50
+        // board; fall back to the local board position; else leave it blank
+        // (a non-breaking space) for players with no finish on this map.
+        if ( this.globalRank > 0 )
+            pos = this.globalRank;
+        else if ( this.pos != -1 )
+            pos = this.pos;
 
         if ( this.practicing && this.recalled && ent.health > 0 && ent.moveType == MOVETYPE_PLAYER )
             racing = S_COLOR_CYAN + "Yes";
@@ -345,8 +387,6 @@ class Player
                 diff = S_COLOR_ORANGE + ( change / 1000 ) + "s";
             else
                 diff = S_COLOR_YELLOW + change;
-            if ( this.pos != -1 )
-                pos = this.pos;
         }
         else
         {

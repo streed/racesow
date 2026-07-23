@@ -695,3 +695,37 @@ test("finish log records every finish (not just PBs), with splits, and skips top
   await race.ingest({ version: VER, map: MAP, source: "topscores", records: [finish("Nova", 40000, [8000, 24000])] });
   assert.equal(await cnt("SELECT COUNT(*) c FROM finish"), before, "topscores source is not logged");
 });
+
+test("gameRanksText: every finisher, canonical-deduped, dense-tie ranks + true total", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({
+    version: VER, map: MAP, source: "racelog",
+    records: [
+      finish("Alpha", 30000),
+      finish("Beta", 32000),
+      finish("Gamma", 32000), // tie with Beta -> both rank 2
+      finish("Delta", 40000), // dense-tie gap -> rank 4
+    ],
+  });
+  // A colour-code variant of an existing finisher must collapse to the same
+  // canonical player (not add a phantom finisher / extra line).
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("^1Alpha", 31000)] });
+
+  const body = await race.gameRanksText(MAP);
+  const lines = body.trimEnd().split("\n");
+  assert.equal(lines[0], "//ranks 4", "header carries the true canonical finisher count");
+  // Ordered by rank, then name; ties share a rank, RANK() leaves the gap.
+  assert.deepEqual(lines.slice(1), ["1 Alpha", "2 Beta", "2 Gamma", "4 Delta"]);
+
+  // Map-name handling: case-insensitive, unknown -> null, unsafe -> null.
+  assert.equal(await race.gameRanksText(MAP.toUpperCase()), body, "map lookup is case-insensitive");
+  assert.equal(await race.gameRanksText("no_such_map"), null, "unknown map -> null (404)");
+  assert.equal(await race.gameRanksText("../etc/passwd"), null, "unsafe map name -> null");
+
+  // An improved time re-ranks live (ingest keeps race.global_rank current), so
+  // the served blob reflects it with no batch refresh in between.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Delta", 10000)] });
+  const after = (await race.gameRanksText(MAP)).trimEnd().split("\n");
+  assert.equal(after[1], "1 Delta", "Delta's faster time makes it rank 1 immediately");
+  assert.equal(after[2], "2 Alpha", "Alpha pushed down to 2");
+});

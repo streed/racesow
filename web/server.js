@@ -11,7 +11,7 @@ import { createLivePoller, parseAddress } from "./live.js";
 import { createStreamRegistry } from "./streams.js";
 import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js";
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
-import { cache } from "./cache.js";
+import { cache, invalidate } from "./cache.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -405,6 +405,24 @@ api.post("/streams/:id/health", express.json({ limit: "8kb" }), wrap(async (req,
 // nothing the map leaderboard pages don't already show.
 api.get("/game/topscores", cache(120), wrap(async (req, res) => {
   const body = await race.gameTopscoresText(req.query.map);
+  if (body == null) return res.status(404).type("text/plain").send("// unknown map\n");
+  res.type("text/plain").send(body);
+}));
+
+// Shared cache-key builder for the ranks blob so the store path (the cache()
+// middleware below) and the eviction path (the ingest handler) agree on the
+// exact key regardless of Express req.path/mount quirks. Lowercased to match the
+// map name the game fetches with.
+const ranksCacheKey = (map) => `/api/game/ranks?map=${String(map || "").toLowerCase()}`;
+
+// True per-player global ranks for game servers (hrace/ranks.as polls this ~60s
+// via the RS_ApiFetchRanks native). Unlike topscores (top-50), this lists EVERY
+// finisher so the in-game scoreboard can show a real "Pos" for players ranked
+// past 50. The leading "//" lets the fetch native reject non-payload bodies.
+// Cached per map; the /api/ingest handler evicts this key the moment a new
+// record lands on the map, so a fresh rank is one refresh interval away.
+api.get("/game/ranks", cache(60, { key: (req) => ranksCacheKey(req.query.map) }), wrap(async (req, res) => {
+  const body = await race.gameRanksText(req.query.map);
   if (body == null) return res.status(404).type("text/plain").send("// unknown map\n");
   res.type("text/plain").send(body);
 }));
@@ -876,6 +894,11 @@ api.post(
           `ingest ${map} from ${req.ingest.serverName} [${source}]: +${counts.inserted} new, ${counts.improved} improved`
         );
         scheduleAggregateRefresh();
+        // A new/improved time reorders the whole map's ranks (it bumps everyone
+        // it passed), so evict the map's cached ranks blob — the next game fetch
+        // recomputes it. `map` already carries the effective name (incl. any
+        // "-reversed" variant the game reported under). ranksCacheKey lowercases.
+        invalidate(ranksCacheKey(map));
       }
       res.json(counts);
     } catch (e) {

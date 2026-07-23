@@ -309,6 +309,12 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # to connecting players without a restart. Until the first successful
         # fetch the server.cfg default applies.
         echo "set rs_api_motd_url \"${INGEST_URL%/api/ingest}/api/game/motd\""
+        # Live per-map global ranks (hrace/ranks.as): the gametype polls this
+        # every ~60s and shows each connected player's true rank in the
+        # scoreboard "Pos" column - including players ranked past the local
+        # top-50 board. Empty url = no-op (scoreboard falls back to the local
+        # top-50 board position).
+        echo "set rs_api_ranks_url \"${INGEST_URL%/api/ingest}/api/game/ranks\""
     fi
     # Cross-server player mirroring: the gametype reads these and drives the
     # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.
