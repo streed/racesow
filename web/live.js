@@ -12,7 +12,7 @@
 // ignores getstatus from non-LAN sources (the co-located container queries
 // arrive from the docker network, which counts as LAN).
 import dgram from "node:dgram";
-import { simplifyName } from "./db.js";
+import { simplifyName, identKey } from "./db.js";
 
 const OOB = Buffer.from([0xff, 0xff, 0xff, 0xff]);
 const GETSTATUS = Buffer.concat([OOB, Buffer.from("getstatus\n")]);
@@ -22,6 +22,29 @@ const QUERY_TIMEOUT_MS = 2000;
 const POLL_INTERVAL_MS = 10_000;
 const MAX_NAME = 64;
 const MAX_PLAYERS = 256;
+
+// Infrastructure spectators — the TV auto-director capture client that drives
+// the /live video stream — connect to every game server and appear in its
+// getstatus reply like any other client. They are not real players: the engine
+// reports a bogus multi-million-ms sentinel for their ping (it tracks the
+// spectator's connection uptime, not a round-trip), so leaving them in would
+// show a "5,000,000 ping" phantom player AND count toward "N players in game"
+// on an otherwise empty server. Filter them out here by clean-name identity,
+// the same EXACT colour-stripped/lowercased match the server (RACE_IsTvClient)
+// and getstatus.sh use — matching the capture container's TV_NAME (default
+// RACESOW-TV). Override via RS_TV_NAMES (comma-separated) if a deployment
+// renames it. Note: score -9999 cannot be used to spot the TV client — a real
+// racer reports -9999 too — so we match on name only.
+const TV_IDENTS = new Set(
+  (process.env.RS_TV_NAMES || "RACESOW-TV")
+    .split(",")
+    .map((n) => identKey(n))
+    .filter(Boolean)
+);
+
+function isTvClient(name) {
+  return TV_IDENTS.has(identKey(name));
+}
 
 export function parseAddress(address) {
   if (typeof address !== "string" || !address.trim()) return null;
@@ -130,12 +153,14 @@ function presentResult(server, result) {
     gametype: info.gametype || info.g_gametype || null,
     maxclients: info.sv_maxclients ? parseInt(info.sv_maxclients, 10) : null,
     mesh: parseMeshStatus(info.rs_mesh_status),
-    players: players.map((p) => ({
-      name: p.name,
-      simplified: simplifyName(p.name),
-      ping: p.ping,
-      score: p.score,
-    })),
+    players: players
+      .filter((p) => !isTvClient(p.name))
+      .map((p) => ({
+        name: p.name,
+        simplified: simplifyName(p.name),
+        ping: p.ping,
+        score: p.score,
+      })),
   };
 }
 

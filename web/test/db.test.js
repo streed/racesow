@@ -62,6 +62,27 @@ test("openDatabase bootstraps a usable schema on an empty database", async (t) =
   assert.deepEqual((await race.maps()).rows, []);
 });
 
+test("blocked maps drop out of the total map count and the maps list", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({ version: VER, map: "keepmap", source: "racelog", records: [finish("Nova", 50000)] });
+  await race.ingest({ version: VER, map: "blockme", source: "racelog", records: [finish("Nova", 51000)] });
+  await race.refreshAggregates(); // populate map_index for the maps() list
+  // Both maps are counted and listed before any block.
+  assert.equal((await race.overview()).totals.maps, 2);
+  assert.equal((await race.maps()).total, 2);
+
+  const blockId = (await race.one("SELECT id FROM map WHERE name = $1", ["blockme"])).id;
+  await race.blockMap(blockId, "test", "cli");
+
+  // Headline total, maps() total, and maps() rows all exclude the blocked map
+  // immediately — the filter is evaluated live against map_block, so no
+  // aggregate rebuild is needed after blocking.
+  assert.equal((await race.overview()).totals.maps, 1, "overview total excludes blocked");
+  const list = await race.maps();
+  assert.equal(list.total, 1, "maps() total excludes blocked");
+  assert.deepEqual(list.rows.map((r) => r.name), ["keepmap"], "maps() rows exclude blocked");
+});
+
 test("a later racelog nick cannot seize an existing canonical group (identity hijack)", async (t) => {
   const race = await freshDb(t);
   // Victim establishes the group under the nick "Victim".

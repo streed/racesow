@@ -1,0 +1,35 @@
+# Phase 0 spike: stock Warfork dedicated race server.
+#
+#   cd warfork && docker compose up --build
+#
+# The server files are pulled from Steam into the named `warfork_server` volume
+# on first boot (a few hundred MB, anonymous). Set SKIP_UPDATE=1 after the first
+# run to skip the Steam check and boot instantly.
+services:
+  warfork-race:
+    build: .
+    image: warfork-race:spike
+    container_name: warfork-race-spike
+    # Host networking makes masterserver registration + client connect behave
+    # like a real deploy (qfusion advertises its own port). Swap to explicit
+    # port mappings if you prefer isolation.
+    network_mode: host
+    environment:
+      SV_HOSTNAME: "Racesow Warfork Spike"
+      G_GAMETYPE: "race"
+      SV_MAXCLIENTS: "16"
+      SV_PUBLIC: "0"          # set 1 to test masterserver listing (needs open UDP 44400)
+      SV_PORT: "44400"
+      SV_HTTP_PORT: "44444"
+      MAP: ""                 # set once we know a stock race map name
+      SKIP_UPDATE: "0"        # 1 = skip Steam update, boot from the cached volume
+      # STEAM_BRANCH: "beta"  # uncomment to pull the public beta branch
+    volumes:
+      - warfork_server:/app/server
+    restart: "no"
+
+volumes:
+  warfork_server:
+    # Reuse the volume the manual spike download populated.
+    name: warfork_server
+    external: true

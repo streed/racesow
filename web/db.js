@@ -519,7 +519,9 @@ class RaceDB {
   async overview() {
     const one = (sql, p) => this.one(sql, p);
     const totals = {
-      maps: num((await one("SELECT COUNT(*) c FROM map")).c),
+      maps: num(
+        (await one("SELECT COUNT(*) c FROM map m WHERE NOT EXISTS (SELECT 1 FROM map_block b WHERE b.map_id = m.id)")).c
+      ),
       players: num((await one("SELECT COUNT(*) c FROM player")).c),
       canonicalPlayers: num((await one("SELECT COUNT(DISTINCT canonical_id) c FROM player")).c),
       rankedPlayers: num((await one("SELECT COUNT(*) c FROM standings")).c),
@@ -1125,7 +1127,8 @@ class RaceDB {
     const direction = dir(order, sort === "name" ? "ASC" : "DESC");
     const lim = clampLimit(limit);
     const off = toOffset(offset);
-    const where = q ? "WHERE mi.name ILIKE $1" : "";
+    const notBlocked = "NOT EXISTS (SELECT 1 FROM map_block b WHERE b.map_id = mi.map_id)";
+    const where = q ? `WHERE mi.name ILIKE $1 AND ${notBlocked}` : `WHERE ${notBlocked}`;
     const args = q ? [`%${likeEscape(q)}%`] : [];
     const total = num((await this.one(`SELECT COUNT(*) c FROM map_index mi ${where}`, args)).c);
     const rows = (

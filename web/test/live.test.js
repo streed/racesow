@@ -175,6 +175,30 @@ test("poller snapshots enrolled+addressed servers, marks dead ones offline", asy
   assert.deepEqual(deadOne.players, []);
 });
 
+test("poller drops the TV capture spectator from the player list", async (t) => {
+  const race = await freshDb(t);
+  // The TV client reports a bogus multi-million-ms ping and score -9999; a real
+  // racer also reports score -9999, so only the name distinguishes them.
+  const { port } = await fakeGameServer(t, {
+    map: "coldrun",
+    players: [
+      { score: -9999, ping: 5496007, name: "RACESOW-TV", team: 0 },
+      { score: -9999, ping: 42, name: "^1real ^7racer", team: 0 },
+    ],
+  });
+  const s = await race.enrollServer("Streamed", "tok-tv".repeat(6));
+  await race.setServerAddress(s.id, `127.0.0.1:${port}`);
+
+  const poller = createLivePoller(race, { timeoutMs: 300 });
+  const snap = await poller.poll();
+  const srv = snap.servers.find((x) => x.id === s.id);
+
+  // Only the real racer survives — the phantom "5,000,000 ping" TV row is gone.
+  assert.equal(srv.players.length, 1);
+  assert.equal(srv.players[0].simplified, "real racer");
+  assert.ok(!srv.players.some((p) => /^RACESOW-TV$/i.test(p.simplified)));
+});
+
 test("revoked servers are not polled", async (t) => {
   const race = await freshDb(t);
   const { port } = await fakeGameServer(t);
