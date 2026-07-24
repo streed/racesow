@@ -308,6 +308,23 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .statrow .s .l { font-family: var(--cond); text-transform: uppercase; letter-spacing: 1.5px; font-size: 11px; color: var(--muted); }
 .statrow .s.hl .n { color: var(--gold); }
 
+/* ---------- skill-rating trend chart (player profile) ---------- */
+.srhist { padding: 16px 18px 12px; margin-bottom: 24px; }
+.srhist-head { display: flex; align-items: baseline; gap: 22px; margin-bottom: 6px; }
+.srhist-now .n { font-family: var(--cond); font-weight: 800; font-style: italic; font-size: 30px; color: var(--gold); font-variant-numeric: tabular-nums; }
+.srhist-now .l, .srhist-delta .l { font-family: var(--cond); text-transform: uppercase; letter-spacing: 1.5px; font-size: 11px; color: var(--muted); margin-left: 8px; }
+.srhist-delta { font-family: var(--cond); font-weight: 700; font-size: 18px; font-variant-numeric: tabular-nums; display: flex; align-items: baseline; gap: 2px; }
+.srhist-delta.up { color: var(--green); }
+.srhist-delta.down { color: #ff6b6b; }
+.srhist-delta.flat { color: var(--muted); }
+.srhist-empty { color: var(--muted); font-size: 14px; padding: 6px 2px; }
+.srchart { display: block; width: 100%; height: auto; max-width: 720px; margin-top: 4px; }
+.srchart .srgrid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 4; }
+.srchart .srarea { fill: rgba(255,106,26,.12); stroke: none; }
+.srchart .srline { fill: none; stroke: var(--orange); stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; }
+.srchart .srdot { fill: var(--orange-2); stroke: var(--bg); stroke-width: 2; }
+.srchart .sraxl, .srchart .sraxd { fill: var(--faint); font-family: var(--mono); font-size: 11px; }
+
 /* ---------- misc ---------- */
 .loading, .empty { text-align: center; color: var(--muted); padding: 40px; font-family: var(--cond); text-transform: uppercase; letter-spacing: 2px; }
 .spinner { display: inline-block; width: 26px; height: 26px; border: 3px solid var(--line-2); border-top-color: var(--orange); border-radius: 50%; animation: spin .7s linear infinite; }

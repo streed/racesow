@@ -31,7 +31,18 @@
 #   MAPLIST_URL=file:///tmp/maplist.html scripts/fetch-maps.sh --dry-run
 set -euo pipefail
 
+# TRUST NOTE: livesow is an uncontrolled third-party mirror reached over plain
+# HTTP (2018-era host, no TLS). Fetched packs are loaded by the game server AND
+# reserved to every client, so treat them as untrusted: we prefer https:// when
+# the host offers it (fall back to http), zip-validate + ClamAV-scan every pack,
+# and honour an optional operator SHA-256 pin (MAP_SHA256SUMS, see below). None
+# of these stop a benign-but-malicious map — that trust is inherent to community
+# content, the same as any Warsow client loading community pk3s.
 MAPLIST_URL="${MAPLIST_URL:-http://livesow.net/race/maplist.php}"
+# Optional integrity pin: path to a "<sha256>  <packname>" sums file. Listed
+# packs are verified after download and rejected on mismatch; unlisted packs
+# pass (the file need not be exhaustive). Unset => no hash check.
+MAP_SHA256SUMS="${MAP_SHA256SUMS:-}"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${REPO_ROOT}/server/maps"
 JOBS=4
@@ -70,8 +81,12 @@ trap 'rm -rf "${STATE}"' EXIT
 
 # --- Fetch the map list and extract unique pk3 URLs ---------------------------
 say "fetching map list from ${MAPLIST_URL}"
-curl -gfsSL --connect-timeout 15 --max-time 120 "${MAPLIST_URL}" > "${STATE}/maplist.html" \
-    || die "could not fetch the map list"
+_ml_secure="${MAPLIST_URL/http:\/\//https:\/\/}"
+if ! { [ "${_ml_secure}" != "${MAPLIST_URL}" ] \
+         && curl -gfsSL --connect-timeout 15 --max-time 120 "${_ml_secure}" > "${STATE}/maplist.html"; } \
+   && ! curl -gfsSL --connect-timeout 15 --max-time 120 "${MAPLIST_URL}" > "${STATE}/maplist.html"; then
+    die "could not fetch the map list"
+fi
 
 # Lines look like: <a href="http://livesow.net/wsw/race/<name>.pk3">pk3</a> ...
 # Several map names can share one pack, so the same href repeats — dedupe.
@@ -141,7 +156,7 @@ fi
 : > "${STATE}/failed"
 
 fetch_one() {
-    local idx url name out part enc
+    local idx url name out part enc secure want got
     IFS=$'\t' read -r idx url <<< "$1"
     name="${url##*/}"
     out="${DEST}/${name}"
@@ -162,10 +177,17 @@ fetch_one() {
     # long a big pack may take on a slow link; --retry-all-errors makes curl
     # also retry mid-transfer drops (exit 18), which plain --retry ignores.
     # Retrying non-transient errors is safe: the zip check gates the install.
-    if ! curl -gfsSL --connect-timeout 15 \
-            --speed-limit 8192 --speed-time 60 --max-time 7200 \
-            --retry 3 --retry-delay 2 --retry-all-errors \
-            -o "${part}" "${enc}"; then
+    # Prefer TLS: try an https:// form first (encrypted transport when the mirror
+    # supports it), falling back to the URL as-scraped so an https-less host still
+    # works. Transport is not integrity on its own — the zip/ClamAV/SHA gates below
+    # are the real content checks.
+    secure="${enc/http:\/\//https:\/\/}"
+    if ! { [ "${secure}" != "${enc}" ] && curl -gfsSL --connect-timeout 15 \
+              --speed-limit 8192 --speed-time 60 --max-time 7200 \
+              --retry 3 --retry-delay 2 --retry-all-errors -o "${part}" "${secure}"; } \
+       && ! curl -gfsSL --connect-timeout 15 \
+              --speed-limit 8192 --speed-time 60 --max-time 7200 \
+              --retry 3 --retry-delay 2 --retry-all-errors -o "${part}" "${enc}"; then
         rm -f "${part}"
         printf '[%s/%s] FAIL %s (download error)\n' "${idx}" "${TOTAL_TODO}" "${name}"
         printf '%s\tdownload-error\n' "${url}" >> "${STATE}/failed"
@@ -186,6 +208,22 @@ fetch_one() {
         printf '[%s/%s] FAIL %s (no zip magic)\n' "${idx}" "${TOTAL_TODO}" "${name}"
         printf '%s\tbad-zip\n' "${url}" >> "${STATE}/failed"
         return 0
+    fi
+
+    # Optional SHA-256 pin (MAP_SHA256SUMS): verify listed packs, reject a
+    # mismatch. Closes the plain-HTTP tamper gap for pinned packs; unlisted packs
+    # fall through to the zip + ClamAV baseline.
+    if [ -n "${MAP_SHA256SUMS:-}" ] && command -v sha256sum >/dev/null 2>&1; then
+        want="$(awk -v n="${name}" '$2 == n || $2 == "*"n {print $1; exit}' "${MAP_SHA256SUMS}" 2>/dev/null || true)"
+        if [ -n "${want}" ]; then
+            got="$(sha256sum "${part}" | cut -d' ' -f1)"
+            if [ "${want}" != "${got}" ]; then
+                rm -f "${part}"
+                printf '[%s/%s] FAIL %s (sha256 mismatch)\n' "${idx}" "${TOTAL_TODO}" "${name}"
+                printf '%s\tsha256-mismatch\n' "${url}" >> "${STATE}/failed"
+                return 0
+            fi
+        fi
     fi
 
     # mktemp creates the temp file 0600; the game container reads the maps dir
@@ -210,7 +248,7 @@ fetch_one() {
     printf '%s\n' "${url}" >> "${STATE}/ok"
 }
 export -f fetch_one
-export DEST STATE TOTAL_TODO="${todo}"
+export DEST STATE TOTAL_TODO="${todo}" MAP_SHA256SUMS
 
 nl -ba -w1 "${STATE}/todo" | xargs -d '\n' -n1 -P "${JOBS}" bash -c 'fetch_one "$1"' _
 

@@ -57,6 +57,16 @@ if (INGEST_TOKEN === PLACEHOLDER_TOKEN) {
   INGEST_TOKEN = "";
 }
 const INGEST_TOKEN_HASH = INGEST_TOKEN ? sha256(INGEST_TOKEN) : "";
+if (INGEST_TOKEN_HASH) {
+  // The shared token writes records with NO per-server identity (server_id
+  // NULL), so a leak lets any holder forge records for any server and they can't
+  // be attributed/rolled back per server. Per-server tokens (node admin.js
+  // enroll) bound that blast radius — nudge operators toward them.
+  console.warn(
+    "NOTE: a shared INGEST_TOKEN is enabled (legacy). Prefer per-server tokens " +
+      "(node admin.js enroll) and unset INGEST_TOKEN — records are then attributable per server."
+  );
+}
 
 // How stale the in-memory aggregates may get during a sustained ingest stream.
 const REFRESH_DEBOUNCE_MS = 3000;
@@ -68,7 +78,27 @@ const MAX_MAP_LEN = 128;
 const MAX_VERSION_LEN = 64;
 const MAX_CHECKPOINTS = 4096;
 const MAX_TIME_MS = 24 * 60 * 60 * 1000;
+// Physically-impossible-fast floor: no real map is traversed in under this, so a
+// sub-floor finish is a forged/absurd time — e.g. the classic time:1ms "seize the
+// WR forever" from a leaked/compromised ingest token. This does NOT stop a
+// PLAUSIBLE forgery by a trusted box (that is inherent to the trusted-server
+// model), but it blocks the trivial case; every record additionally carries its
+// submitting server_id for audit/rollback. Keep it well under any genuine WR.
+const MIN_TIME_MS = 50;
 const MAX_RECORDS_PER_REQUEST = 1000;
+// Per-request ceiling on the TOTAL checkpoint rows across all records. The
+// per-record (4096) and per-batch (1000) caps multiply to ~4M without this, so
+// one authorized request could force millions of checkpoint inserts (DB bloat +
+// pool pressure). 200k comfortably clears any real batch (a top-50 resync of
+// full runs, or a live-finish flush) while rejecting the pathological product.
+// Raise it if a legitimate server ever trips the 400 (see /ingest handler).
+const MAX_TOTAL_CHECKPOINTS = 200000;
+// Per-request ceiling on the SUM of attempt/metric counters. run_tally counters
+// are monotonic (added, never reset), so a token holder could otherwise inflate
+// a player's attempts/wall-jumps/etc. by billions per request. A real flush
+// carries small per-player deltas; this rejects an implausibly large batch while
+// clearing any genuine one by a wide margin. Cosmetic stats only (not rank).
+const MAX_TALLY_PER_REQUEST = 5_000_000;
 // Free-text on a public map-flag report; capped so a report can't be an essay.
 const FLAG_NOTE_MAX = 500;
 
@@ -98,6 +128,21 @@ app.disable("x-powered-by");
 // One trusted proxy (the production nginx) so req.ip is the real client for
 // rate limiting; harmless when hit directly (no X-Forwarded-For -> socket IP).
 app.set("trust proxy", 1);
+
+// Defense-in-depth security headers at the APP layer, so a response served
+// directly by Node (nginx somehow bypassed, a future internal proxy that forgets
+// them, or non-prod use) is never header-naked. In production the front nginx
+// sets the authoritative copies (incl. the CSP + HSTS it alone can size against
+// the deployed SPA/TLS) and strips these upstream duplicates via
+// proxy_hide_header (see deploy/nginx/racesow.conf), so exactly one of each is on
+// the wire. nosniff is idempotent even if a layer double-adds it. The admin
+// router further tightens Referrer-Policy to no-referrer for its own responses.
+app.use((_req, res, next) => {
+  res.set("X-Content-Type-Options", "nosniff");
+  res.set("X-Frame-Options", "SAMEORIGIN");
+  res.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  next();
+});
 
 // Minimal dependency-free fixed-window rate limiter. The production nginx also
 // rate-limits, but the game-server render routes (/player, /og) and ingest
@@ -162,6 +207,23 @@ api.use(apiLimiter);
 function asInt(v) {
   const n = parseInt(v, 10);
   return Number.isNaN(n) ? null : n;
+}
+
+// /api/maps/:id leaderboard page size. The map page requests limit=10000
+// ("everyone") and limit=1 (just map meta), so we can't hard-cap it low without
+// truncating real leaderboards. Instead the raw limit is snapped to a small set
+// of buckets that is ALSO the cache key (see the route): this collapses the
+// attacker's key space — every distinct junk limit (1..N) and every unknown
+// query param would otherwise mint a fresh cache/edge key and force an uncached
+// leaderboard read each time. The returned value is the effective query limit,
+// so the cached body always matches the key it was stored under.
+const MAP_DETAIL_MAX_LIMIT = 10000;
+const MAP_DETAIL_LIMIT_BUCKETS = [1, 50, 100, 1000];
+function mapDetailLimit(raw) {
+  const n = parseInt(raw, 10);
+  if (Number.isNaN(n) || n <= 0) return 50; // default page
+  for (const b of MAP_DETAIL_LIMIT_BUCKETS) if (n <= b) return b;
+  return MAP_DETAIL_MAX_LIMIT;
 }
 
 // Express 4 does not catch rejected async handlers; route through this so a
@@ -231,10 +293,10 @@ function heatmapMeta(id) {
   }
 }
 
-api.get("/maps/:id", cache(60, { edge: true }), wrap(async (req, res) => {
+api.get("/maps/:id", cache(60, { edge: true, key: (req) => `${req.path}?limit=${mapDetailLimit(req.query.limit)}` }), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid map id" });
-  const detail = await race.mapDetail(id, req.query);
+  const detail = await race.mapDetail(id, { limit: mapDetailLimit(req.query.limit) });
   if (!detail) return res.status(404).json({ error: "map not found" });
   detail.heatmap = heatmapMeta(id);
   res.json(detail);
@@ -377,24 +439,40 @@ api.get("/streams", cache(10), wrap(async (_req, res) => {
 // POV here every few seconds. Per-server bearer token (same as /ingest); the
 // token's server must match the :id. The URL is never taken from the body — it
 // stays trusted config — so a compromised token can't redirect viewers.
-api.post("/streams/:id/health", express.json({ limit: "8kb" }), wrap(async (req, res) => {
-  const id = asInt(req.params.id);
-  if (id == null) return res.status(400).json({ error: "invalid server id" });
-  const ident = await authenticateIngest(req);
-  if (!ident || ident.revoked) return res.status(401).json({ error: "unauthorized" });
-  if (ident.serverId != null && ident.serverId !== id) {
-    return res.status(403).json({ error: "token/server mismatch" });
-  }
-  if (!streams.has(id)) return res.status(404).json({ error: "no stream configured for server" });
-  const b = req.body || {};
-  streams.recordHeartbeat(id, {
-    status: b.status,
-    players: Number(b.players),
-    map: b.map,
-    pov: b.pov,
-  });
-  res.json({ ok: true });
-}));
+api.post(
+  "/streams/:id/health",
+  // Authenticate BEFORE parsing the body (mirror /ingest) so an unauthenticated
+  // client can't make us JSON.parse first, and rate-limit per server.
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  express.json({ limit: "8kb" }),
+  wrap(async (req, res) => {
+    const id = asInt(req.params.id);
+    if (id == null) return res.status(400).json({ error: "invalid server id" });
+    // A heartbeat targets a specific stream id, so it must carry that server's
+    // own per-server token. The legacy shared token has no server identity
+    // (serverId null); allowing it would let one shared-token holder spoof the
+    // status/POV shown for ANY configured stream, so it is refused here.
+    if (req.ingest.serverId == null || req.ingest.serverId !== id) {
+      return res.status(403).json({ error: "token/server mismatch" });
+    }
+    if (!streams.has(id)) return res.status(404).json({ error: "no stream configured for server" });
+    const b = req.body || {};
+    streams.recordHeartbeat(id, {
+      status: b.status,
+      players: Number(b.players),
+      map: b.map,
+      pov: b.pov,
+    });
+    res.json({ ok: true });
+  })
+);
 
 // Live topscores for game servers: the hrace gametype's RS_ApiFetchTop
 // native GETs this on map load and on a refresh interval, and swaps the
@@ -663,9 +741,26 @@ function tokenMatches(presented, expectedHash) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// Constant-time equality for two secret strings (e.g. the CSRF token), matching
+// the codebase's constant-time practice for the bearer/password paths.
+function safeEqualStr(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
 // Resolve the Authorization header to an ingest identity, or null.
 //   -> { serverId, serverName } for a per-server token
 //   -> { serverId: null, serverName: 'shared' } for the legacy shared token
+//
+// TRUST BOUNDARY: a valid ingest token is TRUSTED to report game results for any
+// player identity (the player name/login in a record is game-supplied, not
+// proven here), so a compromised game box can forge records — inherent to a
+// shared leaderboard fed by trusted servers. Blast radius is bounded by: (1)
+// per-server tokens so each write is attributed to a server_id (audit/rollback);
+// (2) the MIN_TIME_MS floor blocking absurd-time forgeries; (3) revocation
+// (a revoked server is refused below). Retiring the shared token tightens (1).
 async function authenticateIngest(req) {
   const h = req.headers.authorization || "";
   if (!h.startsWith("Bearer ")) return null;
@@ -704,7 +799,7 @@ function sanitizeMetric(v) {
 function sanitizeRecord(r) {
   if (!r || typeof r.name !== "string" || r.name.length === 0) return null;
   const time = Number(r.time);
-  if (!Number.isInteger(time) || time <= 0 || time > MAX_TIME_MS) return null;
+  if (!Number.isInteger(time) || time < MIN_TIME_MS || time > MAX_TIME_MS) return null;
   const cpsIn = Array.isArray(r.checkpoints) ? r.checkpoints.slice(0, MAX_CHECKPOINTS) : [];
   // attempts = race starts since the player's last flush (includes the start
   // that produced this finish). Absent/invalid -> null: an old server that
@@ -716,9 +811,13 @@ function sanitizeRecord(r) {
     time,
     attempts:
       Number.isInteger(attempts) && attempts >= 0 ? Math.min(attempts, MAX_ATTEMPTS_PER_ENTRY) : null,
+    // Split times are ms into the run, so bound them like the record time: a
+    // legit split is <= MAX_TIME_MS, and this keeps the value inside the
+    // checkpoint.time INT4 column (a larger value would abort the whole ingest
+    // tx with a numeric-overflow error).
     checkpoints: cpsIn.map((t) => {
       const n = Number(t);
-      return Number.isInteger(n) && n > 0 ? n : 0;
+      return Number.isInteger(n) && n > 0 ? Math.min(n, MAX_TIME_MS) : 0;
     }),
     wall_jumps: sanitizeMetric(r.wall_jumps),
     dashes: sanitizeMetric(r.dashes),
@@ -751,7 +850,7 @@ function sanitizeGhost(body) {
   const time = Number(body.time);
   const hz = Number(body.hz);
   if (typeof body.name !== "string" || !body.name) return null;
-  if (!Number.isInteger(time) || time <= 0 || time > MAX_TIME_MS) return null;
+  if (!Number.isInteger(time) || time < MIN_TIME_MS || time > MAX_TIME_MS) return null;
   if (!Number.isInteger(hz) || hz <= 0 || hz > MAX_GHOST_HZ) return null;
   if (!Array.isArray(body.frames) || body.frames.length === 0 || body.frames.length > MAX_GHOST_FRAMES)
     return null;
@@ -837,7 +936,7 @@ api.post(
     if (body.source === "wr_demo" || body.wr_demo) {
       const d = body.wr_demo || {};
       const time = Number(d.time);
-      if (typeof d.name !== "string" || !d.name || !Number.isInteger(time) || time <= 0 || time > MAX_TIME_MS)
+      if (typeof d.name !== "string" || !d.name || !Number.isInteger(time) || time < MIN_TIME_MS || time > MAX_TIME_MS)
         return res.status(400).json({ error: "invalid wr_demo record" });
       if (!validDemoPath(d.demo)) return res.status(400).json({ error: "invalid demo path" });
       try {
@@ -874,6 +973,20 @@ api.post(
     const cleanAttempts = attempts.map(sanitizeAttempt).filter(Boolean);
     if (!clean.length && !cleanAttempts.length) {
       return res.status(400).json({ error: "no valid records or attempts" });
+    }
+    // Backstop the multiplied per-record/per-batch checkpoint caps: reject a
+    // request whose total splits would balloon the checkpoint tables.
+    const totalCheckpoints = clean.reduce((n, r) => n + r.checkpoints.length, 0);
+    if (totalCheckpoints > MAX_TOTAL_CHECKPOINTS) {
+      return res.status(400).json({ error: `too many checkpoints (max ${MAX_TOTAL_CHECKPOINTS} total)` });
+    }
+    // Reject an implausibly large sum of monotonic tally deltas (counter inflation).
+    const metricSum = (e) => e.wall_jumps + e.dashes + e.prejump_failures + e.restarts;
+    const totalTally =
+      clean.reduce((n, r) => n + (r.attempts != null ? r.attempts : 1) + metricSum(r), 0) +
+      cleanAttempts.reduce((n, a) => n + a.count + metricSum(a), 0);
+    if (totalTally > MAX_TALLY_PER_REQUEST) {
+      return res.status(400).json({ error: `implausible counter totals (max ${MAX_TALLY_PER_REQUEST} per request)` });
     }
 
     try {
@@ -1172,7 +1285,7 @@ function isCrossSite(req) {
 // SameSite=Strict and the CSP's form-action 'self'). Returns true to proceed.
 function checkCsrf(req, res) {
   const token = req.body && req.body._csrf;
-  if (!token || typeof token !== "string" || token !== req.session.csrf) {
+  if (!token || typeof token !== "string" || !safeEqualStr(token, req.session.csrf)) {
     res.status(403).type("text/plain").send("Bad CSRF token — reload and retry.");
     return false;
   }

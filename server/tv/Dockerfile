@@ -49,9 +49,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # the exact binaries the dedicated-server image strips out. Base game data
 # (basewsw/*.pk3) is required so the client can actually render maps.
 ARG WARSOW_URL=https://warsow.net/warsow-2.1.2.tar.gz
+# Optional integrity pin: pass --build-arg WARSOW_SHA256=<hex> to verify the
+# tarball before unpacking. warsow.net is an uncontrolled third-party host and
+# HTTPS only stops passive MITM — a host takeover/DNS hijack could still serve a
+# malicious tarball into the image. Empty (default) keeps prior behavior; set it
+# once the known-good hash is recorded (sha256sum warsow-2.1.2.tar.gz).
+ARG WARSOW_SHA256=
 RUN set -eux; \
     mkdir -p "${WARSOW_DIR}"; \
     curl -fSL "${WARSOW_URL}" -o /tmp/warsow.tar.gz; \
+    if [ -n "${WARSOW_SHA256}" ]; then echo "${WARSOW_SHA256}  /tmp/warsow.tar.gz" | sha256sum -c -; fi; \
     tar -xzf /tmp/warsow.tar.gz -C "${WARSOW_DIR}" --strip-components=1; \
     rm -f /tmp/warsow.tar.gz; \
     cd "${WARSOW_DIR}"; \

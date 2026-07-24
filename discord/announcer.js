@@ -55,6 +55,22 @@ function stripColors(name) {
   return String(name || "").replace(/\^[0-9]/g, "");
 }
 
+/* Escape Discord markdown so an attacker-chosen player/map/version string can't
+   inject clickable [masked](links), formatting, or headings into an official-
+   looking announcement embed. Backslash-escapes the active metacharacters and
+   flattens newlines. (Names arrive from the ingest path, which only length-caps
+   them — see web/server.js sanitizeRecord — so treat them as untrusted here.) */
+function mdEscape(s) {
+  return String(s == null ? "" : s)
+    .replace(/[\\`*_~|>[\]()#@!.-]/g, "\\$&")
+    .replace(/\r?\n/g, " ");
+}
+/* For a value shown inside an inline `code span`, where backticks cannot be
+   backslash-escaped: drop backticks and newlines so it can't break out. */
+function codeEscape(s) {
+  return String(s == null ? "" : s).replace(/[`\r\n]/g, "");
+}
+
 async function loadState() {
   try {
     if (existsSync(CFG.statePath)) {
@@ -94,19 +110,19 @@ function buildEmbed(rec) {
   const isWR = rec.global_rank === 1;
   const player = rec.player || stripColors(rec.raw_name) || "unknown";
   const fields = [
-    { name: "Map", value: "`" + rec.map + "`", inline: true },
+    { name: "Map", value: "`" + codeEscape(rec.map) + "`", inline: true },
     { name: "Time", value: "`" + fmtTime(rec.time) + "`", inline: true },
     { name: "Rank", value: `#${rec.global_rank}`, inline: true },
   ];
   if (isWR && rec.margin != null) {
     fields.push({ name: "Ahead of #2 by", value: "`" + fmtTime(rec.margin) + "`", inline: true });
   }
-  fields.push({ name: "Version", value: rec.version, inline: true });
+  fields.push({ name: "Version", value: mdEscape(rec.version), inline: true });
 
   const title = isWR ? "🏆 New World Record!" : `🏁 New Top-${CFG.maxRank} Record`;
   const embed = {
     title,
-    description: `**${player}** just set a ${isWR ? "world record" : "record"} on **${rec.map}**`,
+    description: `**${mdEscape(player)}** just set a ${isWR ? "world record" : "record"} on **${mdEscape(rec.map)}**`,
     color: isWR ? WR_COLOR : EMBED_COLOR,
     fields,
     footer: { text: "Racesow · Warsow Race" },
@@ -127,7 +143,14 @@ async function postEmbeds(recs, onBatchPosted) {
       const res = await fetch(CFG.webhook, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: CFG.username, embeds: batch.map(buildEmbed) }),
+        // allowed_mentions parse:[] is belt-and-suspenders: embed text never
+        // pings anyway, but this guarantees no @everyone/@here/user mention in
+        // an attacker-influenced string can ever notify the channel.
+        body: JSON.stringify({
+          username: CFG.username,
+          allowed_mentions: { parse: [] },
+          embeds: batch.map(buildEmbed),
+        }),
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (res.status === 429) {

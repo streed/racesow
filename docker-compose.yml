@@ -113,7 +113,15 @@ services:
       redis:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      # Loopback-only: the admin portal + full API must sit BEHIND the front
+      # nginx (Cloudflare mTLS + rate limits), never on the public interface.
+      # Binding to 127.0.0.1 here means that holds even if the override (which
+      # also loopback-binds this + adds web2) is ever skipped — e.g. an explicit
+      # `docker compose -f docker-compose.yml up`. Containers still reach the app
+      # over the compose network by service name; the host still reaches it on
+      # localhost for the nginx upstream. Drop the publish entirely if nginx
+      # talks to the app over the docker network instead of via localhost.
+      - "127.0.0.1:8080:8080"
     environment:
       PORT: "8080"
       DATABASE_URL: "postgres://racesow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/racesow"

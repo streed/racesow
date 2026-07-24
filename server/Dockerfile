@@ -33,8 +33,12 @@ ARG GAMESRC_REPO=https://github.com/DenMSC/racemod_2.1
 ARG GAMESRC_BRANCH=race-demos
 RUN git clone --depth 1 -b "${GAMESRC_BRANCH}" "${GAMESRC_REPO}" repo
 ARG ANGELSCRIPT_URL=https://www.angelcode.com/angelscript/sdk/files/angelscript_2.29.2.zip
+# Optional integrity pin (same rationale as WARSOW_SHA256 below): pass
+# --build-arg ANGELSCRIPT_SHA256=<hex> to verify the SDK zip before unpacking.
+ARG ANGELSCRIPT_SHA256=
 RUN mkdir -p repo/libsrcs/angelscript \
     && curl -fSL "${ANGELSCRIPT_URL}" -o /tmp/as.zip \
+    && if [ -n "${ANGELSCRIPT_SHA256}" ]; then echo "${ANGELSCRIPT_SHA256}  /tmp/as.zip" | sha256sum -c -; fi \
     && unzip -q /tmp/as.zip -d repo/libsrcs/angelscript \
     && rm -f /tmp/as.zip
 # AngelScript 2.29.2 predates GCC 5's removal of the std::has_trivial_* traits;
@@ -197,6 +201,12 @@ FROM ubuntu:18.04
 ARG RACEMOD_REPO=https://github.com/DenMSC/wsw-race.git
 ARG RACEMOD_BRANCH=racemod
 ARG WARSOW_URL=https://warsow.net/warsow-2.1.2.tar.gz
+# Optional integrity pin: --build-arg WARSOW_SHA256=<hex> verifies the tarball
+# before unpacking. warsow.net is an uncontrolled third-party host and HTTPS only
+# stops passive MITM; a host takeover could still serve a malicious tarball into
+# the image. Empty (default) keeps prior behavior; record the known-good hash
+# (sha256sum warsow-2.1.2.tar.gz) and pin it here / in CI.
+ARG WARSOW_SHA256=
 
 ENV DEBIAN_FRONTEND=noninteractive \
     WARSOW_DIR=/warsow \
@@ -231,6 +241,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN set -eux; \
     mkdir -p "${WARSOW_DIR}"; \
     curl -fSL "${WARSOW_URL}" -o /tmp/warsow.tar.gz; \
+    if [ -n "${WARSOW_SHA256}" ]; then echo "${WARSOW_SHA256}  /tmp/warsow.tar.gz" | sha256sum -c -; fi; \
     tar -xzf /tmp/warsow.tar.gz -C "${WARSOW_DIR}" --strip-components=1; \
     rm -f /tmp/warsow.tar.gz; \
     cd "${WARSOW_DIR}"; \

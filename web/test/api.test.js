@@ -28,6 +28,18 @@ async function adminQuery(sql) {
   }
 }
 
+// Query the throwaway per-run database the server is using (ADMIN_URL targets
+// the base `racesow` db, which only exists to CREATE/DROP the test db).
+async function dbQuery(sql) {
+  const c = new pg.Client({ connectionString: ADMIN_URL.replace(/\/[^/]*$/, `/${dbName}`) });
+  await c.connect();
+  try {
+    return await c.query(sql);
+  } finally {
+    await c.end();
+  }
+}
+
 before(async () => {
   dbName = "test_api_" + crypto.randomBytes(6).toString("hex");
   await adminQuery(`CREATE DATABASE ${dbName}`);
@@ -84,6 +96,13 @@ async function get(p) {
   const r = await fetch(`${base}/api${p}`);
   assert.equal(r.status, 200, `GET ${p} -> ${r.status}`);
   return r.json();
+}
+
+// UTC ISO day (YYYY-MM-DD) `offset` days from now — matches how db.js buckets SR
+// snapshots (new Date().toISOString()), so seeded rows line up with the server's
+// notion of "today" regardless of the machine's local timezone.
+function isoDay(offset) {
+  return new Date(Date.now() + offset * 86400000).toISOString().slice(0, 10);
 }
 
 test("ingest rejects missing/wrong bearer tokens", async () => {
@@ -229,6 +248,46 @@ test("movement metrics ride finishes and standalone flushes into player totals",
   );
 });
 
+test("player profile carries a 30-day Skill Rating history ending at the current SR", async () => {
+  // "Strafer" was ingested + aggregate-refreshed by the previous test, so a
+  // refresh (and thus at least one daily snapshot) has already run this process.
+  const id = (await get("/players?q=Strafer")).rows[0].id;
+  const pd = await get(`/players/${id}`);
+  assert.ok(Array.isArray(pd.srHistory), "srHistory is present");
+  assert.ok(pd.srHistory.length >= 1, "at least the current point");
+  const last = pd.srHistory[pd.srHistory.length - 1];
+  assert.match(last.day, /^\d{4}-\d{2}-\d{2}$/, "ISO day");
+  assert.equal(last.sr, pd.standing.sr, "series ends at the live SR value");
+});
+
+test("Skill Rating history returns stored daily points oldest->newest, capped to 30 days", async () => {
+  const id = (await get("/players?q=Strafer")).rows[0].id;
+  // Seed prior days directly (the live snapshot only ever writes 'today'), using
+  // explicit UTC dates so they line up with the server's day bucketing. One row
+  // sits well outside the 30-day window and must NOT be surfaced by the read.
+  await dbQuery(
+    `INSERT INTO sr_history (player_id, day, sr) VALUES
+       (${id}, '${isoDay(-40)}', 111),
+       (${id}, '${isoDay(-30)}', 350),
+       (${id}, '${isoDay(-6)}',  400),
+       (${id}, '${isoDay(-2)}',  500)
+     ON CONFLICT (player_id, day) DO UPDATE SET sr = EXCLUDED.sr`
+  );
+  const pd = await get(`/players/${id}`);
+  const days = pd.srHistory.map((p) => p.day);
+  assert.deepEqual([...days].sort(), days, "ordered oldest -> newest");
+  assert.ok(!pd.srHistory.some((p) => p.sr === 111), "row 40 days old is outside the window");
+  // The full 30-day span is retained: a row exactly 30 days old must survive the
+  // read cutoff (regression guard for the today-29 vs today-30 off-by-one).
+  assert.equal(pd.srHistory.find((p) => p.day === isoDay(-30))?.sr, 350, "row exactly 30 days old is kept");
+  assert.equal(pd.srHistory.find((p) => p.day === isoDay(-6))?.sr, 400);
+  assert.equal(pd.srHistory.find((p) => p.day === isoDay(-2))?.sr, 500);
+  // The final point is still today at the live SR (no duplicate today rows).
+  const todays = pd.srHistory.filter((p) => p.day === isoDay(0));
+  assert.equal(todays.length, 1, "exactly one 'today' point");
+  assert.equal(todays[0].sr, pd.standing.sr);
+});
+
 test("re-sending the same finish is idempotent for records", async () => {
   const body = gameBody({ map: "testmap2", name: "Rep", time: 30000, cps: [15000] });
   const first = await ingest(body);
@@ -351,4 +410,64 @@ test("names are truncated and checkpoint garbage is normalised, not fatal", asyn
   await new Promise((r) => setTimeout(r, 3500));
   const maps = await get("/maps?q=testmap3");
   assert.equal(maps.rows[0].wr_time, 25000);
+});
+
+// --- Security regressions (kept last: some cases ingest real records, which
+// would otherwise perturb the absolute-total assertions in earlier tests) ---
+
+test("ingest rejects physically-impossible-fast times (forgery floor)", async () => {
+  // A time below MIN_TIME_MS (50) is a forged/absurd time (the classic time:1ms
+  // "seize the WR"); an all-sub-floor batch is dropped to a 400.
+  assert.equal((await ingest(gameBody({ map: "floormap", name: "x", time: 1 }))).status, 400);
+  assert.equal((await ingest(gameBody({ map: "floormap", name: "x", time: 49 }))).status, 400);
+  assert.equal((await ingest(gameBody({ map: "floormap", name: "x", time: 50 }))).status, 200);
+});
+
+test("ingest rejects an aggregate checkpoint bomb", async () => {
+  // Each record caps at MAX_CHECKPOINTS (4096); 49 of them clears the 200k
+  // per-request total and must be refused before any DB work (no ~4M inserts).
+  const cps = Array.from({ length: 4096 }, () => 1000).join(",");
+  const recs = Array.from(
+    { length: 49 },
+    (_, i) => `{"name":"CP${i}","login":"","time":5000,"checkpoints":[${cps}]}`
+  ).join(",");
+  const { status } = await ingest(`{"version":"wsw 2.1","map":"cpbomb","source":"racelog","records":[${recs}]}`);
+  assert.equal(status, 400);
+});
+
+test("ingest rejects implausible counter inflation", async () => {
+  // Six maxed movement-metric records sum past MAX_TALLY_PER_REQUEST (5M).
+  const recs = Array.from(
+    { length: 6 },
+    (_, i) => `{"name":"Infl${i}","login":"","time":1000,"attempts":1,"checkpoints":[],"wall_jumps":1000000}`
+  ).join(",");
+  const { status } = await ingest(`{"version":"wsw 2.1","map":"inflmap","source":"racelog","records":[${recs}]}`);
+  assert.equal(status, 400);
+});
+
+test("ingest clamps an out-of-range checkpoint value instead of aborting", async () => {
+  // A split above the INT4 column range would abort the whole tx (500) before
+  // the fix; it is now clamped to MAX_TIME_MS and the ingest succeeds.
+  const { status } = await ingest(gameBody({ map: "clampmap", name: "Clamp", time: 5000, cps: [3000000000] }));
+  assert.equal(status, 200);
+});
+
+test("responses carry app-level security headers (defense-in-depth)", async () => {
+  const r = await fetch(`${base}/api/health`);
+  assert.equal(r.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(r.headers.get("x-frame-options"), "SAMEORIGIN");
+  assert.ok((r.headers.get("referrer-policy") || "").length > 0);
+});
+
+test("stream heartbeat: unauth 401 (pre-parse), shared token cannot target a stream", async () => {
+  const post = (tok) =>
+    fetch(`${base}/api/streams/1/health`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(tok ? { Authorization: `Bearer ${tok}` } : {}) },
+      body: `{"status":"live","pov":"x"}`,
+    });
+  assert.equal((await post(null)).status, 401); // no token — refused before body parse
+  // The shared token has no server identity, so it can't post a heartbeat for a
+  // specific stream id (would otherwise spoof any stream's status/POV).
+  assert.equal((await post(TOKEN)).status, 403);
 });

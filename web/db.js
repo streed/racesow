@@ -86,6 +86,13 @@ export const SR_GAMMA = 3;
 export const SR_TOP_K = 20;
 export const SR_MIN_FIELD = 5;
 
+// How many days of per-player Skill Rating history to retain (rolling window).
+// One SR value is snapshotted per player per UTC day at the tail of an aggregate
+// refresh (snapshotSrHistory), and anything older than this many days is pruned
+// in the same pass, so the `sr_history` table stays bounded and the profile
+// shows a 30-day trend. See the 20260723130000000_sr_history migration.
+export const SR_HISTORY_DAYS = 30;
+
 // Schema is managed by node-pg-migrate: versioned files in ./migrations run at
 // startup (see openDatabase). The baseline (0001) reflects the former SQLite
 // era's final shape and adopts the existing production DB idempotently; future
@@ -1437,6 +1444,44 @@ class RaceDB {
     )) || { rank: null, points: 0, sr: 0, wr: 0, podium: 0, maps: 0 };
     if (standing.rank != null) standing.rank = num(standing.rank);
 
+    // Rolling-window Skill Rating history for the profile trend chart: the stored
+    // daily points (oldest -> newest), already capped to SR_HISTORY_DAYS server
+    // side. Always end the series at the *current* SR so the chart runs up to
+    // "today" even before today's snapshot has been written (first refresh after
+    // midnight) — carrying today's value forward rather than showing a stale tail.
+    const today = new Date().toISOString().slice(0, 10);
+    // Read-side window bound (UTC, matching the snapshot's day bucketing). Span
+    // the full SR_HISTORY_DAYS (today - 30d), NOT today - 29d: the prune runs on
+    // the FIRST refresh of each UTC day, so on a quiet day (or just after midnight
+    // before that refresh) "today" has already advanced past the last pruned day,
+    // and a today-29 cutoff would clip the oldest still-retained row -> 29 days
+    // shown instead of 30. today-30 always covers everything the prune keeps, and
+    // since the table is itself capped at 30 days it can never over-return.
+    const cutoff = new Date(Date.now() - SR_HISTORY_DAYS * 86400000)
+      .toISOString()
+      .slice(0, 10);
+    // Read across ALL nick variants of this canonical group, not just the current
+    // representative id: each daily row is written under whichever id was the
+    // representative that day (standings.player_id), so if the representative
+    // later flips, earlier rows would otherwise orphan under the old id. One
+    // snapshot per day + the (player_id, day) key still yields at most one row per
+    // day across the group. LIMIT is a pure backstop (the cutoff already bounds
+    // the set) sized just above the window so it can never clip a real point.
+    const srHistory = (
+      await this.all(
+        `SELECT to_char(day, 'YYYY-MM-DD') AS day, sr FROM sr_history
+         WHERE player_id IN (SELECT id FROM player WHERE canonical_id = $1)
+           AND day >= $2::date
+         ORDER BY day ASC
+         LIMIT ${SR_HISTORY_DAYS + 1}`,
+        [canonId, cutoff]
+      )
+    ).map((r) => ({ day: r.day, sr: num(r.sr) }));
+    const curSr = num(standing.sr);
+    const lastPt = srHistory[srHistory.length - 1];
+    if (!lastPt || lastPt.day !== today) srHistory.push({ day: today, sr: curSr });
+    else lastPt.sr = curSr;
+
     const groupWhere = "player_id IN (SELECT id FROM player WHERE canonical_id = $1)";
     const finishes = num(
       (await this.one(`SELECT COALESCE(SUM(finishes),0) c FROM run_tally WHERE ${groupWhere}`, [canonId])).c
@@ -1560,6 +1605,7 @@ class RaceDB {
       login: player.login,
       aliases,
       standing,
+      srHistory,
       finishes,
       attempts,
       metrics,
@@ -1758,6 +1804,62 @@ class RaceDB {
       await client.query("SELECT pg_advisory_xact_lock(727411001)"); // arbitrary fixed key
       await buildAggregates(client);
       await client.query("COMMIT");
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+    // Best-effort daily SR snapshot off the freshly-committed standings. Never
+    // let a snapshot failure fail the aggregate refresh — the live site depends
+    // on the aggregates, not on the history table; the next refresh retries.
+    try {
+      await this.snapshotSrHistory();
+    } catch (e) {
+      console.error("sr_history snapshot failed (will retry next refresh):", e?.message ?? e);
+    }
+  }
+
+  // Append today's Skill Rating for every ranked player to sr_history, then
+  // prune anything outside the rolling SR_HISTORY_DAYS window. Called at the tail
+  // of every refreshAggregates but does real work at most once per UTC day: the
+  // first refresh after midnight writes the day's rows; later refreshes (many per
+  // minute during active play) short-circuit on an in-memory memo, and across the
+  // two web replicas / a restart on the day already present in the table.
+  //
+  // `day` is computed in UTC in JS so the bucket never depends on the Postgres
+  // session TZ. The (player_id, day) PK makes the whole thing idempotent: the
+  // advisory lock + a re-check inside it means the second replica to arrive skips
+  // the ~9k-row write entirely rather than redoing it.
+  async snapshotSrHistory() {
+    const day = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+    if (this._srSnapshotDay === day) return;
+    // Cheap pre-lock gate: today's snapshot already taken by anyone?
+    if (await this.one("SELECT 1 FROM sr_history WHERE day = $1 LIMIT 1", [day])) {
+      this._srSnapshotDay = day;
+      return;
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(727411002)"); // distinct from the aggregate lock
+      // Re-check under the lock: the replica that lost the race must not repeat
+      // the full insert the winner just committed.
+      const taken = await client.query("SELECT 1 FROM sr_history WHERE day = $1 LIMIT 1", [day]);
+      if (taken.rows.length === 0) {
+        await client.query(
+          `INSERT INTO sr_history (player_id, day, sr)
+           SELECT player_id, $1::date, sr FROM standings
+           ON CONFLICT (player_id, day) DO UPDATE SET sr = EXCLUDED.sr`,
+          [day]
+        );
+        await client.query(
+          `DELETE FROM sr_history WHERE day < $1::date - ${SR_HISTORY_DAYS - 1}`,
+          [day]
+        );
+      }
+      await client.query("COMMIT");
+      this._srSnapshotDay = day;
     } catch (e) {
       try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
       throw e;
@@ -2292,10 +2394,14 @@ class RaceDB {
             [playerId, mapRow.id, versionRow.id, rec.time, serverId, now]
           );
           const cps = Array.isArray(rec.checkpoints) ? rec.checkpoints : [];
-          for (let i = 0; i < cps.length; i++) {
+          if (cps.length) {
+            // One bulk insert rather than N awaited round-trips: UNNEST the
+            // splits array; WITH ORDINALITY yields the 1-based position, so
+            // `number` = ord - 1 (0-based), matching the old per-row loop.
             await client.query(
-              "INSERT INTO finish_checkpoint (finish_id, number, time) VALUES ($1, $2, $3)",
-              [fin.id, i, cps[i]]
+              `INSERT INTO finish_checkpoint (finish_id, number, time)
+               SELECT $1, (ord - 1)::int, t FROM unnest($2::int[]) WITH ORDINALITY AS s(t, ord)`,
+              [fin.id, cps]
             );
           }
         }
@@ -2318,12 +2424,12 @@ class RaceDB {
            VALUES ($1, $2, $3, $4, $5, $6, $7)`,
           [raceId, versionRow.id, playerId, mapRow.id, rec.time, serverId, now]
         );
-        for (let i = 0; i < rec.checkpoints.length; i++) {
-          await client.query("INSERT INTO checkpoint (race_id, number, time) VALUES ($1, $2, $3)", [
-            raceId,
-            i,
-            rec.checkpoints[i],
-          ]);
+        if (rec.checkpoints.length) {
+          await client.query(
+            `INSERT INTO checkpoint (race_id, number, time)
+             SELECT $1, (ord - 1)::int, t FROM unnest($2::int[]) WITH ORDINALITY AS s(t, ord)`,
+            [raceId, rec.checkpoints]
+          );
         }
         counts[existing ? "improved" : "inserted"]++;
       }
