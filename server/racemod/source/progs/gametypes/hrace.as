@@ -583,6 +583,11 @@ void GT_ThinkRules()
     // drops out of randmap/meshvote/prerandmap without a server restart
     RACE_ApiBlockedThink();
 
+    // per-map weapon table from the central DB (no-op when rs_api_mapweapons_url
+    // is empty); lets `callvote randmap rl` / `randmap strafe` filter the vote
+    // pool by what a map plays like (mapweapons.as)
+    RACE_ApiMapWeaponsThink();
+
     // live MOTD from the central admin (no-op when rs_api_motd_url is empty);
     // an edit at /admin/motd shows to newly connecting players without a
     // restart (feeds sv_MOTDString, which the patched engine re-reads per

@@ -45,9 +45,19 @@ bool Cmd_CallvoteValidate( Client@ client, const String &cmdString, const String
         {
             Cvar mapname( "mapname", "", 0 );
             String current = mapname.string;
-            String pattern = argsString.getToken( 1 );
+            // Everything after "randmap" is the filter: a name pattern as before,
+            // or a strafe / weapon filter (e.g. "strafe", "rl", "rl pg") that
+            // GetMapsByFilter resolves against the scanned map weapons.
+            String pattern = "";
+            for ( int t = 1; ; t++ )
+            {
+                String tok = argsString.getToken( t );
+                if ( tok.length() == 0 )
+                    break;
+                pattern += ( pattern.length() == 0 ? "" : " " ) + tok;
+            }
 
-            String[] maps = GetMapsByPattern( pattern, current );
+            String[] maps = GetMapsByFilter( pattern, current );
 
             if ( maps.length() == 0 )
             {
@@ -380,10 +390,19 @@ bool Cmd_Mark( Client@ client, const String &cmdString, const String &argsString
 bool Cmd_PreRandmap( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
     Player@ player = RACE_GetPlayer( client );
-    String pattern = argsString.getToken( 0 );
+    // The whole argument is the filter: a name pattern as before, or a strafe /
+    // weapon filter (e.g. "strafe", "rl", "rl pg") resolved via GetMapsByFilter.
+    String pattern = "";
+    for ( int t = 0; ; t++ )
+    {
+        String tok = argsString.getToken( t );
+        if ( tok.length() == 0 )
+            break;
+        pattern += ( pattern.length() == 0 ? "" : " " ) + tok;
+    }
     if ( pattern == "" )
     {
-        client.printMessage( "Usage: /prerandmap <* | pattern>\n" );
+        client.printMessage( "Usage: /prerandmap <* | pattern | strafe | weapon...>\n" );
         return false;
     }
 

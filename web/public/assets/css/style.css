@@ -217,6 +217,11 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .pill.wr { color: var(--gold); border-color: rgba(255,210,74,.4); background: rgba(255,210,74,.08); }
 .pill.rev { color: var(--orange); border-color: rgba(255,106,26,.45); background: rgba(255,106,26,.08); }
 .pill.pb { color: #7ee787; border-color: rgba(126,231,135,.4); background: rgba(126,231,135,.08); }
+/* Weapon / strafe tags shown after a map name on the maps page. */
+.wpn { display: inline-block; font-family: var(--cond); font-weight: 600; text-transform: uppercase;
+  letter-spacing: .5px; font-size: 9px; padding: 1px 5px; margin-left: 3px; border-radius: 4px;
+  vertical-align: middle; background: var(--panel-2); color: var(--muted); border: 1px solid var(--line-2); }
+.wpn.strafe { color: var(--cyan); border-color: rgba(34,211,238,.4); background: rgba(34,211,238,.08); }
 
 /* pagination */
 .pager { display: flex; gap: 8px; align-items: center; justify-content: center; padding: 16px; }

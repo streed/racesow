@@ -387,6 +387,48 @@ RANKS_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, RANKS_ENTRY, "asGlobFuncs ranks entry")
 
+# --- 1i. per-map weapon inventory: pull the central map-weapons table ---------
+# Adds RS_ApiFetchMapWeapons / RS_ApiPollMapWeapons / RS_MapWeaponsText (impl in
+# g_rs_api.cpp). The gametype (hrace/mapweapons.as) polls this so `callvote
+# randmap rl` / `randmap strafe` can filter the vote pool by what a map plays
+# like. Same fetch/poll/text shape as the blocked-maps trio (url + token, no map
+# arg). Anchors re-emitted so they stay unique. The Dockerfile asserts on
+# "asFunc_RS_ApiFetchMapWeapons".
+MAPWEAPONS_WRAPPER = (
+    "// racesow-docker: per-map weapon inventory - GETs the central\n"
+    "// /api/game/map-weapons text (one \"<map> code code ...\" line per map, a\n"
+    "// bare name = strafe) into memory; the gametype polls RS_ApiPollMapWeapons\n"
+    "// and reads RS_MapWeaponsText so randmap can filter the vote pool by weapon.\n"
+    "void RS_ApiFetchMapWeapons( const char *url, const char *token );\n"
+    "int RS_ApiPollMapWeapons( void );\n"
+    "const char *RS_MapWeaponsText( void );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchMapWeapons( asstring_t *url, asstring_t *token )\n"
+    "{\n"
+    "\tif( !url || !url->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchMapWeapons( url->buffer, token && token->buffer ? token->buffer : \"\" );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollMapWeapons( void ) { return RS_ApiPollMapWeapons(); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_MapWeaponsText( void )\n"
+    "{\n"
+    "\tconst char *s = RS_MapWeaponsText();\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, MAPWEAPONS_WRAPPER, "asFunc mapweapons wrapper")
+
+MAPWEAPONS_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchMapWeapons( const String &in url, const String &in token )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchMapWeapons), NULL },\n"
+    "\t{ \"int RS_ApiPollMapWeapons()\", asFUNCTION(asFunc_RS_ApiPollMapWeapons), NULL },\n"
+    "\t{ \"const String @RS_MapWeaponsText()\", asFUNCTION(asFunc_RS_MapWeaponsText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, MAPWEAPONS_ENTRY, "asGlobFuncs mapweapons entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

@@ -45,7 +45,8 @@ enum RequestType {
 	REQ_GET_GHOST,     // WR ghost trajectory -> parsed into memory (RS_ApiPollGhost)
 	REQ_GET_BLOCKED,   // live map blocklist -> stored in memory (RS_ApiPollBlocked)
 	REQ_GET_MOTD,      // live message of the day -> stored in memory (RS_ApiPollMotd)
-	REQ_GET_RANKS      // live per-map global ranks -> stored in memory (RS_ApiPollRanks)
+	REQ_GET_RANKS,     // live per-map global ranks -> stored in memory (RS_ApiPollRanks)
+	REQ_GET_MAPWEAPONS // per-map weapon inventory -> stored in memory (RS_ApiPollMapWeapons)
 };
 
 // note: no default member initializers — the game module builds as C++11,
@@ -135,11 +136,23 @@ struct ApiState {
 	std::mutex ranksMutex;
 	std::string ranksText;
 
+	// Map-weapons fetch handshake (same shape as the blocked/ranks ones).
+	// mapWeaponsText holds the raw payload (one "<map> code code ..." line per
+	// map, a bare name = strafe); the script thread copies it out with
+	// RS_MapWeaponsText after RS_ApiPollMapWeapons reports 1. Deduped on change
+	// like MOTD/ranks so the gametype only re-parses the (large, but static)
+	// table when it actually changed.
+	std::atomic<unsigned> fetchMapWeaponsGen;
+	std::atomic<int> fetchMapWeaponsResult;
+	std::mutex mapWeaponsMutex;
+	std::string mapWeaponsText;
+
 	ApiState()
 		: stop( false ), fetchGen( 0 ), fetchResult( 0 ), fetchGhostGen( 0 ), fetchGhostResult( 0 ),
 		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ),
 		  fetchBlockedGen( 0 ), fetchBlockedResult( 0 ), fetchMotdGen( 0 ), fetchMotdResult( 0 ),
-		  fetchRanksGen( 0 ), fetchRanksResult( 0 ) {}
+		  fetchRanksGen( 0 ), fetchRanksResult( 0 ),
+		  fetchMapWeaponsGen( 0 ), fetchMapWeaponsResult( 0 ) {}
 };
 
 // Script-thread-only accumulator for building a ghost upload body incrementally
@@ -683,6 +696,51 @@ void workerMain( ApiState *s )
 					fprintf( stderr, "rs_api: ranks fetch failed for good, status %ld: %s\n",
 						status, req.url.c_str() );
 				s->fetchRanksResult.store( -1 );
+				continue;
+			}
+			// transient: fall through to the requeue below
+		} else if( req.type == REQ_GET_MAPWEAPONS ) {
+			// A fetch queued once shutdown is under way is worthless: nobody
+			// will ever poll the result.
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchMapWeaponsGen.load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded while in flight - drop silently
+				// Plain text, one "<map> code code ..." line per map; an empty
+				// body is valid. Reject an HTML body, though - a captive portal
+				// / proxy error page answering 200 must never overwrite the good
+				// table. Map lines never contain '<'.
+				if( payload.find( '<' ) != std::string::npos ) {
+					fprintf( stderr, "rs_api: rejecting non-mapweapons payload from %s\n",
+						req.url.c_str() );
+					s->fetchMapWeaponsResult.store( -1 );
+					continue;
+				}
+				{
+					std::lock_guard<std::mutex> lock( s->mapWeaponsMutex );
+					// Unchanged since the last swap: skip the signal so the
+					// gametype doesn't re-parse the (large) table every interval
+					// (same idea as the motd/ranks compare).
+					if( payload == s->mapWeaponsText )
+						continue;
+					s->mapWeaponsText.swap( payload );
+				}
+				s->fetchMapWeaponsResult.store( 1 );
+				continue;
+			}
+			if( !current )
+				continue; // superseded - do not burn retries on a stale fetch
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				if( status != 404 )
+					fprintf( stderr, "rs_api: map-weapons fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchMapWeaponsResult.store( -1 );
 				continue;
 			}
 			// transient: fall through to the requeue below
@@ -1350,6 +1408,79 @@ const char *RS_BlockedListText( void )
 	}
 	std::lock_guard<std::mutex> lock( s->blockedMutex );
 	buf = s->blockedText;
+	return buf.c_str();
+}
+
+/*
+ * RS_ApiFetchMapWeapons / RS_ApiPollMapWeapons / RS_MapWeaponsText
+ *
+ * Fetch the per-map weapon table from <url> (the public /api/game/map-weapons
+ * endpoint: plain text, one "<map> code code ..." line per map, a bare name =
+ * strafe) into memory. RS_ApiPollMapWeapons() returns 1 when a CHANGED table has
+ * landed (read it with RS_MapWeaponsText and parse it), -1 when the last fetch
+ * failed for good, 0 otherwise. The gametype refreshes this rarely (the table
+ * only moves when the maps are re-scanned) so `callvote randmap rl` / `randmap
+ * strafe` can filter the vote pool by what a map plays like. A newer fetch
+ * supersedes an in-flight one; a failed fetch leaves the last good table in
+ * place. No-op when url is empty.
+ */
+void RS_ApiFetchMapWeapons( const char *url, const char *token )
+{
+	if( !url || !url[0] )
+		return;
+
+	ApiState *s = ensureStarted();
+	unsigned gen = s->fetchMapWeaponsGen.fetch_add( 1 ) + 1;
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			// evict another fetch (fully reproducible next interval) before a
+			// one-shot race report
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_MAPWEAPONS || it->type == REQ_GET_RANKS ||
+					it->type == REQ_GET_MOTD || it->type == REQ_GET_BLOCKED ||
+					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				// No fetch to evict: the whole queue is reports. Spool the
+				// oldest instead of silently losing a finish.
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
+			REQ_GET_MAPWEAPONS, "", gen } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollMapWeapons( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	return s->fetchMapWeaponsResult.exchange( 0 );
+}
+
+// Copy out the last-fetched map-weapons table. Called from the script thread
+// after a poll of 1; the AngelScript wrapper copies the static buffer
+// immediately (no reentrancy on the single script thread).
+const char *RS_MapWeaponsText( void )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->mapWeaponsMutex );
+	buf = s->mapWeaponsText;
 	return buf.c_str();
 }
 

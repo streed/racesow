@@ -526,6 +526,16 @@ api.get("/game/blocked-maps", cache(30), wrap(async (_req, res) => {
   res.type("text/plain").send(names.length ? names.join("\n") + "\n" : "");
 }));
 
+// Per-map weapon inventory for the game servers: the gametype polls this
+// (hrace/mapweapons.as via RS_ApiFetchMapWeapons) so `callvote randmap rl` /
+// `randmap strafe` can filter the vote pool by what a map plays like. Plain
+// text, one line per scanned map "<name> code code ..." (a strafe map is a bare
+// name). The data only changes when the maps are re-scanned, so cache long.
+api.get("/game/map-weapons", cache(600), wrap(async (_req, res) => {
+  const body = await race.gameMapWeaponsText();
+  res.type("text/plain").send(body ? body + "\n" : "");
+}));
+
 // Message of the day for the game servers: the gametype polls this (~60s,
 // hrace/motd.as) and sets the engine's sv_MOTDString cvar, so an admin edit
 // reaches newly connecting players without a restart. The "RSMOTD" first line

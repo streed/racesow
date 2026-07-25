@@ -61,6 +61,38 @@ String[] GetMapsByPattern( String@ pattern, String@ ignore = null )
     return maps;
 }
 
+// Map selection for the vote paths (randmap / prerandmap / meshvote). If <arg>
+// is a weapon/strafe filter (strafe, or weapon codes/names like rl / rocket /
+// "rl pg", no wildcard) it returns the installed maps that satisfy it, per the
+// scanned map_weapon table (mapweapons.as); otherwise it is a classic name
+// pattern and this delegates to GetMapsByPattern with identical behaviour. Both
+// paths drop moderator-blocked maps and the <ignore> map (the current one).
+String[] GetMapsByFilter( String@ arg, String@ ignore = null )
+{
+    // Not a weapon/strafe filter? Keep the original name-pattern behaviour.
+    // (RACE_IsWeaponFilter also populates the scratch filter used below.)
+    if ( !RACE_IsWeaponFilter( arg ) )
+        return GetMapsByPattern( arg, ignore );
+
+    String[] maps;
+    uint i = 0;
+    while ( true )
+    {
+        const String@ map = ML_GetMapByNum( i++ );
+        if ( @map == null )
+            break;
+        if ( @ignore != null && map == ignore )
+            continue;
+        String clean_map = map.removeColorTokens().tolower();
+        if ( RACE_IsMapBlocked( clean_map ) )
+            continue;
+        if ( RACE_MapMatchesFilter( clean_map ) )
+            maps.insertLast( map );
+    }
+
+    return maps;
+}
+
 String RACE_TimeToString( uint time )
 {
     // convert times to printable form

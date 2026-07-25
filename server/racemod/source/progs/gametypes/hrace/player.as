@@ -1259,7 +1259,7 @@ class Player
         Cvar mapname( "mapname", "", 0 );
         String current = mapname.string;
 
-        String[] maps = GetMapsByPattern( pattern, current );
+        String[] maps = GetMapsByFilter( pattern, current );
 
         if ( maps.length() == 0 )
         {

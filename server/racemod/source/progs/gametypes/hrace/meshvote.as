@@ -269,14 +269,15 @@ bool Cmd_MeshVote( Client@ client, const String &cmdString, const String &argsSt
     String rawArg = argsString.getToken( 0 );
     String map;
     // Wildcard / random selection (same semantics as the native randmap
-    // callvote): '*' picks any installed map, 'pat*' a random match. The
-    // master resolves it to ONE concrete map here, then broadcasts that map,
-    // so every server votes on — and switches to — the same one.
-    if ( rawArg.locate( "*", 0 ) < rawArg.length() )
+    // callvote): '*' picks any installed map, 'pat*' a random match, and a
+    // strafe / weapon filter ("strafe", "rl", ...) a random map that plays that
+    // way. The master resolves it to ONE concrete map here, then broadcasts that
+    // map, so every server votes on — and switches to — the same one.
+    if ( RACE_IsWeaponFilter( rawArg ) || rawArg.locate( "*", 0 ) < rawArg.length() )
     {
         Cvar mapnameVar( "mapname", "", 0 );
-        String current = mapnameVar.string; // local String (matches GetMapsByPattern's String@ param)
-        String[] maps = GetMapsByPattern( rawArg, current );
+        String current = mapnameVar.string; // local String (matches GetMapsByFilter's String@ param)
+        String[] maps = GetMapsByFilter( rawArg, current );
         if ( maps.length() == 0 )
         {
             client.printMessage( "No installed map matches '" + rawArg + "'.\n" );

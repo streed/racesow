@@ -32,6 +32,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { runner as pgMigrateRunner } from "node-pg-migrate";
+import { tokenToCode } from "./weapons.js";
 
 // Async (thread-pool) compression for the request/ingest paths — the sync
 // variants block the event loop for the duration of an 8MB trajectory.
@@ -206,6 +207,21 @@ export function canonKey(simplified, _login) {
 // "a_b" match literally (the historical SQLite layer had this hole).
 function likeEscape(s) {
   return String(s).replace(/[\\%_]/g, (c) => "\\" + c);
+}
+
+// Resolve the maps page ?weapon= filter into { codes, strafe }. Accepts a 2-char
+// code, full weapon name, or alias (comma/space separated => AND), plus the
+// reserved token "strafe". Unknown tokens are ignored. Mirrors the in-game
+// randmap token rules so the website search behaves the same as a vote.
+function parseWeaponFilter(param) {
+  const codes = [];
+  let strafe = false;
+  for (const tok of String(param || "").toLowerCase().split(/[\s,]+/).filter(Boolean)) {
+    if (tok === "strafe") { strafe = true; continue; }
+    const code = tokenToCode(tok);
+    if (code && !codes.includes(code)) codes.push(code);
+  }
+  return { codes, strafe };
 }
 
 export async function openDatabase(connectionString) {
@@ -1122,21 +1138,45 @@ class RaceDB {
     return body;
   }
 
-  async maps({ q = "", sort = "records", order, limit, offset } = {}) {
+  async maps({ q = "", sort = "records", order, limit, offset, weapon = "" } = {}) {
     const col = MAP_SORTS[sort] || MAP_SORTS.records;
     const direction = dir(order, sort === "name" ? "ASC" : "DESC");
     const lim = clampLimit(limit);
     const off = toOffset(offset);
-    const notBlocked = "NOT EXISTS (SELECT 1 FROM map_block b WHERE b.map_id = mi.map_id)";
-    const where = q ? `WHERE mi.name ILIKE $1 AND ${notBlocked}` : `WHERE ${notBlocked}`;
-    const args = q ? [`%${likeEscape(q)}%`] : [];
+
+    // Build the WHERE incrementally so the weapon/strafe filter and the name
+    // search share one parameter list (both the COUNT and the page query use it).
+    const conds = ["NOT EXISTS (SELECT 1 FROM map_block b WHERE b.map_id = mi.map_id)"];
+    const args = [];
+    if (q) {
+      args.push(`%${likeEscape(q)}%`);
+      conds.push(`mi.name ILIKE $${args.length}`);
+    }
+    const { codes, strafe } = parseWeaponFilter(weapon);
+    if (codes.length) {
+      // weapons @> ARRAY[...] => the map carries ALL requested weapons (GIN idx).
+      args.push(codes);
+      conds.push(
+        `EXISTS (SELECT 1 FROM map_weapon w WHERE w.name = lower(mi.name) AND w.weapons @> $${args.length})`
+      );
+    }
+    if (strafe) {
+      // Same union as the in-game randmap: scanned-strafe OR a "strafe" map name.
+      conds.push(
+        `(EXISTS (SELECT 1 FROM map_weapon w WHERE w.name = lower(mi.name) AND w.is_strafe) OR mi.name ILIKE '%strafe%')`
+      );
+    }
+    const where = `WHERE ${conds.join(" AND ")}`;
+
     const total = num((await this.one(`SELECT COUNT(*) c FROM map_index mi ${where}`, args)).c);
     const rows = (
       await this.all(
         `SELECT mi.map_id AS id, mi.name, mi.records, mi.finishes, mi.players, mi.wr_time,
-                mi.last_played, mi.wr_pid, mi.wr_version, p.name AS wr_name, p.simplified AS wr_simplified
+                mi.last_played, mi.wr_pid, mi.wr_version, p.name AS wr_name, p.simplified AS wr_simplified,
+                w.weapons, w.is_strafe
          FROM map_index mi
          LEFT JOIN player p ON p.id = mi.wr_pid
+         LEFT JOIN map_weapon w ON w.name = lower(mi.name)
          ${where}
          ORDER BY ${col} ${direction} NULLS LAST, lower(mi.name) ASC
          LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
@@ -1150,6 +1190,8 @@ class RaceDB {
       races: r.records,
       last_played: r.last_played != null ? num(r.last_played) : null,
       wr_version_name: this.versions[num(r.wr_version)] || null,
+      weapons: Array.isArray(r.weapons) ? r.weapons : [],
+      is_strafe: !!r.is_strafe,
     }));
     return { total, limit: lim, offset: off, rows };
   }
@@ -2189,6 +2231,23 @@ class RaceDB {
     return (await this.all("SELECT m.name FROM map_block b JOIN map m ON m.id = b.map_id ORDER BY m.name")).map(
       (r) => String(r.name).toLowerCase()
     );
+  }
+
+  // Per-map weapon inventory for the game servers' randmap-by-weapon voting
+  // (hrace/mapweapons.as via the RS_ApiFetchMapWeapons native). Plain text, one
+  // line per scanned map, sorted by name: "<name> code code ...". A strafe map
+  // (no weapons) is a bare name with no codes. Sorted so the game can binary
+  // search the parsed table.
+  async gameMapWeaponsText() {
+    // COLLATE "C" => byte-order sort, so the gametype can binary search the
+    // parsed table with a plain byte compare (AngelScript String has no opCmp).
+    const rows = await this.all('SELECT name, weapons FROM map_weapon ORDER BY name COLLATE "C"');
+    return rows
+      .map((r) => {
+        const codes = Array.isArray(r.weapons) ? r.weapons : [];
+        return codes.length ? `${r.name} ${codes.join(" ")}` : r.name;
+      })
+      .join("\n");
   }
 
   // --- Site settings (admin-edited key/value, e.g. the game-server MOTD) -----

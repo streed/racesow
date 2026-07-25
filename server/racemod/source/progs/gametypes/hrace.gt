@@ -33,6 +33,7 @@ hrace/lastrecords.as;
 hrace/racelog.as;
 hrace/apitop.as;
 hrace/blockedmaps.as;
+hrace/mapweapons.as;
 hrace/motd.as;
 hrace/ranks.as;
 hrace/demos.as;

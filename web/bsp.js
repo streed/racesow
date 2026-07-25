@@ -62,6 +62,59 @@ export function extractBsp(pk3Path, mapName) {
   return null;
 }
 
+// Scan a .pk3 once and return [{ name, entities }] for every maps/<name>.bsp it
+// carries. The map pool is thousands of packs, so this reads the archive a
+// single time rather than extractBsp-per-map (which re-reads the whole file for
+// each map). `name` is the lowercased bsp basename — the in-game map name, which
+// is NOT always the pack filename. `entities` is the raw lump-0 text (possibly
+// "" for a corrupt/unreadable bsp). Returns [] for an unreadable / non-zip pack.
+export function extractMapEntities(pk3Path) {
+  let buf;
+  try {
+    buf = fs.readFileSync(pk3Path);
+  } catch {
+    return [];
+  }
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i > buf.length - 22 - 65536; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return [];
+  const cdCount = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16); // central directory offset
+  const out = [];
+  for (let n = 0; n < cdCount; n++) {
+    if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) break;
+    const method = buf.readUInt16LE(p + 10);
+    const compSize = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localOff = buf.readUInt32LE(p + 42);
+    const fname = buf.toString("latin1", p + 46, p + 46 + nameLen).toLowerCase();
+    const m = fname.match(/^maps\/([a-z0-9_.-]+)\.bsp$/);
+    if (m) {
+      // Same untrusted-offset guard as extractBsp: a corrupt central directory
+      // must yield "" for this map, never a throw that aborts the whole scan.
+      let bsp = null;
+      if (localOff + 30 <= buf.length && buf.readUInt32LE(localOff) === 0x04034b50) {
+        const lNameLen = buf.readUInt16LE(localOff + 26);
+        const lExtraLen = buf.readUInt16LE(localOff + 28);
+        const dataOff = localOff + 30 + lNameLen + lExtraLen;
+        const comp = buf.subarray(dataOff, dataOff + compSize);
+        try {
+          bsp = method === 0 ? Buffer.from(comp) : zlib.inflateRawSync(comp);
+        } catch {
+          bsp = null;
+        }
+      }
+      out.push({ name: m[1], entities: bsp ? parseEntities(bsp) : "" });
+    }
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
 // --- BSP parse (IBSP + FBSP) -------------------------------------------------
 // Returns { vx, vy, vz, tris:[[a,b,c]...], kinds:["floor"|"wall"|"slope"] } or
 // null when the buffer is not a BSP we understand.
@@ -282,6 +335,24 @@ export function drawMarkers(rgba, S, markers) {
     disc(rgba, S, x, y, 10, T.orange[0], T.orange[1], T.orange[2], 235);
     label(rgba, S, "F", x, y, 3, T.bg[0], T.bg[1], T.bg[2], 255);
   }
+}
+
+// --- BSP entity lump (lump 0) ------------------------------------------------
+// Lump 0 is a plain-text list of `{ "key" "value" ... }` blocks. We only need it
+// to discover which weapon_* spawn entities a map carries, so hand back the raw
+// text and let the caller scan it. Same untrusted-lump bounds check as parseBsp
+// (offset can be negative / past EOF in a corrupt header). Entities are ASCII;
+// latin1 maps every byte 1:1 and never throws. Returns "" when the buffer is not
+// a BSP or the lump is empty/out of bounds.
+export function parseEntities(buf) {
+  if (!buf || buf.length < 8 + 17 * 8) return "";
+  const magic = buf.toString("latin1", 0, 4);
+  if (magic !== "IBSP" && magic !== "FBSP") return "";
+  const offset = buf.readInt32LE(8); // lump 0: offset@8, length@12
+  const length = buf.readInt32LE(12);
+  if (offset < 0 || length < 0 || offset + length > buf.length) return "";
+  // Trailing NUL padding is common; strip it so the caller's regex is clean.
+  return buf.toString("latin1", offset, offset + length).replace(/\0+$/, "");
 }
 
 // Convenience: pk3 path + map name -> parsed map geometry, or null. Strips a

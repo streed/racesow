@@ -304,6 +304,11 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # every ~30s so a map blocked in the web admin leaves the vote pool
         # without a restart. Same list the g_maplist build above already drops.
         echo "set rs_api_blocked_url \"${INGEST_URL%/api/ingest}/api/game/blocked-maps\""
+        # Per-map weapon table (hrace/mapweapons.as): the gametype polls this so
+        # `callvote randmap rl` / `randmap strafe` filters the vote pool by what
+        # a map plays like. Static between map re-scans, so it refreshes rarely.
+        # Empty url = feature off (weapon votes report no matches).
+        echo "set rs_api_mapweapons_url \"${INGEST_URL%/api/ingest}/api/game/map-weapons\""
         # Live MOTD (hrace/motd.as): the gametype polls this every ~60s and
         # feeds sv_MOTDString, so the message admins edit at /admin/motd shows
         # to connecting players without a restart. Until the first successful

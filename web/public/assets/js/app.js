@@ -386,16 +386,41 @@ function th(label, key, state, extraClass = "") {
 
 const PAGE = 50;
 
+// Weapon tags a map's .bsp was scanned for (see server scan-map-weapons.js);
+// mirrors web/weapons.js. Used for the maps-page weapon/strafe filter + badges.
+const WEAPON_LABELS = {
+  gb: "Gunblade", mg: "Machinegun", rg: "Riotgun", gl: "Grenade Launcher",
+  rl: "Rocket Launcher", pg: "Plasmagun", lg: "Lasergun", eb: "Electrobolt", ig: "Instagun",
+};
+const WEAPON_FILTER_OPTS = [
+  ["", "All maps"],
+  ["strafe", "Strafe (no weapons)"],
+  ["rl", "Rocket Launcher"], ["pg", "Plasmagun"], ["gl", "Grenade Launcher"],
+  ["rg", "Riotgun"], ["lg", "Lasergun"], ["eb", "Electrobolt"],
+  ["mg", "Machinegun"], ["ig", "Instagun"], ["gb", "Gunblade"],
+];
+
+// Little badges after a map name: a STRAFE pill for no-weapon maps, otherwise
+// one code chip per weapon (the gunblade everyone spawns with is not shown).
+function weaponBadges(m) {
+  if (m.is_strafe) return ` <span class="wpn strafe" title="No weapons — strafe map">STRAFE</span>`;
+  const codes = Array.isArray(m.weapons) ? m.weapons.filter((c) => c !== "gb") : [];
+  return codes.length
+    ? " " + codes.map((c) => `<span class="wpn" title="${esc(WEAPON_LABELS[c] || c)}">${esc(c.toUpperCase())}</span>`).join("")
+    : "";
+}
+
 async function viewMaps(params) {
   loading();
   const state = {
     q: params.q || "",
+    weapon: params.weapon || "",
     sort: params.sort || "races",
     order: params.order || (params.sort === "name" ? "asc" : "desc"),
     offset: parseInt(params.offset || "0", 10) || 0,
   };
   const data = await api(
-    "/maps" + buildQuery({ q: state.q, sort: state.sort, order: state.order, limit: PAGE, offset: state.offset })
+    "/maps" + buildQuery({ q: state.q, weapon: state.weapon, sort: state.sort, order: state.order, limit: PAGE, offset: state.offset })
   );
 
   app.innerHTML = `
@@ -403,6 +428,9 @@ async function viewMaps(params) {
     <p class="page-sub">Browse every race map, sorted and searchable. Click a map for its full leaderboard and world-record splits.</p>
     <div class="toolbar">
       <input class="filter" id="mfilter" placeholder="Filter maps by name…" value="${esc(state.q)}">
+      <select class="filter version" id="mweapon" title="Filter by weapon or strafe">
+        ${WEAPON_FILTER_OPTS.map(([v, l]) => `<option value="${v}"${state.weapon === v ? " selected" : ""}>${esc(l)}</option>`).join("")}
+      </select>
       <span class="count">${fmtNum(data.total)} maps</span>
     </div>
     <div class="table-wrap"><div class="tscroll">
@@ -419,19 +447,23 @@ async function viewMaps(params) {
           ${data.rows.map((m) => `
             <tr class="clickable" data-nav="#/map/${m.id}">
               <td class="mapname">${mapNameHtml(m.name)}
-                <a class="extlink" href="${padporkUrl(m.name)}" target="_blank" rel="noopener external" title="${esc(baseMapName(m.name))} on padpork.org">↗</a>
+                <a class="extlink" href="${padporkUrl(m.name)}" target="_blank" rel="noopener external" title="${esc(baseMapName(m.name))} on padpork.org">↗</a>${weaponBadges(m)}
               </td>
               <td class="num">${fmtNum(m.records != null ? m.records : m.races)}</td>
               <td class="num">${fmtNum(m.finishes != null ? m.finishes : m.races)}</td>
               <td class="num"><span class="time">${m.wr_time != null ? fmtTime(m.wr_time) : "—"}</span></td>
               <td>${m.wr_name ? wname(m.wr_name) : '<span class="pill">no runs</span>'}</td>
               <td class="num"><span class="muted">${m.last_played != null ? fmtAgo(m.last_played) : "—"}</span></td>
-            </tr>`).join("") || `<tr><td colspan="6" class="empty">No maps match “${esc(state.q)}”.</td></tr>`}
+            </tr>`).join("") || `<tr><td colspan="6" class="empty">No maps match ${state.q ? `“${esc(state.q)}”` : "that filter"}.</td></tr>`}
         </tbody>
       </table>
     </div>${pager(state, data, "#/maps")}</div>`;
 
   wireFilter("mfilter", "#/maps", state);
+  const wsel = document.getElementById("mweapon");
+  if (wsel) wsel.addEventListener("change", () => {
+    go("#/maps" + buildQuery({ ...pageParams(state), weapon: wsel.value, offset: 0 }));
+  });
   wireSort("#/maps", state);
 }
 
@@ -1422,6 +1454,7 @@ function pager(state, data, base) {
 function pageParams(state) {
   const p = {};
   if (state.q) p.q = state.q;
+  if (state.weapon) p.weapon = state.weapon;
   if (state.sort) p.sort = state.sort;
   if (state.order) p.order = state.order;
   if (state.version) p.version = state.version;
