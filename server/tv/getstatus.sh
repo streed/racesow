@@ -2,9 +2,11 @@
 # Query a Warsow/qfusion server with a connectionless "getstatus" packet and
 # print how many connected clients are *watchable* — i.e. real people on the
 # server, excluding our own infrastructure clients (the wswtv relay and the TV
-# capture spectator), matched by EXACT (color-stripped, case-insensitive) name.
+# capture spectator), matched by EXACT name after normalising it the same way
+# the site does (strip ^N colour codes, lowercase, drop the mod's "(N)"
+# duplicate-name suffix — see web/db.js identKey / web/live.js).
 #
-#   getstatus.sh host:port [excludeCsv]     (excludeCsv: exact names, default none)
+#   getstatus.sh host:port [excludeCsv]     (excludeCsv: exact names; default RACESOW-TV)
 #
 # NOTE: in the race gametype a spawned racer and a spectator are indistinguishable
 # in getstatus (both report score -9999, team 0), so we cannot filter to only
@@ -14,7 +16,7 @@
 set -uo pipefail
 
 addr="${1:?usage: getstatus.sh host:port [excludeCsv]}"
-excl="${2:-RACESOW}"
+excl="${2:-RACESOW-TV}"
 host="${addr%:*}"
 port="${addr##*:}"
 
@@ -37,15 +39,18 @@ resp="$(perl -MIO::Socket::INET -MIO::Select -e '
 [ -z "${resp}" ] && { echo 0; exit 0; }
 
 # Player lines start at line 3: <score> <ping> "name" [team]. Count clients whose
-# (color-stripped) name is not EXACTLY one of the excluded infra names. Exact,
-# case-insensitive match — mirrors the server-side RACE_IsTvClient identity so a
-# real player merely SHARING a prefix (e.g. "RACESOW-fan") is still counted.
+# normalised name is not EXACTLY one of the excluded infra names. Normalisation
+# mirrors the site's identKey (web/db.js): strip ^N colour codes, lowercase, and
+# drop the mod's trailing "(N)" duplicate-name suffix — so a reconnecting TV
+# spectator briefly renamed "RACESOW-TV(1)" is still excluded, while a real
+# player merely SHARING a prefix (e.g. "RACESOW-fan") is still counted.
 echo "${resp}" | awk -v excl="${excl}" '
     BEGIN { n = split(tolower(excl), ex, ",") }
     NR > 2 && match($0, /"[^"]*"/) {
         name = substr($0, RSTART + 1, RLENGTH - 2)
         gsub(/\^[0-9]/, "", name)               # strip ^N color codes
         lname = tolower(name)
+        sub(/[[:space:]]*\([0-9]+\)[[:space:]]*$/, "", lname)  # drop (N) dup suffix
         keep = 1
         for (i = 1; i <= n; i++) {
             p = ex[i]
