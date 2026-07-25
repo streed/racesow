@@ -31,6 +31,8 @@ data/*.sqlite-shm
 *.sqlite-wal
 *.sqlite-shm
 .env
+# Per-box TV capture secrets/config (see server/tv/tv.env.example)
+server/tv/tv.env
 backups/
 
 # Generated WR-ghost viewer meshes (converted on the box, mounted into web)

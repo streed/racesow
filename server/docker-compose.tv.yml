@@ -1,0 +1,82 @@
+# Warsow TV live-stream capture (ROLE=capture): the headless spectator +
+# ffmpeg -> HLS encoder that powers https://racesow.org/live. Co-located with
+# the game server on each game box; it joins the SAME external `racesow_default`
+# network so `warsow-race:44400` resolves.
+#
+# This replaces the old hand-typed `docker run` whose ~20 env vars lived ONLY in
+# the running container — losing them once (a bad recreate) caused an EU stream
+# outage. Now the invariant config is here and the per-box + secret values live
+# in ./tv/tv.env (gitignored; copy from tv/tv.env.example).
+#
+# Setup / deploy — run from the server/ directory on each game box:
+#   cp tv/tv.env.example tv/tv.env         # then edit STREAM_ID, SERVER_ID, token
+#   docker compose -f docker-compose.tv.yml up -d --build
+# Redeploy after a tv/*.sh change (e.g. getstatus.sh) is the SAME one-liner —
+# `--build` rebuilds the image and compose recreates the container in place.
+# Roll back to the previous image: `docker tag warsow-tv:prev warsow-tv:2.1.2`
+# then re-run the up command without --build.
+#
+# Its own compose project (distinct from the game/web stacks); it only ever
+# manages this one service and attaches to the shared network by name.
+name: racesow-tv
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  tv-capture:
+    build:
+      context: .
+      dockerfile: tv/Dockerfile
+      args:
+        # Bake the game's racemod_ui HUD pak from THIS box's server image so the
+        # spectator's pak checksum matches the running server (no mid-connect
+        # download stall). Defaults to the standard tag, which is correct when
+        # its HUD pak matches the running server (verify with:
+        #   docker exec warsow-race sh -c 'sha256sum /warsow/racemod/racemod_ui_*.pk3')
+        GAME_IMAGE: "${GAME_IMAGE:-warsow-race:2.1.2}"
+    image: warsow-tv:2.1.2
+    container_name: warsow-tv-capture
+    restart: unless-stopped
+    init: true
+    logging: *default-logging
+    # Pin OFF the game/Postgres cores so the software (llvmpipe) encoder never
+    # steals game ticks — see docs/live-stream-design.md. Override per box layout.
+    cpuset: "${TV_CPUSET:-8-11}"
+    # Per-box + secret values: STREAM_ID, SERVER_ID, SERVER_NAME, HEARTBEAT_URL,
+    # HEARTBEAT_TOKEN (+ optional encoder overrides). Copy tv/tv.env.example.
+    env_file:
+      - ./tv/tv.env
+    environment:
+      # --- invariant across both boxes (env_file supplies the per-box rest) ---
+      ROLE: capture
+      # The game server: same container name on both boxes, shared network.
+      TV_CONNECT: warsow-race:44400
+      STATUS_ADDR: warsow-race:44400
+      # The infra spectator name — excluded from the watch count (getstatus.sh)
+      # and from the site's /api/live player list (web/live.js).
+      TV_NAME: RACESOW-TV
+      EXCLUDE_NAMES: RACESOW
+      # Top-3 shown on the idle "waiting for racers" card.
+      API_TOP_URL: https://racesow.org/api/game/topscores
+      # Encoder res/fps/bitrate default to 1280x720/30/2500k in capture-run.sh;
+      # set WIDTH/HEIGHT/FPS/VBITRATE in tv/tv.env to lighten a constrained box.
+    volumes:
+      # HLS segment output in RAM. The host serves /dev/shm/hls/<STREAM_ID>/ as
+      # /hls/<id>/ (EU: host nginx directly; US: nginx proxied EU->US:44446).
+      - /dev/shm/hls:/hls
+      # Map paks (read-only) so this pure spectator never DOWNLOADS one on
+      # connect — same packs the game server serves.
+      - ./maps:/warsow/maps_extra:ro
+    networks:
+      - racesow_default
+
+networks:
+  # Created by the co-located stack (repo-root compose on EU; the agent compose
+  # on US). External here so this file never creates/owns it.
+  racesow_default:
+    external: true
+    name: racesow_default

@@ -82,60 +82,62 @@ image; `docker compose up -d warsow-race` on the prior `warsow-race` image tag
 
 ## Phase B — capture stack on EU (the risky co-located part)  · MONITOR
 
-4. **Build the tv image** on the box:
-   ```
-   docker build -f server/tv/Dockerfile -t warsow-tv:2.1.2 server/
-   ```
-5. **Enable the director** on the game server (spectator name it will drive):
+4. **Enable the director** on the game server (spectator name it will drive):
    ```
    # add to warsow-race env / EXTRA_ARGS, then recreate:
    #   EXTRA_ARGS="+set rs_tv_name RACESOW-TV"
    ```
    Harmless until a client named `RACESOW-TV` connects.
-6. **Start capture** — RAM tmpfs, cpuset-pinned OFF the game cores, capped res/fps.
-   `$GAME_CORES` = the cores the game loop/Postgres use; pin capture to the rest.
-   Start conservative (854×480@30), raise only if headroom proven.
+5. **Configure + start capture** via compose (`server/docker-compose.tv.yml`).
+   The service is cpuset-pinned OFF the game cores, writes HLS to RAM, and builds
+   the image from THIS box's game image so the HUD pak matches. Per-box + secret
+   values live in `server/tv/tv.env` (gitignored):
    ```
-   mkdir -p /dev/shm/wtv-hls && chmod 777 /dev/shm/wtv-hls
-   docker run -d --name warsow-tv-capture --restart unless-stopped --init \
-     --network <game compose net> --shm-size=256m \
-     --cpuset-cpus="<NON-GAME CORES, e.g. 8-11>" --cpu-shares=512 \
-     -e ROLE=capture -e TV_CONNECT=warsow-race:44400 -e STATUS_ADDR=warsow-race:44400 \
-     -e TV_NAME=RACESOW-TV -e EXCLUDE_NAMES=RACESOW -e SERVER_NAME="Racesow · EU" \
-     -e STREAM_ID=eu -e WIDTH=854 -e HEIGHT=480 -e FPS=30 -e VBITRATE=1500k \
-     -e API_TOP_URL=https://racesow.org/api/game/topscores \
-     -e HEARTBEAT_URL=https://racesow.org/api/streams/<EU_SERVER_ID>/health \
-     -e HEARTBEAT_TOKEN=<EU server ingest token> -e SERVER_ID=<EU_SERVER_ID> \
-     -v /dev/shm/wtv-hls:/hls warsow-tv:2.1.2
+   cd server
+   cp tv/tv.env.example tv/tv.env
+   # edit tv/tv.env: STREAM_ID (eu|us), SERVER_ID, SERVER_NAME, HEARTBEAT_URL,
+   #   HEARTBEAT_TOKEN (= this box's game INGEST_TOKEN)
+   docker compose -f docker-compose.tv.yml up -d --build
    ```
-7. **GO / NO-GO gate — watch for 10–15 min under real load:**
+   The old hand-typed `docker run` is retired — a script change (e.g.
+   `tv/getstatus.sh`) redeploys with the SAME `up -d --build` one-liner, and the
+   container's config now lives in `tv.env` rather than only inside the running
+   container. To lighten a constrained box, set `WIDTH/HEIGHT/FPS/VBITRATE` (e.g.
+   `854`/`480`/`30`/`1500k`) in `tv.env`.
+6. **GO / NO-GO gate — watch for 10–15 min under real load:**
    - Game tick/snapshot rate steady (`sv_pps` honored; no stutter reports).
    - `mpstat -P ALL 2` — game cores NOT saturated by the encoder; capture stays on its cores.
-   - `du -sh /dev/shm/wtv-hls` stays ~small (delete_segments working).
+   - `du -sh /dev/shm/hls` stays ~small (delete_segments working).
    - Stream reachable: `curl -I https://racesow.org/hls/eu/index.m3u8` (200, not 400).
    - **NO-GO** ⇒ lower WIDTH/HEIGHT/FPS/VBITRATE, tighten `--cpuset-cpus`, or
      `docker rm -f warsow-tv-capture` (stream stops; game untouched) and revisit
      placement (separate box / GPU VPS per the design).
-8. **Surface it on the site:** set `STREAM_URLS` on the web service, e.g.
+7. **Surface it on the site:** set `STREAM_URLS` on the web service, e.g.
    `STREAM_URLS="<EU_SERVER_ID>=https://racesow.org/hls/eu/index.m3u8"`, then
    `scripts/rolling-deploy.sh`. The server page now shows the LIVE STREAM + the
    `connect <game addr>` chip; empty ⇒ the RACESOW top-3 card.
-9. **Cloudflare:** apply the chosen delivery option (A cache-rule / B grey-cloud),
+8. **Cloudflare:** apply the chosen delivery option (A cache-rule / B grey-cloud),
    confirm `CF-Cache-Status` and that segments load in a real browser; watch egress.
 
 ---
 
 ## Phase C — US box  (`us.east`, game run MANUALLY — no `racesow-agent.service`)
-Repeat Phase B on us.east with `STREAM_ID=us`, `SERVER_NAME="Racesow · US"`,
-`HEARTBEAT_URL=.../api/streams/<US_SERVER_ID>/health`, and add
-`<US_SERVER_ID>=https://racesow.org/hls/us/index.m3u8` (or the us stream host) to
-`STREAM_URLS`. Same GO/NO-GO gate.
+Repeat Phase B on us.east: its own `server/tv/tv.env` with `STREAM_ID=us`,
+`SERVER_ID=<US_SERVER_ID>`, `SERVER_NAME="Racesow - US East"`,
+`HEARTBEAT_URL=.../api/streams/<US_SERVER_ID>/health`, and
+`HEARTBEAT_TOKEN` = the US box's game `INGEST_TOKEN` (US has no `server/.env`;
+read it from the running container: `docker inspect warsow-race`). Then
+`docker compose -f docker-compose.tv.yml up -d --build`, and add
+`<US_SERVER_ID>=https://racesow.org/hls/us/index.m3u8` to `STREAM_URLS`. Same
+GO/NO-GO gate.
 
 ---
 
 ## Supervision / limits (bake in during Phase B/C)
-- **systemd** `racesow-tv-capture.service` (`Restart=always`) if not under compose;
-  add a `scripts/hls-health-check.sh` (lag < 60 s, dropped < 1 %) on a timer.
+- **Restart policy:** the capture runs under compose (`server/docker-compose.tv.yml`,
+  `restart: unless-stopped`), so it comes back after a daemon/box restart; capture-run.sh
+  also self-heals a wedged encoder/director. Optionally add `scripts/hls-health-check.sh`
+  (lag < 60 s, dropped < 1 %) on a timer.
 - **rolling-deploy:** the capture is independent of the web replicas; no drain needed,
   but note it in the deploy checklist so a game-image rebuild recreates it cleanly.
 - **Disk:** HLS is RAM (tmpfs) + `delete_segments` ⇒ bounded (~10 MB); wiped on restart.
