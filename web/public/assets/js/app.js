@@ -1032,6 +1032,57 @@ function stopLiveRefresh() {
   liveTimer = null;
 }
 
+// Do a peer's map and this server's map refer to the same map? The peer map is
+// lowercased + truncated to 16 chars on publish (RACE_MeshStatusClean), so
+// compare case-insensitively and allow a truncated peer value to prefix-match.
+function meshSameMap(peerMap, myMap) {
+  if (!peerMap || !myMap) return false;
+  const p = peerMap.toLowerCase();
+  const m = myMap.toLowerCase();
+  return p.length >= 16 ? m.startsWith(p) : p === m;
+}
+
+// Cross-server mesh line(s) for a live card. The meaningful state is "a linked
+// server is on the SAME map right now": those players appear in-game as
+// translucent ghosts you race alongside. Peers sharing this card's map (and
+// actually populated) get a highlighted "racing together" row; the rest are
+// shown as a compact "linked" list so it's obvious the servers are joined
+// without re-dumping each sibling card's full state.
+function renderMesh(s) {
+  if (!s.mesh || !s.mesh.length) return "";
+  const here = [];
+  const linked = [];
+  for (const p of s.mesh) {
+    if (p.players > 0 && meshSameMap(p.map, s.map)) here.push(p);
+    else linked.push(p);
+  }
+  const rows = [];
+  if (here.length) {
+    const ghosts = here.reduce((n, p) => n + p.players, 0);
+    const who = here.map((p) => esc(p.tag)).join(" + ");
+    rows.push(`<div class="mesh-row active"
+        title="${here.length} linked server${here.length === 1 ? " is" : "s are"} on this map right now. Those players appear in-game as translucent ghosts — you race alongside them and never collide.">
+        <span class="mesh-ico">⇄</span>
+        <span class="mesh-txt">Racing together on <b>${esc(s.map || "this map")}</b> · <b>+${ghosts}</b> ghost${ghosts === 1 ? "" : "s"} from ${who}</span>
+      </div>`);
+  }
+  if (linked.length) {
+    const chips = linked.map((p) => `
+        <span class="mesh-peer" title="${esc(p.tag)}${p.map ? ` is on ${esc(p.map)}` : ""} · ${p.players} player${p.players === 1 ? "" : "s"}">
+          <span class="mesh-tag">${esc(p.tag)}</span>
+          ${p.map ? `<span class="mesh-map">▸ ${esc(p.map)}</span>` : ""}
+          ${p.players > 0 ? `<span class="mesh-num">${fmtNum(p.players)}</span>` : ""}
+        </span>`).join("");
+    rows.push(`<div class="mesh-row"
+        title="These servers are joined into one race mesh. Whenever two are on the same map, their players race together as cross-server ghosts.">
+        <span class="mesh-ico">⇄</span>
+        <span class="mesh-lbl">Linked</span>
+        ${chips}
+      </div>`);
+  }
+  return `<div class="live-mesh">${rows.join("")}</div>`;
+}
+
 function liveServerCard(s) {
   const head = `
     <h3>
@@ -1051,20 +1102,9 @@ function liveServerCard(s) {
       ${s.map ? `<span class="live-map ${s.mapId ? "clickable" : ""}" ${s.mapId ? `data-nav="#/map/${s.mapId}"` : ""}>▸ ${esc(s.map)}</span>` : ""}
       ${s.address ? `<span class="live-addr mono">connect ${esc(s.address)}</span>` : ""}
     </div>`;
-  // Cross-server mesh: the peer servers this node currently hears (from its
-  // rs_mesh_status serverinfo). Renders nothing when mirroring is off or no
-  // peers are up, so non-meshed servers are unaffected.
-  const mesh = s.mesh && s.mesh.length
-    ? `<div class="live-mesh" title="Cross-server mesh — peers this server is currently linked with">
-        <span class="mesh-label">⇄ mesh</span>
-        ${s.mesh.map((p) => `
-          <span class="mesh-peer" title="${esc(p.tag)}${p.map ? ` on ${esc(p.map)}` : ""} · ${p.players} player${p.players === 1 ? "" : "s"}">
-            <span class="mesh-tag">${esc(p.tag)}</span>
-            ${p.map ? `<span class="mesh-map">▸ ${esc(p.map)}</span>` : ""}
-            <span class="mesh-num">${fmtNum(p.players)}</span>
-          </span>`).join("")}
-      </div>`
-    : "";
+  // Cross-server mesh: peers this node currently hears (rs_mesh_status). Renders
+  // nothing when mirroring is off or no peers are up. See renderMesh.
+  const mesh = renderMesh(s);
   const players = s.players.length
     ? `<table class="data">
         <thead><tr><th>Player</th><th class="num">Ping</th></tr></thead>
@@ -1080,12 +1120,24 @@ function liveServerCard(s) {
   return `<div class="panel live-srv">${head}${meta}${mesh}${players}</div>`;
 }
 
+// Warfork servers are named "... Warfork"; everything else is Warsow.
+const isWarforkServer = (s) => /warfork/i.test(s.name || "");
+
 async function renderLive() {
   const d = await api("/live");
+  // The API orders servers by last_seen_at, so cards reshuffle as boxes check
+  // in. Pin a stable display order: Warsow first, then Warfork, id-tiebroken.
+  const servers = d.servers
+    .slice()
+    .sort((a, b) => (isWarforkServer(a) - isWarforkServer(b)) || (a.id - b.id));
   const online = d.servers.filter((s) => s.online);
   const total = online.reduce((n, s) => n + s.players.length, 0);
   const maint = d.maintenance && d.maintenance.active
     ? `<div class="maint-banner">🛠 Maintenance in progress — ${esc((d.maintenance.message || "").replace(/\^[0-9]/g, ""))}</div>`
+    : "";
+  // Explain the ⇄ that shows up on meshed cards, but only when a mesh is live.
+  const meshNote = online.some((s) => s.mesh && s.mesh.length)
+    ? `<p class="live-mesh-note"><span class="mesh-ico">⇄</span> The servers are <b>linked into one mesh</b> — when two are on the same map, players race alongside each other as ghosts across the Atlantic.</p>`
     : "";
   const html = `
     ${maint}
@@ -1096,8 +1148,9 @@ async function renderLive() {
         : "Who's racing right now, on this server and every server feeding records here."}
       ${d.updatedAt ? ` · updated ${fmtAgo(d.updatedAt)}` : ""}
     </p>
+    ${meshNote}
     ${d.servers.length
-      ? `<div class="live-grid">${d.servers.map(liveServerCard).join("")}</div>`
+      ? `<div class="live-grid">${servers.map(liveServerCard).join("")}</div>`
       : `<div class="empty">No live-enabled servers yet.<br><small>The site admin can add one with <span class="mono">node admin.js address &lt;serverId&gt; &lt;host:port&gt;</span>.</small></div>`}`;
   // Only touch the DOM when something changed — no 5s flicker.
   if (app.dataset.liveHtml !== html) {
