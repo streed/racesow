@@ -61,7 +61,21 @@ if [ -n "${INGEST_URL}" ]; then
         | tr -d '\r' | grep -vE '^\s*(//|$)' | awk '{print tolower($1)}' || true)"
     [ -n "${BLOCKED}" ] && INSTALLED="$(echo "${INSTALLED}" | grep -vxiF "${BLOCKED}" || true)"
 fi
-MAPLIST="$(echo "${INSTALLED}" | tr '\n' ' ' | sed 's/  */ /g;s/^ //;s/ $//')"
+# Curated rotation from mappool.txt — the SAME file the Warsow servers use
+# (server/configs/mappool.txt, baked into the image), so the map cycle is
+# consistent across both games. One map per line; '#'/blank ignored; only keep
+# maps actually installed. Fall back to every installed map if none match.
+MAPPOOL_FILE="${MOD_DIR}/mappool.txt"
+REQUESTED=""
+[ -f "${MAPPOOL_FILE}" ] && REQUESTED="$(grep -vE '^\s*(#|$)' "${MAPPOOL_FILE}" | tr -d '\r' | awk '{print $1}')"
+MAPLIST=""
+if [ -n "${REQUESTED}" ]; then
+    for m in ${REQUESTED}; do
+        echo "${INSTALLED}" | grep -qx "${m}" && MAPLIST="${MAPLIST}${m} " || echo ">> mappool: skipping '${m}' (not installed)"
+    done
+fi
+[ -z "${MAPLIST}" ] && MAPLIST="$(echo "${INSTALLED}" | tr '\n' ' ')"
+MAPLIST="$(echo "${MAPLIST}" | sed 's/  */ /g;s/^ //;s/ $//')"
 # Cap at the engine's 1024-char command-buffer boundary (see design/memory:
 # a chopped `set g_maplist` line runs its tail as garbage commands).
 if [ "${#MAPLIST}" -gt 1000 ]; then

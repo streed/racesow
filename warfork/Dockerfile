@@ -129,6 +129,9 @@ RUN set -eux; \
 
 # --- server config + entrypoint ----------------------------------------------
 COPY warfork/configs/server.cfg "${WF_DIR}/${FS_GAME}/configs/server/server.cfg"
+# Same curated map cycle the Warsow servers use (server/configs/mappool.txt), so
+# the rotation is consistent across both games (entrypoint reads it).
+COPY server/configs/mappool.txt "${WF_DIR}/${FS_GAME}/mappool.txt"
 COPY warfork/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
