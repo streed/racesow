@@ -232,6 +232,8 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_MeshVote( client, cmdString, argsString, argc );
     else if ( cmdString == "flag" )
         return Cmd_Flag( client, cmdString, argsString, argc );
+    else if ( cmdString == "lastmaps" )
+        return Cmd_LastMaps( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -587,6 +589,11 @@ void GT_ThinkRules()
     // is empty); lets `callvote randmap rl` / `randmap strafe` filter the vote
     // pool by what a map plays like (mapweapons.as)
     RACE_ApiMapWeaponsThink();
+
+    // recently-played maps from the central DB (no-op when rs_api_lastmaps_url
+    // is empty); caches the last-played list so the in-game /lastmaps command
+    // answers instantly (lastmaps.as)
+    RACE_ApiLastMapsThink();
 
     // live MOTD from the central admin (no-op when rs_api_motd_url is empty);
     // an edit at /admin/motd shows to newly connecting players without a
@@ -1295,6 +1302,7 @@ void GT_InitGametype()
     G_RegisterCommand( "help" );
     G_RegisterCommand( "rules" );
     G_RegisterCommand( "flag" );
+    G_RegisterCommand( "lastmaps" );
 
     RACE_MirrorInit(); // registers "who" and "watch"
     RACE_GhostInit();

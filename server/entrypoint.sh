@@ -320,6 +320,10 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # top-50 board. Empty url = no-op (scoreboard falls back to the local
         # top-50 board position).
         echo "set rs_api_ranks_url \"${INGEST_URL%/api/ingest}/api/game/ranks\""
+        # Recently-played maps (hrace/lastmaps.as): the gametype polls this ~60s
+        # so the in-game /lastmaps command shows the last maps played across the
+        # network from a cached list. Empty url = command reports unavailable.
+        echo "set rs_api_lastmaps_url \"${INGEST_URL%/api/ingest}/api/game/last-maps\""
     fi
     # Cross-server player mirroring: the gametype reads these and drives the
     # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.

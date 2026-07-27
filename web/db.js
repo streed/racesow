@@ -2250,6 +2250,25 @@ class RaceDB {
       .join("\n");
   }
 
+  // Most-recently-played maps for the game servers' in-game /lastmaps command
+  // (hrace/lastmaps.as via the RS_ApiFetchLastMaps native). Plain text, one
+  // lowercased map name per line, most-recent first: the last 10 DISTINCT maps
+  // anyone finished. The finish log is the live play signal — map_index.last_played
+  // is an UNLOGGED aggregate rebuilt only on the periodic refresh and would lag
+  // behind by minutes, so this queries finish directly (behind the endpoint's
+  // short cache the full-table group is a rare, cheap-enough scan). Lowercased to
+  // match how the game keys/prints map names everywhere else.
+  async gameLastMapsText() {
+    const rows = await this.all(
+      `SELECT m.name, MAX(f.created_at) AS last_played
+         FROM finish f JOIN map m ON m.id = f.map_id
+        GROUP BY m.id, m.name
+        ORDER BY MAX(f.created_at) DESC
+        LIMIT 10`
+    );
+    return rows.map((r) => String(r.name).toLowerCase()).join("\n");
+  }
+
   // --- Site settings (admin-edited key/value, e.g. the game-server MOTD) -----
   // Returns null when the key was never set (callers pick their own default).
   async getSetting(key) {

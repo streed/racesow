@@ -536,6 +536,17 @@ api.get("/game/map-weapons", cache(600), wrap(async (_req, res) => {
   res.type("text/plain").send(body ? body + "\n" : "");
 }));
 
+// Most-recently-played maps for the game servers' in-game /lastmaps command
+// (hrace/lastmaps.as polls this via the RS_ApiFetchLastMaps native). Plain text,
+// one lowercased map name per line, most-recent first — the last 10 DISTINCT
+// maps anyone finished across the network. Same public plain-text shape as
+// blocked-maps; the game-side native rejects an HTML error body via its '<'
+// check, so no header line is needed. The list moves slowly, so cache a minute.
+api.get("/game/last-maps", cache(60), wrap(async (_req, res) => {
+  const body = await race.gameLastMapsText();
+  res.type("text/plain").send(body ? body + "\n" : "");
+}));
+
 // Message of the day for the game servers: the gametype polls this (~60s,
 // hrace/motd.as) and sets the engine's sv_MOTDString cvar, so an admin edit
 // reaches newly connecting players without a restart. The "RSMOTD" first line

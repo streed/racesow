@@ -429,6 +429,48 @@ MAPWEAPONS_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, MAPWEAPONS_ENTRY, "asGlobFuncs mapweapons entry")
 
+# --- 1j. recently-played maps: pull the central last-played list --------------
+# Adds RS_ApiFetchLastMaps / RS_ApiPollLastMaps / RS_LastMapsText (impl in
+# g_rs_api.cpp). The gametype (hrace/lastmaps.as) polls this ~60s so the in-game
+# /lastmaps command answers instantly from the cached list of the maps most
+# recently finished across the network. Same fetch/poll/text shape as the
+# blocked-maps trio (url + token, no map arg). Anchors re-emitted so they stay
+# unique. The Dockerfile asserts on "asFunc_RS_ApiFetchLastMaps".
+LASTMAPS_WRAPPER = (
+    "// racesow-docker: recently-played maps - GETs the central\n"
+    "// /api/game/last-maps text (one lowercased map name per line, most-recent\n"
+    "// first) into memory; the gametype polls RS_ApiPollLastMaps and reads\n"
+    "// RS_LastMapsText so the in-game /lastmaps command answers from a cached list.\n"
+    "void RS_ApiFetchLastMaps( const char *url, const char *token );\n"
+    "int RS_ApiPollLastMaps( void );\n"
+    "const char *RS_LastMapsText( void );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchLastMaps( asstring_t *url, asstring_t *token )\n"
+    "{\n"
+    "\tif( !url || !url->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchLastMaps( url->buffer, token && token->buffer ? token->buffer : \"\" );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollLastMaps( void ) { return RS_ApiPollLastMaps(); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_LastMapsText( void )\n"
+    "{\n"
+    "\tconst char *s = RS_LastMapsText();\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, LASTMAPS_WRAPPER, "asFunc lastmaps wrapper")
+
+LASTMAPS_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchLastMaps( const String &in url, const String &in token )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchLastMaps), NULL },\n"
+    "\t{ \"int RS_ApiPollLastMaps()\", asFUNCTION(asFunc_RS_ApiPollLastMaps), NULL },\n"
+    "\t{ \"const String @RS_LastMapsText()\", asFUNCTION(asFunc_RS_LastMapsText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, LASTMAPS_ENTRY, "asGlobFuncs lastmaps entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

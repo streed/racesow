@@ -649,6 +649,9 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/lastrecs" );
         cmdlist.addCell( "Shows the most recent records set on this server across maps." );
 
+        cmdlist.addCell( "/lastmaps" );
+        cmdlist.addCell( "Shows the maps most recently played across the network." );
+
         cmdlist.addCell( "/cps" );
         cmdlist.addCell( "Shows your per-checkpoint splits vs your PB and the server record." );
 
@@ -746,6 +749,11 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
     {
         client.printMessage( S_COLOR_YELLOW + "/lastrecs" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Shows the most recent records set on this server (across maps), with who beat whom." + "\n" );
+    }
+    else if ( command == "lastmaps" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/lastmaps" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Shows the last maps played across the network, most recent first." + "\n" );
     }
     else if ( command == "cps" )
     {
