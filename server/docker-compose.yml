@@ -38,10 +38,11 @@ services:
       # Warsow uses a single UDP port; pk3 downloads also flow over it (the
       # engine's HTTP server is disabled via sv_http 0 in entrypoint.sh).
       - "44400:44400/udp"
-      # Uncomment for cross-HOST player mirroring (peers on other machines
+      # Published for cross-HOST player mirroring (peers on other machines
       # need to reach the mirror port). Same-host/compose-network peers and
-      # the local mesh test do NOT need it published.
-      # - "44450:44450/udp"
+      # the local mesh test do NOT strictly need it, but prod (EU<->US mesh)
+      # relies on it, so it's on by default here.
+      - "44450:44450/udp"
     environment:
       SV_HOSTNAME: "${SV_HOSTNAME:-Dockerized Warsow Race - go fast!}"
       SV_MAXCLIENTS: "${SV_MAXCLIENTS:-16}"
@@ -80,7 +81,9 @@ services:
       MIRROR_SECRET: "${MIRROR_SECRET:-}"   # shared: openssl rand -hex 24
       MIRROR_PORT: "${MIRROR_PORT:-44450}"
       MIRROR_TAG: "${MIRROR_TAG:-}"         # short id shown as [TAG] in chat
-      # EXTRA_ARGS: "+set sv_maxrate 0"
+      # Extra engine cvars appended to the server command line. Prod names the
+      # TV/mirror client so the site can filter it out of the live view.
+      EXTRA_ARGS: "+set rs_tv_name RACESOW-TV"
     networks:
       - default
       # The central stats stack's network (created by the repo-root compose),
