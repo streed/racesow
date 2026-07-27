@@ -1137,7 +1137,7 @@ async function renderLive() {
     : "";
   // Explain the ⇄ that shows up on meshed cards, but only when a mesh is live.
   const meshNote = online.some((s) => s.mesh && s.mesh.length)
-    ? `<p class="live-mesh-note"><span class="mesh-ico">⇄</span> The servers are <b>linked into one mesh</b> — when two are on the same map, players race alongside each other as ghosts across the Atlantic.</p>`
+    ? `<p class="live-mesh-note"><span class="mesh-ico">⇄</span> The servers are <b>linked into one mesh</b> — when 2 or more servers share the same map, players race alongside each other as ghosts across the Atlantic.</p>`
     : "";
   const html = `
     ${maint}
