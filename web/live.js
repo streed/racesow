@@ -152,7 +152,11 @@ function presentResult(server, result) {
     map: info.mapname || null,
     gametype: info.gametype || info.g_gametype || null,
     maxclients: info.sv_maxclients ? parseInt(info.sv_maxclients, 10) : null,
-    mesh: parseMeshStatus(info.rs_mesh_status),
+    // rs_mesh_status overflows into rs_mesh_status2 once the peer list exceeds
+    // one 63-char serverinfo value (long map names); concatenate before parsing.
+    mesh: parseMeshStatus(
+      [info.rs_mesh_status, info.rs_mesh_status2].filter((v) => v && v.trim()).join(",")
+    ),
     players: players
       .filter((p) => !isTvClient(p.name))
       .map((p) => ({

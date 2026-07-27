@@ -34,6 +34,11 @@ Cvar rsMirrorDebug( "rs_mirror_debug", "0", 0 );
 // Info_Validate rejects the whole value (keeping the previous one). See
 // RACE_MirrorPublishStatus.
 Cvar rsMeshStatus( "rs_mesh_status", "", CVAR_SERVERINFO );
+// Overflow key: one serverinfo value caps at MAX_INFO_VALUE (64), which only
+// fits ~2 "TAG:map:players" records once map names are long (e.g. aurora-speed1),
+// so a 3rd+ peer would be dropped. Spill into rs_mesh_status2; the web concats
+// the two (live.js parseMeshStatus). Two 63-char keys hold ~6 peers.
+Cvar rsMeshStatus2( "rs_mesh_status2", "", CVAR_SERVERINFO );
 
 const uint MIRROR_PUBLISH_INTERVAL = 16; // ms between state publishes/syncs (~60Hz)
 const uint MIRROR_EXTRAPOLATE_MAX = 150;  // ms of dead-reckoning before a ghost freezes
@@ -320,6 +325,7 @@ String RACE_MeshStatusClean( const String &in raw, uint maxLen )
 void RACE_MirrorPublishStatus()
 {
     String status = "";
+    String status2 = "";
     int pc = RS_MirrorPeerCount();
     for ( int i = 0; i < pc; i++ )
     {
@@ -340,14 +346,23 @@ void RACE_MirrorPublishStatus()
 
         String rec = tag + ":" + map + ":" + players;
         String next = ( status.length() == 0 ) ? rec : ( status + "," + rec );
-        if ( next.length() > MESH_STATUS_MAX )
-            break; // keep the value valid rather than lose it all to Info_Validate
-        status = next;
+        if ( next.length() <= MESH_STATUS_MAX )
+        {
+            status = next;
+            continue;
+        }
+        // First key full: spill this (and any later) record into the overflow key.
+        String next2 = ( status2.length() == 0 ) ? rec : ( status2 + "," + rec );
+        if ( next2.length() > MESH_STATUS_MAX )
+            break; // both keys full — stop rather than lose a value to Info_Validate
+        status2 = next2;
     }
 
     // Only write on change: trap_Cvar_Set flags serverinfo dirty every call.
     if ( status != rsMeshStatus.string )
         rsMeshStatus.set( status );
+    if ( status2 != rsMeshStatus2.string )
+        rsMeshStatus2.set( status2 );
 }
 
 // True for our mirror bots (and any fake client). We test SVF_FAKECLIENT on the
