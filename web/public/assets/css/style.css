@@ -360,7 +360,7 @@ footer.site a { color: var(--cyan); }
   color: var(--orange-2); font-family: var(--cond); font-weight: 700;
   font-size: 15px; letter-spacing: .5px;
 }
-.live-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(340px,1fr)); gap: 20px; }
+.live-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 20px; }
 .live-srv.off { opacity: .55; }
 .live-srv h3 .pill { margin-left: 8px; }
 .live-count {
