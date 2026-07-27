@@ -1,0 +1,86 @@
+# Racesow WARFORK game-server — ADDITIVE bundle.
+#
+# Runs a Warfork race server ALONGSIDE the existing Warsow `warsow-race`
+# (docker-compose.agent.yml) on the SAME box, feeding the SAME racesow.org
+# stats and joined to the SAME cross-server mesh. It is deliberately a separate
+# compose file so it never recreates or disturbs the running Warsow server:
+#
+#   docker compose -f docker-compose.warfork.yml up -d --build
+#
+# Ports are offset from Warsow's (game 44400 / mirror 44450) so both coexist:
+#   Warfork game  UDP 44410, http/pak TCP 44411, mirror UDP 44451.
+# Records are tagged on the unified leaderboard via VERSION_NAME ("wf <ver>",
+# mirroring Warsow's "wsw 2.1"); the mesh tag is [<REGION>-WF].
+#
+# Maps are the SHARED pool: this mounts the very same ./server/maps directory
+# the Warsow service already uses (read-only) — zero duplicate storage.
+#
+# NOTE: the build context / image is finalized by Task #2 (warfork/Dockerfile,
+# pending the hettoo-vs-DenMSC codebase decision from the research workflow).
+# Until then `--build` has nothing to build; the env/port/volume CONTRACT below
+# is stable and is what the Warfork entrypoint will consume.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  warfork-race:
+    build:
+      context: .                  # repo root: Dockerfile COPYs server/ + warfork/
+      dockerfile: warfork/Dockerfile
+    image: warfork-race:racesow
+    container_name: warfork-race
+    restart: unless-stopped
+    logging: *default-logging
+    tty: true
+    # Warfork, like Warsow, holds every mounted pk3 open at once; a full map
+    # mirror blows past the 2048-fd soft limit.
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 16384
+    ports:
+      - "${WF_SV_PORT:-44410}:44410/udp"
+      - "${WF_SV_HTTP_PORT:-44411}:44411/tcp"
+      # Cross-server mesh port (distinct from Warsow's 44450 so both bind on the
+      # same host). Published so peers on other hosts reach this server's mirror.
+      - "${WF_MIRROR_PORT:-44451}:44451/udp"
+    environment:
+      SV_HOSTNAME: "${WF_SV_HOSTNAME:-Racesow Warfork}"
+      SV_MAXCLIENTS: "${WF_SV_MAXCLIENTS:-16}"
+      SV_PUBLIC: "${WF_SV_PUBLIC:-1}"
+      SV_PORT: "44410"
+      SV_HTTP_PORT: "44411"
+      G_GAMETYPE: "hrace"       # our racemod gametype (hrace.gt), NOT stock Warfork `race`
+      RCON_PASSWORD: "${WF_RCON_PASSWORD:-}"
+      # The gametype POSTs every finish to the central ingest endpoint
+      # (racelog.as -> RS_ApiReportRace), name-keyed, exactly like Warsow.
+      INGEST_URL: "${INGEST_URL:?set INGEST_URL in .env}"
+      INGEST_TOKEN: "${WF_INGEST_TOKEN:?set WF_INGEST_TOKEN (a NEW per-server token) in .env}"
+      # Unified-leaderboard tag: records show a [wf <ver>] pill + own rank bucket.
+      VERSION_NAME: "${WF_VERSION_NAME:-wf 2.16}"
+      LOG_SHIP: "${WF_LOG_SHIP:-1}"
+      SV_UPLOADS_BASEURL: "${WF_SV_UPLOADS_BASEURL:-}"
+      # Cross-game mesh (UDP). Peers = the OTHER three nodes (see design doc
+      # §11.1). Reuse the boxes' existing shared MIRROR_SECRET.
+      MIRROR_PEERS: "${WF_MIRROR_PEERS:-}"     # e.g. "us.east...:44450 eu.frankfurt...:44450 eu.frankfurt...:44451"
+      MIRROR_SECRET: "${MIRROR_SECRET:-}"      # SAME shared key as the Warsow nodes
+      MIRROR_PORT: "44451"
+      MIRROR_TAG: "${WF_MIRROR_TAG:-}"         # US-WF / EU-WF
+    volumes:
+      # SHARED map pool — identical host dir the Warsow service mounts. Read-only.
+      # The entrypoint symlinks these pk3s into the racesow fs_game dir so the
+      # engine scans them (zero-copy; no duplicate storage).
+      - ./server/maps:/warfork/maps_extra:ro
+      # Warfork's own record/demo state (separate from Warsow's volumes).
+      - wf_racelog:/racesow/racelog
+      - wf_topscores:/racesow/topscores
+      - wf_demos:/racesow/demos
+
+volumes:
+  wf_racelog:
+  wf_topscores:
+  wf_demos:

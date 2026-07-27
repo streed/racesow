@@ -1,0 +1,23 @@
+# Applies to REPO-ROOT-context builds (currently only warfork/Dockerfile, which
+# needs server/enginepatches + server/racemod + warfork/). Keep the context tiny:
+# exclude the huge map pool, git history, node_modules, and runtime state.
+.git
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+
+# 12 GB shared map pool — mounted read-only at runtime, never needed at build.
+server/maps
+server/mirror-test-maps
+server/demos
+server/racelog
+server/topscores
+
+# other build contexts' outputs / bulky assets not used by the warfork build
+web/public/maps
+web/og-assets
+tv
+server/tv
+
+*.log
+*.pk3

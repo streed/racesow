@@ -1,0 +1,18 @@
+Racesow base projectile / prejump-state natives for the Warfork port, vendored
+from the community Warfork racesow port so we don't hand-reimplement them.
+
+Upstream: https://github.com/Gelmo/warfork-racemod
+Commit:   7c6a50fc5831d0ac109274f15e5461e2be687a5b  (Warfork 2.15 tree)
+
+Files (GPLv2, same license as qfusion/Warfork):
+  g_racesow.{cpp,h}  - RS_removeProjectiles(owner) [owner-filtered G_RemoveProjectiles],
+                       racesow weapon-def cvars (rs_grenade_*/rs_rocket_*/rs_plasma_*/
+                       rs_gunblade_*) + RS_Init/RS_SplashFrac (physics-parity layer,
+                       currently unwired - see docs/warfork-port-design.md D2).
+  gs_racesow.{c,h}   - pj_jumps/pj_dashes/pj_walljumps[MAX_CLIENTS] prejump state:
+                       RS_QueryPjState / RS_ResetPjState / RS_Increment{Jumps,Dashes,WallJumps}.
+
+These are lifted onto CURRENT vanilla warfork-qfusion 2.16 (proto 27), NOT built
+from Gelmo's 2.15 tree (proto 26, incompatible with current clients). The
+g_ascript.cpp binding + include wiring + (deferred) gs_pmove.c prejump hooks are
+applied by patch-pjstate-natives.py.

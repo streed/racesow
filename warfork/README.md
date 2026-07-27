@@ -1,43 +1,52 @@
-# Warfork race server (spike)
+# Warfork race server (racesow port)
 
-Exploration of running a **Warfork** race server alongside the Warsow 2.1.2
-servers, feeding the same stats site. Full findings + port plan:
+A **Warfork 2.16** race server that runs OUR racemod gametype alongside the
+Warsow servers, feeding the SAME racesow.org leaderboard (records tagged
+`wf 2.16`) and joined to the SAME cross-server mesh. Full design + rationale:
 [`../docs/warfork-port-design.md`](../docs/warfork-port-design.md).
 
-## TL;DR
+## How it's built (proven end-to-end)
 
-- **Build from source — works, no Steam needed.** `warfork-qfusion` is GPLv2 and
-  builds `wf_server` + the `game` module with `-DBUILD_STEAMLIB=0`, mirroring our
-  Warsow `server/Dockerfile`. This is the path.
-- **Stock server via anonymous SteamCMD — currently broken.** appid `1136510`'s
-  public build fails to commit (`Missing configuration`) and `beta` is gated to
-  licensed accounts. The SteamCMD scaffold here is kept only as a fallback for
-  when a licensed Steam account is available.
-
-## Build & run from source (working)
+`Dockerfile` (build from the **repo root**) does, in order:
+1. clone warfork-qfusion 2.16 (pinned) + submodules (−crashpad);
+2. vendor Gelmo's racesow projectile/prejump natives (`enginepatches/{g,gs}_racesow.*`)
+   + `patch-pjstate-natives.py` — creates the `RS_ResetPjState` binding our patches need;
+3. apply our `../server/enginepatches/patch-{api,mirror,wrghost}-*.py` **unchanged**
+   (Warfork & Warsow share the qfusion game-module lineage);
+4. `cmake --preset workflow-linux-release -DBUILD_STEAMLIB=0` → `wf_server` + game module;
+5. package our `../server/racemod/source` as the `racesow` fs_game, after
+   `scriptpatches/patch-scripts-as2024.py` adapts the shared scripts to AS2024.
 
 ```bash
-./build-from-source.sh          # clone warfork-qfusion, build wf_server + game module
+# from repo root:
+docker build -f warfork/Dockerfile -t warfork-race:racesow .
 ```
-Outputs `~/warfork-build/warfork-qfusion/source/build/warfork-qfusion/`
-(`wf_server.x86_64`, `basewf/libgame_x86_64.so`, packed paks incl. `wfrace1` map).
 
-Boot the race gametype headless (validated 2026-07-24):
-```bash
-OUT=~/warfork-build/warfork-qfusion/source/build/warfork-qfusion
-docker run --rm --entrypoint /bin/bash -v "$OUT:/server" -w /server warfork-builder \
-  -c './wf_server.x86_64 +set fs_basepath /server +set fs_game basewf +set dedicated 1 \
-       +set g_gametype race +map wfrace1'
-# → "Gametype 'Race' initialized" / "Warfork Initialized" (UDP :44400, TCP :44444)
-```
+Validated: natives compile+link, `hrace` gametype boots ("Gametype 'Race'
+initialized"), Warfork↔Warsow mesh (drop=0, heard both ways), shared IBSP+FBSP
+map load, api fetch wiring.
 
 ## Files
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `build-from-source.sh` | **Working path** — build wf_server + game module from source |
-| `Dockerfile`, `entrypoint.sh`, `configs/server.cfg`, `docker-compose.yml` | SteamCMD stock-server scaffold — **currently blocked** (see TL;DR); usable once a licensed Steam account is available |
+| `Dockerfile` | multi-stage build (source → runtime image) |
+| `entrypoint.sh` | env → `rs_api_*`/`rs_mirror_*` cvars; shared-map symlink + `g_maplist`; launch |
+| `configs/server.cfg` | race gameplay tuning (`sv_pure 0` for v1) |
+| `enginepatches/` | Gelmo racesow natives (`g_racesow.*`, `gs_racesow.*`) + `patch-pjstate-natives.py` + UPSTREAM |
+| `scriptpatches/patch-scripts-as2024.py` | Warfork-only AS2024 adaptation of the shared scripts |
+| `build-from-source.sh` | standalone local source build (dev iteration) |
+| `../docker-compose.warfork.yml` | additive deploy service (ports 44410/44411/44451, shared maps) |
 
-## Ports
+## Deploy (additive; leaves Warsow untouched)
 
-Game **UDP 44400**, HTTP/query **TCP 44444** (Warfork/LinuxGSM defaults).
+See the runbook in `../docs/warfork-port-design.md §11.4`. In short, per box:
+set `.env` (`WF_INGEST_TOKEN`, `MIRROR_TAG`/`MIRROR_PEERS` per §11.1,
+`VERSION_NAME="wf 2.16"`, reuse `MIRROR_SECRET`+`INGEST_URL`), open UFW
+`44451/udp`, `docker compose -f docker-compose.warfork.yml up -d --build`,
+then expand the live Warsow `MIRROR_PEERS`+retag and tear down the old
+`warfork-test` spike.
+
+**Deferred** (not launch blockers): client UI pak + `sv_pure 1` delivery, per-client
+demo natives, prejump `gs_pmove.c` hooks, weapon-def physics parity, public Steam
+listing (`BUILD_STEAMLIB=1` + GSLT).
