@@ -1100,7 +1100,7 @@ function liveServerCard(s) {
     <div class="live-meta">
       ${s.hostname ? wname(s.hostname) : ""}
       ${s.map ? `<span class="live-map ${s.mapId ? "clickable" : ""}" ${s.mapId ? `data-nav="#/map/${s.mapId}"` : ""}>▸ ${esc(s.map)}</span>` : ""}
-      ${s.address ? `<span class="live-addr mono">connect ${esc(s.address)}</span>` : ""}
+      ${s.address ? `<button type="button" class="live-connect mono" data-copy="connect ${esc(s.address)}" title="Click to copy — paste into the Warsow console (~) to join"><span class="live-connect-cmd">connect ${esc(s.address)}</span><span class="live-connect-tag"></span></button>` : ""}
     </div>`;
   // Cross-server mesh: peers this node currently hears (rs_mesh_status). Renders
   // nothing when mirroring is off or no peers are up. See renderMesh.
@@ -1240,7 +1240,7 @@ function serverBodyHtml(s) {
     ? `<div class="live-meta">
         ${li.hostname ? wname(li.hostname) : ""}
         ${li.map ? `<span class="live-map ${li.mapId ? "clickable" : ""}" ${li.mapId ? `data-nav="#/map/${li.mapId}"` : ""}>▸ ${esc(li.map)}</span>` : ""}
-        ${s.address ? `<span class="live-addr mono">connect ${esc(s.address)}</span>` : ""}
+        ${s.address ? `<button type="button" class="live-connect mono" data-copy="connect ${esc(s.address)}" title="Click to copy — paste into the Warsow console (~) to join"><span class="live-connect-cmd">connect ${esc(s.address)}</span><span class="live-connect-tag"></span></button>` : ""}
       </div>`
     : `<div class="live-meta"><span class="muted">Not responding to queries right now.</span></div>`;
   const players = li.online

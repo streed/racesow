@@ -372,7 +372,28 @@ footer.site a { color: var(--cyan); }
 }
 .live-map { color: var(--cyan); font-family: var(--mono); font-size: 13px; }
 .live-map.clickable:hover { text-decoration: underline; cursor: pointer; }
-.live-addr { color: var(--faint); font-family: var(--mono); font-size: 12px; }
+/* Click-to-copy connect string on the live cards / server page. A bordered
+   button so it reads as actionable; the tag flips "copy" -> "copied" on click
+   (driven by the global [data-copy] handler adding .copied). */
+.live-connect {
+  display: inline-flex; align-items: center; gap: 8px; max-width: 100%;
+  border: 1px solid var(--line-2); background: var(--panel-2); color: var(--text);
+  padding: 4px 6px 4px 10px; border-radius: 6px; cursor: pointer;
+  font-family: var(--mono); font-size: 13px; line-height: 1.5;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.live-connect:hover { border-color: var(--orange); color: var(--orange-2); background: var(--panel); }
+.live-connect-cmd { overflow-wrap: anywhere; min-width: 0; }
+.live-connect-tag {
+  flex: 0 0 auto; font-family: var(--cond); text-transform: uppercase;
+  letter-spacing: .5px; font-size: 10px; color: var(--faint);
+  border-left: 1px solid var(--line-2); padding-left: 8px; white-space: nowrap;
+}
+.live-connect-tag::before { content: "⧉ copy"; }
+.live-connect:hover .live-connect-tag { color: var(--orange-2); border-color: var(--orange); }
+.live-connect.copied { border-color: var(--green); color: var(--green); }
+.live-connect.copied .live-connect-tag { color: var(--green); border-color: rgba(169,242,106,.5); }
+.live-connect.copied .live-connect-tag::before { content: "✓ copied"; }
 .live-empty { padding: 10px 18px 16px; }
 .live-srv > .muted { display: block; padding: 12px 18px 16px; }
 /* cross-server mesh (live server cards). Two states: an "active" row when a
@@ -474,7 +495,7 @@ tr:hover td.mapname .extlink { color: var(--cyan); }
   .live-meta { flex-direction: column; align-items: flex-start; gap: 4px; }
   .feeditem { padding: 10px 14px; }
   /* Let long connect strings / addresses wrap instead of overflowing. */
-  .live-addr, .live-meta { overflow-wrap: anywhere; }
+  .live-connect, .live-meta { overflow-wrap: anywhere; }
 }
 
 /* Header wordmark/nav further tightening on very small phones. */
