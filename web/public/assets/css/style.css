@@ -337,7 +337,6 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 footer.site { border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
 footer.site .fi { max-width: 1180px; margin: 0 auto; padding: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px 18px; }
 footer.site .foot-right { display: flex; align-items: center; gap: 16px; }
-footer.site .foot-sponsor { border: 0; border-radius: 6px; display: block; }
 footer.site a { color: var(--cyan); }
 .hide { display: none !important; }
 
