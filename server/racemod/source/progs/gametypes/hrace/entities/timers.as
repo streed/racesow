@@ -24,6 +24,10 @@ void target_stoptimer_use( Entity@ self, Entity@ other, Entity@ activator )
 
     Player@ player = RACE_GetPlayer( activator.client );
 
+    G_Print( "RSDBG finish-touch: inRace=" + player.inRace + " practicing=" + player.practicing
+            + " reversed=" + player.reversed + " postRace=" + player.postRace
+            + " team=" + activator.client.team + " match=" + match.getState() + "\n" );
+
     // Reverse mode: the map's FINISH line is the reverse START. Begin the timed
     // run here (same path — and prejump gate — as a normal start).
     if ( player.reversed )
@@ -76,6 +80,10 @@ void target_starttimer_use( Entity@ self, Entity@ other, Entity@ activator )
         return;
 
     Player@ player = RACE_GetPlayer( activator.client );
+
+    G_Print( "RSDBG start-touch: inRace=" + player.inRace + " practicing=" + player.practicing
+            + " reversed=" + player.reversed + " postRace=" + player.postRace
+            + " team=" + activator.client.team + " match=" + match.getState() + "\n" );
 
     // Reverse mode: the map's START line is the reverse FINISH. Stop the timer
     // and bank the reversed run here (same path as a normal finish).

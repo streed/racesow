@@ -1562,11 +1562,18 @@ class Player
 
     bool startRace()
     {
+        G_Print( "RSDBG startRace ENTER: inRace=" + this.inRace + " practicing=" + this.practicing
+                + " postRace=" + this.postRace + " team=" + this.client.team + " recalled=" + this.recalled
+                + " autoRecall=" + this.autoRecall + " pj=" + RS_QueryPjState( this.client.playerNum ) + "\n" );
+
         // Mirror bots (and any fake client) are puppets driven by the mesh
         // stream, not real input — they must never enter a race, so they can
         // never count an attempt or set a record on this server.
         if ( RACE_MirrorIsFakeClient( this.client ) )
+        {
+            G_Print( "RSDBG startRace FAIL: fakeclient\n" );
             return false;
+        }
 
         // Auto-recall: starting a practice run from a recalled position starts
         // the timer (extending the recalled run) instead of a fresh race.
@@ -1588,7 +1595,10 @@ class Player
         }
 
         if ( !this.preRace() )
+        {
+            G_Print( "RSDBG startRace FAIL: preRace false\n" );
             return false;
+        }
 
         this.currentCheckpoint = 0;
         this.inRace = true;
@@ -1628,6 +1638,7 @@ class Player
 
         this.setQuickMenu();
 
+        G_Print( "RSDBG startRace OK: inRace now true\n" );
         return true;
     }
 
@@ -1943,6 +1954,10 @@ class Player
 
     void completeRace()
     {
+        G_Print( "RSDBG completeRace ENTER: inRace=" + this.inRace + " practicing=" + this.practicing
+                + " recalled=" + this.recalled + " validTime=" + this.validTime()
+                + " raceTime=" + this.raceTime() + "\n" );
+
         // Belt-and-suspenders: a fake client should never be inRace (startRace
         // refuses them), but never log a finish, report to the API, or write a
         // top score for one even if some other path gets here.
@@ -1951,6 +1966,7 @@ class Player
 
         if ( this.practicing && !this.recalled )
         {
+            G_Print( "RSDBG completeRace: practicemode branch (no real finish)\n" );
             if ( this.practiceFinish == 0 || this.timeStamp() > this.practiceFinish + 5000 )
             {
                 this.client.addAward( S_COLOR_CYAN + "Finished in practicemode!" );
