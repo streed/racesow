@@ -54,6 +54,12 @@ services:
       SV_PUBLIC: "${WF_SV_PUBLIC:-1}"
       SV_PORT: "44410"
       SV_HTTP_PORT: "44411"
+      # The shared RS_Api* native (g_rs_api.cpp) derives its libc write paths from
+      # $WARSOW_DIR; on Warfork it must equal the engine base ($WF_DIR=/warfork),
+      # else `top` / the live-record refresh write to a dead /warsow path the
+      # engine never reads. (entrypoint.sh also exports this; set here too so a
+      # bare `up -d` recreate — no rebuild — is already correct.)
+      WARSOW_DIR: "/warfork"
       G_GAMETYPE: "hrace"       # our racemod gametype (hrace.gt), NOT stock Warfork `race`
       RCON_PASSWORD: "${WF_RCON_PASSWORD:-}"
       # The gametype POSTs every finish to the central ingest endpoint
@@ -75,10 +81,14 @@ services:
       # The entrypoint symlinks these pk3s into the racesow fs_game dir so the
       # engine scans them (zero-copy; no duplicate storage).
       - ./server/maps:/warfork/maps_extra:ro
-      # Warfork's own record/demo state (separate from Warsow's volumes).
-      - wf_racelog:/racesow/racelog
-      - wf_topscores:/racesow/topscores
-      - wf_demos:/racesow/demos
+      # Warfork's own record/demo state (separate from Warsow's volumes). Mounted
+      # at the real mod write dir /warfork/racesow/... (engine fs_basepath=/warfork
+      # + fs_game=racesow) — the same path the RS_Api* native now writes to — so
+      # these persist across recreates. (Previously mounted at /racesow/..., a
+      # third orphaned path that persisted nothing.)
+      - wf_racelog:/warfork/racesow/racelog
+      - wf_topscores:/warfork/racesow/topscores
+      - wf_demos:/warfork/racesow/demos
 
 volumes:
   wf_racelog:

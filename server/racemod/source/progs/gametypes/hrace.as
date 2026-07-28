@@ -58,6 +58,15 @@ Cvar rs_tv_name( "rs_tv_name", "", 0 );
 // and the website can caption "watching <player>". Empty = free-fly / idle.
 // (Kept < MAX_INFO_VALUE and sanitized via RACE_MeshStatusClean before setting.)
 Cvar rs_tv_pov( "rs_tv_pov", "", CVAR_SERVERINFO );
+// Auto-join genuine humans to the players team on connect. A dedicated race
+// server is meant to drop you straight into the run: the Warsow client
+// auto-joins an isRace gametype, but the retail Warfork client does not (join is
+// UI-driven), so real players sit in TEAM_SPECTATOR where preRace() is false and
+// startRace() silently no-ops (no start line trip, hence no finish either). On
+// Warsow the client has already joined by the time enterGame fires, so the
+// TEAM_SPECTATOR guard below makes this inert there. Set 0 to require a manual
+// join.
+Cvar rs_autojoin( "rs_autojoin", "1", 0 );
 bool RACE_IsTvClient( Client@ client )
 {
     if ( @client is null )
@@ -353,6 +362,20 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
         {
             RACE_GetPlayer( client ).clear();
             RACE_UpdateHUDTopScores();
+
+            // Drop genuine humans straight onto the players team so crossing the
+            // start line trips the timer (see rs_autojoin above). Mirror bots
+            // (they represent peer-server players) and the TV director stay
+            // spectators. Reuses the exact team+respawn the `join` command runs
+            // (commands.as, Cmd_RaceRestart).
+            if ( rs_autojoin.integer != 0
+                    && client.team == TEAM_SPECTATOR
+                    && !RACE_MirrorIsFakeClient( client )
+                    && !RACE_IsTvClient( client ) )
+            {
+                client.team = TEAM_PLAYERS;
+                client.respawn( false );
+            }
         }
 
         RACE_ShowRules(client, 2000);

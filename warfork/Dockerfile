@@ -53,16 +53,24 @@ COPY server/enginepatches/g_rs_mirrorbots.cpp source/game/g_rs_mirrorbots.cpp
 COPY server/enginepatches/patch-api-natives.py    /tmp/patch-api-natives.py
 COPY server/enginepatches/patch-mirror-natives.py /tmp/patch-mirror-natives.py
 COPY server/enginepatches/patch-wrghost-cull.py   /tmp/patch-wrghost-cull.py
+# Hide the cross-server mirror-bot ghosts (SVF_FAKECLIENT slots) from the
+# getstatus/heartbeat player list, exactly as the Warsow image does — otherwise
+# mesh ghosts leak out as real players on THIS server (inflated browser count,
+# same player shown on two servers). The patch's sv_oob.c anchors match Warfork
+# 2.15.1 byte-for-byte, so the shared script applies unchanged.
+COPY server/enginepatches/patch-status-hide-bots.py /tmp/patch-status-hide-bots.py
 RUN cd source \
     && python3 /tmp/patch-api-natives.py \
     && python3 /tmp/patch-mirror-natives.py \
     && python3 /tmp/patch-wrghost-cull.py \
+    && python3 /tmp/patch-status-hide-bots.py \
     && grep -q 'asFunc_RS_ApiReportRace'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_MirrorRefresh'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchRanks'  game/g_ascript.cpp \
     && grep -q 'RS_MirrorLocalChat'       game/g_cmds.cpp \
     && grep -q 'rs_isWrGhost'             game/g_public.h \
-    && grep -q 'rs_isWrGhost'             qcommon/snap_write.c
+    && grep -q 'rs_isWrGhost'             qcommon/snap_write.c \
+    && grep -q 'racesow-docker: mirror-bot ghosts' server/sv_oob.c
 
 # --- build wf_server + game module (2.15.1: plain cmake, no preset/submodules) -
 RUN export CC=clang CXX=clang++ \
