@@ -118,11 +118,16 @@ void target_starttimer_use( Entity@ self, Entity@ other, Entity@ activator )
     }
 }
 
-// doesn't need to do anything at all, just sit there, waiting
+// doesn't need to do anything at all, just sit there, waiting.
+// NOTE: do NOT set ent.wait here. On the START, `ent` is the trigger_multiple,
+// whose wait defaults to 0.2 (SP_trigger_multiple). Warfork's multi_trigger frees
+// any trigger with wait <= 0 after its FIRST fire (G_FreeEdict), so `ent.wait = 0`
+// deleted the start trigger for the rest of the map — the race could be started
+// once and then never again (finish/death/restart could not re-arm it). Warsow's
+// engine tolerated wait=0; Warfork does not. Stock race.as never sets it either.
 void target_starttimer( Entity@ ent )
 {
     @ent.use = target_starttimer_use;
-    ent.wait = 0;
 }
 
 void target_startTimer( Entity@ ent )
