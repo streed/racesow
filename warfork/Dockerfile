@@ -59,11 +59,13 @@ COPY server/enginepatches/patch-wrghost-cull.py   /tmp/patch-wrghost-cull.py
 # same player shown on two servers). The patch's sv_oob.c anchors match Warfork
 # 2.15.1 byte-for-byte, so the shared script applies unchanged.
 COPY server/enginepatches/patch-status-hide-bots.py /tmp/patch-status-hide-bots.py
+COPY warfork/enginepatches/patch-DEBUG-trigger.py /tmp/patch-DEBUG-trigger.py
 RUN cd source \
     && python3 /tmp/patch-api-natives.py \
     && python3 /tmp/patch-mirror-natives.py \
     && python3 /tmp/patch-wrghost-cull.py \
     && python3 /tmp/patch-status-hide-bots.py \
+    && python3 /tmp/patch-DEBUG-trigger.py \
     && grep -q 'asFunc_RS_ApiReportRace'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_MirrorRefresh'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchRanks'  game/g_ascript.cpp \
