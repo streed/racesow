@@ -34,7 +34,7 @@
 // once at creation. Give a server token to the operator (INGEST_TOKEN); give an
 // admin password to the moderator (they can change it at /admin/account).
 import crypto from "node:crypto";
-import { openDatabase, rebuildCanonical, hashPassword } from "./db.js";
+import { openDatabase, rebuildCanonical, hashPassword, simplifyName } from "./db.js";
 import { broadcastRcon, sayCommand } from "./rcon.js";
 import { parseAddress } from "./live.js";
 
@@ -359,6 +359,58 @@ try {
       break;
     }
 
+    // ---- Offensive-name censoring (see web/censor.js) ----
+    case "names": {
+      const rows = await race.censoredPlayers();
+      if (!rows.length) {
+        console.log("No flagged or censored names.");
+        break;
+      }
+      console.log("id     state     original                       shown as");
+      for (const r of rows) {
+        console.log(
+          `${String(r.id).padEnd(6)} ${String(r.action || "auto").padEnd(9)} ${simplifyName(r.name)
+            .slice(0, 30)
+            .padEnd(30)} ${r.action === "allow" ? "—" : simplifyName(r.masked)}`
+        );
+      }
+      break;
+    }
+    case "censor":
+    case "allow": {
+      const id = parseInt(args[0], 10);
+      if (Number.isNaN(id)) throw new Error(`usage: node admin.js ${cmd} <playerId>`);
+      await race.setPlayerCensor(id, cmd, "cli", "cli");
+      console.log(`Player #${id} -> ${cmd === "allow" ? "shown in full (whitelisted)" : "force-censored"}.`);
+      break;
+    }
+    case "uncensor": {
+      const id = parseInt(args[0], 10);
+      if (Number.isNaN(id)) throw new Error("usage: node admin.js uncensor <playerId>");
+      const ok = await race.clearPlayerCensor(id);
+      console.log(ok ? `Cleared override on player #${id}.` : `No override on player #${id}.`);
+      break;
+    }
+    case "terms": {
+      const rows = await race.censorTerms();
+      console.log("term             mode  severity   by");
+      for (const t of rows) {
+        console.log(`${t.term.padEnd(16)} ${t.mode.padEnd(5)} ${t.severity.padEnd(10)} ${t.added_by || ""}`);
+      }
+      break;
+    }
+    case "term-add": {
+      if (!args[0]) throw new Error("usage: node admin.js term-add <term> [norm|word] [slur|hate|sexual|profanity]");
+      const t = await race.addCensorTerm(args[0], args[1] || "norm", args[2] || "profanity", "cli");
+      console.log(t ? `Added/updated term "${t}".` : "Nothing to add (term normalised to empty).");
+      break;
+    }
+    case "term-rm": {
+      const ok = await race.removeCensorTerm(args[0]);
+      console.log(ok ? "Removed." : "Term not found.");
+      break;
+    }
+
     default:
       console.log(
         "commands:\n" +
@@ -368,7 +420,9 @@ try {
           "  admin-add <user> [pw] | admin-list | admin-passwd <user> [pw] | admin-remove <user>\n" +
           "  flags [open|all|resolved|dismissed] | resolve <flagId> | dismiss <flagId>\n" +
           "  resolve-map <mapId> | dismiss-map <mapId>\n" +
-          "  block-map <mapId> [reason] | unblock-map <mapId> | blocked"
+          "  block-map <mapId> [reason] | unblock-map <mapId> | blocked\n" +
+          "  names | censor <playerId> | allow <playerId> | uncensor <playerId>\n" +
+          "  terms | term-add <term> [norm|word] [severity] | term-rm <term>"
       );
   }
 } finally {

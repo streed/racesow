@@ -1511,7 +1511,7 @@ admin.get("/flags", requireAuth, wrap(async (req, res) => {
   sendAdmin(res, "Flag queue", `
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
-      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a>${isAdminSession(req.session) ? ` · <a href="/admin/motd">motd</a>` : ""} · <a href="/admin/account">account</a></p>
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a>` : ""} · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
 }));
 
@@ -1638,6 +1638,145 @@ admin.get("/blocked", requireAuth, wrap(async (req, res) => {
     <p class="sub">${rows.length} map${rows.length === 1 ? "" : "s"} removed from the vote pool + cycle ·
       served to game servers at <span style="font-family:monospace">/api/game/blocked-maps</span></p>
     ${done}${body}`, req.session);
+}));
+
+// --- Offensive-name censoring ---
+// Masks offensive player nicks at display time everywhere they are shown (site,
+// OG/Discord cards, in-game topscores/ranks, live rosters). Originals stay in
+// the DB, so records/history are untouched. The word list auto-catches existing
+// AND future nicks; per-player overrides fix the edges. See web/censor.js.
+const CENSOR_SEVERITIES = ["slur", "hate", "sexual", "profanity"];
+function censorSevBadge(sev) {
+  return `<span class="cs-sev cs-${CENSOR_SEVERITIES.includes(sev) ? sev : "profanity"}">${escHtml(sev)}</span>`;
+}
+const CENSOR_CSS = `
+  .cs-sev{display:inline-block;font-size:11px;padding:1px 6px;border-radius:10px;margin-left:4px;vertical-align:middle}
+  .cs-slur{background:#b00020;color:#fff}.cs-hate{background:#7c1fa0;color:#fff}
+  .cs-sexual{background:#a15c00;color:#fff}.cs-profanity{background:#555;color:#fff}
+  .cs-pill{display:inline-block;font-size:12px;padding:1px 8px;border-radius:10px}
+  .cs-auto{background:#334;color:#cde}.cs-force{background:#b00020;color:#fff}.cs-allow{background:#1f7a2f;color:#fff}
+  table.cs{border-collapse:collapse;width:100%;margin:10px 0}
+  table.cs th,table.cs td{text-align:left;padding:6px 8px;border-bottom:1px solid #2a2a34;vertical-align:top}
+  table.cs td.mono,table.cs td.cs-masked{font-family:monospace}
+  .cs-muted{color:#888}`;
+
+admin.get("/names", requireAdmin, wrap(async (req, res) => {
+  const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
+  const csrf = escHtml(req.session.csrf);
+  const [players, terms] = await Promise.all([race.censoredPlayers(), race.censorTerms()]);
+
+  const pbtn = (id, act, label) =>
+    `<form class="inline" method="post" action="/admin/names/player/${id}">` +
+    `<input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="action" value="${act}">` +
+    `<button type="submit">${label}</button></form>`;
+  const playerRows = players.length
+    ? players
+        .map((p) => {
+          const orig = escHtml(simplifyName(p.name)) || "<span class='cs-muted'>(blank)</span>";
+          const masked = escHtml(simplifyName(p.masked));
+          const termList = p.terms.length
+            ? p.terms.map((t) => `${escHtml(t.term)}${censorSevBadge(t.severity)}`).join(" ")
+            : "<span class='cs-muted'>—</span>";
+          const state =
+            p.action === "allow"
+              ? `<span class="cs-pill cs-allow">shown in full</span>`
+              : p.action === "censor"
+              ? `<span class="cs-pill cs-force">force-censored</span>`
+              : `<span class="cs-pill cs-auto">auto</span>`;
+          const actions = [
+            p.action !== "censor" ? pbtn(p.id, "censor", "Force-censor") : "",
+            p.action !== "allow" ? pbtn(p.id, "allow", "Allow") : "",
+            p.action ? pbtn(p.id, "clear", "Clear") : "",
+          ].join(" ");
+          return `<tr>
+            <td><a href="/player/${p.id}" target="_blank" rel="noopener">${orig}</a></td>
+            <td class="cs-masked">${p.action === "allow" ? "<span class='cs-muted'>—</span>" : masked}</td>
+            <td>${termList}</td>
+            <td>${state}</td>
+            <td class="actions">${actions}</td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="5" class="empty">No names currently flagged or censored.</td></tr>`;
+
+  const sevOptions = CENSOR_SEVERITIES.map((s) => `<option value="${s}">${s}</option>`).join("");
+  const termRows = terms.length
+    ? terms
+        .map(
+          (t) => `<tr>
+          <td class="mono">${escHtml(t.term)}</td>
+          <td>${escHtml(t.mode)}</td>
+          <td>${censorSevBadge(t.severity)}</td>
+          <td>${t.added_by ? escHtml(t.added_by) : ""}</td>
+          <td class="actions"><form class="inline" method="post" action="/admin/names/term/remove">
+            <input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="term" value="${escHtml(t.term)}">
+            <button type="submit">Remove</button></form></td>
+        </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="5" class="empty">Word list is empty.</td></tr>`;
+
+  sendAdmin(
+    res,
+    "Names",
+    `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Name censoring</h1>
+    <p class="sub">Offensive nicks are masked wherever they appear (site, Discord cards, in-game boards, live rosters).
+      Originals stay in the database — records and history are never altered.
+      <b>norm</b> matches anywhere in the colour/punctuation-stripped nick (best for slurs);
+      <b>word</b> matches only whole words (fewer false positives).</p>
+    ${done}
+    <h2>Flagged &amp; censored players <span class="cs-muted">(${players.length})</span></h2>
+    <p class="sub"><b>Allow</b> whitelists a false positive; <b>Force-censor</b> masks a nick the word list missed.</p>
+    <table class="cs">
+      <thead><tr><th>Original</th><th>Shown as</th><th>Matched</th><th>State</th><th></th></tr></thead>
+      <tbody>${playerRows}</tbody>
+    </table>
+    <h2>Word list <span class="cs-muted">(${terms.length})</span></h2>
+    <form class="card" method="post" action="/admin/names/term/add" style="max-width:560px">
+      <input type="hidden" name="_csrf" value="${csrf}">
+      <div class="actions" style="gap:8px;flex-wrap:wrap">
+        <input name="term" placeholder="term" maxlength="64" required style="font-family:monospace">
+        <select name="mode"><option value="norm">norm</option><option value="word">word</option></select>
+        <select name="severity">${sevOptions}</select>
+        <button class="primary" type="submit">Add / update</button>
+      </div>
+    </form>
+    <table class="cs">
+      <thead><tr><th>Term</th><th>Mode</th><th>Severity</th><th>Added by</th><th></th></tr></thead>
+      <tbody>${termRows}</tbody>
+    </table>`,
+    req.session,
+    `<style>${CENSOR_CSS}</style>`
+  );
+}));
+
+admin.post("/names/term/add", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const t = await race.addCensorTerm(
+    req.body && req.body.term,
+    req.body && req.body.mode,
+    req.body && req.body.severity,
+    req.session.username
+  );
+  res.redirect(303, `/admin/names?done=${encodeURIComponent(t ? `Added "${t}".` : "Nothing to add.")}`);
+}));
+admin.post("/names/term/remove", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const ok = await race.removeCensorTerm(req.body && req.body.term);
+  res.redirect(303, `/admin/names?done=${encodeURIComponent(ok ? "Removed term." : "Term not found.")}`);
+}));
+admin.post("/names/player/:id", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad player id");
+  const action = req.body && req.body.action;
+  if (action === "clear") {
+    await race.clearPlayerCensor(id);
+    return res.redirect(303, `/admin/names?done=${encodeURIComponent("Cleared override.")}`);
+  }
+  const ok = await race.setPlayerCensor(id, action, "set via /admin/names", req.session.username);
+  res.redirect(303, `/admin/names?done=${encodeURIComponent(ok ? "Override updated." : "Invalid action.")}`);
 }));
 
 // --- Game-server MOTD ---

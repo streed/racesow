@@ -135,7 +135,7 @@ export function parseMeshStatus(raw) {
 }
 
 // Shape one server's poll result for the API/frontend.
-function presentResult(server, result) {
+function presentResult(server, result, race) {
   const base = {
     id: server.id,
     name: server.name,
@@ -145,6 +145,10 @@ function presentResult(server, result) {
   };
   if (!result) return base;
   const { info, players } = result;
+  // Live rosters are the players' CURRENT in-game nicks (from getstatus), not DB
+  // rows, so only the word list applies (no per-player override id). Censor the
+  // raw name and re-derive simplified from it so both stay consistent.
+  const cn = (name) => (race ? race._cn(name) : name);
   return {
     ...base,
     online: true,
@@ -159,12 +163,15 @@ function presentResult(server, result) {
     ),
     players: players
       .filter((p) => !isTvClient(p.name))
-      .map((p) => ({
-        name: p.name,
-        simplified: simplifyName(p.name),
-        ping: p.ping,
-        score: p.score,
-      })),
+      .map((p) => {
+        const name = cn(p.name);
+        return {
+          name,
+          simplified: simplifyName(name),
+          ping: p.ping,
+          score: p.score,
+        };
+      }),
   };
 }
 
@@ -201,9 +208,9 @@ export function createLivePoller(race, { intervalMs = POLL_INTERVAL_MS, timeoutM
         targets.map(async (s) => {
           const { host, port } = parseAddress(s.address);
           try {
-            return presentResult(s, await queryServer(host, port, timeoutMs));
+            return presentResult(s, await queryServer(host, port, timeoutMs), race);
           } catch {
-            return presentResult(s, null); // offline / unreachable
+            return presentResult(s, null, race); // offline / unreachable
           }
         })
       );

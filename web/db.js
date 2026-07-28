@@ -33,6 +33,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { runner as pgMigrateRunner } from "node-pg-migrate";
 import { tokenToCode } from "./weapons.js";
+import { buildMatcher, censorName, normalizeTerm } from "./censor.js";
 
 // Async (thread-pool) compression for the request/ingest paths — the sync
 // variants block the event loop for the duration of an 8MB trajectory.
@@ -262,6 +263,11 @@ export async function openDatabase(connectionString) {
   await race.refreshAggregates();
   await race._relayoutGhostFiles();
   await race.syncGhostPayloads(); // durable ghosts: backfill payloads + restore any lost files
+  await race.loadCensorConfig(); // offensive-name word list + per-player overrides
+  // Re-read the censor config periodically so an admin edit on ONE web replica
+  // converges on the others (mirrors the ~live cadence of map-block/motd). Admin
+  // mutations also call refreshCensor() for an immediate local effect.
+  setInterval(() => race.loadCensorConfig().catch(() => {}), 60000).unref();
   console.log(`Database ready in ${Date.now() - t0}ms`);
   return race;
 }
@@ -515,6 +521,10 @@ class RaceDB {
     this.versions = {};
     // Memoized perfect-run per map (recomputed when an ingest touches the map).
     this._perfectRunCache = new Map();
+    // Offensive-name censoring config (word-list matcher + per-player overrides),
+    // loaded from censor_term/player_censor and refreshed on a timer + admin edit.
+    // Starts empty (a no-op matcher) so reads before the first load never throw.
+    this._censor = { matcher: buildMatcher([]), overrides: new Map() };
   }
 
   async _loadVersions() {
@@ -560,7 +570,7 @@ class RaceDB {
          FROM standings s JOIN player p ON p.id = s.player_id
          ORDER BY s.rank LIMIT 20`
       )
-    ).map((r) => ({ ...r, rank: num(r.rank), id: num(r.id) }));
+    ).map((r) => this._censorNamed({ ...r, rank: num(r.rank), id: num(r.id) }, num(r.id)));
     const recent = await this.recentRecords(8);
     const recentFinishes = await this.recentFinishes({ limit: 10 });
     const lastUpdate = await this.one("SELECT value FROM config WHERE key='last_update'");
@@ -592,14 +602,19 @@ class RaceDB {
          LIMIT $1`,
         [limit]
       )
-    ).map((r) => ({
-      ...r,
-      id: num(r.id),
-      map_id: num(r.map_id),
-      player_id: num(r.player_id),
-      created_at: num(r.created_at),
-      versionName: null,
-    }));
+    ).map((r) =>
+      this._censorNamed(
+        {
+          ...r,
+          id: num(r.id),
+          map_id: num(r.map_id),
+          player_id: num(r.player_id),
+          created_at: num(r.created_at),
+          versionName: null,
+        },
+        num(r.player_id)
+      )
+    );
   }
 
   // Recent finishes from the full finish log (every completed run, not just PBs
@@ -640,19 +655,24 @@ class RaceDB {
          LIMIT $${args.length}`,
         args
       )
-    ).map((r) => ({
-      id: num(r.id),
-      time: num(r.time),
-      created_at: num(r.created_at),
-      map_id: num(r.map_id),
-      map: r.map,
-      player_id: num(r.player_id),
-      name: r.name,
-      simplified: r.simplified,
-      server: r.server,
-      pb: !!r.pb,
-      checkpoints: (r.checkpoints || []).map(num),
-    }));
+    ).map((r) =>
+      this._censorNamed(
+        {
+          id: num(r.id),
+          time: num(r.time),
+          created_at: num(r.created_at),
+          map_id: num(r.map_id),
+          map: r.map,
+          player_id: num(r.player_id),
+          name: r.name,
+          simplified: r.simplified,
+          server: r.server,
+          pb: !!r.pb,
+          checkpoints: (r.checkpoints || []).map(num),
+        },
+        num(r.player_id)
+      )
+    );
   }
 
   // New records after a race id, for the Discord announcer (GET /api/records).
@@ -683,18 +703,25 @@ class RaceDB {
         );
         margin = m && m.t != null ? num(m.t) - r.time : null;
       }
-      out.push({
-        id: num(r.id),
-        time: r.time,
-        global_rank: r.global_rank,
-        version_rank: r.version_rank,
-        version: this.versions[num(r.version_id)] || String(r.version_id),
-        map_id: num(r.map_id),
-        map: r.map,
-        raw_name: r.raw_name,
-        player: r.player,
-        margin,
-      });
+      out.push(
+        this._censorNamed(
+          {
+            id: num(r.id),
+            time: r.time,
+            global_rank: r.global_rank,
+            version_rank: r.version_rank,
+            version: this.versions[num(r.version_id)] || String(r.version_id),
+            map_id: num(r.map_id),
+            map: r.map,
+            raw_name: r.raw_name,
+            player: r.player,
+            margin,
+          },
+          undefined,
+          "raw_name",
+          "player"
+        )
+      );
     }
     const maxRow = await this.one("SELECT COALESCE(MAX(id), 0) m FROM race");
     return { maxId: num(maxRow.m), records: out };
@@ -803,7 +830,7 @@ class RaceDB {
          FROM race r JOIN player pl ON pl.id = r.player_id
          WHERE r.map_id = $1
        )
-       SELECT k.rid, k.time, rep.name
+       SELECT k.rid, k.time, k.cid, rep.name
        FROM k JOIN player rep ON rep.id = k.cid
        WHERE k.rn = 1 ORDER BY k.time, k.rid LIMIT 50`,
       [map.id]
@@ -826,7 +853,7 @@ class RaceDB {
 
     let body = `//${name} top scores\n\n`;
     for (const r of top) {
-      const cleanName = sanitize(r.name);
+      const cleanName = sanitize(this._cn(r.name, r.cid));
       if (!cleanName) continue; // empty token would truncate the loader
       const sectors = cpsByRace.get(num(r.rid)) || [];
       let line = `"${r.time}" "${cleanName}" "${sectors.length}" `;
@@ -869,7 +896,7 @@ class RaceDB {
          WHERE r.map_id = $1
          GROUP BY pl.canonical_id
        )
-       SELECT rep.name AS name, RANK() OVER (ORDER BY b.t) AS rank
+       SELECT rep.name AS name, b.cid AS cid, RANK() OVER (ORDER BY b.t) AS rank
        FROM bests b JOIN player rep ON rep.id = b.cid
        ORDER BY rank, rep.name`,
       [map.id]
@@ -884,7 +911,7 @@ class RaceDB {
     // empty-name row is skipped from the body below.
     let body = `//ranks ${rows.length}\n`;
     for (const r of rows) {
-      const nm = sanitize(r.name);
+      const nm = sanitize(this._cn(r.name, r.cid));
       if (!nm) continue; // an empty name would be an unmatchable, malformed line
       body += `${num(r.rank)} ${nm}\n`;
     }
@@ -1127,7 +1154,9 @@ class RaceDB {
       return null;
     }
     const frames = Array.isArray(g.frames) ? g.frames : [];
-    const cleanName = String(g.player || "").replace(/[\r\n\t]/g, "").slice(0, 64);
+    const cleanName = this._cn(String(g.player || ""))
+      .replace(/[\r\n\t]/g, "")
+      .slice(0, 64);
     let body = `RSGHOST 1 ${g.hz | 0} ${g.time | 0} ${frames.length}\n`;
     body += cleanName + "\n";
     body += (Array.isArray(g.cps) ? g.cps.map((n) => n | 0).join(" ") : "") + "\n";
@@ -1182,7 +1211,7 @@ class RaceDB {
          LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
         [...args, lim, off]
       )
-    ).map((r) => ({
+    ).map((r) => this._censorNamed({
       ...r,
       id: num(r.id),
       wr_pid: num(r.wr_pid),
@@ -1192,7 +1221,7 @@ class RaceDB {
       wr_version_name: this.versions[num(r.wr_version)] || null,
       weapons: Array.isArray(r.weapons) ? r.weapons : [],
       is_strafe: !!r.is_strafe,
-    }));
+    }, num(r.wr_pid), "wr_name", "wr_simplified"));
     return { total, limit: lim, offset: off, rows };
   }
 
@@ -1211,16 +1240,21 @@ class RaceDB {
          ORDER BY b.time ASC, b.player_id ASC LIMIT $2`,
         [id, lim]
       )
-    ).map((r, i) => ({
-      pos: i + 1,
-      playerId: num(r.player_id),
-      name: r.name,
-      simplified: r.simplified,
-      time: r.time,
-      globalRank: r.global_rank,
-      version: num(r.version),
-      versionName: this.versions[num(r.version)] || null,
-    }));
+    ).map((r, i) =>
+      this._censorNamed(
+        {
+          pos: i + 1,
+          playerId: num(r.player_id),
+          name: r.name,
+          simplified: r.simplified,
+          time: r.time,
+          globalRank: r.global_rank,
+          version: num(r.version),
+          versionName: this.versions[num(r.version)] || null,
+        },
+        num(r.player_id)
+      )
+    );
 
     // Per-player demo/ghost links for the leaderboard rows (one PB per player
     // per map). A row only gets links if that player has a captured replay.
@@ -1268,6 +1302,7 @@ class RaceDB {
         versionName: this.versions[num(idx.wr_version)] || null,
         splits,
       };
+      this._censorNamed(wr, wr.playerId); // WR holder name
 
       // Best-captured replay for this map: the fastest recorded demo/ghost
       // across all players (one PB per player per map, faster-only upsert).
@@ -1277,7 +1312,7 @@ class RaceDB {
       // its OWN time/holder, with isWr telling the UI whether it's the outright
       // record so it can label a slower replay honestly.
       const demo = await this.one(
-        `SELECT d.time, d.demo_path, d.bytes, p.name AS holder, p.simplified AS holder_s
+        `SELECT d.player_id, d.time, d.demo_path, d.bytes, p.name AS holder, p.simplified AS holder_s
          FROM player_demo d JOIN player p ON p.id = d.player_id
          WHERE d.map_id = $1 ORDER BY d.time ASC LIMIT 1`,
         [id]
@@ -1292,6 +1327,7 @@ class RaceDB {
           holderSimplified: demo.holder_s,
           isWr: demo.time === idx.wr_time,
         };
+        this._censorNamed(wr.demo, num(demo.player_id), "holder", "holderSimplified");
       }
       const g = await this.one(
         `SELECT g.player_id, g.time, g.hz, g.frames, p.name AS holder, p.simplified AS holder_s
@@ -1311,6 +1347,7 @@ class RaceDB {
           holderSimplified: g.holder_s,
           isWr: g.time === idx.wr_time,
         };
+        this._censorNamed(wr.ghost, wr.ghost.playerId, "holder", "holderSimplified");
       }
     }
 
@@ -1405,7 +1442,8 @@ class RaceDB {
          WHERE r.id = ANY($1)`,
         [involved]
       );
-      for (const r of rows) owner.set(num(r.id), { name: r.name, simplified: r.simplified });
+      for (const r of rows)
+        owner.set(num(r.id), this._censorNamed({ name: r.name, simplified: r.simplified }, undefined));
     }
 
     let total = 0;
@@ -1461,12 +1499,17 @@ class RaceDB {
          LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
         [...args, lim, off]
       )
-    ).map((r) => ({
-      ...r,
-      rank: num(r.rank),
-      id: num(r.id),
-      last_active: r.last_active != null ? num(r.last_active) : null,
-    }));
+    ).map((r) =>
+      this._censorNamed(
+        {
+          ...r,
+          rank: num(r.rank),
+          id: num(r.id),
+          last_active: r.last_active != null ? num(r.last_active) : null,
+        },
+        num(r.id)
+      )
+    );
     return { total, limit: lim, offset: off, rows };
   }
 
@@ -1643,6 +1686,8 @@ class RaceDB {
       }
     }
 
+    this._censorNamed(player, num(player.id)); // canonical display name
+    for (const a of aliases) this._censorNamed(a, undefined); // alias variants (no id => word list)
     return {
       id: num(player.id),
       name: player.name,
@@ -1673,6 +1718,7 @@ class RaceDB {
       [canonId]
     )) || { rank: null, points: 0, sr: 0, wr: 0, podium: 0, maps: 0 };
     if (standing.rank != null) standing.rank = num(standing.rank);
+    this._censorNamed(player, num(player.id));
     return {
       id: num(player.id),
       name: player.name,
@@ -1829,7 +1875,12 @@ class RaceDB {
          LIMIT $3`,
         [q, esc, limit]
       )
-    ).map((r) => ({ id: num(r.id), name: r.name, simplified: r.simplified, rank: num(r.rank), points: r.points }));
+    ).map((r) =>
+      this._censorNamed(
+        { id: num(r.id), name: r.name, simplified: r.simplified, rank: num(r.rank), points: r.points },
+        num(r.id)
+      )
+    );
     return { maps, players };
   }
 
@@ -2231,6 +2282,143 @@ class RaceDB {
     return (await this.all("SELECT m.name FROM map_block b JOIN map m ON m.id = b.map_id ORDER BY m.name")).map(
       (r) => String(r.name).toLowerCase()
     );
+  }
+
+  // ======================= Offensive-name censoring =========================
+  // Names are masked at DISPLAY time only (originals stay in `player`). Every
+  // display method below routes its name field(s) through _censorNamed / _cn,
+  // so a nick that trips the word list is starred everywhere it is shown — and
+  // future nicks are handled by the same read path with no backfill. See
+  // censor.js and migration 20260728120000000_name_censor.sql.
+  //
+  // IMPORTANT for maintainers: any NEW query method that returns a player name
+  // must route it through _censorNamed(row, playerId) (or _cn for a bare
+  // string), or that surface will leak un-censored names.
+
+  // (Re)load the word list + per-player overrides into an in-memory matcher.
+  // Never throws: a pre-migration table or transient error keeps the prior
+  // matcher (empty at worst), so a config hiccup can't take down reads.
+  async loadCensorConfig() {
+    try {
+      const terms = await this.all("SELECT term, mode, severity FROM censor_term WHERE active = true");
+      const overrides = new Map();
+      for (const r of await this.all("SELECT player_id, action FROM player_censor")) {
+        overrides.set(num(r.player_id), r.action);
+      }
+      this._censor = { matcher: buildMatcher(terms), overrides };
+    } catch (e) {
+      console.error("censor config load failed (keeping previous):", e?.message ?? e);
+    }
+  }
+  // Re-read config immediately (called right after an admin edit).
+  async refreshCensor() {
+    return this.loadCensorConfig();
+  }
+
+  // Censor a bare raw name string for the given player row id (id omitted =>
+  // word list only, no per-player override).
+  _cn(name, id) {
+    const ov = id != null ? this._censor.overrides.get(num(id)) : undefined;
+    return censorName(name, this._censor.matcher, ov);
+  }
+  // Mask the {name, simplified} pair on a result row IN PLACE, keeping the two
+  // consistent (simplified is re-derived from the masked raw name). Returns the
+  // row so it can wrap a .map() expression.
+  _censorNamed(obj, id, nameKey = "name", simpKey = "simplified") {
+    if (!obj) return obj;
+    const ov = id != null ? this._censor.overrides.get(num(id)) : undefined;
+    if (obj[nameKey] != null) {
+      const c = censorName(obj[nameKey], this._censor.matcher, ov);
+      if (c !== obj[nameKey]) {
+        obj[nameKey] = c;
+        if (obj[simpKey] != null) obj[simpKey] = simplifyName(c);
+      }
+    } else if (obj[simpKey] != null) {
+      obj[simpKey] = censorName(obj[simpKey], this._censor.matcher, ov);
+    }
+    return obj;
+  }
+
+  // ---- Admin management (the /admin/names page + CLI) ----
+  async censorTerms() {
+    return this.all(
+      "SELECT term, mode, severity, active, added_at, added_by FROM censor_term ORDER BY severity, term"
+    );
+  }
+  async addCensorTerm(term, mode, severity, by, now = Math.floor(Date.now() / 1000)) {
+    const t = normalizeTerm(term);
+    if (!t) return null;
+    const m = mode === "word" ? "word" : "norm";
+    const sev = ["slur", "hate", "sexual", "profanity"].includes(severity) ? severity : "profanity";
+    await this.pool.query(
+      `INSERT INTO censor_term (term, mode, severity, active, added_at, added_by)
+       VALUES ($1, $2, $3, true, $4, $5)
+       ON CONFLICT (term) DO UPDATE SET mode = EXCLUDED.mode, severity = EXCLUDED.severity,
+         active = true, added_at = EXCLUDED.added_at, added_by = EXCLUDED.added_by`,
+      [t, m, sev, now, by]
+    );
+    await this.refreshCensor();
+    return t;
+  }
+  async removeCensorTerm(term) {
+    const t = normalizeTerm(term);
+    const r = await this.pool.query("DELETE FROM censor_term WHERE term = $1", [t]);
+    await this.refreshCensor();
+    return r.rowCount > 0;
+  }
+  // action='allow' whitelists a false positive; action='censor' force-masks a
+  // nick the word list missed. Keyed by the player row whose name is displayed.
+  async setPlayerCensor(playerId, action, reason, by, now = Math.floor(Date.now() / 1000)) {
+    if (action !== "allow" && action !== "censor") return false;
+    await this.pool.query(
+      `INSERT INTO player_censor (player_id, action, reason, set_at, set_by)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (player_id) DO UPDATE SET action = EXCLUDED.action, reason = EXCLUDED.reason,
+         set_at = EXCLUDED.set_at, set_by = EXCLUDED.set_by`,
+      [playerId, action, reason || null, now, by]
+    );
+    await this.refreshCensor();
+    return true;
+  }
+  async clearPlayerCensor(playerId) {
+    const r = await this.pool.query("DELETE FROM player_censor WHERE player_id = $1", [playerId]);
+    await this.refreshCensor();
+    return r.rowCount > 0;
+  }
+  // Representative (displayed) player rows that trip the word list OR carry an
+  // override — the review table for /admin/names. Scans in memory against the
+  // loaded matcher (cheap: short names, small term list).
+  async censoredPlayers({ limit = 1000 } = {}) {
+    // Scan the displayed (canonical) players in memory against the matcher.
+    // Overridden rows first so they can't be pushed out by the cap; a generous
+    // LIMIT bounds the fetch (prod has ~9k standings players) without clipping.
+    const rows = await this.all(
+      `SELECT p.id, p.name, p.simplified, pc.action, pc.reason, pc.set_by
+       FROM player p
+       JOIN standings s ON s.player_id = p.id
+       LEFT JOIN player_censor pc ON pc.player_id = p.id
+       ORDER BY (pc.action IS NOT NULL) DESC, p.id
+       LIMIT 50000`
+    );
+    const out = [];
+    for (const r of rows) {
+      const id = num(r.id);
+      const ov = this._censor.overrides.get(id);
+      const terms = this._censor.matcher.scan(r.name);
+      if (!terms.length && !ov) continue;
+      out.push({
+        id,
+        name: r.name,
+        simplified: r.simplified,
+        masked: this._cn(r.name, id),
+        terms,
+        action: ov || null,
+        reason: r.reason || null,
+        set_by: r.set_by || null,
+      });
+      if (out.length >= limit) break;
+    }
+    return out; // already override-first via the query's ORDER BY
   }
 
   // Per-map weapon inventory for the game servers' randmap-by-weapon voting
