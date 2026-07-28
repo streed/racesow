@@ -25,6 +25,13 @@ const uint API_TOP_REFRESH_MS = 60 * 1000;
 // frame fires one immediately; then one per refresh interval. Same levelTime
 // idiom as lastRecordSent in hrace.as.
 uint apiTopLastFetch = 0;
+// The native coalesces topscores fetches with a single per-type generation
+// counter, dropping any but the latest-queued as "superseded". Queuing base AND
+// "<map>-reversed" in the same frame therefore races — the reversed fetch (added
+// second) supersedes the base one, so the base board would never be written.
+// Alternate the two variants across refresh cycles so each is the sole in-flight
+// topscores fetch when it completes.
+bool apiTopFetchReversed = false;
 
 // --- Verified record announcements ------------------------------------------
 // A finish that ranks #1 in the LOCAL top scores is only a genuine server/world
@@ -128,9 +135,14 @@ void RACE_ApiTopThink()
         Cvar mapNameVar( "mapname", "", 0 );
         String baseMap = mapNameVar.string.tolower();
         // empty token: the endpoint is public, so the ingest write-credential
-        // has no business riding along on this request. Refresh both the
-        // standard and the reverse-variant boards.
-        RS_ApiFetchTop( rsApiTopUrl.string, "", baseMap );
-        RS_ApiFetchTop( rsApiTopUrl.string, "", baseMap + REVERSE_SUFFIX );
+        // has no business riding along on this request. Alternate the standard
+        // and reverse-variant boards across cycles (see apiTopFetchReversed) so
+        // neither supersedes the other in the native's per-type fetch coalescing;
+        // the first fetch on a fresh map is the base board.
+        if ( apiTopFetchReversed )
+            RS_ApiFetchTop( rsApiTopUrl.string, "", baseMap + REVERSE_SUFFIX );
+        else
+            RS_ApiFetchTop( rsApiTopUrl.string, "", baseMap );
+        apiTopFetchReversed = !apiTopFetchReversed;
     }
 }
