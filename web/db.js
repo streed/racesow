@@ -826,6 +826,13 @@ class RaceDB {
     const row = await this.one("SELECT id FROM map WHERE name = $1", [String(name).toLowerCase()]);
     return row ? num(row.id) : null;
   }
+  // Real (un-censored) map name for a map id. Used by the /map/:id/padpork
+  // redirect so an offensive map name resolves to its external page WITHOUT the
+  // name ever reaching the client.
+  async mapNameById(id) {
+    const row = await this.one("SELECT name FROM map WHERE id = $1", [id]);
+    return row ? row.name : null;
+  }
 
   // --------------------------------------------------------------------------
   // Live topscores for game servers (GET /api/game/topscores?map=) ------------

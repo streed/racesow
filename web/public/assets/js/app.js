@@ -124,11 +124,9 @@ const mapNameHtml = (n) =>
     ? `${esc(baseMapName(n))} <span class="pill rev" title="Reverse route — separate leaderboard">REVERSE</span>`
     : esc(n);
 
-/* External link to a map's page on padpork.org (map downloads/info). Reversed
-   variants have no padpork entry, so link to the base map. */
-function padporkUrl(mapName) {
-  return "https://padpork.org/maps/" + encodeURIComponent(baseMapName(mapName));
-}
+/* A map's external padpork.org page is linked by map id (/map/:id/padpork), so
+   the server can resolve the REAL name for the redirect and a censored/offensive
+   map name never reaches the client. Reversed variants strip "-reversed" there. */
 
 function setActiveNav(path) {
   document.querySelectorAll("nav.main a").forEach((a) => {
@@ -447,7 +445,7 @@ async function viewMaps(params) {
           ${data.rows.map((m) => `
             <tr class="clickable" data-nav="#/map/${m.id}">
               <td class="mapname">${mapNameHtml(m.name)}
-                <a class="extlink" href="${padporkUrl(m.name)}" target="_blank" rel="noopener external" title="${esc(baseMapName(m.name))} on padpork.org">↗</a>${weaponBadges(m)}
+                <a class="extlink" href="/map/${m.id}/padpork" target="_blank" rel="noopener external" title="${esc(baseMapName(m.name))} on padpork.org">↗</a>${weaponBadges(m)}
               </td>
               <td class="num">${fmtNum(m.records != null ? m.records : m.races)}</td>
               <td class="num">${fmtNum(m.finishes != null ? m.finishes : m.races)}</td>
@@ -588,7 +586,7 @@ async function viewMap(id) {
     <div class="page-title">${mapNameHtml(d.name)}</div>
     ${isReversedMap(d.name) ? `<p class="page-sub reverse-note">Reverse route of <b>${esc(baseMapName(d.name))}</b> — start at the finish line, run the checkpoints backward to the start. Separate leaderboard from the normal map. <a data-nav="#/about">How reverse mode works ↗</a></p>` : ""}
     <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board
-      · <a class="extlink" href="${padporkUrl(d.name)}" target="_blank" rel="noopener external">padpork.org ↗</a></p>
+      · <a class="extlink" href="/map/${d.id}/padpork" target="_blank" rel="noopener external">padpork.org ↗</a></p>
 
     <div class="map-hero">
       <div class="map-hero-main">

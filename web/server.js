@@ -2539,6 +2539,17 @@ app.use(
 );
 
 // SPA fallback for client-side routes (non-API, non-asset).
+// External padpork.org link for a map, by id. The site links here (never by
+// name) so a censored/offensive map name never reaches the client: we resolve
+// the REAL name server-side and 302 to its padpork page. Reversed variants have
+// no padpork entry, so strip the "-reversed" suffix and link to the base map.
+app.get("/map/:id/padpork", wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  const name = id == null ? null : await race.mapNameById(id);
+  const base = name ? String(name).replace(/-reversed$/, "") : "";
+  res.redirect(302, base ? "https://padpork.org/maps/" + encodeURIComponent(base) : "https://padpork.org/maps");
+}));
+
 app.get("*", (req, res, next) => {
   if (req.path.startsWith("/api/") || req.path.includes(".")) return next();
   sendShell(res, defaultShell(req));
