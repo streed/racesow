@@ -33,6 +33,18 @@ async function adminQuery(sql) {
   }
 }
 
+// Query the throwaway test DB itself (adminQuery talks to the maintenance DB) —
+// used to simulate the production data state a lost legacy ghost leaves behind.
+async function dbQuery(sql, params = []) {
+  const c = new pg.Client({ connectionString: ADMIN_URL.replace(/\/[^/]*$/, `/${dbName}`) });
+  await c.connect();
+  try {
+    return await c.query(sql, params);
+  } finally {
+    await c.end();
+  }
+}
+
 async function ingest(body, token = TOKEN, route = "/ingest") {
   const headers = { "Content-Type": "application/json" };
   if (token != null) headers.Authorization = `Bearer ${token}`;
@@ -279,4 +291,43 @@ test("ghost durability: a lost file is served + restored from the DB payload", a
   assert.equal((await gr.json()).frames.length, frames.length);
   // ...and the file has been restored on disk for subsequent reads + the heatmap.
   assert.ok(fs.existsSync(file), "ghost file restored from the DB payload");
+});
+
+test("WR ghost: a lost fastest ghost falls through to the fastest recoverable one (not blank)", async () => {
+  // Regression: the map's fastest player_ghost row is an orphan captured before
+  // the payload column whose file was lost to a volume reset (no file AND no
+  // payload). It must not shadow the intact, slower ghosts behind it — otherwise
+  // the map serves NO WR ghost at all (the in-game ghost racer + browser replay
+  // go blank) even though recoverable ghosts exist. Reproduces the aurora-speed1
+  // production state (fastest two rows payloadless + fileless, five intact behind).
+  const fast = [[0, 0, 0, 0, 0, 0, 0, 0, 0], [5, 0, 2, 0, 45, 0, 200, 0, 10]];
+  const slow = [[0, 0, 0, 0, 0, 0, 0, 0, 0], [9, 1, 3, 0, 60, 0, 250, 5, 0], [18, 4, 6, 0, 70, 0, 260, 8, -5]];
+
+  assert.equal((await ingest(finishBody({ map: "shadowmap", name: "FastLost", time: 5000, cps: [2000] }))).status, 200);
+  assert.equal((await ingest(finishBody({ map: "shadowmap", name: "SlowIntact", time: 9000, cps: [4000] }))).status, 200);
+  await new Promise((r) => setTimeout(r, 3600)); // aggregate refresh so /maps sees it
+  const mapId = (await getJson("/maps?q=shadowmap")).rows[0].id;
+
+  assert.deepEqual((await ingest(JSON.stringify({ version: "wsw 2.1", map: "shadowmap", name: "FastLost", login: "", time: 5000, hz: 25, frames: fast, cps: [1] }), TOKEN, "/ingest/ghost")).json, { ok: true, stored: true });
+  assert.deepEqual((await ingest(JSON.stringify({ version: "wsw 2.1", map: "shadowmap", name: "SlowIntact", login: "", time: 9000, hz: 25, frames: slow, cps: [2] }), TOKEN, "/ingest/ghost")).json, { ok: true, stored: true });
+
+  // Make the fastest (FastLost) ghost unrecoverable: delete its file AND null its
+  // DB payload — exactly what a lost pre-payload-column orphan looks like.
+  const lost = (await dbQuery("SELECT player_id FROM player_ghost WHERE map_id = $1 AND time = 5000", [mapId])).rows[0].player_id;
+  fs.rmSync(path.join(ghostDir, String(mapId), `${lost}.json.gz`));
+  await dbQuery("UPDATE player_ghost SET payload = NULL WHERE map_id = $1 AND player_id = $2", [mapId, lost]);
+
+  // Game endpoint: must fall through to SlowIntact's ghost, not 404 / "no ghost".
+  const tr = await fetch(`${base}/api/game/ghost?map=shadowmap`);
+  assert.equal(tr.status, 200, "game ghost served despite the lost fastest row");
+  const lines = (await tr.text()).split("\n");
+  assert.equal(lines[0], `RSGHOST 1 25 9000 ${slow.length}`, "serves the fastest RECOVERABLE ghost");
+  assert.equal(lines[1], "SlowIntact");
+
+  // Browser endpoint: same fall-through.
+  const gr = await fetch(`${base}/api/maps/${mapId}/ghost`);
+  assert.equal(gr.status, 200, "browser ghost served despite the lost fastest row");
+  const ghost = await gr.json();
+  assert.equal(ghost.time, 9000);
+  assert.equal(ghost.frames.length, slow.length);
 });

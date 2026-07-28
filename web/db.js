@@ -1052,34 +1052,50 @@ class RaceDB {
     return true;
   }
 
-  // Raw gzipped ghost JSON for a (map, player), served with Content-Encoding:
-  // gzip to the browser viewer. playerId omitted => the map's fastest recorded
-  // ghost (the WR replay). null if there is no such ghost / the file is missing.
-  async ghostGzip(mapId, playerId = null) {
-    let pid = playerId;
-    if (pid == null) {
-      const row = await this.one(
-        "SELECT player_id FROM player_ghost WHERE map_id = $1 ORDER BY time ASC LIMIT 1",
-        [mapId]
-      );
-      if (!row) return null;
-      pid = num(row.player_id);
-    } else if (!(await this.one("SELECT 1 FROM player_ghost WHERE map_id = $1 AND player_id = $2", [mapId, pid]))) {
-      return null;
-    }
+  // Read the gzipped ghost bytes for one specific (map, player): the local file
+  // if present, else the durable DB payload (restoring the file for later reads
+  // + the heatmap). null when the row has neither a file nor a payload — an
+  // orphan captured before the payload column whose file was lost to a volume
+  // reset (see syncGhostPayloads). Assumes the row exists.
+  async _readGhostBytes(mapId, pid) {
     const file = this._ghostPath(mapId, pid);
     try {
       return await fs.promises.readFile(file);
     } catch {
-      // File missing (volume reset / lost pre-shared-mount): fall back to the
-      // durable DB payload and restore the file so later reads + the heatmap are
-      // served locally again. Only null when we truly never stored the payload.
       const row = await this.one("SELECT payload FROM player_ghost WHERE map_id = $1 AND player_id = $2", [mapId, pid]);
       if (!row || !row.payload) return null;
       const buf = Buffer.isBuffer(row.payload) ? row.payload : Buffer.from(row.payload);
       try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, buf); } catch { /* read-only fs: still serve */ }
       return buf;
     }
+  }
+
+  // Raw gzipped ghost JSON for a (map, player), served with Content-Encoding:
+  // gzip to the browser viewer. playerId omitted => the map's fastest recorded
+  // ghost (the WR replay). null if there is no such ghost / the file is missing.
+  async ghostGzip(mapId, playerId = null) {
+    if (playerId != null) {
+      if (!(await this.one("SELECT 1 FROM player_ghost WHERE map_id = $1 AND player_id = $2", [mapId, playerId])))
+        return null;
+      return this._readGhostBytes(mapId, num(playerId));
+    }
+    // WR replay: the fastest ghost we can ACTUALLY serve. A fastest-but-lost
+    // legacy row (no local file AND no DB payload — captured before the payload
+    // column, its file gone to a volume reset) must not shadow the recoverable
+    // ghosts behind it, or the map serves no WR ghost at all even though slower,
+    // intact ghosts exist (and the in-game ghost racer + browser replay go
+    // blank). Walk candidates fastest-first and return the first that yields
+    // bytes. Cheap: rows/map are few, this endpoint is cache-fronted, and the
+    // common case (fastest row intact) returns on the first iteration.
+    const rows = (await this.pool.query(
+      "SELECT player_id FROM player_ghost WHERE map_id = $1 ORDER BY time ASC",
+      [mapId]
+    )).rows;
+    for (const r of rows) {
+      const buf = await this._readGhostBytes(mapId, num(r.player_id));
+      if (buf) return buf;
+    }
+    return null;
   }
 
   // Reconcile the ghost files on disk with the durable DB payloads: backfill a
@@ -1289,7 +1305,8 @@ class RaceDB {
       )) demoByPid.set(num(d.player_id), d);
       const ghostByPid = new Map();
       for (const g of await this.all(
-        "SELECT player_id, time, hz, frames FROM player_ghost WHERE map_id = $1 AND player_id = ANY($2)",
+        // payload IS NOT NULL => the ghost bytes are servable (see wr.ghost note).
+        "SELECT player_id, time, hz, frames FROM player_ghost WHERE map_id = $1 AND player_id = ANY($2) AND payload IS NOT NULL",
         [id, pids]
       )) ghostByPid.set(num(g.player_id), g);
       for (const row of leaderboard) {
@@ -1352,9 +1369,16 @@ class RaceDB {
         this._censorNamed(wr.demo, num(demo.player_id), "holder", "holderSimplified");
       }
       const g = await this.one(
+        // Only advertise a ghost whose trajectory bytes are actually servable:
+        // ghostGzip() serves from the DB payload (or a file it restores from the
+        // payload), so a row with a NULL payload and a lost file 404s. Requiring
+        // payload IS NOT NULL keeps the "Watch replay" button and /replay/:id in
+        // sync with what the ghost endpoint can serve. syncGhostPayloads()
+        // backfills payload from any surviving file at startup, so this predicate
+        // is exactly "recoverable".
         `SELECT g.player_id, g.time, g.hz, g.frames, p.name AS holder, p.simplified AS holder_s
          FROM player_ghost g JOIN player p ON p.id = g.player_id
-         WHERE g.map_id = $1 ORDER BY g.time ASC LIMIT 1`,
+         WHERE g.map_id = $1 AND g.payload IS NOT NULL ORDER BY g.time ASC LIMIT 1`,
         [id]
       );
       if (g) {
@@ -1697,7 +1721,8 @@ class RaceDB {
       )) demoByMap.set(num(d.map_id), d);
       const ghostByMap = new Map();
       for (const g of await this.all(
-        "SELECT map_id, time, hz, frames FROM player_ghost WHERE player_id = $1 AND map_id = ANY($2)",
+        // payload IS NOT NULL => the ghost bytes are servable (see wr.ghost note).
+        "SELECT map_id, time, hz, frames FROM player_ghost WHERE player_id = $1 AND map_id = ANY($2) AND payload IS NOT NULL",
         [canonId, mids]
       )) ghostByMap.set(num(g.map_id), g);
       for (const row of records) {
