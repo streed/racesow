@@ -5,6 +5,9 @@ void target_checkpoint_use( Entity@ self, Entity@ other, Entity@ activator )
 
     Player@ player = RACE_GetPlayer( activator.client );
 
+    G_Print( "RSDBG checkpoint-touch: cp=" + self.count + " inRace=" + ( player.inRace ? "1" : "0" )
+            + " numCheckpoints=" + numCheckpoints + "\n" );
+
     if ( player.touchCheckPoint( self.count ) )
         self.useTargets( activator );
 }
