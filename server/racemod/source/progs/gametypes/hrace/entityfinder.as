@@ -89,8 +89,14 @@ class EntityFinder
         array<Entity@>@ targeting = ent.findTargeting();
         if( ent.classname == "trigger_multiple" || ent.classname == "info_player_deathmatch" || ent.classname == "func_door" || ent.classname == "func_door_rotating" || ( addUntargeted && targeting.length == 0 ) )
         {
+            // Near-zero (not exactly 0) so the start trigger stays effectively
+            // re-triggerable without a debounce, WITHOUT tripping Warfork's
+            // multi_trigger, which frees any trigger with wait <= 0 after its
+            // first fire (G_FreeEdict) — that deleted the start trigger for the
+            // rest of the map, so a race could be started once and never again
+            // (finish/death/restart could not re-arm it). Warsow tolerated 0.
             if( resetWait )
-                ent.wait = 0;
+                ent.wait = 0.05;
             this.add( type, ent, Centre( ent ) );
             result = true;
         }
