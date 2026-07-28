@@ -67,7 +67,6 @@ Cvar rs_tv_pov( "rs_tv_pov", "", CVAR_SERVERINFO );
 // TEAM_SPECTATOR guard below makes this inert there. Set 0 to require a manual
 // join.
 Cvar rs_autojoin( "rs_autojoin", "1", 0 );
-uint rsdbgNextLog = 0; // RSDBG throttle
 bool RACE_IsTvClient( Client@ client )
 {
     if ( @client is null )
@@ -79,7 +78,6 @@ bool RACE_IsTvClient( Client@ client )
 // the player has finished the race. This entity times his automatic respawning
 void race_respawner_think( Entity@ respawner )
 {
-    G_Print( "RSDBG respawner-think fired slot=" + respawner.count + "\n" );
     Client@ client = G_GetClient( respawner.count );
 
     // for accuracy, reset scores.
@@ -480,9 +478,6 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     RACE_GhostApplyClientPref( ent.client );
 
     Player@ player = RACE_GetPlayer( ent.client );
-    G_Print( "RSDBG respawn ENTER: " + ent.client.name + " old=" + old_team + " new=" + new_team
-            + " postRace=" + ( player.postRace ? "1" : "0" ) + " inRace=" + ( player.inRace ? "1" : "0" )
-            + " ghosting=" + ( ent.isGhosting() ? "1" : "0" ) + "\n" );
     player.cancelRace();
 
     player.setQuickMenu();
@@ -709,17 +704,6 @@ void GT_ThinkRules()
 
         // all stats are set to 0 each frame, so it's only needed to set a stat if it's going to get a value
         @player = RACE_GetPlayer( client );
-
-        if ( client.team != TEAM_SPECTATOR && levelTime >= rsdbgNextLog )
-        {
-            Entity@ pe = client.getEnt();
-            G_Print( "RSDBG state: " + client.name + " team=" + client.team + " health=" + pe.health
-                    + " ghost=" + ( pe.isGhosting() ? "1" : "0" ) + " mt=" + pe.moveType
-                    + " inRace=" + ( player.inRace ? "1" : "0" ) + " postRace=" + ( player.postRace ? "1" : "0" )
-                    + " ox=" + pe.origin.x + " oy=" + pe.origin.y + "\n" );
-            rsdbgNextLog = levelTime + 1000;
-        }
-
         if ( player.inRace || ( player.practicing && player.recalled && client.getEnt().health > 0 ) )
         {
             if ( client.getEnt().moveType == MOVETYPE_NONE )

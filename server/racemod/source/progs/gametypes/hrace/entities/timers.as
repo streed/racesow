@@ -5,9 +5,6 @@ void target_checkpoint_use( Entity@ self, Entity@ other, Entity@ activator )
 
     Player@ player = RACE_GetPlayer( activator.client );
 
-    G_Print( "RSDBG checkpoint-touch: cp=" + self.count + " inRace=" + ( player.inRace ? "1" : "0" )
-            + " numCheckpoints=" + numCheckpoints + "\n" );
-
     if ( player.touchCheckPoint( self.count ) )
         self.useTargets( activator );
 }
@@ -26,10 +23,6 @@ void target_stoptimer_use( Entity@ self, Entity@ other, Entity@ activator )
         return;
 
     Player@ player = RACE_GetPlayer( activator.client );
-
-    G_Print( "RSDBG finish-touch: inRace=" + ( player.inRace ? "1" : "0" ) + " practicing=" + ( player.practicing ? "1" : "0" )
-            + " reversed=" + ( player.reversed ? "1" : "0" ) + " postRace=" + ( player.postRace ? "1" : "0" )
-            + " team=" + activator.client.team + " match=" + match.getState() + "\n" );
 
     // Reverse mode: the map's FINISH line is the reverse START. Begin the timed
     // run here (same path — and prejump gate — as a normal start).
@@ -84,10 +77,6 @@ void target_starttimer_use( Entity@ self, Entity@ other, Entity@ activator )
 
     Player@ player = RACE_GetPlayer( activator.client );
 
-    G_Print( "RSDBG start-touch: inRace=" + ( player.inRace ? "1" : "0" ) + " practicing=" + ( player.practicing ? "1" : "0" )
-            + " reversed=" + ( player.reversed ? "1" : "0" ) + " postRace=" + ( player.postRace ? "1" : "0" )
-            + " team=" + activator.client.team + " match=" + match.getState() + "\n" );
-
     // Reverse mode: the map's START line is the reverse FINISH. Stop the timer
     // and bank the reversed run here (same path as a normal finish).
     if ( player.reversed )
@@ -118,16 +107,11 @@ void target_starttimer_use( Entity@ self, Entity@ other, Entity@ activator )
     }
 }
 
-// doesn't need to do anything at all, just sit there, waiting.
-// NOTE: do NOT set ent.wait here. On the START, `ent` is the trigger_multiple,
-// whose wait defaults to 0.2 (SP_trigger_multiple). Warfork's multi_trigger frees
-// any trigger with wait <= 0 after its FIRST fire (G_FreeEdict), so `ent.wait = 0`
-// deleted the start trigger for the rest of the map — the race could be started
-// once and then never again (finish/death/restart could not re-arm it). Warsow's
-// engine tolerated wait=0; Warfork does not. Stock race.as never sets it either.
+// doesn't need to do anything at all, just sit there, waiting
 void target_starttimer( Entity@ ent )
 {
     @ent.use = target_starttimer_use;
+    ent.wait = 0;
 }
 
 void target_startTimer( Entity@ ent )
