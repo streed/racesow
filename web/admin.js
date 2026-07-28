@@ -410,6 +410,38 @@ try {
       console.log(ok ? "Removed." : "Term not found.");
       break;
     }
+    case "mapnames": {
+      const rows = await race.censoredMaps();
+      if (!rows.length) {
+        console.log("No flagged or censored map names.");
+        break;
+      }
+      console.log("id     state     real name                      shown as");
+      for (const r of rows) {
+        console.log(
+          `${String(r.id).padEnd(6)} ${String(r.action || "auto").padEnd(9)} ${String(r.name)
+            .slice(0, 30)
+            .padEnd(30)} ${r.action === "allow" ? "—" : r.masked}`
+        );
+      }
+      break;
+    }
+    case "map-censor":
+    case "map-allow": {
+      const id = parseInt(args[0], 10);
+      if (Number.isNaN(id)) throw new Error(`usage: node admin.js ${cmd} <mapId>`);
+      const act = cmd === "map-allow" ? "allow" : "censor";
+      await race.setMapCensor(id, act, "cli", "cli");
+      console.log(`Map #${id} -> ${act === "allow" ? "shown in full (whitelisted)" : "force-censored"}.`);
+      break;
+    }
+    case "map-uncensor": {
+      const id = parseInt(args[0], 10);
+      if (Number.isNaN(id)) throw new Error("usage: node admin.js map-uncensor <mapId>");
+      const ok = await race.clearMapCensor(id);
+      console.log(ok ? `Cleared override on map #${id}.` : `No override on map #${id}.`);
+      break;
+    }
 
     default:
       console.log(
@@ -422,6 +454,7 @@ try {
           "  resolve-map <mapId> | dismiss-map <mapId>\n" +
           "  block-map <mapId> [reason] | unblock-map <mapId> | blocked\n" +
           "  names | censor <playerId> | allow <playerId> | uncensor <playerId>\n" +
+          "  mapnames | map-censor <mapId> | map-allow <mapId> | map-uncensor <mapId>\n" +
           "  terms | term-add <term> [norm|word] [severity] | term-rm <term>"
       );
   }

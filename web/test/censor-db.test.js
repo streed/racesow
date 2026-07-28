@@ -119,6 +119,81 @@ test("word-list edits take effect live", async (t) => {
   assert.equal((await race.playerDetail(await pidByMap(race, "toxic"))).name, "Bananaman");
 });
 
+// id of a map by its (real) name.
+async function mapId(race, name) {
+  return Number((await race.one("SELECT id FROM map WHERE name = $1", [name])).id);
+}
+
+test("map names are masked across display queries; real name kept for lookups", async (t) => {
+  const race = await freshDb(t);
+  await ingest(race, "pneumo-shit6", "Nova", 40000); // offensive map name
+  await ingest(race, "cleanmap", "Nova", 41000); // clean
+
+  // maps() listing: offensive map masked, clean untouched.
+  const list = await race.maps({});
+  const names = Object.fromEntries(list.rows.map((r) => [r.id, r.name]));
+  const badId = await mapId(race, "pneumo-shit6");
+  assert.equal(names[badId], "pneumo-****6");
+  assert.equal(names[await mapId(race, "cleanmap")], "cleanmap");
+
+  // mapDetail top-level name + search + recent finishes all mask it.
+  assert.equal((await race.mapDetail(badId)).name, "pneumo-****6");
+  assert.equal((await race.search("pneumo")).maps.find((m) => m.id === badId).name, "pneumo-****6");
+  const feed = await race.recentFinishes({ limit: 20 });
+  assert.ok(feed.some((f) => f.map === "pneumo-****6"));
+  assert.ok(!feed.some((f) => /shit/.test(f.map)));
+
+  // The stored name is untouched — the game/site still resolve the REAL name.
+  assert.equal((await race.one("SELECT name FROM map WHERE id=$1", [badId])).name, "pneumo-shit6");
+  assert.ok((await race.gameRanksText("pneumo-shit6")).length, "real name still resolves in-game");
+});
+
+test("map overrides: allow whitelists, censor force-masks", async (t) => {
+  const race = await freshDb(t);
+  await ingest(race, "pneumo-shit6", "Nova", 40000); // auto-censored
+  await ingest(race, "coolrun", "Nova", 41000); // clean
+  const badId = await mapId(race, "pneumo-shit6");
+  const cleanId = await mapId(race, "coolrun");
+
+  assert.equal(await race.setMapCensor(badId, "allow", "fine", "test"), true);
+  assert.equal((await race.mapDetail(badId)).name, "pneumo-shit6"); // shown in full
+
+  assert.equal(await race.setMapCensor(cleanId, "censor", "manual", "test"), true);
+  assert.equal((await race.mapDetail(cleanId)).name, "*******"); // "coolrun" -> 7 stars
+
+  await race.clearMapCensor(badId);
+  assert.equal((await race.mapDetail(badId)).name, "pneumo-****6"); // back to auto
+});
+
+test("map overrides apply by name too (sync display / live-snapshot spots)", async (t) => {
+  const race = await freshDb(t);
+  await ingest(race, "coolrun", "Nova", 40000); // clean
+  await ingest(race, "ok-cuntroll", "Nova", 41000); // word-list hit
+  // Word-list masking works when only the name is known.
+  assert.equal(race._cnMapByName("ok-cuntroll"), "ok-****roll");
+  // Force-censoring a clean map is honoured by the name-keyed override.
+  await race.setMapCensor(await mapId(race, "coolrun"), "censor", "x", "test");
+  assert.equal(race._cnMapByName("coolrun"), "*******");
+  // Allowing a word-list hit shows it in full, by name.
+  await race.setMapCensor(await mapId(race, "ok-cuntroll"), "allow", "ok", "test");
+  assert.equal(race._cnMapByName("ok-cuntroll"), "ok-cuntroll");
+});
+
+test("censoredMaps lists flagged + overridden maps for the admin UI", async (t) => {
+  const race = await freshDb(t);
+  await ingest(race, "ok-cuntroll", "Nova", 40000);
+  await ingest(race, "nicemap", "Nova", 41000);
+  await race.setMapCensor(await mapId(race, "nicemap"), "censor", "manual", "test");
+
+  const flagged = await race.censoredMaps();
+  const byName = Object.fromEntries(flagged.map((f) => [f.name, f]));
+  assert.ok(byName["ok-cuntroll"], "auto-flagged map is listed");
+  assert.equal(byName["ok-cuntroll"].masked, "ok-****roll");
+  assert.ok(byName["ok-cuntroll"].terms.some((tm) => tm.term === "cunt"));
+  assert.ok(byName["nicemap"], "force-censored map is listed");
+  assert.equal(byName["nicemap"].action, "censor");
+});
+
 test("censoredPlayers lists flagged + overridden players for the admin UI", async (t) => {
   const race = await freshDb(t);
   await ingest(race, "rev", "^1Nigger^7", 40000);

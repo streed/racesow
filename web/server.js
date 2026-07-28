@@ -249,7 +249,7 @@ api.get("/servers/:id", wrap(async (req, res) => {
   res.json({
     ...s,
     updatedAt: snap.updatedAt,
-    live: li ? { ...li, mapId } : { online: false, players: [] },
+    live: li ? { ...li, map: race._cnMap(li.map, mapId), mapId } : { online: false, players: [] },
     stream: streams.for(id),
   });
 }));
@@ -264,7 +264,7 @@ api.get("/maps/blocked", cache(60), wrap(async (_req, res) => {
   res.json({
     maps: rows.map((r) => ({
       id: r.map_id,
-      name: r.name,
+      name: race._cnMap(r.name, r.map_id), // display-only; real name unaffected in play
       reason: r.reason,
       blockedAt: Number(r.blocked_at),
       blockedBy: r.blocked_by,
@@ -396,11 +396,12 @@ api.get("/records", cache(60), wrap(async (req, res) => {
 api.get("/live", wrap(async (_req, res) => {
   const snap = live.getLive();
   const servers = await Promise.all(
-    snap.servers.map(async (s) => ({
-      ...s,
-      mapId: s.map ? await race.mapIdByName(s.map) : null,
-      stream: streams.for(s.id),
-    }))
+    snap.servers.map(async (s) => {
+      const mapId = s.map ? await race.mapIdByName(s.map) : null;
+      // Censor the displayed current-map name (real name already used above for
+      // the mapId link lookup).
+      return { ...s, map: race._cnMap(s.map, mapId), mapId, stream: streams.for(s.id) };
+    })
   );
   res.json({
     ...snap,
@@ -429,7 +430,7 @@ api.get("/streams", cache(10), wrap(async (_req, res) => {
       pov: stream.pov,
       online: !!(li && li.online),
       players: li && li.players ? li.players.length : 0,
-      map: li ? li.map || null : null,
+      map: li ? race._cnMapByName(li.map || null) : null,
     });
   }
   res.json({ updatedAt: snap.updatedAt, streams: list });
@@ -1663,7 +1664,11 @@ const CENSOR_CSS = `
 admin.get("/names", requireAdmin, wrap(async (req, res) => {
   const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
   const csrf = escHtml(req.session.csrf);
-  const [players, terms] = await Promise.all([race.censoredPlayers(), race.censorTerms()]);
+  const [players, terms, maps] = await Promise.all([
+    race.censoredPlayers(),
+    race.censorTerms(),
+    race.censoredMaps(),
+  ]);
 
   const pbtn = (id, act, label) =>
     `<form class="inline" method="post" action="/admin/names/player/${id}">` +
@@ -1699,6 +1704,38 @@ admin.get("/names", requireAdmin, wrap(async (req, res) => {
         .join("")
     : `<tr><td colspan="5" class="empty">No names currently flagged or censored.</td></tr>`;
 
+  const mbtn = (id, act, label) =>
+    `<form class="inline" method="post" action="/admin/names/map/${id}">` +
+    `<input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="action" value="${act}">` +
+    `<button type="submit">${label}</button></form>`;
+  const mapRows = maps.length
+    ? maps
+        .map((m) => {
+          const termList = m.terms.length
+            ? m.terms.map((t) => `${escHtml(t.term)}${censorSevBadge(t.severity)}`).join(" ")
+            : "<span class='cs-muted'>—</span>";
+          const state =
+            m.action === "allow"
+              ? `<span class="cs-pill cs-allow">shown in full</span>`
+              : m.action === "censor"
+              ? `<span class="cs-pill cs-force">force-censored</span>`
+              : `<span class="cs-pill cs-auto">auto</span>`;
+          const actions = [
+            m.action !== "censor" ? mbtn(m.id, "censor", "Force-censor") : "",
+            m.action !== "allow" ? mbtn(m.id, "allow", "Allow") : "",
+            m.action ? mbtn(m.id, "clear", "Clear") : "",
+          ].join(" ");
+          return `<tr>
+            <td class="mono"><a href="/map/${m.id}" target="_blank" rel="noopener">${escHtml(m.name)}</a></td>
+            <td class="cs-masked">${m.action === "allow" ? "<span class='cs-muted'>—</span>" : escHtml(m.masked)}</td>
+            <td>${termList}</td>
+            <td>${state}</td>
+            <td class="actions">${actions}</td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="5" class="empty">No map names currently flagged or censored.</td></tr>`;
+
   const sevOptions = CENSOR_SEVERITIES.map((s) => `<option value="${s}">${s}</option>`).join("");
   const termRows = terms.length
     ? terms
@@ -1721,8 +1758,8 @@ admin.get("/names", requireAdmin, wrap(async (req, res) => {
     "Names",
     `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
     <h1>Name censoring</h1>
-    <p class="sub">Offensive nicks are masked wherever they appear (site, Discord cards, in-game boards, live rosters).
-      Originals stay in the database — records and history are never altered.
+    <p class="sub">Offensive player nicks and map names are masked wherever they appear (site, Discord cards, in-game
+      boards, live rosters). Originals stay in the database — records, history and map loading are never altered.
       <b>norm</b> matches anywhere in the colour/punctuation-stripped nick (best for slurs);
       <b>word</b> matches only whole words (fewer false positives).</p>
     ${done}
@@ -1731,6 +1768,13 @@ admin.get("/names", requireAdmin, wrap(async (req, res) => {
     <table class="cs">
       <thead><tr><th>Original</th><th>Shown as</th><th>Matched</th><th>State</th><th></th></tr></thead>
       <tbody>${playerRows}</tbody>
+    </table>
+    <h2>Flagged &amp; censored maps <span class="cs-muted">(${maps.length})</span></h2>
+    <p class="sub">Map names are masked on the site + feeds only; the real name is untouched so the map still loads,
+      votes and links normally. To remove a map from play entirely use <a href="/admin/blocked">blocked maps</a>.</p>
+    <table class="cs">
+      <thead><tr><th>Map (real name)</th><th>Shown as</th><th>Matched</th><th>State</th><th></th></tr></thead>
+      <tbody>${mapRows}</tbody>
     </table>
     <h2>Word list <span class="cs-muted">(${terms.length})</span></h2>
     <form class="card" method="post" action="/admin/names/term/add" style="max-width:560px">
@@ -1777,6 +1821,18 @@ admin.post("/names/player/:id", requireAdmin, wrap(async (req, res) => {
   }
   const ok = await race.setPlayerCensor(id, action, "set via /admin/names", req.session.username);
   res.redirect(303, `/admin/names?done=${encodeURIComponent(ok ? "Override updated." : "Invalid action.")}`);
+}));
+admin.post("/names/map/:id", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad map id");
+  const action = req.body && req.body.action;
+  if (action === "clear") {
+    await race.clearMapCensor(id);
+    return res.redirect(303, `/admin/names?done=${encodeURIComponent("Cleared map override.")}`);
+  }
+  const ok = await race.setMapCensor(id, action, "set via /admin/names", req.session.username);
+  res.redirect(303, `/admin/names?done=${encodeURIComponent(ok ? "Map override updated." : "Invalid action.")}`);
 }));
 
 // --- Game-server MOTD ---
@@ -2302,7 +2358,7 @@ function liveCardData() {
     name: s.name,
     online: !!s.online,
     hostname: s.hostname,
-    map: s.map,
+    map: race._cnMapByName(s.map), // display-only; name-keyed override (sync builder, no id)
     maxclients: s.maxclients,
     players: (s.players || []).length,
   }));
@@ -2364,7 +2420,13 @@ app.get("/og/live.png", renderLimiter, wrap(async (req, res) => {
 async function serverForOg(id) {
   const s = (await race.servers()).find((x) => x.id === id);
   if (!s) return null;
-  const li = (live.getLive().servers || []).find((x) => x.id === id) || null;
+  let li = (live.getLive().servers || []).find((x) => x.id === id) || null;
+  // Censor the displayed current-map for the OG card + description (the raw name
+  // is only needed to resolve the map id, which we do first for override support).
+  if (li && li.map) {
+    const mapId = await race.mapIdByName(li.map);
+    li = { ...li, map: race._cnMap(li.map, mapId), mapId };
+  }
   return { db: s, live: li };
 }
 

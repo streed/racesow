@@ -153,6 +153,9 @@ function presentResult(server, result, race) {
     ...base,
     online: true,
     hostname: info.sv_hostname || null,
+    // Raw current-map name — it's a functional key (server.js resolves it via
+    // mapIdByName for the map link), so it is censored at the display boundary
+    // (the /api/live, /api/servers, /api/streams responses), not here.
     map: info.mapname || null,
     gametype: info.gametype || info.g_gametype || null,
     maxclients: info.sv_maxclients ? parseInt(info.sv_maxclients, 10) : null,

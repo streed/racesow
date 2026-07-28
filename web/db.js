@@ -521,10 +521,16 @@ class RaceDB {
     this.versions = {};
     // Memoized perfect-run per map (recomputed when an ingest touches the map).
     this._perfectRunCache = new Map();
-    // Offensive-name censoring config (word-list matcher + per-player overrides),
-    // loaded from censor_term/player_censor and refreshed on a timer + admin edit.
+    // Offensive-name censoring config: word-list matcher (shared by player AND
+    // map names) + per-player and per-map override maps, loaded from
+    // censor_term/player_censor/map_censor and refreshed on a timer + admin edit.
     // Starts empty (a no-op matcher) so reads before the first load never throw.
-    this._censor = { matcher: buildMatcher([]), overrides: new Map() };
+    this._censor = {
+      matcher: buildMatcher([]),
+      overrides: new Map(),
+      mapOverrides: new Map(), // by map id
+      mapOverridesByName: new Map(), // by lowercased map name, for sync/no-id display spots
+    };
   }
 
   async _loadVersions() {
@@ -603,16 +609,19 @@ class RaceDB {
         [limit]
       )
     ).map((r) =>
-      this._censorNamed(
-        {
-          ...r,
-          id: num(r.id),
-          map_id: num(r.map_id),
-          player_id: num(r.player_id),
-          created_at: num(r.created_at),
-          versionName: null,
-        },
-        num(r.player_id)
+      this._censorMapped(
+        this._censorNamed(
+          {
+            ...r,
+            id: num(r.id),
+            map_id: num(r.map_id),
+            player_id: num(r.player_id),
+            created_at: num(r.created_at),
+            versionName: null,
+          },
+          num(r.player_id)
+        ),
+        num(r.map_id)
       )
     );
   }
@@ -656,21 +665,24 @@ class RaceDB {
         args
       )
     ).map((r) =>
-      this._censorNamed(
-        {
-          id: num(r.id),
-          time: num(r.time),
-          created_at: num(r.created_at),
-          map_id: num(r.map_id),
-          map: r.map,
-          player_id: num(r.player_id),
-          name: r.name,
-          simplified: r.simplified,
-          server: r.server,
-          pb: !!r.pb,
-          checkpoints: (r.checkpoints || []).map(num),
-        },
-        num(r.player_id)
+      this._censorMapped(
+        this._censorNamed(
+          {
+            id: num(r.id),
+            time: num(r.time),
+            created_at: num(r.created_at),
+            map_id: num(r.map_id),
+            map: r.map,
+            player_id: num(r.player_id),
+            name: r.name,
+            simplified: r.simplified,
+            server: r.server,
+            pb: !!r.pb,
+            checkpoints: (r.checkpoints || []).map(num),
+          },
+          num(r.player_id)
+        ),
+        num(r.map_id)
       )
     );
   }
@@ -704,22 +716,25 @@ class RaceDB {
         margin = m && m.t != null ? num(m.t) - r.time : null;
       }
       out.push(
-        this._censorNamed(
-          {
-            id: num(r.id),
-            time: r.time,
-            global_rank: r.global_rank,
-            version_rank: r.version_rank,
-            version: this.versions[num(r.version_id)] || String(r.version_id),
-            map_id: num(r.map_id),
-            map: r.map,
-            raw_name: r.raw_name,
-            player: r.player,
-            margin,
-          },
-          undefined,
-          "raw_name",
-          "player"
+        this._censorMapped(
+          this._censorNamed(
+            {
+              id: num(r.id),
+              time: r.time,
+              global_rank: r.global_rank,
+              version_rank: r.version_rank,
+              version: this.versions[num(r.version_id)] || String(r.version_id),
+              map_id: num(r.map_id),
+              map: r.map,
+              raw_name: r.raw_name,
+              player: r.player,
+              margin,
+            },
+            undefined,
+            "raw_name",
+            "player"
+          ),
+          num(r.map_id)
         )
       );
     }
@@ -1211,7 +1226,7 @@ class RaceDB {
          LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
         [...args, lim, off]
       )
-    ).map((r) => this._censorNamed({
+    ).map((r) => this._censorMapped(this._censorNamed({
       ...r,
       id: num(r.id),
       wr_pid: num(r.wr_pid),
@@ -1221,7 +1236,7 @@ class RaceDB {
       wr_version_name: this.versions[num(r.wr_version)] || null,
       weapons: Array.isArray(r.weapons) ? r.weapons : [],
       is_strafe: !!r.is_strafe,
-    }, num(r.wr_pid), "wr_name", "wr_simplified"));
+    }, num(r.wr_pid), "wr_name", "wr_simplified"), num(r.id), "name"));
     return { total, limit: lim, offset: off, rows };
   }
 
@@ -1353,7 +1368,7 @@ class RaceDB {
 
     return {
       id: num(map.id),
-      name: map.name,
+      name: this._cnMap(map.name, num(map.id)),
       records: idx ? idx.records : 0,
       races: idx ? idx.records : 0, // legacy alias
       finishes: idx ? idx.finishes : 0,
@@ -1652,12 +1667,18 @@ class RaceDB {
          LIMIT $${fargs.length + 1} OFFSET $${fargs.length + 2}`,
         [...fargs, lim, off]
       )
-    ).map((r) => ({
-      ...r,
-      map_id: num(r.map_id),
-      version: num(r.version_id),
-      versionName: this.versions[num(r.version_id)] || String(r.version_id),
-    }));
+    ).map((r) =>
+      this._censorMapped(
+        {
+          ...r,
+          map_id: num(r.map_id),
+          version: num(r.version_id),
+          versionName: this.versions[num(r.version_id)] || String(r.version_id),
+        },
+        num(r.map_id),
+        "map_name"
+      )
+    );
 
     // This player's demo + browser-replay link per finished map (one PB each).
     if (records.length) {
@@ -1771,7 +1792,7 @@ class RaceDB {
       const aTime = r.a_time, bTime = r.b_time;
       return {
         mapId: num(r.map_id),
-        name: r.name,
+        name: this._cnMap(r.name, num(r.map_id)),
         aTime,
         bTime,
         aRank: r.a_rank,
@@ -1844,7 +1865,7 @@ class RaceDB {
          LIMIT $3`,
         [q, esc, limit]
       )
-    ).map((m) => ({ id: num(m.id), name: m.name, records: m.records, finishes: m.finishes, races: m.records }));
+    ).map((m) => ({ id: num(m.id), name: this._cnMap(m.name, num(m.id)), records: m.records, finishes: m.finishes, races: m.records }));
 
     const players = (
       await this.all(
@@ -2305,7 +2326,15 @@ class RaceDB {
       for (const r of await this.all("SELECT player_id, action FROM player_censor")) {
         overrides.set(num(r.player_id), r.action);
       }
-      this._censor = { matcher: buildMatcher(terms), overrides };
+      const mapOverrides = new Map();
+      const mapOverridesByName = new Map();
+      for (const r of await this.all(
+        "SELECT mc.map_id, mc.action, m.name FROM map_censor mc JOIN map m ON m.id = mc.map_id"
+      )) {
+        mapOverrides.set(num(r.map_id), r.action);
+        mapOverridesByName.set(String(r.name).toLowerCase(), r.action);
+      }
+      this._censor = { matcher: buildMatcher(terms), overrides, mapOverrides, mapOverridesByName };
     } catch (e) {
       console.error("censor config load failed (keeping previous):", e?.message ?? e);
     }
@@ -2336,6 +2365,26 @@ class RaceDB {
     } else if (obj[simpKey] != null) {
       obj[simpKey] = censorName(obj[simpKey], this._censor.matcher, ov);
     }
+    return obj;
+  }
+
+  // Map-name equivalents. Map names are plain identifiers (no ^colour codes, no
+  // separate `simplified`), masked with the SAME word list but keyed on the
+  // per-MAP override. Display only — the stored map.name is untouched, so the
+  // game still loads/votes by it and the site still routes by map id.
+  _cnMap(name, id) {
+    const ov = id != null ? this._censor.mapOverrides.get(num(id)) : undefined;
+    return censorName(name, this._censor.matcher, ov);
+  }
+  // Censor a map name when only the NAME is known (sync display builders / live
+  // snapshot spots that have no map id): resolves the per-map override by name
+  // so a force-censor/allow still applies without a DB round-trip.
+  _cnMapByName(name) {
+    const ov = name != null ? this._censor.mapOverridesByName.get(String(name).toLowerCase()) : undefined;
+    return censorName(name, this._censor.matcher, ov);
+  }
+  _censorMapped(obj, mapId, key = "map") {
+    if (obj && obj[key] != null) obj[key] = this._cnMap(obj[key], mapId);
     return obj;
   }
 
@@ -2421,6 +2470,53 @@ class RaceDB {
     return out; // already override-first via the query's ORDER BY
   }
 
+  // --- Map-name overrides (share the /admin/names page + CLI) ----
+  async setMapCensor(mapId, action, reason, by, now = Math.floor(Date.now() / 1000)) {
+    if (action !== "allow" && action !== "censor") return false;
+    await this.pool.query(
+      `INSERT INTO map_censor (map_id, action, reason, set_at, set_by)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (map_id) DO UPDATE SET action = EXCLUDED.action, reason = EXCLUDED.reason,
+         set_at = EXCLUDED.set_at, set_by = EXCLUDED.set_by`,
+      [mapId, action, reason || null, now, by]
+    );
+    await this.refreshCensor();
+    return true;
+  }
+  async clearMapCensor(mapId) {
+    const r = await this.pool.query("DELETE FROM map_censor WHERE map_id = $1", [mapId]);
+    await this.refreshCensor();
+    return r.rowCount > 0;
+  }
+  // Maps whose name trips the word list OR carries an override, for /admin/names.
+  async censoredMaps({ limit = 1000 } = {}) {
+    const rows = await this.all(
+      `SELECT m.id, m.name, mc.action, mc.reason, mc.set_by
+       FROM map m
+       LEFT JOIN map_censor mc ON mc.map_id = m.id
+       ORDER BY (mc.action IS NOT NULL) DESC, m.name
+       LIMIT 50000`
+    );
+    const out = [];
+    for (const r of rows) {
+      const id = num(r.id);
+      const ov = this._censor.mapOverrides.get(id);
+      const terms = this._censor.matcher.scan(r.name);
+      if (!terms.length && !ov) continue;
+      out.push({
+        id,
+        name: r.name,
+        masked: this._cnMap(r.name, id),
+        terms,
+        action: ov || null,
+        reason: r.reason || null,
+        set_by: r.set_by || null,
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
   // Per-map weapon inventory for the game servers' randmap-by-weapon voting
   // (hrace/mapweapons.as via the RS_ApiFetchMapWeapons native). Plain text, one
   // line per scanned map, sorted by name: "<name> code code ...". A strafe map
@@ -2448,13 +2544,13 @@ class RaceDB {
   // match how the game keys/prints map names everywhere else.
   async gameLastMapsText() {
     const rows = await this.all(
-      `SELECT m.name, MAX(f.created_at) AS last_played
+      `SELECT m.id AS map_id, m.name, MAX(f.created_at) AS last_played
          FROM finish f JOIN map m ON m.id = f.map_id
         GROUP BY m.id, m.name
         ORDER BY MAX(f.created_at) DESC
         LIMIT 10`
     );
-    return rows.map((r) => String(r.name).toLowerCase()).join("\n");
+    return rows.map((r) => this._cnMap(String(r.name).toLowerCase(), num(r.map_id))).join("\n");
   }
 
   // --- Site settings (admin-edited key/value, e.g. the game-server MOTD) -----
