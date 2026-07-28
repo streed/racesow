@@ -1562,9 +1562,9 @@ class Player
 
     bool startRace()
     {
-        G_Print( "RSDBG startRace ENTER: inRace=" + this.inRace + " practicing=" + this.practicing
-                + " postRace=" + this.postRace + " team=" + this.client.team + " recalled=" + this.recalled
-                + " autoRecall=" + this.autoRecall + " pj=" + RS_QueryPjState( this.client.playerNum ) + "\n" );
+        G_Print( "RSDBG startRace ENTER: inRace=" + ( this.inRace ? "1" : "0" ) + " practicing=" + ( this.practicing ? "1" : "0" )
+                + " postRace=" + ( this.postRace ? "1" : "0" ) + " team=" + this.client.team + " recalled=" + ( this.recalled ? "1" : "0" )
+                + " autoRecall=" + ( this.autoRecall ? "1" : "0" ) + " pj=" + ( RS_QueryPjState( this.client.playerNum ) ? "1" : "0" ) + "\n" );
 
         // Mirror bots (and any fake client) are puppets driven by the mesh
         // stream, not real input — they must never enter a race, so they can
@@ -1954,8 +1954,8 @@ class Player
 
     void completeRace()
     {
-        G_Print( "RSDBG completeRace ENTER: inRace=" + this.inRace + " practicing=" + this.practicing
-                + " recalled=" + this.recalled + " validTime=" + this.validTime()
+        G_Print( "RSDBG completeRace ENTER: inRace=" + ( this.inRace ? "1" : "0" ) + " practicing=" + ( this.practicing ? "1" : "0" )
+                + " recalled=" + ( this.recalled ? "1" : "0" ) + " validTime=" + ( this.validTime() ? "1" : "0" )
                 + " raceTime=" + this.raceTime() + "\n" );
 
         // Belt-and-suspenders: a fake client should never be inRace (startRace
