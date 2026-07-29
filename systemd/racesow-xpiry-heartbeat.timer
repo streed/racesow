@@ -1,0 +1,13 @@
+# Push a heartbeat to xpiry.dev every 60s (see scripts/xpiry-heartbeat.sh). The
+# monitors are created with expected_interval=60s and a generous grace period, so
+# a single missed tick (or the nightly restart) does not alarm.
+[Unit]
+Description=Racesow xpiry.dev heartbeat poll
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,22 @@
+# One-shot: push liveness heartbeats for this box's game servers (+ TV encoder)
+# to xpiry.dev (see scripts/xpiry-heartbeat.sh). Driven by the paired .timer, or
+# on demand: `systemctl start racesow-xpiry-heartbeat`. Template __RACESOW_DIR__
+# / __RACESOW_USER__ are substituted by systemd/install.sh. Installed on BOTH
+# tiers (each box heartbeats its own servers).
+#
+# Runs as __RACESOW_USER__ (needs the docker group for the TV container check,
+# which that user already has). XPIRY_PING_* are read from the repo-root .env —
+# populate it from scripts/xpiry-provision.sh output first.
+[Unit]
+Description=Racesow xpiry.dev heartbeat push (game servers + TV)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__RACESOW_USER__
+WorkingDirectory=__RACESOW_DIR__
+EnvironmentFile=-__RACESOW_DIR__/.env
+ExecStart=__RACESOW_DIR__/scripts/xpiry-heartbeat.sh
+TimeoutStartSec=45
+Nice=10

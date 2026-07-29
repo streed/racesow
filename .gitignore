@@ -35,8 +35,24 @@ data/*.sqlite-shm
 server/tv/tv.env
 backups/
 
+# SFTP demo dropbox: uploaded demos (runtime, per-box) + private host keys.
+# The committed public keys (server/sftp/keys/*.pub) + users.conf stay tracked.
+server/sftp-uploads/
+server/sftp/hostkeys/
+# Client-demo ingestion watcher runtime (scripts/ingest-demos.sh)
+demo-ingest.log
+.demo-ingest.lock
+
+# xpiry.dev monitoring: generated per-box heartbeat ping URLs (semi-secret —
+# anyone with the URL can post a heartbeat) + heartbeat runtime lock/log.
+scripts/xpiry-monitors.local.env
+.xpiry-heartbeat.lock
+xpiry-heartbeat.log
+
 # Generated WR-ghost viewer meshes (converted on the box, mounted into web)
 web/public/maps/*.glb
 
 # Local scratch (screenshots, large paks deployed out-of-band)
 temp/
+
+.env.production
