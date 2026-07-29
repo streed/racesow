@@ -108,6 +108,16 @@ RUN python3 /tmp/patch-wrghost-cull.py \
     && grep -q "rs_isWrGhost" qcommon/snap_write.c \
     && grep -q "rs_hideWrGhost" qcommon/snap_write.c
 
+# 7c. Quiet the connect/disconnect console spam from our infra fake-clients (the
+#     in-game WR ghost racer + the cross-server mesh mirror bots). This dedicated
+#     race server runs no AI bots, so every SVF_FAKECLIENT is one of ours and is
+#     (re)created constantly; suppress its "entered the game"/"disconnected"
+#     broadcasts. Remote players are still announced ONCE, [TAG]-prefixed, by the
+#     mesh relay. Edits game/p_client.cpp; the grep asserts the edit landed.
+COPY enginepatches/patch-quiet-fakeclient-connect.py /tmp/patch-quiet-fakeclient-connect.py
+RUN python3 /tmp/patch-quiet-fakeclient-connect.py \
+    && grep -q "racesow-docker: fake clients" game/p_client.cpp
+
 # 8. Quad rocket-jump fix (rs_quad_fix, default 0): racesow's self-knockback
 #    recompute in G_RadiusDamage discards the fire-time QUAD_KNOCKBACK_SCALE, so
 #    quad does nothing for rocket/plasma/grenade jumps -- unlike Quake3/defrag,

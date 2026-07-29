@@ -64,12 +64,17 @@ COPY server/enginepatches/patch-status-hide-bots.py /tmp/patch-status-hide-bots.
 # to newly connecting players without a restart. Anchor (SV_MOTD_Get_f) matches
 # Warfork 2.15.1's server/sv_motd.c, so the shared script applies unchanged.
 COPY server/enginepatches/patch-motd-live.py /tmp/patch-motd-live.py
+# Quiet the connect/disconnect console spam from infra fake-clients (WR ghost +
+# mesh mirror bots). Same game/p_client.cpp anchors as Warsow 2.1.2 (verified
+# byte-identical in Warfork 2.15.1), so the shared script applies unchanged.
+COPY server/enginepatches/patch-quiet-fakeclient-connect.py /tmp/patch-quiet-fakeclient-connect.py
 RUN cd source \
     && python3 /tmp/patch-api-natives.py \
     && python3 /tmp/patch-mirror-natives.py \
     && python3 /tmp/patch-wrghost-cull.py \
     && python3 /tmp/patch-status-hide-bots.py \
     && python3 /tmp/patch-motd-live.py \
+    && python3 /tmp/patch-quiet-fakeclient-connect.py \
     && grep -q 'asFunc_RS_ApiReportRace'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_MirrorRefresh'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchRanks'  game/g_ascript.cpp \
@@ -80,7 +85,8 @@ RUN cd source \
     && grep -q 'rs_isWrGhost'             game/g_public.h \
     && grep -q 'rs_isWrGhost'             qcommon/snap_write.c \
     && grep -q 'racesow-docker: mirror-bot ghosts' server/sv_oob.c \
-    && grep -q 'racesow-docker: live MOTD' server/sv_motd.c
+    && grep -q 'racesow-docker: live MOTD' server/sv_motd.c \
+    && grep -q 'racesow-docker: fake clients' game/p_client.cpp
 
 # --- build wf_server + game module (2.15.1: plain cmake, no preset/submodules) -
 RUN export CC=clang CXX=clang++ \
