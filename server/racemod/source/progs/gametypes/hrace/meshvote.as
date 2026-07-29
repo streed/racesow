@@ -173,6 +173,192 @@ void RACE_MeshVoteAnnounce( const String &in msg )
 /// Command
 ///*****************************************************************
 
+// Shared pre-flight for opening a NEW mesh vote (a map vote or a sync vote): no
+// vote already running anywhere in the mesh, off cooldown, and the starter is an
+// active player. Prints the reason and returns false when a vote can't start now.
+bool RACE_MeshVoteCanStart( Client@ client )
+{
+    // A vote already running (ours, or a peer's OPEN we adopted) blocks a second
+    // one — respect the earlier vote. RACE_MeshVoteOnEvent sets mvActive as soon
+    // as a peer's OPEN arrives, so this fires the moment we've heard it.
+    if ( mvActive )
+    {
+        String who = ( mvMaster == rsMirrorTag.string )
+                ? "here" : ( "on [" + mvMaster + S_COLOR_WHITE + "]" );
+        client.printMessage( "A mesh vote for " + S_COLOR_GREEN + mvMap + S_COLOR_WHITE
+                + " is already in progress (started " + who + ") - only one mesh vote at a"
+                + " time. Cast yours with " + S_COLOR_GREEN + "/meshvote yes"
+                + S_COLOR_WHITE + " or " + S_COLOR_GREEN + "/meshvote no" + S_COLOR_WHITE + ".\n" );
+        return false;
+    }
+    if ( realTime < mvCooldownUntil )
+    {
+        client.printMessage( "Please wait a bit before starting another mesh vote.\n" );
+        return false;
+    }
+    if ( !RACE_MeshVoteEligible( client.playerNum ) )
+    {
+        client.printMessage( "Only active players can start a mesh vote.\n" );
+        return false;
+    }
+    return true;
+}
+
+// Become master for a fresh vote on an already-resolved, already-validated map
+// and broadcast the OPEN to the mesh. `context` is an optional phrase shown in
+// the announce right after the map (e.g. a sync's " (syncing to [tag])"). Callers
+// MUST have passed RACE_MeshVoteCanStart first.
+void RACE_MeshVoteOpen( Client@ client, const String &in map, const String &in context )
+{
+    mvActive = true;
+    mvIsMaster = true;
+    mvMaster = rsMirrorTag.string;
+    mvVoteId = rsMirrorTag.string + ":" + levelTime;
+    mvMap = map;
+    mvDeadline = realTime + MESHVOTE_DURATION;
+    for ( int i = 0; i < maxClients; i++ )
+        mvBallot[i] = 0;
+    mvBallot[client.playerNum] = 1; // initiator votes yes
+    mvNextTally = 0;
+
+    // O(pen): name = voteId, text = "<map> <durationSec> <initiator>"
+    RS_MirrorEvent( "O", mvVoteId, mvMap + " " + ( MESHVOTE_DURATION / 1000 ) + " " + client.name );
+    RACE_MeshVoteAnnounce( client.name + " wants to change ALL servers to "
+            + S_COLOR_GREEN + mvMap + S_COLOR_WHITE + context
+            + " - /meshvote yes | /meshvote no (" + ( MESHVOTE_DURATION / 1000 ) + "s)" );
+}
+
+// List the peered servers a player can sync to (tag + current map) from the live
+// peer registry — which includes EMPTY peers, since their keepalives carry the
+// map (RS_MirrorPeerMap). Used by /meshvote sync with a missing/failed target.
+void RACE_MeshVoteListPeers( Client@ client )
+{
+    RS_MirrorRefresh();
+    int pc = RS_MirrorPeerCount();
+    int shown = 0;
+    for ( int i = 0; i < pc; i++ )
+    {
+        String ptag = RS_MirrorPeerTag( i );
+        if ( ptag.removeColorTokens().length() == 0 )
+            continue;
+        String pmap = RS_MirrorPeerMap( i );
+        String mapPart;
+        if ( pmap.length() > 0 )
+            mapPart = S_COLOR_GREEN + pmap;
+        else
+            mapPart = S_COLOR_WHITE + "(unknown map)";
+        if ( shown == 0 )
+            client.printMessage( "Servers you can sync to:\n" );
+        client.printMessage( "  [" + ptag + S_COLOR_WHITE + "] " + mapPart + S_COLOR_WHITE + "\n" );
+        shown++;
+    }
+    if ( shown == 0 )
+        client.printMessage( "No peered servers are currently connected.\n" );
+}
+
+// /meshvote sync <server tag | /who number> — vote to move ALL mesh servers to
+// whatever map the chosen peer is currently running. The target's map comes from
+// the live peer registry (RS_MirrorPeerMap, which works even for an empty peer)
+// or, for a /who number, the matching remote player's origin-server map. Once
+// resolved to a concrete installed map it reuses the ordinary master vote flow.
+bool Cmd_MeshVoteSync( Client@ client, const String &in argsString )
+{
+    if ( !RACE_MeshVoteCanStart( client ) )
+        return true;
+
+    String arg = argsString.getToken( 1 );
+    if ( arg.length() == 0 )
+    {
+        client.printMessage( "Usage: meshvote sync <server tag | /who number> - move ALL servers to that server's current map.\n" );
+        RACE_MeshVoteListPeers( client );
+        return true;
+    }
+
+    RS_MirrorRefresh(); // freshen the peer snapshot we read below
+
+    String targetTag = "";
+    String targetMap = "";
+
+    if ( arg.isNumeric() )
+    {
+        // A /who row number -> that remote player's origin server + its map.
+        int n = arg.toInt();
+        if ( n < 1 || n > int( mirrorPlayers.length() ) )
+        {
+            client.printMessage( "There is no /who row " + n + ". Use /who to list the numbered players.\n" );
+            return true;
+        }
+        targetTag = mirrorPlayers[n - 1].server;
+        targetMap = mirrorPlayers[n - 1].map;
+    }
+    else
+    {
+        // A server tag (case-insensitive substring). Peer tags are unique in the
+        // registry, so the match set is at most one server per distinct tag.
+        String want = arg.removeColorTokens().tolower();
+        if ( want.length() == 0 ) // arg was all colour tokens - would match everything
+        {
+            client.printMessage( "Give a server tag or a /who number to sync to.\n" );
+            RACE_MeshVoteListPeers( client );
+            return true;
+        }
+        int pc = RS_MirrorPeerCount();
+        int matches = 0;
+        for ( int i = 0; i < pc; i++ )
+        {
+            String ptag = RS_MirrorPeerTag( i );
+            String cleanTag = ptag.removeColorTokens().tolower();
+            if ( cleanTag.length() == 0 )
+                continue;
+            if ( cleanTag.locate( want, 0 ) < cleanTag.length() )
+            {
+                targetTag = ptag;
+                targetMap = RS_MirrorPeerMap( i );
+                matches++;
+            }
+        }
+        if ( matches == 0 )
+        {
+            client.printMessage( "No peered server matches '" + arg + "'.\n" );
+            RACE_MeshVoteListPeers( client );
+            return true;
+        }
+        if ( matches > 1 )
+        {
+            client.printMessage( "More than one server matches '" + arg + "' - be more specific.\n" );
+            RACE_MeshVoteListPeers( client );
+            return true;
+        }
+    }
+
+    if ( targetTag.removeColorTokens().tolower() == rsMirrorTag.string.removeColorTokens().tolower() )
+    {
+        client.printMessage( "That is this server - pick another server to sync to.\n" );
+        return true;
+    }
+
+    targetMap = targetMap.removeColorTokens().tolower();
+    if ( targetMap.length() == 0 )
+    {
+        client.printMessage( "Don't know what map [" + targetTag + S_COLOR_WHITE + "] is on yet - try again in a moment.\n" );
+        return true;
+    }
+    if ( !RACE_MapExists( targetMap ) )
+    {
+        client.printMessage( "[" + targetTag + S_COLOR_WHITE + "] is on " + S_COLOR_GREEN + targetMap
+                + S_COLOR_WHITE + ", which is not installed on this server.\n" );
+        return true;
+    }
+    if ( RACE_IsMapBlocked( targetMap ) )
+    {
+        client.printMessage( "Map '" + targetMap + "' is blocked and can't be voted right now.\n" );
+        return true;
+    }
+
+    RACE_MeshVoteOpen( client, targetMap, " (syncing to [" + targetTag + S_COLOR_WHITE + "])" );
+    return true;
+}
+
 bool Cmd_MeshVote( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
     if ( !RACE_MirrorEnabled() )
@@ -185,7 +371,7 @@ bool Cmd_MeshVote( Client@ client, const String &cmdString, const String &argsSt
 
     if ( sub == "" )
     {
-        client.printMessage( "Usage: meshvote <map | * | pattern*>  |  meshvote yes|no  |  meshvote status  |  meshvote cancel\n" );
+        client.printMessage( "Usage: meshvote <map | * | pattern*>  |  meshvote sync <server>  |  meshvote yes|no  |  meshvote status  |  meshvote cancel\n" );
         if ( mvActive )
             client.printMessage( "A mesh vote for " + S_COLOR_GREEN + mvMap + S_COLOR_WHITE + " is in progress.\n" );
         return true;
@@ -241,31 +427,15 @@ bool Cmd_MeshVote( Client@ client, const String &cmdString, const String &argsSt
         return true;
     }
 
-    // Otherwise: sub is a map name -> START a vote (we become master). But if a
-    // vote is already running anywhere in the mesh — because we adopted a peer's
-    // OPEN or started our own — respect that earlier vote and refuse to start a
-    // second one. (RACE_MeshVoteOnEvent sets mvActive when a peer's OPEN
-    // arrives, so this guard fires as soon as we've heard the earlier message.)
-    if ( mvActive )
-    {
-        String who = ( mvMaster == rsMirrorTag.string )
-                ? "here" : ( "on [" + mvMaster + S_COLOR_WHITE + "]" );
-        client.printMessage( "A mesh vote for " + S_COLOR_GREEN + mvMap + S_COLOR_WHITE
-                + " is already in progress (started " + who + ") - only one mesh vote at a"
-                + " time. Cast yours with " + S_COLOR_GREEN + "/meshvote yes"
-                + S_COLOR_WHITE + " or " + S_COLOR_GREEN + "/meshvote no" + S_COLOR_WHITE + ".\n" );
+    if ( sub == "sync" )
+        return Cmd_MeshVoteSync( client, argsString );
+
+    // Otherwise: sub is a map name -> START a vote (we become master). The shared
+    // pre-flight refuses a second concurrent vote, honours the cooldown, and
+    // requires an active starter (RACE_MeshVoteOnEvent sets mvActive as soon as a
+    // peer's OPEN arrives, so a peer-started vote blocks us here too).
+    if ( !RACE_MeshVoteCanStart( client ) )
         return true;
-    }
-    if ( realTime < mvCooldownUntil )
-    {
-        client.printMessage( "Please wait a bit before starting another mesh vote.\n" );
-        return true;
-    }
-    if ( !RACE_MeshVoteEligible( client.playerNum ) )
-    {
-        client.printMessage( "Only active players can start a mesh vote.\n" );
-        return true;
-    }
     String rawArg = argsString.getToken( 0 );
     String map;
     // Wildcard / random selection (same semantics as the native randmap
@@ -305,22 +475,7 @@ bool Cmd_MeshVote( Client@ client, const String &cmdString, const String &argsSt
         }
     }
 
-    mvActive = true;
-    mvIsMaster = true;
-    mvMaster = rsMirrorTag.string;
-    mvVoteId = rsMirrorTag.string + ":" + levelTime;
-    mvMap = map;
-    mvDeadline = realTime + MESHVOTE_DURATION;
-    for ( int i = 0; i < maxClients; i++ )
-        mvBallot[i] = 0;
-    mvBallot[client.playerNum] = 1; // initiator votes yes
-    mvNextTally = 0;
-
-    // O(pen): name = voteId, text = "<map> <durationSec> <initiator>"
-    RS_MirrorEvent( "O", mvVoteId, mvMap + " " + ( MESHVOTE_DURATION / 1000 ) + " " + client.name );
-    RACE_MeshVoteAnnounce( client.name + " wants to change ALL servers to "
-            + S_COLOR_GREEN + mvMap + S_COLOR_WHITE + " - /meshvote yes | /meshvote no ("
-            + ( MESHVOTE_DURATION / 1000 ) + "s)" );
+    RACE_MeshVoteOpen( client, map, "" );
     return true;
 }
 

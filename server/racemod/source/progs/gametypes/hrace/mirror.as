@@ -133,6 +133,138 @@ bool RACE_MirrorEnabled()
     return rsMirrorTag.string.length() > 0 && rsMirrorPeers.string.length() > 0;
 }
 
+///*****************************************************************
+/// Cross-mesh presence + activity feed — make the mesh feel like one big
+/// server. Notable moments (a new server record, a top-3 finish) are broadcast
+/// to every peer so each server sees "what's happening on the network" live,
+/// and players get an ambient picture of who's online elsewhere.
+///
+/// The activity broadcast rides the EXISTING bridged chat event ("C") with a
+/// sentinel-prefixed payload, so it needs no new native/event kind. The receiver
+/// (RACE_MirrorDrainEvents) routes any "C" event whose text starts with the
+/// sentinel to RACE_MirrorRenderActivity instead of printing it as chat. Payload
+/// (the event's tab-delimited text field, so intra-field spaces are safe):
+///   ~RSACT~ <rec|fin> <rev:0|1> <rank> <timeMs> <mapname>
+///*****************************************************************
+
+const String MESH_ACT_SENTINEL = "~RSACT~";
+const uint MESH_PRESENCE_INTERVAL = 180000; // ms between ambient network lines (3 min)
+uint mirrorNextPresence = 0;
+
+// Broadcast a notable local finish to the mesh. `actor` = the finishing player's
+// name (its own event field, so spaces/colours are fine); no-op when mirroring
+// is off. Records use kind "rec" (rank ignored); top finishes use "fin" with the
+// 1-based rank. A server never hears its OWN events, so this is peer-facing only
+// — the local server shows its own finishes through the normal race announces.
+void RACE_MirrorBroadcastActivity( const String &in actor, const String &in kind, bool reversed, int rank, uint timeMs, const String &in map )
+{
+    if ( !RACE_MirrorEnabled() )
+        return;
+    String payload = MESH_ACT_SENTINEL + " " + kind + " " + ( reversed ? "1" : "0" )
+            + " " + rank + " " + timeMs + " " + map;
+    RS_MirrorEvent( "C", actor, payload );
+}
+
+// True only for a WELL-FORMED activity payload: the sentinel, a known kind, and
+// a non-empty map field. Because activity shares the "C" chat channel, a chat
+// line that merely starts with the sentinel would otherwise be mis-rendered as a
+// garbled feed entry — this structural check routes such chat back to normal
+// display. (A deliberately hand-crafted valid payload typed in chat is still
+// flood-limited and self-attributed; a fully spoof-proof feed needs a dedicated
+// mesh event kind, i.e. a small native change.)
+bool RACE_MirrorLooksLikeActivity( const String &in body )
+{
+    if ( body.getToken( 0 ) != MESH_ACT_SENTINEL )
+        return false;
+    String kind = body.getToken( 1 );
+    if ( kind != "rec" && kind != "fin" )
+        return false;
+    return body.getToken( 5 ).length() > 0; // map field present
+}
+
+// Render a received activity payload as a one-line network-feed entry. Called
+// from RACE_MirrorDrainEvents for a "C" event whose text is sentinel-prefixed.
+void RACE_MirrorRenderActivity( const String &in tag, const String &in actor, const String &in payload )
+{
+    String kind = payload.getToken( 1 );
+    bool reversed = payload.getToken( 2 ) == "1";
+    int rank = payload.getToken( 3 ).toInt();
+    uint timeMs = uint( payload.getToken( 4 ).toInt() );
+    String map = payload.getToken( 5 );
+    String revNote = "";
+    if ( reversed )
+        revNote = " (reverse)";
+    String head = S_COLOR_ORANGE + ">> " + S_COLOR_WHITE + "[" + tag + S_COLOR_WHITE + "] " + actor;
+    if ( kind == "rec" )
+        G_PrintMsg( null, head + S_COLOR_YELLOW + " * NEW RECORD " + S_COLOR_WHITE + "on "
+                + S_COLOR_GREEN + map + revNote + S_COLOR_WHITE + "  " + S_COLOR_GREEN + RACE_TimeToString( timeMs ) + "\n" );
+    else
+        G_PrintMsg( null, head + S_COLOR_WHITE + " finished " + S_COLOR_YELLOW + "#" + rank
+                + S_COLOR_WHITE + " on " + S_COLOR_GREEN + map + revNote + S_COLOR_WHITE + "  "
+                + S_COLOR_GREEN + RACE_TimeToString( timeMs ) + "\n" );
+}
+
+// A compact one-line summary of who's online across the mesh right now: each
+// peer server that has players, with its count and map. Built from the live peer
+// registry (RS_MirrorPeer*, which includes empty peers) counted against the
+// remote-player roster (mirrorPlayers).
+String RACE_MirrorNetworkLine()
+{
+    RS_MirrorRefresh();
+    int pc = RS_MirrorPeerCount();
+    String line = S_COLOR_ORANGE + "Network: " + S_COLOR_WHITE;
+    int shown = 0;
+    for ( int i = 0; i < pc; i++ )
+    {
+        String ptag = RS_MirrorPeerTag( i );
+        if ( ptag.removeColorTokens().length() == 0 )
+            continue;
+        int players = 0;
+        for ( uint j = 0; j < mirrorPlayers.length(); j++ )
+        {
+            if ( mirrorPlayers[j].server == ptag && !mirrorPlayers[j].spectator )
+                players++;
+        }
+        if ( players == 0 )
+            continue; // compact line: only servers with players
+        String pmap = RS_MirrorPeerMap( i );
+        if ( shown > 0 )
+            line += S_COLOR_WHITE + "   ";
+        line += "[" + ptag + S_COLOR_WHITE + "] " + players + S_COLOR_WHITE + " on " + S_COLOR_GREEN + pmap;
+        shown++;
+    }
+    if ( shown == 0 )
+        line += "you're the only players online right now";
+    return line;
+}
+
+// Ambient network line, printed to everyone at a low frequency so players stay
+// aware of the wider mesh without typing /who. Silent when nobody is on any peer
+// (a solo session shouldn't be nagged). Called each frame from RACE_MirrorThink.
+void RACE_MirrorPresenceTick()
+{
+    if ( realTime < mirrorNextPresence )
+        return;
+    mirrorNextPresence = realTime + MESH_PRESENCE_INTERVAL;
+    if ( mirrorPlayers.length() == 0 )
+        return;
+    G_PrintMsg( null, RACE_MirrorNetworkLine() + "\n" );
+}
+
+// Greet a joining player with the network picture + the commands that make the
+// mesh feel like one server. Skipped for a solo session and for fake clients.
+void RACE_MirrorGreet( Client@ client )
+{
+    if ( client is null || RACE_MirrorIsFakeClient( client ) || RACE_IsTvClient( client ) )
+        return;
+    if ( mirrorPlayers.length() == 0 )
+        return;
+    client.printMessage( RACE_MirrorNetworkLine() + "\n" );
+    client.printMessage( S_COLOR_WHITE + "Use " + S_COLOR_YELLOW + "/who" + S_COLOR_WHITE + " to see everyone, "
+            + S_COLOR_YELLOW + "/watch <#>" + S_COLOR_WHITE + " to spectate them, or "
+            + S_COLOR_YELLOW + "/meshvote sync <server>" + S_COLOR_WHITE + " to bring their map here.\n" );
+}
+
 MirrorPlayer@ RACE_MirrorFind( const String &in server, const String &in name )
 {
     for ( uint i = 0; i < mirrorPlayers.length(); i++ )
@@ -235,6 +367,7 @@ void RACE_MirrorThink()
     RACE_MirrorUpdateBots();
     RACE_MirrorUpdateWatchers();
     RACE_MeshVoteThink();
+    RACE_MirrorPresenceTick();
 
     if ( realTime >= mirrorNextPublish )
     {
@@ -528,17 +661,25 @@ void RACE_MirrorDrainEvents()
                     + ( type == 1 ? ( ": " + RS_MirrorEventText() ) : "" ) + "\n" );
 
         if ( type == 1 )
-            G_PrintMsg( null, "[" + tag + S_COLOR_WHITE + "] " + name
-                    + S_COLOR_GREEN + ": " + S_COLOR_WHITE + RS_MirrorEventText() + "\n" );
+        {
+            // A "C" event is either real cross-server chat or a sentinel-prefixed
+            // activity broadcast (record / top finish) — route accordingly.
+            String body = RS_MirrorEventText();
+            if ( RACE_MirrorLooksLikeActivity( body ) )
+                RACE_MirrorRenderActivity( tag, name, body );
+            else
+                G_PrintMsg( null, "[" + tag + S_COLOR_WHITE + "] " + name
+                        + S_COLOR_GREEN + ": " + S_COLOR_WHITE + body + "\n" );
+        }
         else if ( type == 2 )
-            G_PrintMsg( null, "[" + tag + S_COLOR_WHITE + "] " + name
+            G_PrintMsg( null, S_COLOR_ORANGE + ">> " + S_COLOR_WHITE + "[" + tag + S_COLOR_WHITE + "] " + name
                     + S_COLOR_YELLOW + " connected\n" );
         else if ( type == 3 )
-            G_PrintMsg( null, "[" + tag + S_COLOR_WHITE + "] " + name
+            G_PrintMsg( null, S_COLOR_ORANGE + ">> " + S_COLOR_WHITE + "[" + tag + S_COLOR_WHITE + "] " + name
                     + S_COLOR_YELLOW + " disconnected\n" );
         else if ( type == 7 ) // M: a peer changed map
-            G_PrintMsg( null, "[" + tag + S_COLOR_WHITE + "] "
-                    + S_COLOR_YELLOW + "now playing " + S_COLOR_GREEN + name + "\n" );
+            G_PrintMsg( null, S_COLOR_ORANGE + ">> " + S_COLOR_WHITE + "[" + tag + S_COLOR_WHITE + "] "
+                    + S_COLOR_YELLOW + "now on " + S_COLOR_GREEN + name + "\n" );
         else if ( type >= 4 && type <= 6 ) // O/T/R mesh-vote events
             RACE_MeshVoteOnEvent( type, tag, name, RS_MirrorEventText() );
     }
@@ -874,23 +1015,65 @@ bool Cmd_MirrorWho( Client@ client, const String &cmdString, const String &argsS
         return true;
     }
 
+    RS_MirrorRefresh();
+
+    // Real local humans (exclude the mirror bots that stand in for peer players).
     int localCount = 0;
     for ( int i = 0; i < maxClients; i++ )
     {
         Client@ other = G_GetClient( i );
-        if ( other.state() >= CS_SPAWNED && other.team != TEAM_SPECTATOR )
+        if ( other.state() >= CS_SPAWNED && other.team != TEAM_SPECTATOR && !RACE_MirrorIsFakeClient( other ) )
             localCount++;
     }
-    client.printMessage( "[" + rsMirrorTag.string + S_COLOR_WHITE + "] " + S_COLOR_GREEN + mirrorLocalMap
-            + S_COLOR_WHITE + " - " + localCount + " playing (this server)\n" );
+
+    int pc = RS_MirrorPeerCount();
+    int totalPlayers = localCount + int( mirrorPlayers.length() );
+    String plural = "";
+    if ( totalPlayers != 1 )
+        plural = "s";
+    client.printMessage( S_COLOR_ORANGE + "Network: " + S_COLOR_WHITE + totalPlayers
+            + " player" + plural + " on " + ( pc + 1 ) + " servers\n" );
+
+    // This server, then every peer (including EMPTY ones — their keepalives carry
+    // the map), each with its live player count. This is the "one big server,
+    // different maps" view.
+    client.printMessage( "  " + S_COLOR_GREEN + "[" + rsMirrorTag.string + S_COLOR_GREEN + "] "
+            + S_COLOR_WHITE + mirrorLocalMap + " - " + localCount + " here " + S_COLOR_YELLOW + "(you)\n" );
+    for ( int i = 0; i < pc; i++ )
+    {
+        String ptag = RS_MirrorPeerTag( i );
+        if ( ptag.removeColorTokens().length() == 0 )
+            continue;
+        int players = 0;
+        for ( uint j = 0; j < mirrorPlayers.length(); j++ )
+        {
+            if ( mirrorPlayers[j].server == ptag && !mirrorPlayers[j].spectator )
+                players++;
+        }
+        String pmap = RS_MirrorPeerMap( i );
+        String mapPart;
+        if ( pmap.length() > 0 )
+            mapPart = S_COLOR_GREEN + pmap;
+        else
+            mapPart = S_COLOR_WHITE + "(unknown)";
+        String countPart;
+        if ( players > 0 )
+            countPart = "" + players + " playing";
+        else
+            countPart = "empty";
+        client.printMessage( "  [" + ptag + S_COLOR_WHITE + "] " + mapPart
+                + S_COLOR_WHITE + " - " + countPart + "\n" );
+    }
 
     if ( mirrorPlayers.length() == 0 )
     {
-        client.printMessage( "No peered players online.\n" );
+        if ( localCount <= 1 )
+            client.printMessage( S_COLOR_WHITE + "You've got the network to yourself right now.\n" );
         return true;
     }
 
     // Numbered rows; the number is what /watch <#> takes (index in mirrorPlayers).
+    client.printMessage( S_COLOR_WHITE + "Players elsewhere " + S_COLOR_YELLOW + "(watch <#>)" + S_COLOR_WHITE + ":\n" );
     for ( uint i = 0; i < mirrorPlayers.length(); i++ )
     {
         MirrorPlayer@ rp = mirrorPlayers[i];

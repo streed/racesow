@@ -257,3 +257,119 @@ bool Cmd_ClearStart( Client@ client, const String &cmdString, const String &args
         + S_COLOR_WHITE + mapName + S_COLOR_GREEN + ".\n" );
     return true;
 }
+
+// /copystart <player> - adopt another connected player's START spot as your own for
+// this session. You are teleported to their exact starting position + facing with a
+// fresh loadout, and it becomes your prerace spawn so every /kill / restart returns
+// there. Session-only by design: it is NEVER written to the central saved-start
+// store (use /savestart for that), so a rejoin or map change reverts you to your own
+// start. Direction-scoped like /savestart: a race player copies a race start, a
+// reversed player a reverse one, so the copied spot is always valid for you.
+bool Cmd_CopyStart( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    Player@ player = RACE_GetPlayer( client );
+
+    String pattern = argsString.getToken( 0 );
+    if ( pattern.length() == 0 )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/copystart <player>" + S_COLOR_WHITE + " - start where another player on the server starts.\n" );
+        return false;
+    }
+
+    if ( !player.preRace() )
+    {
+        client.printMessage( S_COLOR_RED + "You can only copy a start before a run - not during a race or in practice mode. Use " + S_COLOR_WHITE + "/kill" + S_COLOR_RED + " first.\n" );
+        return false;
+    }
+
+    Entity@ ent = client.getEnt();
+    if ( @ent == null || ent.health <= 0 )
+    {
+        client.printMessage( S_COLOR_RED + "You can only copy a start while alive.\n" );
+        return false;
+    }
+
+    // Resolve exactly one connected player (prints its own no-match / multiple-match).
+    Player@ target = player.oneMatchingPlayer( pattern );
+    if ( @target == null )
+        return false;
+
+    if ( target.client is client )
+    {
+        client.printMessage( S_COLOR_RED + "That is your own start.\n" );
+        return false;
+    }
+    // Mirror puppets (remote mesh players) and the TV director have no locally
+    // maintained prerace start - their positions track a remote / auto-directed body.
+    if ( RACE_MirrorIsFakeClient( target.client ) || RACE_IsTvClient( target.client ) )
+    {
+        client.printMessage( S_COLOR_RED + "That player's start cannot be copied.\n" );
+        return false;
+    }
+    if ( target.reversed != player.reversed )
+    {
+        client.printMessage( target.client.name + S_COLOR_RED + " is racing the other direction - match them with "
+            + S_COLOR_WHITE + "/reverse" + S_COLOR_RED + " first.\n" );
+        return false;
+    }
+
+    // Their START spot: their custom saved prerace start (slot 0) if they set one,
+    // else - only if they are a live prerace body - wherever they are standing right
+    // now. Never a mid-race position: slot 0 still holds the prerace start during a
+    // run, and the current-position fallback is gated on the target being in prerace.
+    Vec3 srcLoc, srcAng;
+    bool haveSrc = false;
+    Position@ tslot0 = target.preRacePositionStore.get( "" );
+    if ( @tslot0 != null && tslot0.saved )
+    {
+        srcLoc = tslot0.location;
+        srcAng = tslot0.angles;
+        haveSrc = true;
+    }
+    else if ( target.preRace() )
+    {
+        Entity@ tent = target.client.getEnt();
+        if ( @tent != null && tent.health > 0 )
+        {
+            srcLoc = tent.origin;
+            srcAng = tent.angles;
+            haveSrc = true;
+        }
+    }
+    if ( !haveSrc )
+    {
+        client.printMessage( target.client.name + S_COLOR_RED + " has no start to copy right now.\n" );
+        return false;
+    }
+
+    // Adopt it, mirroring RACE_MaybeApplySavedStart: a fresh-spawn loadout
+    // (currentPosition) with only origin + facing overridden and velocity zeroed, so
+    // this is a relocation, not a stolen inventory. Writing prerace slot 0 makes
+    // every later /kill / restart return here; latching savedStartApplied (race only,
+    // as in Cmd_SaveStart) stops a still-in-flight saved-start fetch from our own
+    // join from stomping it. Deliberately no RS_ApiSaveStart call - session only.
+    Position p = player.currentPosition();
+    p.location = srcLoc;
+    p.angles = srcAng;
+    p.velocity = Vec3();
+    p.saved = true;
+    p.recalled = false;
+    p.skipWeapons = false;
+    player.preRacePositionStore.set( "", p );
+    player.applyPosition( p );
+    // We teleported the caller onto the copied spot, so re-derive reverse
+    // start-on-exit from the new position exactly as every other reversed
+    // relocation does (GT_PlayerRespawn, finalizeReverse): a reverse start sitting
+    // inside a finish volume must arm start-on-EXIT (checkReverseStart) so the
+    // finish touch already firing there does not start the timer instantly. In the
+    // race direction, latch savedStartApplied (as Cmd_SaveStart does) so a still
+    // in-flight saved-start fetch from our own join cannot stomp the copied spot.
+    if ( player.reversed )
+        player.reverseAwaitFinishExit = player.insideFinishVolume();
+    else
+        player.savedStartApplied = true;
+
+    client.printMessage( S_COLOR_GREEN + "Copied " + target.client.name + S_COLOR_GREEN
+        + "'s start - you'll respawn here until you rejoin or the map changes.\n" );
+    return true;
+}

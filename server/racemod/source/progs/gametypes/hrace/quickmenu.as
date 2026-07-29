@@ -13,7 +13,8 @@ enum eMenuItems
     MI_REVERSE_LOCK,
     MI_REVERSE_OFF,
     MI_SHOW_TRIGGERS,
-    MI_HIDE_TRIGGERS
+    MI_HIDE_TRIGGERS,
+    MI_SERVERS
 };
 
 // Each entry is '"<label>" "<command>" ' — the second token is the client
@@ -34,5 +35,6 @@ array<const String@> menuItems = {
     '"Lock in reverse start" "reverse" ',
     '"Leave reverse mode" "reverse off" ',
     '"Show triggers" "showtriggers" ',
-    '"Hide triggers" "showtriggers" '
+    '"Hide triggers" "showtriggers" ',
+    '"Other servers" "servers" '
 };

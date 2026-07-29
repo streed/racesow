@@ -664,8 +664,20 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/callvote randmap" );
         cmdlist.addCell( "Calls a vote for a random map in the current mappool." );
 
+        cmdlist.addCell( "/meshvote <map|*|sync>" );
+        cmdlist.addCell( "Vote to change ALL mesh servers together - to a map, a random one, or another server's map." );
+
+        cmdlist.addCell( "/servers, /hop <#>" );
+        cmdlist.addCell( "List the other Racesow servers for your game (live map + players) and jump to one." );
+
         cmdlist.addCell( "/flag <reason>" );
         cmdlist.addCell( "Flags the current map for moderator review (broken, offensive, etc.)." );
+
+        cmdlist.addCell( "/savestart /clearstart" );
+        cmdlist.addCell( "Save (or forget) a personal spawn spot for this map that you keep across rejoins." );
+
+        cmdlist.addCell( "/copystart <player>" );
+        cmdlist.addCell( "Start where another player on the server starts (this session only)." );
 
         for ( uint i = 0; i < cmdlist.numRows(); i++ )
             client.printMessage( cmdlist.getRow(i) + "\n" );
@@ -760,6 +772,39 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         client.printMessage( S_COLOR_YELLOW + "/cps" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Shows your per-checkpoint split times for the current run, compared to your" + "\n" );
         client.printMessage( S_COLOR_WHITE + "  personal best and the server record." + "\n" );
+    }
+    else if ( command == "savestart" || command == "clearstart" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/savestart" + S_COLOR_WHITE + " and " + S_COLOR_YELLOW + "/clearstart" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- /savestart marks your current prerace spot as your personal start for this map, saved to your" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  account so you spawn there whenever you rejoin. In reverse it saves your reverse start instead." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  /clearstart forgets it for the direction you're in. Run both before a race (use /kill first)." + "\n" );
+    }
+    else if ( command == "copystart" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/copystart <player>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Spawns you where another player on the server starts and makes that your start for now, so every" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  /kill returns there. It copies their saved start, or where they're standing before a run. Not saved" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  - it lasts until you rejoin or the map changes, and you must both race the same direction. Use" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  /savestart if you want to keep it." + "\n" );
+    }
+    else if ( command == "servers" || command == "hop" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/servers" + S_COLOR_WHITE + " and " + S_COLOR_YELLOW + "/hop <# | name>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- /servers lists the other Racesow servers for your game (Warsow or Warfork) with each one's" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  live map and player count. /hop <#> (the list number) or /hop <name> jumps you straight there;" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  it also prints the connect address in case your client doesn't switch automatically." + "\n" );
+    }
+    else if ( command == "meshvote" || command == "mv" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/meshvote <map | * | pattern* | rl|strafe|...>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Starts a vote to change EVERY peered server to the same map at once. Give a map name, or " + S_COLOR_YELLOW + "*" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  for a random installed map, " + S_COLOR_YELLOW + "pat*" + S_COLOR_WHITE + " for a random name match, or a weapon/strafe filter (" + S_COLOR_YELLOW + "rl" + S_COLOR_WHITE + ", " + S_COLOR_YELLOW + "strafe" + S_COLOR_WHITE + "," + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  " + S_COLOR_YELLOW + "rl pg" + S_COLOR_WHITE + ") for a random map that plays that way - same selection as " + S_COLOR_YELLOW + "callvote randmap" + S_COLOR_WHITE + "." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/meshvote sync <server tag | /who number>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Vote to move ALL servers onto whatever map that server is currently running (great for regrouping)." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/meshvote yes | no | status | cancel" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Cast your vote, show the live tally, or (starter only) cancel. Only one mesh vote runs at a time." + "\n" );
     }
     else if ( command == "position" && subcommand == "speed" )
     {

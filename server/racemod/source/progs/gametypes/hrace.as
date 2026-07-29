@@ -247,6 +247,10 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_SaveStart( client, cmdString, argsString, argc );
     else if ( cmdString == "clearstart" )
         return Cmd_ClearStart( client, cmdString, argsString, argc );
+    else if ( cmdString == "copystart" )
+        return Cmd_CopyStart( client, cmdString, argsString, argc );
+    else if ( cmdString == "servers" || cmdString == "hop" )
+        return Cmd_Servers( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -390,6 +394,10 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
             // Pull this player's saved START for this map so they spawn where
             // they left off (savedstarts.as; no-op when the feature is off).
             RACE_TriggerSavedStartFetch( RACE_GetPlayer( client ) );
+
+            // Greet them with the wider-mesh picture (who's online elsewhere +
+            // the commands that tie the servers together). No-op solo / off-mesh.
+            RACE_MirrorGreet( client );
         }
 
         RACE_ShowRules(client, 2000);
@@ -1362,6 +1370,9 @@ void GT_InitGametype()
     G_RegisterCommand( "lastmaps" );
     G_RegisterCommand( "savestart" );
     G_RegisterCommand( "clearstart" );
+    G_RegisterCommand( "copystart" );
+    G_RegisterCommand( "servers" );
+    G_RegisterCommand( "hop" );
 
     RACE_MirrorInit(); // registers "who" and "watch"
     RACE_GhostInit();

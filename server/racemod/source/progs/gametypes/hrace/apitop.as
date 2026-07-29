@@ -56,6 +56,11 @@ void RACE_DoRecordAnnounce( const String &in playerName, uint finishTime, bool r
     if ( board[ 1 ].isFinished() )
         str += " " + S_COLOR_YELLOW + "[-" + RACE_TimeToString( board[ 1 ].getFinishTime() - finishTime ) + "]";
     G_PrintMsg( null, str + "\n" );
+
+    // Share the (already API-verified, so never a false positive) record with the
+    // rest of the mesh so every server sees it live. Peer-facing only — this
+    // server already printed it above.
+    RACE_MirrorBroadcastActivity( playerName, "rec", reversed, 1, finishTime, mirrorLocalMap );
 }
 
 // Called from completeRace when a finish is a LOCAL #1. Defers the announce

@@ -482,6 +482,12 @@ class Player
         // Trigger-plane markers toggle (a viewing aid, useful in any mode).
         s += this.showingTriggers ? menuItems[MI_HIDE_TRIGGERS] : menuItems[MI_SHOW_TRIGGERS];
 
+        // "Other servers" jump menu — only when this box has a hop list
+        // configured (rs_hop_servers), so an unconfigured server never spends a
+        // radial slot on an empty menu.
+        if ( rsHopServers.string.length() > 0 )
+            s += menuItems[MI_SERVERS];
+
         GENERIC_SetQuickMenu( this.client, s );
     }
 
@@ -2084,6 +2090,12 @@ class Player
             // false-announce — apitop.as verifies against a fresh API pull first.
             if ( pos == 0 )
                 RACE_QueueRecordAnnounce( this.client.name, finishTime, this.reversed );
+            // Share a fresh TOP-3 personal best with the mesh activity feed (a new
+            // #2 / #3 run). Rank 0 is the record — left to the API-verified announce
+            // above (RACE_DoRecordAnnounce broadcasts it) so we neither double up nor
+            // risk a false "record" from a stale local #1.
+            else if ( newPersonalBest && pos <= 2 )
+                RACE_MirrorBroadcastActivity( this.client.name, "fin", this.reversed, int( pos ) + 1, finishTime, mirrorLocalMap );
 
             // Upload the demo pointer + ghost trajectory for every PERSONAL BEST
             // (one per player per map). The web keeps a per-(player, map) row
