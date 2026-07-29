@@ -1,6 +1,10 @@
 // Race stats web server: hosts the race SQLite database behind a small REST API
 // and serves the static frontend that consumes it.
 import express from "express";
+// The Sentry SDK is initialised out-of-band via `node --import ./instrument.mjs`
+// (see web/Dockerfile CMD); this import only exposes the API. With SENTRY_DSN
+// unset no client is created, so every Sentry.* call below is a silent no-op.
+import * as Sentry from "@sentry/node";
 import path from "node:path";
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -1266,6 +1270,9 @@ app.use("/api", (err, _req, res, _next) => {
   if (err.type === "entity.parse.failed" || err.status === 400 || err.statusCode === 400) {
     return res.status(400).json({ error: "bad request" });
   }
+  // Genuine server fault (500) — report to Sentry (no-op when unconfigured)
+  // and log it. The 4xx client faults above returned already and are never sent.
+  Sentry.captureException(err);
   console.error("api error:", err);
   res.status(500).json({ error: "internal error" });
 });
@@ -2312,7 +2319,10 @@ app.use("/admin", (err, _req, res, _next) => {
   // Body-parser/client faults carry a 4xx status; anything else is a server
   // fault — log it and say so instead of masking it as the client's fault.
   const clientFault = err && Number.isInteger(err.status) && err.status >= 400 && err.status < 500;
-  if (!clientFault) console.error("admin route error:", err);
+  if (!clientFault) {
+    Sentry.captureException(err); // no-op when Sentry is unconfigured
+    console.error("admin route error:", err);
+  }
   if (clientFault) return res.status(400).type("text/plain").send("bad request");
   res.status(500).type("text/plain").send("server error");
 });
@@ -2646,6 +2656,21 @@ app.get("*", (req, res, next) => {
   sendShell(res, defaultShell(req));
 });
 
+// Global Sentry catch-all for any route error NOT already consumed by the
+// path-scoped /api and /admin error handlers above (those capture explicitly
+// then respond, so their errors never reach here — no double-reporting).
+// Registered last so Express treats it as error-handling middleware. Only
+// reports 5xx / no-status faults; 4xx client errors carry a status and are
+// skipped. Installed only when Sentry is configured (see instrument.mjs).
+if (Sentry.getClient()) {
+  Sentry.setupExpressErrorHandler(app, {
+    shouldHandleError(error) {
+      const status = error?.status ?? error?.statusCode ?? 500;
+      return status >= 500;
+    },
+  });
+}
+
 const server = app.listen(PORT, async () => {
   console.log(`Race stats server listening on http://0.0.0.0:${PORT}`);
   // The status lines are informational — a DB blip here must not become an
@@ -2698,6 +2723,8 @@ async function shutdown(signal) {
     // Cut lingering keep-alive/streaming sockets so close() can complete.
     setTimeout(() => server.closeAllConnections(), 4000).unref();
   });
+  // Deliver any buffered Sentry events before exit (no-op when unconfigured).
+  await Sentry.flush(2000).catch(() => {});
   await race.close().catch(() => {});
   process.exit(0);
 }

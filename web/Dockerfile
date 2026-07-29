@@ -16,7 +16,9 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY server.js db.js censor.js live.js streams.js og-image.js cache.js admin.js rcon.js seed-topscores.js heatmap.js bsp.js weapons.js scan-map-weapons.js migrate-sqlite-to-pg.js ./
+# instrument.mjs is the Sentry bootstrap loaded via `--import` in the CMD below
+# (must run before server.js under ESM) — keep it first in this explicit list.
+COPY instrument.mjs server.js db.js censor.js live.js streams.js og-image.js cache.js admin.js rcon.js seed-topscores.js heatmap.js bsp.js mapindex.js weapons.js scan-map-weapons.js migrate-sqlite-to-pg.js ./
 COPY migrations ./migrations
 COPY og-assets ./og-assets
 COPY public ./public
@@ -31,4 +33,6 @@ HEALTHCHECK --interval=30s --timeout=4s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://localhost:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 USER node
-CMD ["node", "server.js"]
+# --import loads the Sentry SDK (instrument.mjs) before server.js so it can wrap
+# http/express/pg under ESM. Harmless no-op when SENTRY_DSN is unset.
+CMD ["node", "--import", "./instrument.mjs", "server.js"]

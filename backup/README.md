@@ -25,11 +25,16 @@ Each zip contains a plain-SQL PostgreSQL dump (`racesow-db-YYYYMMDD.sql`), a
 
 ## What is included / excluded
 
-**Included** — the public race record: `race`, `checkpoint`, `run_tally`,
-`player`, `map`, `version`, `canonical`, per-player replay metadata
-(`player_demo`, `player_ghost`), and game-server **names** (`server`), plus the
-`config` counter and `pgmigrations` bookkeeping (so a restore boots without
-re-running migrations).
+It is a **full public mirror** of the gameplay data, not just current records.
+
+**Included** — every personal-best record (`race`) **and** the complete
+finish-log history (`finish`), all their checkpoint splits (`checkpoint`,
+`finish_checkpoint`), `run_tally`, `player`, `map`, `version`, `canonical`,
+per-player replay metadata (`player_demo`, `player_ghost`), daily Skill-Rating
+history (`sr_history`), the per-map weapon index (`map_weapon`), the message of
+the day (`site_setting`) and game-server **names** (`server`), plus the `config`
+counter and `pgmigrations` bookkeeping (so a restore boots without re-running
+migrations).
 
 **Excluded** — anything private:
 
@@ -37,14 +42,19 @@ re-running migrations).
 | --- | --- |
 | `admin_user`, `admin_session` | moderator logins + sessions |
 | `map_flag` | abuse reports + salted reporter-IP hashes |
+| `map_block` | moderation block decisions (admin usernames) |
 | `server.token_hash` | ingest API tokens |
 | `server.address` | game-server IP addresses |
+| `site_setting.updated_by` | admin username on the MOTD |
+| `config.maintenance_*` | maintenance-mode state + the admin who toggled it |
 | mesh keys, `INGEST_TOKEN` | live in env/config, never stored in the DB |
 
-The `server` table's data is dumped through a sanitized `SELECT` (id, name,
-status, timestamps, record count) — `token_hash` and `address` are never
-written out. Everything else on the exclude list is simply never selected by
-`pg_dump`.
+`config`, `server` and `site_setting` have their **data** dumped through a
+sanitized `SELECT` (config: every key except `maintenance_*`, so the
+`next_race_id` bootstrap counter survives; server: id, name, status, timestamps,
+record count; site_setting: key, value, timestamp) — `token_hash`, `address`,
+`updated_by` and the `maintenance_*` keys are never written out. Everything else
+on the exclude list is simply never selected by `pg_dump`.
 
 ## Restore
 

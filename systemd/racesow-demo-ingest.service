@@ -1,0 +1,22 @@
+# One-shot: ingest client demos dropped in the SFTP quarantine (see
+# scripts/ingest-demos.sh). Driven by racesow-demo-ingest.timer, or on demand:
+# `systemctl start racesow-demo-ingest`. Template __RACESOW_DIR__ is substituted
+# by systemd/install.sh. US (agent) box only — pairs with docker-compose.sftp.yml.
+#
+# Runs as ROOT (not __RACESOW_USER__): it moves files owned by the SFTP jail user
+# (uid 1500) out of the incoming dir and talks to Docker. INGEST_URL/INGEST_TOKEN
+# are read from the repo-root .env the agent compose already uses.
+[Unit]
+Description=Racesow client-demo ingestion (SFTP dropbox -> stats)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__RACESOW_DIR__
+EnvironmentFile=-__RACESOW_DIR__/.env
+ExecStart=__RACESOW_DIR__/scripts/ingest-demos.sh
+TimeoutStartSec=0
+Nice=10
+IOSchedulingClass=idle

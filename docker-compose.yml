@@ -150,6 +150,13 @@ services:
       # (served at /api/maps/:id/heatmap.png). Also under ./data, shared by both
       # web replicas; the sidecar writes, the web only reads.
       HEATMAP_DIR: "/data/heatmaps"
+      # Sentry error + performance reporting (web/instrument.mjs). Empty DSN =
+      # disabled/no-op. Keep these in exact lockstep with the web2 replica in
+      # docker-compose.override.yml (rolling-deploy.sh fails on env drift).
+      SENTRY_DSN: "${SENTRY_DSN:-}"
+      SENTRY_ENVIRONMENT: "${SENTRY_ENVIRONMENT:-production}"
+      SENTRY_TRACES_SAMPLE_RATE: "${SENTRY_TRACES_SAMPLE_RATE:-0.1}"
+      SENTRY_RELEASE: "${SENTRY_RELEASE:-}"
     volumes:
       # Legacy SQLite location — only read by migrate-sqlite-to-pg.js now; also
       # holds the WR ghost files (GHOST_DIR=/data/ghosts above), shared by both

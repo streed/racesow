@@ -1,0 +1,13 @@
+# Poll the SFTP demo dropbox every couple of minutes (see scripts/ingest-demos.sh).
+# A timer (not a .path unit) is deliberate: SFTP writes land incrementally, so we
+# process files that have been SETTLED for a bit rather than firing mid-upload.
+[Unit]
+Description=Racesow client-demo ingestion poll
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

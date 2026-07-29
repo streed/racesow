@@ -617,6 +617,16 @@ a.replay-badge { text-decoration: none; }
 /* Section headings between panels — pull the shared .page-title down a touch. */
 .about-h2 { margin-top: 14px; font-size: 24px; }
 
+/* DB-download panel: prominent button + snapshot stats, filled from /api/backup. */
+.db-meta { margin: 4px 0 2px; }
+.db-dl-btn { display: inline-block; text-decoration: none; }
+.db-dl-btn:hover { color: #fff; }
+.db-stats { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 10px;
+  font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.db-stats span { position: relative; }
+.db-stats span + span::before { content: "·"; position: absolute; left: -9px; color: var(--line-2); }
+.db-sha { margin-top: 8px; font-size: 11px; color: var(--faint); overflow-wrap: anywhere; }
+
 /* Connect cards */
 .srv-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 6px 0 4px; }
 .srv-card { border: 1px solid var(--line-2); border-radius: 10px; padding: 12px 14px; background: var(--bg-2); }

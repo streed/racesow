@@ -16,6 +16,7 @@
   "//": "better-sqlite3 is used ONLY by the one-time migrate-sqlite-to-pg.js, but stays a runtime dependency because that tool runs inside the production image (which installs with --omit=dev). pg is the live driver. node-pg-migrate runs the schema migrations at startup (see web/db.js openDatabase and web/migrations/).",
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",
+    "@sentry/node": "^10.69.0",
     "better-sqlite3": "^11.8.1",
     "express": "^4.21.2",
     "node-pg-migrate": "^8.0.4",

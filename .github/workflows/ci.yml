@@ -47,3 +47,5 @@ jobs:
         run: sh e2e/mirror_fuzz_run.sh
       - name: WR-demo filename port equivalence
         run: node --test server/test/demoname.test.mjs
+      - name: demo metadata parser (client-demo attribution)
+        run: node --test server/test/demo-meta.test.mjs

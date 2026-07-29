@@ -1,0 +1,62 @@
+# Secure SFTP demo dropbox (US box). A hardened, key-only, chrooted SFTP server
+# that trusted uploaders use to drop client-recorded race demos into an ISOLATED
+# quarantine directory. Nothing here is public and nothing is served — the
+# host-side ingestion watcher (scripts/ingest-demos.sh) later AV-scans, parses
+# (web/demo-meta.mjs), attributes and promotes each demo into the served tree.
+#
+# Why atmoz/sftp: it wraps OpenSSH with ForceCommand internal-sftp + a per-user
+# ChrootDirectory + no shell, so a compromised/hostile uploader is confined to
+# their own upload dir and can never run a command or see the rest of the box.
+# It is its OWN compose project (like docker-compose.tv.yml) and attaches to NO
+# other network — fully standalone, so it shares nothing with the game stack.
+#
+# One shared `demos` jail holds EVERY uploader's public key (server/sftp/keys/*.pub);
+# the demo file itself carries the runner + time, so we don't need per-person
+# upload accounts. To switch to per-user jails, add more `user::UID:GID:incoming`
+# lines to users.conf and matching key/incoming mounts below.
+#
+# Setup / deploy — run from the server/ directory on the US box:
+#   mkdir -p sftp/hostkeys sftp-uploads/demos/incoming
+#   ssh-keygen -t ed25519 -f sftp/hostkeys/ssh_host_ed25519_key -N ''   # once
+#   ssh-keygen -t rsa -b 4096 -f sftp/hostkeys/ssh_host_rsa_key -N ''   # once
+#   docker compose -f docker-compose.sftp.yml up -d
+#   sudo ufw allow ${SFTP_PORT:-2222}/tcp                               # once
+# Add an uploader: drop their pubkey in sftp/keys/<name>.pub, re-run `up -d`.
+# Connect:  sftp -P 2222 demos@us.east.racesow.org   then  put run.wdz20 incoming/
+name: racesow-sftp
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  sftp:
+    image: atmoz/sftp:alpine
+    container_name: racesow-sftp
+    restart: unless-stopped
+    logging: *default-logging
+    # Block privilege escalation via setuid binaries inside the jail. sshd still
+    # drops privileges TO the unprivileged user, which this does not prevent.
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      # Dedicated port, distinct from the box's admin SSH (22). Key-only.
+      - "${SFTP_PORT:-2222}:22/tcp"
+    volumes:
+      # One line per jail: `user::UID:GID:incoming` — empty password field means
+      # key-only (login requires a mounted public key). `incoming` is the single
+      # writable subdir; the chroot root /home/demos stays root-owned.
+      - ./sftp/users.conf:/etc/sftp/users.conf:ro
+      # Every *.pub here is appended to demos' authorized_keys at container start.
+      - ./sftp/keys:/home/demos/.ssh/keys:ro
+      # The ISOLATED landing zone, persisted on the host for the ingestion watcher
+      # to pick up (it globs sftp-uploads/*/incoming). Owned by the jail's UID
+      # (1500); nothing else touches it.
+      - ./sftp-uploads/demos/incoming:/home/demos/incoming
+      # Persistent host keys so the server identity is stable across restarts
+      # (otherwise every recreate trips clients' known_hosts MITM warning).
+      # Generated once on the box (see header); gitignored.
+      - ./sftp/hostkeys/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro
+      - ./sftp/hostkeys/ssh_host_rsa_key:/etc/ssh/ssh_host_rsa_key:ro

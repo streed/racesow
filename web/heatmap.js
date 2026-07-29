@@ -28,6 +28,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { loadMapGeometry, renderMapBase, makeProject, fillBg, drawGrid, drawMarkers, THEME } from "./bsp.js";
+import { getMapIndex, rebuildMapIndex } from "./mapindex.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -385,7 +386,11 @@ export function generateMap(mapId, name = null, { ghostDir = GHOST_DIR, outDir =
   let mapBase = false;
   if (mapsDir && name) {
     try {
-      const geom = loadMapGeometry(mapsDir, name);
+      // Resolve the map name to its real pack via the pool index (pack filenames
+      // routinely differ from the map/bsp name); the index is built + cached +
+      // persisted next to the rendered images (mapindex.json).
+      const index = getMapIndex(mapsDir, outDir);
+      const geom = loadMapGeometry(mapsDir, name, (n) => index.get(n));
       if (geom) { renderMapBase(canvas, S, built.bounds, built.fit, geom); mapBase = true; }
     } catch (e) {
       log(`map-base render failed for ${mapId} (${name}): ${e.message}`);
@@ -573,7 +578,25 @@ async function runLoop() {
 const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) {
   const args = process.argv.slice(2);
-  if (args.includes("--loop")) {
+  if (args.includes("--reindex")) {
+    // Build (or rebuild) the name -> pk3 lookup table and report how many maps
+    // ship in a pack whose filename differs from the map name (the ones the old
+    // ${name}.pk3 guess missed). Writes HEATMAP_DIR/mapindex.json when MAPS_DIR
+    // is set; a bare dump otherwise.
+    if (!MAPS_DIR) { log("MAPS_DIR is unset — nothing to index"); process.exit(1); }
+    // Force a fresh rebuild + rewrite (ignores any existing same-signature file),
+    // so this is a true escape hatch even after an in-place pack swap.
+    const index = rebuildMapIndex(MAPS_DIR, HEATMAP_DIR);
+    let mismatch = 0, multi = 0;
+    for (const [name, packs] of index) {
+      if (packs.length > 1) multi++;
+      // Case-insensitive: a capitalized pack filename that matches the (lowercased)
+      // map name only by case is NOT a differently-named pack — it still resolves.
+      if (!packs.some((p) => p.toLowerCase() === `${name}.pk3`)) mismatch++;
+    }
+    log(`indexed ${index.size} maps; ${mismatch} live only in a differently-named pack (base render would miss these), ${multi} appear in multiple packs -> ${path.join(HEATMAP_DIR, "mapindex.json")}`);
+    process.exit(0);
+  } else if (args.includes("--loop")) {
     runLoop();
   } else if (args.includes("--all")) {
     runOnce({ all: true }).then(

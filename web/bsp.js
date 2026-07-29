@@ -355,11 +355,28 @@ export function parseEntities(buf) {
   return buf.toString("latin1", offset, offset + length).replace(/\0+$/, "");
 }
 
-// Convenience: pk3 path + map name -> parsed map geometry, or null. Strips a
+// Convenience: maps dir + map name -> parsed map geometry, or null. Strips a
 // "-reversed" suffix (reverse maps reuse the base map's .bsp/.pk3).
-export function loadMapGeometry(mapsDir, mapName) {
-  const base = String(mapName || "").replace(/-reversed$/, "");
-  if (!base || !/^[a-z0-9_.-]+$/i.test(base)) return null;
-  const bsp = extractBsp(`${mapsDir}/${base}.pk3`, base);
-  return bsp ? parseBsp(bsp) : null;
+//
+// A pack's filename is often NOT the map name (bug70_slick-wjfix.bsp ships in
+// bug70-wjfix.pk3), so the map name alone can't name the pack. `resolvePk3s`
+// (see mapindex.js getMapIndex) maps a name to the candidate pack FILENAMES that
+// actually carry maps/<name>.bsp; we try them in order until one parses. The old
+// same-name guess is kept as a final fallback so callers without an index (and
+// the common name==filename case) still work.
+export function loadMapGeometry(mapsDir, mapName, resolvePk3s = null) {
+  const base = String(mapName || "").replace(/-reversed$/, "").toLowerCase();
+  if (!base || !/^[a-z0-9_.-]+$/.test(base)) return null;
+  const candidates = [];
+  if (resolvePk3s) {
+    for (const f of resolvePk3s(base) || []) if (!candidates.includes(f)) candidates.push(f);
+  }
+  const legacy = `${base}.pk3`;
+  if (!candidates.includes(legacy)) candidates.push(legacy);
+  for (const f of candidates) {
+    const bsp = extractBsp(`${mapsDir}/${f}`, base);
+    const geom = bsp ? parseBsp(bsp) : null;
+    if (geom) return geom;
+  }
+  return null;
 }

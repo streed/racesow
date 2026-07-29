@@ -72,7 +72,7 @@ const POINTS_CASE = `CASE rank
 // style, so a couple of lucky near-WRs can't top the board). The prefix-max
 // subset — provably "include a run iff it holds up at your proven level" — is
 // what makes SR safe to grind: casually cruising map 500 can only ever raise
-// it, never dilute a rating earned on your best 20, so a 30-map career and a
+// it, never dilute a rating earned on your best 50, so a 30-map career and a
 // 3000-map one compete fairly. The prefix minimum of 1 keeps below-prior
 // players ranked by their best run instead of clamping half the board at the
 // prior; only players with NO contested map sit at exactly 1000*SR_MU.
@@ -81,11 +81,17 @@ const POINTS_CASE = `CASE rank
 // players): the proven multi-WR names hold the top-10 in a credible order,
 // sub-10-map one-hit wonders drop from the top-10 to #150-500 (22 of the SR
 // top-50 had <10 maps under the old formula; now 0), and the distribution
-// spreads to p1=895 / median=319 / p90=224 instead of bunching at 850-980.
+// spreads to p1=898 / median=319 / p90=224 instead of bunching at 850-980.
+//
+// SR_TOP_K was widened from 20 to 50 so deep, consistently-strong catalogs get
+// full credit for their depth. Because SR is the MAX over prefixes 1..K, raising
+// the cap is monotone: it can only raise or hold a rating, never lower one. On
+// the 2026-07 snapshot it moved 130 of 9.2k players, every one a gain of +1..+27
+// (top-heavy; players with <20 contested maps are untouched), nudging p1 895->898.
 export const SR_MU = 0.35;
 export const SR_KAPPA = 10;
 export const SR_GAMMA = 3;
-export const SR_TOP_K = 20;
+export const SR_TOP_K = 50;
 export const SR_MIN_FIELD = 5;
 
 // How many days of per-player Skill Rating history to retain (rolling window).

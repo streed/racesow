@@ -55,6 +55,13 @@ services:
       GHOST_DIR: "/data/ghosts"
       BACKUP_DIR: "/data/backups"
       HEATMAP_DIR: "/data/heatmaps"
+      # Sentry — MUST match the base `web` service in docker-compose.yml exactly
+      # (same ${...} defaults → identical resolved values): rolling-deploy.sh
+      # fails the parity preflight on any env drift between web and web2.
+      SENTRY_DSN: "${SENTRY_DSN:-}"
+      SENTRY_ENVIRONMENT: "${SENTRY_ENVIRONMENT:-production}"
+      SENTRY_TRACES_SAMPLE_RATE: "${SENTRY_TRACES_SAMPLE_RATE:-0.1}"
+      SENTRY_RELEASE: "${SENTRY_RELEASE:-}"
     volumes:
       - ./data:/data
       # Same read-only replay-mesh mount as `web` — without it this replica
