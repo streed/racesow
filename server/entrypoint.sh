@@ -35,6 +35,19 @@ MIRROR_SECRET="${MIRROR_SECRET:-}"          # shared HMAC key (hex recommended: 
                                             # Must not contain '"' or ';' (it is emitted into a cfg line).
 MIRROR_PORT="${MIRROR_PORT:-44450}"         # local mirror UDP bind port
 MIRROR_TAG="${MIRROR_TAG:-}"                # short server id shown as [TAG] in mirrored chat
+# In-game server hopping (hrace/serverhop.as): the shared list of every Racesow
+# server (tag;Display Name;game;host:port, entries joined by '|'), and this box's
+# game which filters the list to same-game peers + drops this box's own entry.
+# HOP_GAME defaults from the -ws / -wf MIRROR_TAG suffix, so no per-box config is
+# needed; each field is protected by the surrounding quotes when written to cfg.
+HOP_SERVERS="${HOP_SERVERS:-eu-ws;Racesow EU Warsow;warsow;eu.frankfurt.racesow.org:44400|us-ws;Racesow US Warsow;warsow;us.east.racesow.org:44400|eu-wf;Racesow EU Warfork;warfork;eu.frankfurt.racesow.org:44410|us-wf;Racesow US Warfork;warfork;us.east.racesow.org:44410}"
+HOP_GAME="${HOP_GAME:-}"
+if [ -z "${HOP_GAME}" ]; then
+    case "${MIRROR_TAG}" in
+        *-wf) HOP_GAME="warfork" ;;
+        *-ws) HOP_GAME="warsow" ;;
+    esac
+fi
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 cd "${WARSOW_DIR}"
@@ -344,6 +357,12 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         echo "set rs_mirror_port \"${MIRROR_PORT}\""
         echo "set rs_mirror_peers \"${MIRROR_PEERS}\""
         [ -n "${MIRROR_SECRET}" ] && echo "set rs_mirror_secret \"${MIRROR_SECRET}\""
+    fi
+    # In-game server hopping (/servers, /hop) - hrace/serverhop.as. Off unless both
+    # the list and this box's game resolved (game auto-derived from the tag above).
+    if [ -n "${HOP_SERVERS}" ] && [ -n "${HOP_GAME}" ]; then
+        echo "set rs_hop_servers \"${HOP_SERVERS}\""
+        echo "set rs_hop_game \"${HOP_GAME}\""
     fi
 } > "${ENV_CFG}"
 

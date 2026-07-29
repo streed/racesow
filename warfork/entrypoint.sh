@@ -36,6 +36,16 @@ MIRROR_PEERS=${MIRROR_PEERS:-}
 MIRROR_SECRET=${MIRROR_SECRET:-}
 MIRROR_PORT=${MIRROR_PORT:-44451}
 MIRROR_TAG=${MIRROR_TAG:-}
+# In-game server hopping (hrace/serverhop.as): shared server list + this box's
+# game (auto-derived from the -ws / -wf MIRROR_TAG suffix, so no per-box config).
+HOP_SERVERS="${HOP_SERVERS:-eu-ws;Racesow EU Warsow;warsow;eu.frankfurt.racesow.org:44400|us-ws;Racesow US Warsow;warsow;us.east.racesow.org:44400|eu-wf;Racesow EU Warfork;warfork;eu.frankfurt.racesow.org:44410|us-wf;Racesow US Warfork;warfork;us.east.racesow.org:44410}"
+HOP_GAME="${HOP_GAME:-}"
+if [ -z "${HOP_GAME}" ]; then
+    case "${MIRROR_TAG}" in
+        *-wf) HOP_GAME="warfork" ;;
+        *-ws) HOP_GAME="warsow" ;;
+    esac
+fi
 MAP_ROTATION=${MAP_ROTATION:-2}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 
@@ -139,6 +149,11 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         [ -n "${MIRROR_SECRET}" ] && echo "set rs_mirror_secret \"${MIRROR_SECRET}\""
     elif [ -n "${MIRROR_PEERS}" ]; then
         echo ">> WARNING: MIRROR_PEERS set but MIRROR_TAG empty; mesh stays OFF." >&2
+    fi
+    # In-game server hopping (/servers, /hop) - hrace/serverhop.as.
+    if [ -n "${HOP_SERVERS}" ] && [ -n "${HOP_GAME}" ]; then
+        echo "set rs_hop_servers \"${HOP_SERVERS}\""
+        echo "set rs_hop_game \"${HOP_GAME}\""
     fi
 } > "${ENV_CFG}"
 
