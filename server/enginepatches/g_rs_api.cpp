@@ -47,7 +47,9 @@ enum RequestType {
 	REQ_GET_MOTD,      // live message of the day -> stored in memory (RS_ApiPollMotd)
 	REQ_GET_RANKS,      // live per-map global ranks -> stored in memory (RS_ApiPollRanks)
 	REQ_GET_MAPWEAPONS, // per-map weapon inventory -> stored in memory (RS_ApiPollMapWeapons)
-	REQ_GET_LASTMAPS    // recently-played maps -> stored in memory (RS_ApiPollLastMaps)
+	REQ_GET_LASTMAPS,   // recently-played maps -> stored in memory (RS_ApiPollLastMaps)
+	REQ_GET_PLAYERREC,  // one player's PB on the current map -> stored per-slot (RS_ApiPollPlayerRecord)
+	REQ_GET_SAVEDSTART  // one player's saved start(s) on the current map -> per-slot (RS_ApiPollSavedStart)
 };
 
 // note: no default member initializers — the game module builds as C++11,
@@ -59,7 +61,8 @@ struct ApiRequest {
 	int attempts;
 	int type;             // RequestType
 	std::string filePath; // REQ_GET_TOPSCORES: where the payload lands
-	unsigned gen;         // REQ_GET_TOPSCORES: fetch generation (stale = discard)
+	unsigned gen;         // REQ_GET_TOPSCORES / REQ_GET_PLAYERREC: fetch generation (stale = discard)
+	int slot;             // REQ_GET_PLAYERREC: which player slot this result belongs to (else 0/unused)
 };
 
 constexpr size_t QUEUE_MAX = 256;
@@ -158,13 +161,48 @@ struct ApiState {
 	std::mutex lastMapsMutex;
 	std::string lastMapsText;
 
+	// Per-player PB fetch handshake. Unlike every fetch above (one shared slot per
+	// map), this is PER PLAYER: a player-record fetch is keyed by playerNum so
+	// several joining players can be in flight at once without clobbering each
+	// other. Fixed C array (std::atomic is not copyable, so a std::vector is
+	// illegal); sized to a compile-time cap >= the engine's MAX_CLIENTS, matching
+	// RS_MAX_BOT_SLOTS. playerRecText[i] holds the raw "//playerrec ..." payload
+	// for slot i, guarded by the single playerRecMutex; the per-slot gen supersedes
+	// an in-flight fetch (a re-join / rename on the same slot), and the per-slot
+	// result is read-and-cleared by RS_ApiPollPlayerRecord(i).
+	static const int RS_PLAYERREC_MAX = 256;
+	std::atomic<unsigned> fetchPlayerRecGen[RS_PLAYERREC_MAX];
+	std::atomic<int> fetchPlayerRecResult[RS_PLAYERREC_MAX];
+	std::mutex playerRecMutex;
+	std::string playerRecText[RS_PLAYERREC_MAX];
+
+	// Per-player saved-START fetch handshake — identical PER-PLAYER shape to the
+	// player-record slots above (keyed by playerNum, one payload per slot behind
+	// savedStartMutex, a per-slot gen to supersede an in-flight re-join fetch,
+	// per-slot result read-and-cleared by RS_ApiPollSavedStart(i)). Shares the
+	// RS_PLAYERREC_MAX cap (both are keyed by the same player slot).
+	std::atomic<unsigned> fetchSavedStartGen[RS_PLAYERREC_MAX];
+	std::atomic<int> fetchSavedStartResult[RS_PLAYERREC_MAX];
+	std::mutex savedStartMutex;
+	std::string savedStartText[RS_PLAYERREC_MAX];
+
 	ApiState()
 		: stop( false ), fetchGen( 0 ), fetchResult( 0 ), fetchGhostGen( 0 ), fetchGhostResult( 0 ),
 		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ),
 		  fetchBlockedGen( 0 ), fetchBlockedResult( 0 ), fetchMotdGen( 0 ), fetchMotdResult( 0 ),
 		  fetchRanksGen( 0 ), fetchRanksResult( 0 ),
 		  fetchMapWeaponsGen( 0 ), fetchMapWeaponsResult( 0 ),
-		  fetchLastMapsGen( 0 ), fetchLastMapsResult( 0 ) {}
+		  fetchLastMapsGen( 0 ), fetchLastMapsResult( 0 )
+	{
+		// Atomics can't be aggregate-initialized in the member-init list loop-free,
+		// so zero the per-slot arrays here in the ctor body.
+		for( int i = 0; i < RS_PLAYERREC_MAX; i++ ) {
+			fetchPlayerRecGen[i].store( 0 );
+			fetchPlayerRecResult[i].store( 0 );
+			fetchSavedStartGen[i].store( 0 );
+			fetchSavedStartResult[i].store( 0 );
+		}
+	}
 };
 
 // Script-thread-only accumulator for building a ghost upload body incrementally
@@ -190,6 +228,30 @@ size_t collectBody( void *data, size_t size, size_t nmemb, void *userp )
 		return 0; // absurd payload; abort the transfer
 	out->append( (const char *)data, n );
 	return n;
+}
+
+// RFC3986 percent-encode for a query-string value. The map-name fetches never
+// needed this (map names are [a-z0-9._-]), but a player nick can carry spaces,
+// '&', '#' or UTF-8 bytes that would corrupt "?map=..&name=<nick>" — and curl
+// does NOT auto-encode CURLOPT_URL. Hand-rolled + ASCII so it survives the
+// POSIX-locale build; encodes everything except the RFC3986 unreserved set.
+std::string urlEncode( const std::string &s )
+{
+	static const char hex[] = "0123456789ABCDEF";
+	std::string out;
+	out.reserve( s.size() );
+	for( size_t i = 0; i < s.size(); i++ ) {
+		unsigned char c = (unsigned char)s[i];
+		if( ( c >= 'A' && c <= 'Z' ) || ( c >= 'a' && c <= 'z' ) ||
+			( c >= '0' && c <= '9' ) || c == '-' || c == '_' || c == '.' || c == '~' ) {
+			out.push_back( (char)c );
+		} else {
+			out.push_back( '%' );
+			out.push_back( hex[c >> 4] );
+			out.push_back( hex[c & 0xF] );
+		}
+	}
+	return out;
 }
 
 // -1 = transport error (retryable), otherwise the HTTP status.
@@ -340,7 +402,7 @@ std::vector<ApiRequest> loadSpool()
 		if( tab != std::string::npos && tab > 0 && tab + 1 < line.size() &&
 			line.size() < SPOOL_LINE_MAX && out.size() < SPOOL_LOAD_MAX ) {
 			out.push_back( ApiRequest{ line.substr( 0, tab ), token ? token : "",
-				line.substr( tab + 1 ), 0, REQ_POST_REPORT, "", 0 } );
+				line.substr( tab + 1 ), 0, REQ_POST_REPORT, "", 0, 0 } );
 		} else if( !line.empty() ) {
 			skipped++;
 		}
@@ -801,6 +863,95 @@ void workerMain( ApiState *s )
 				continue;
 			}
 			// transient: fall through to the requeue below
+		} else if( req.type == REQ_GET_PLAYERREC ) {
+			// Per-player PB fetch, keyed by req.slot. A fetch queued once
+			// shutdown is under way is worthless: nobody will ever poll it.
+			if( req.slot < 0 || req.slot >= ApiState::RS_PLAYERREC_MAX )
+				continue;
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchPlayerRecGen[req.slot].load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded (re-join / rename on this slot) - drop
+				// The web leads a real record with a "//playerrec" header (an empty
+				// body means "this player has no record here"), so anything not
+				// "//..." is a captive portal / proxy error page and an empty body
+				// is a fail-open "none" - both -> -1 so the gametype keeps the
+				// player's existing board seed untouched.
+				if( payload.empty() || payload.compare( 0, 2, "//" ) != 0 ) {
+					s->fetchPlayerRecResult[req.slot].store( -1 );
+					continue;
+				}
+				{
+					std::lock_guard<std::mutex> lock( s->playerRecMutex );
+					s->playerRecText[req.slot].swap( payload );
+				}
+				// Always signal 1 on a good body (no "skip if unchanged" dedup like
+				// the map-wide fetches use): this is a ONE-SHOT fetch the script side
+				// gates behind a per-player pendingRecordFetch flag it clears only on
+				// a non-zero poll. Suppressing the signal for an identical payload
+				// would strand that flag true and the gametype would poll forever.
+				s->fetchPlayerRecResult[req.slot].store( 1 );
+				continue;
+			}
+			if( !current )
+				continue; // superseded - do not burn retries on a stale fetch
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				// 404 is the expected "this player has no record on this map".
+				if( status != 404 )
+					fprintf( stderr, "rs_api: player-record fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchPlayerRecResult[req.slot].store( -1 );
+				continue;
+			}
+			// transient: fall through to the requeue below
+			} else if( req.type == REQ_GET_SAVEDSTART ) {
+				// Per-player saved-START fetch, keyed by req.slot - same per-slot
+				// handshake as REQ_GET_PLAYERREC above.
+				if( req.slot < 0 || req.slot >= ApiState::RS_PLAYERREC_MAX )
+					continue;
+				if( s->stop.load() )
+					continue;
+				std::string payload;
+				status = doGet( req, payload );
+				bool current = req.gen == s->fetchSavedStartGen[req.slot].load();
+				if( status >= 200 && status < 300 ) {
+					if( !current )
+						continue; // superseded (re-join on this slot) - drop
+					// The web always leads with a "//starts" header (a bare header =
+					// this player has no saved start). Anything not "//..." is a captive
+					// portal / proxy error page -> fail-open -1 (stay at map default).
+					if( payload.empty() || payload.compare( 0, 2, "//" ) != 0 ) {
+						s->fetchSavedStartResult[req.slot].store( -1 );
+						continue;
+					}
+					{
+						std::lock_guard<std::mutex> lock( s->savedStartMutex );
+						s->savedStartText[req.slot].swap( payload );
+					}
+					// One-shot fetch: always signal 1 on a good body (the script clears
+					// its pendingSavedStartFetch only on a non-zero poll).
+					s->fetchSavedStartResult[req.slot].store( 1 );
+					continue;
+				}
+				if( !current )
+					continue; // superseded - do not burn retries on a stale fetch
+				bool permanent = status >= 400 && status < 500;
+				req.attempts++;
+				if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+					// 404 is the expected "unknown map / no saved start".
+					if( status != 404 )
+						fprintf( stderr, "rs_api: saved-start fetch failed for good, status %ld: %s\n",
+							status, req.url.c_str() );
+					s->fetchSavedStartResult[req.slot].store( -1 );
+					continue;
+				}
+				// transient: fall through to the requeue below
 		} else {
 			if( s->stop.load() && stopDrainFailed ) {
 				spoolReport( req );
@@ -929,7 +1080,7 @@ static void rsQueuePost( const char *url, const char *token, std::string &&body 
 			}
 		}
 		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
-			REQ_POST_REPORT, "", 0 } );
+			REQ_POST_REPORT, "", 0, 0 } );
 	}
 	s->cv.notify_one();
 }
@@ -1120,7 +1271,7 @@ void RS_ApiFetchTop( const char *url, const char *token, const char *mapname )
 			// over a race report (a finish is reported exactly once).
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_TOPSCORES ) {
+				if( it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
 					evicted = true;
 					break;
@@ -1135,7 +1286,7 @@ void RS_ApiFetchTop( const char *url, const char *token, const char *mapname )
 			}
 		}
 		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
-			REQ_GET_TOPSCORES, std::move( path ), gen } );
+			REQ_GET_TOPSCORES, std::move( path ), gen, 0 } );
 	}
 	s->cv.notify_one();
 }
@@ -1297,7 +1448,7 @@ void RS_ApiFetchGhost( const char *url, const char *token, const char *mapname )
 			// evict another fetch (reproducible) before a one-shot race report
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
+				if( it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
 					evicted = true;
 					break;
@@ -1312,7 +1463,7 @@ void RS_ApiFetchGhost( const char *url, const char *token, const char *mapname )
 			}
 		}
 		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
-			REQ_GET_GHOST, "", gen } );
+			REQ_GET_GHOST, "", gen, 0 } );
 	}
 	s->cv.notify_one();
 }
@@ -1424,7 +1575,7 @@ void RS_ApiFetchBlocked( const char *url, const char *token )
 			// one-shot race report
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
+				if( it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
 					evicted = true;
 					break;
@@ -1439,7 +1590,7 @@ void RS_ApiFetchBlocked( const char *url, const char *token )
 			}
 		}
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
-			REQ_GET_BLOCKED, "", gen } );
+			REQ_GET_BLOCKED, "", gen, 0 } );
 	}
 	s->cv.notify_one();
 }
@@ -1497,7 +1648,7 @@ void RS_ApiFetchMapWeapons( const char *url, const char *token )
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
 				if( it->type == REQ_GET_MAPWEAPONS || it->type == REQ_GET_RANKS ||
 					it->type == REQ_GET_MOTD || it->type == REQ_GET_BLOCKED ||
-					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
+					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
 					evicted = true;
 					break;
@@ -1512,7 +1663,7 @@ void RS_ApiFetchMapWeapons( const char *url, const char *token )
 			}
 		}
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
-			REQ_GET_MAPWEAPONS, "", gen } );
+			REQ_GET_MAPWEAPONS, "", gen, 0 } );
 	}
 	s->cv.notify_one();
 }
@@ -1570,7 +1721,7 @@ void RS_ApiFetchLastMaps( const char *url, const char *token )
 				if( it->type == REQ_GET_LASTMAPS || it->type == REQ_GET_MAPWEAPONS ||
 					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD ||
 					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
-					it->type == REQ_GET_TOPSCORES ) {
+					it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
 					evicted = true;
 					break;
@@ -1585,7 +1736,7 @@ void RS_ApiFetchLastMaps( const char *url, const char *token )
 			}
 		}
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
-			REQ_GET_LASTMAPS, "", gen } );
+			REQ_GET_LASTMAPS, "", gen, 0 } );
 	}
 	s->cv.notify_one();
 }
@@ -1642,7 +1793,7 @@ void RS_ApiFetchMotd( const char *url, const char *token )
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
 				if( it->type == REQ_GET_MOTD || it->type == REQ_GET_BLOCKED ||
-					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
+					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
 					evicted = true;
 					break;
@@ -1657,7 +1808,7 @@ void RS_ApiFetchMotd( const char *url, const char *token )
 			}
 		}
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
-			REQ_GET_MOTD, "", gen } );
+			REQ_GET_MOTD, "", gen, 0 } );
 	}
 	s->cv.notify_one();
 }
@@ -1740,7 +1891,7 @@ void RS_ApiFetchRanks( const char *url, const char *token, const char *mapname )
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
 				if( it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD ||
 					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
-					it->type == REQ_GET_TOPSCORES ) {
+					it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
 					evicted = true;
 					break;
@@ -1755,7 +1906,7 @@ void RS_ApiFetchRanks( const char *url, const char *token, const char *mapname )
 			}
 		}
 		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
-			REQ_GET_RANKS, "", gen } );
+			REQ_GET_RANKS, "", gen, 0 } );
 	}
 	s->cv.notify_one();
 }
@@ -1782,4 +1933,221 @@ const char *RS_RanksText( void )
 	std::lock_guard<std::mutex> lock( s->ranksMutex );
 	buf = s->ranksText;
 	return buf.c_str();
+}
+
+
+/*
+ * RS_ApiFetchPlayerRecord / RS_ApiPollPlayerRecord / RS_PlayerRecordText
+ *
+ * Fetch ONE player's personal best on <mapname> from <url> (the central
+ * /api/game/player-record endpoint; ?map=<map>&name=<urlencoded cleanName> is
+ * appended) into a PER-PLAYER slot (keyed by playerNum), so the gametype
+ * (hrace/playerrecord.as) can seed that player's best_recordTime - rank, finish
+ * time AND checkpoint splits - the moment they join. Unlike the map-wide fetches
+ * above (one shared slot), several joining players can be in flight at once.
+ * RS_ApiPollPlayerRecord(playerNum) returns 1 when a fresh payload has landed for
+ * that slot (read it with RS_PlayerRecordText(playerNum) and parse it), -1 when
+ * the last fetch failed for good OR the player has no record here (404 / empty
+ * body - both fail-open: keep the board seed), 0 otherwise. A newer fetch on the
+ * same slot (re-join / rename) supersedes an in-flight one. No-op when url is
+ * empty. The player name is URL-encoded (it can carry spaces / '&' / UTF-8).
+ */
+void RS_ApiFetchPlayerRecord( const char *url, const char *token, const char *mapname,
+	const char *cleanName, int playerNum )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] || !cleanName )
+		return;
+	if( playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return;
+
+	// The map name rides in the query string - accept the same character set the
+	// stats API allows and refuse anything else outright. (The name is encoded
+	// instead of charset-guarded.)
+	for( const char *p = mapname; *p; p++ ) {
+		char c = *p;
+		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
+			c == '_' || c == '.' || c == '-';
+		if( !ok ) {
+			fprintf( stderr, "rs_api: refusing player-record fetch for unsafe map name\n" );
+			return;
+		}
+	}
+
+	std::string full = std::string( url ) + "?map=" + mapname + "&name=" + urlEncode( cleanName );
+	ApiState *s = ensureStarted();
+	// Bump the slot's generation (supersedes any in-flight fetch), THEN clear any
+	// stale result still sitting in the slot. This matters because slots are
+	// REUSED across players: if the previous occupant's fetch completed but they
+	// left before their poll consumed the result, the new occupant's first poll
+	// would otherwise read that stale 1 and apply the PREVIOUS player's record.
+	// Clearing here (after the gen bump, so a concurrent completion of the old
+	// fetch sees the new gen and drops) guarantees the poller returns 0 until THIS
+	// fetch lands. Order is load-bearing: gen first, result second.
+	unsigned gen = s->fetchPlayerRecGen[playerNum].fetch_add( 1 ) + 1;
+	s->fetchPlayerRecResult[playerNum].store( 0 );
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			// evict another fetch (fully reproducible on the next join) before a
+			// one-shot race report
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_PLAYERREC || it->type == REQ_GET_RANKS ||
+					it->type == REQ_GET_MOTD || it->type == REQ_GET_BLOCKED ||
+					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				// No fetch to evict: the whole queue is reports. Spool the
+				// oldest instead of silently losing a finish.
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
+			REQ_GET_PLAYERREC, "", gen, playerNum } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollPlayerRecord( int playerNum )
+{
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return 0;
+	return s->fetchPlayerRecResult[playerNum].exchange( 0 );
+}
+
+// Copy out the last-fetched per-player record payload for a slot. Called from
+// the script thread after a poll of 1; the AngelScript wrapper copies the static
+// buffer immediately (no reentrancy on the single script thread).
+const char *RS_PlayerRecordText( int playerNum )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->playerRecMutex );
+	buf = s->playerRecText[playerNum];
+	return buf.c_str();
+}
+
+
+/*
+ * RS_ApiFetchSavedStart / RS_ApiPollSavedStart / RS_SavedStartText
+ *
+ * Per-player fetch of ONE player's saved start(s) on <mapname> from <url> (the
+ * central /api/game/saved-start endpoint; ?map=<map>&name=<urlencoded name> is
+ * appended), keyed by playerNum into a per-slot buffer - the exact shape of the
+ * player-record trio above, so several joiners can be in flight at once. The
+ * gametype (hrace/savedstarts.as) parses the "//starts" payload and teleports
+ * the player to their saved spot. RS_ApiPollSavedStart(playerNum) returns 1 when
+ * a fresh payload landed, -1 on a hard failure / unknown map (fail-open), else 0.
+ */
+void RS_ApiFetchSavedStart( const char *url, const char *token, const char *mapname,
+	const char *cleanName, int playerNum )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] || !cleanName )
+		return;
+	if( playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return;
+
+	// Map name rides in the query string - same charset guard as the other map
+	// fetches; the player name is percent-encoded instead.
+	for( const char *p = mapname; *p; p++ ) {
+		char c = *p;
+		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
+			c == '_' || c == '.' || c == '-';
+		if( !ok ) {
+			fprintf( stderr, "rs_api: refusing saved-start fetch for unsafe map name\n" );
+			return;
+		}
+	}
+
+	std::string full = std::string( url ) + "?map=" + mapname + "&name=" + urlEncode( cleanName );
+	ApiState *s = ensureStarted();
+	// gen first, result second (see RS_ApiFetchPlayerRecord): slots are reused
+	// across players, so clear any stale result the previous occupant left behind.
+	unsigned gen = s->fetchSavedStartGen[playerNum].fetch_add( 1 ) + 1;
+	s->fetchSavedStartResult[playerNum].store( 0 );
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_SAVEDSTART || it->type == REQ_GET_PLAYERREC ||
+					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD ||
+					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
+					it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
+			REQ_GET_SAVEDSTART, "", gen, playerNum } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollSavedStart( int playerNum )
+{
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return 0;
+	return s->fetchSavedStartResult[playerNum].exchange( 0 );
+}
+
+const char *RS_SavedStartText( int playerNum )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->savedStartMutex );
+	buf = s->savedStartText[playerNum];
+	return buf.c_str();
+}
+
+/*
+ * RS_ApiSaveStart - fire-and-forget POST of a player's saved start to <url>
+ * (/api/ingest/saved-start), or a DELETE of that direction when coords is empty.
+ * Same queued-POST path as RS_ApiFlag. `coords` is a pre-formatted, purely
+ * numeric "x y z pitch yaw roll" string built by the gametype.
+ */
+void RS_ApiSaveStart( const char *url, const char *token, const char *mapname,
+	const char *player, const char *login, const char *mode, const char *coords )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] )
+		return;
+
+	std::string body;
+	body.reserve( 192 );
+	body += "{\"map\":\"";
+	jsonEscapeInto( body, mapname );
+	body += "\",\"name\":\"";
+	jsonEscapeInto( body, player );
+	body += "\",\"login\":\"";
+	jsonEscapeInto( body, login ? login : "" );
+	body += "\",\"mode\":\"";
+	jsonEscapeInto( body, mode ? mode : "" );
+	body += "\",\"coords\":\"";
+	jsonEscapeInto( body, coords ? coords : "" );
+	body += "\"}";
+
+	rsQueuePost( url, token, std::move( body ) );
 }

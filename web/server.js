@@ -506,6 +506,46 @@ api.get("/game/ranks", cache(60, { key: (req) => ranksCacheKey(req.query.map) })
   res.type("text/plain").send(body);
 }));
 
+// One player's personal best on a map (hrace/playerrecord.as polls this per
+// player on join via the RS_ApiFetchPlayerRecord native). Carries the player's
+// rank, finish time AND checkpoint splits so the scoreboard "Pos"/time works
+// for players ranked past the local top-50 board and the live per-checkpoint
+// comparison is ready from their first run. Cached per (map, name); the record
+// only changes when THAT player finishes (updated live in-game anyway), so the
+// short TTL without ingest eviction is fine — a stale seed is harmless. The name
+// arrives already URL-decoded by Express; a 200 empty body = no record for that
+// player (fail-open), a 404 = unknown map or malformed name.
+const playerRecCacheKey = (map, name) =>
+  `/api/game/player-record?map=${String(map || "").toLowerCase()}&name=${String(name || "").slice(0, 64)}`;
+api.get("/game/player-record", cache(60, { key: (req) => playerRecCacheKey(req.query.map, req.query.name) }), wrap(async (req, res) => {
+  const { map, name } = req.query;
+  if (typeof map !== "string" || !/^[a-z0-9][a-z0-9_.-]*$/.test(map.toLowerCase()))
+    return res.status(404).type("text/plain").send("// unknown map\n");
+  if (typeof name !== "string" || name.length === 0 || name.length > 64 || /[\x00-\x1f\x7f]/.test(name))
+    return res.status(404).type("text/plain").send("// bad name\n");
+  const body = await race.gamePlayerRecordText(map, name);
+  if (body == null) return res.status(404).type("text/plain").send("// unknown map\n");
+  res.type("text/plain").send(body); // "" => 200 empty (no record)
+}));
+
+// One player's saved START(s) for a map (hrace/savedstarts.as polls this per
+// player on join via the RS_ApiFetchSavedStart native), so a returning player
+// spawns where they left off. Plain text behind a "//starts" header: a
+// "<race|reverse> x y z pitch yaw roll" line per saved direction, or a bare
+// header when that player has none. Not cached: it is fetched once per join and
+// must reflect a /savestart the player just made before reconnecting; the load
+// is trivial. A 404 = unknown/invalid map or bad name.
+api.get("/game/saved-start", wrap(async (req, res) => {
+  const { map, name } = req.query;
+  if (typeof map !== "string" || !/^[a-z0-9][a-z0-9_.-]*$/.test(map.toLowerCase()))
+    return res.status(404).type("text/plain").send("// unknown map\n");
+  if (typeof name !== "string" || name.length === 0 || name.length > 64 || /[\x00-\x1f\x7f]/.test(name))
+    return res.status(404).type("text/plain").send("// bad name\n");
+  const body = await race.savedStartText(map, name);
+  if (body == null) return res.status(404).type("text/plain").send("// unknown map\n");
+  res.type("text/plain").send(body);
+}));
+
 // Flat-text WR ghost for game servers: the hrace gametype's RS_ApiFetchGhost
 // native GETs this on map load and drives an in-game "ghost racer" along it.
 // Text (not the gzipped JSON) because AngelScript can't decompress/parse JSON.
@@ -1158,6 +1198,57 @@ api.post(
     if (!r.ok) return res.status(404).json({ error: "unknown map" });
     recordEvent(req.ingest.serverId, `/flag ${mapName} from ${req.ingest.serverName} (${reason})${r.duplicate ? " [dup]" : ""}`);
     res.json({ ok: true, duplicate: !!r.duplicate });
+  })
+);
+
+// In-game "/savestart": a game server persists a player's chosen START position
+// for the current map (or clears it, when coords is empty, for "/clearstart").
+// Server-token authed like /ingest and keyed by map NAME + player nick (the game
+// doesn't know the web's ids). Stored per (canonical player, map, direction) so
+// it comes back when they rejoin. Auth runs BEFORE body parsing (DoS guard).
+api.post(
+  "/ingest/saved-start",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  express.json({ limit: "8kb" }),
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const mapName = typeof body.map === "string" ? body.map.slice(0, MAX_MAP_LEN).toLowerCase() : "";
+    if (!mapName || !/^[a-z0-9][a-z0-9_.-]*$/.test(mapName)) return res.status(400).json({ error: "map required" });
+    const name = typeof body.name === "string" ? body.name.slice(0, MAX_NAME_LEN) : "";
+    if (!name) return res.status(400).json({ error: "name required" });
+    const login = typeof body.login === "string" ? body.login.slice(0, MAX_NAME_LEN) : "";
+    const mode = body.mode === "reverse" ? "reverse" : "race";
+    const coords = typeof body.coords === "string" ? body.coords.trim() : "";
+
+    // Empty coords => "/clearstart": remove this direction's saved start.
+    if (coords === "") {
+      const cleared = await race.deletePlayerSavedStart({ map: mapName, name, login, mode });
+      recordEvent(req.ingest.serverId, `/clearstart ${mapName} (${mode}) from ${req.ingest.serverName}${cleared ? "" : " [none]"}`);
+      return res.json({ ok: true, cleared });
+    }
+
+    // "x y z pitch yaw roll" — six finite numbers; origin bounded to Quake
+    // worldspace so a pathological payload can't store a nonsense spawn.
+    const nums = coords.split(/\s+/).map(Number);
+    if (nums.length !== 6 || nums.some((n) => !Number.isFinite(n) || Math.abs(n) > 1e6))
+      return res.status(400).json({ error: "invalid coords" });
+    if (nums.slice(0, 3).some((n) => Math.abs(n) > 65536))
+      return res.status(400).json({ error: "coords out of range" });
+
+    await race.upsertPlayerSavedStart({
+      map: mapName, name, login, mode,
+      origin: nums.slice(0, 3), angles: nums.slice(3, 6),
+      serverId: req.ingest.serverId,
+    });
+    recordEvent(req.ingest.serverId, `/savestart ${mapName} (${mode}) from ${req.ingest.serverName}`);
+    res.json({ ok: true });
   })
 );
 

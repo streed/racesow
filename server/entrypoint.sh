@@ -320,6 +320,18 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # top-50 board. Empty url = no-op (scoreboard falls back to the local
         # top-50 board position).
         echo "set rs_api_ranks_url \"${INGEST_URL%/api/ingest}/api/game/ranks\""
+        # Per-player PB on join (hrace/playerrecord.as): the gametype fetches each
+        # joining player's own record for the current map - rank, time AND
+        # checkpoint splits - so their scoreboard Pos/time shows and the live
+        # per-checkpoint comparison is ready even when they are ranked past the
+        # local top-50 board. Empty url = no-op (falls back to the top-50 seed).
+        echo "set rs_api_player_record_url \"${INGEST_URL%/api/ingest}/api/game/player-record\""
+        # Persistent saved START per player (hrace/savedstarts.as): the GET fetch
+        # pulls a joining player's saved start(s) so they spawn where they left
+        # off; the POST persists /savestart (and clears on /clearstart). Empty
+        # urls = feature off (no /savestart, no restore-on-join).
+        echo "set rs_api_savedstart_get_url \"${INGEST_URL%/api/ingest}/api/game/saved-start\""
+        echo "set rs_api_savedstart_post_url \"${INGEST_URL%/api/ingest}/api/ingest/saved-start\""
         # Recently-played maps (hrace/lastmaps.as): the gametype polls this ~60s
         # so the in-game /lastmaps command shows the last maps played across the
         # network from a cached list. Empty url = command reports unavailable.

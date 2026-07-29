@@ -750,3 +750,119 @@ test("gameRanksText: every finisher, canonical-deduped, dense-tie ranks + true t
   assert.equal(after[1], "1 Delta", "Delta's faster time makes it rank 1 immediately");
   assert.equal(after[2], "2 Alpha", "Alpha pushed down to 2");
 });
+
+test("gamePlayerRecordText: one player's PB — rank+total header + exact topscores data line", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({
+    version: VER, map: MAP, source: "racelog",
+    records: [
+      finish("Nova", 30000, [10000, 20000]),
+      finish("Beta", 32000, [11000, 21000]),
+      finish("Gamma", 32000, [12000, 22000]), // tie with Beta -> both rank 2
+      finish("^3Zeta", 35000, [13000, 26000]), // colour-coded nick
+      finish("Delta", 40000, [15000, 30000]),
+    ],
+  });
+
+  // Exact bytes: header "//playerrec <rank> <total>", then the topscores
+  // per-record line — every field quoted, sectors in `number` order, and the
+  // SINGLE trailing space after the last sector preserved (the game's getToken
+  // loader keeps it; do NOT trimEnd the assertion).
+  assert.equal(
+    await race.gamePlayerRecordText(MAP, "nova"),
+    `//playerrec 1 5\n"30000" "Nova" "2" "10000" "20000" \n`,
+    "leader: rank 1 of 5, checkpoints ascending by number"
+  );
+  assert.equal(
+    await race.gamePlayerRecordText(MAP, "beta"),
+    `//playerrec 2 5\n"32000" "Beta" "2" "11000" "21000" \n`,
+    "dense-tie rank matches the ranks blob (Beta shares rank 2)"
+  );
+
+  // Colour-code match: the game sends removeColorTokens().tolower() = "zeta";
+  // it must resolve to ^3Zeta's canonical group (SQL strips ^N the same way).
+  assert.equal(
+    await race.gamePlayerRecordText(MAP, "zeta"),
+    `//playerrec 4 5\n"35000" "^3Zeta" "2" "13000" "26000" \n`,
+    "colour-stripped name still finds the record; emitted name keeps ^ codes"
+  );
+
+  // Fail-open: known map + no record for that player => empty body (NOT null).
+  assert.equal(await race.gamePlayerRecordText(MAP, "nobody"), "", "unknown player => empty body");
+  assert.equal(await race.gamePlayerRecordText(MAP, "^1^2"), "", "name that normalises to nothing => empty body");
+
+  // Map handling mirrors gameRanksText: case-insensitive, unknown/unsafe => null.
+  assert.equal(
+    await race.gamePlayerRecordText(MAP.toUpperCase(), "nova"),
+    await race.gamePlayerRecordText(MAP, "nova"),
+    "map lookup is case-insensitive"
+  );
+  assert.equal(await race.gamePlayerRecordText("no_such_map", "nova"), null, "unknown map => null (404)");
+  assert.equal(await race.gamePlayerRecordText("../etc/passwd", "nova"), null, "unsafe map name => null");
+
+  // Canonical grouping: a PB set under a colour/(N) variant collapses into the
+  // player's single best, and the rank recomputes live. "Nova(2)" identKeys to
+  // "nova" (both for canonical grouping AND for the match), so a faster run
+  // under that nick becomes Nova's PB and both queries return it identically.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova(2)", 25000, [8000, 16000])] });
+  const viaBase = await race.gamePlayerRecordText(MAP, "nova");
+  const viaSuffix = await race.gamePlayerRecordText(MAP, "nova(2)");
+  assert.equal(viaBase, viaSuffix, "the (N) collision suffix resolves to the same canonical group");
+  assert.match(viaBase, /^\/\/playerrec 1 5\n"25000" /, "faster variant run becomes the group PB, still rank 1");
+  assert.match(viaBase, /"2" "8000" "16000" \n$/, "the variant run's checkpoints are the ones served");
+});
+
+test("saved starts: upsert, per-player text, canonical match, replace, delete", async (t) => {
+  const race = await freshDb(t);
+  const M = "spacejam";
+
+  // Store a race start (colour-coded nick) and a reverse start (plain nick) —
+  // both identKey to "nova", so they collapse onto ONE canonical player.
+  assert.equal(
+    await race.upsertPlayerSavedStart({
+      map: M, name: "^3Nova", mode: "race",
+      origin: [100.5, -200.25, 16], angles: [0, 90, 0],
+    }),
+    true
+  );
+  await race.upsertPlayerSavedStart({
+    map: M, name: "Nova", mode: "reverse",
+    origin: [1, 2, 3], angles: [10, 20, 30],
+  });
+  // A different player's start must not leak into Nova's payload.
+  await race.upsertPlayerSavedStart({ map: M, name: "Beta", mode: "race", origin: [9, 9, 9], angles: [1, 1, 1] });
+
+  // Per-player text: "//starts" header, one line per direction, floats to 3dp,
+  // matched by colour-stripped nick.
+  const nova = await race.savedStartText(M, "nova");
+  assert.match(nova, /^\/\/starts\n/, "leads with the //starts header");
+  assert.match(nova, /\nrace 100\.500 -200\.250 16\.000 0\.000 90\.000 0\.000\n/, "race line");
+  assert.match(nova, /\nreverse 1\.000 2\.000 3\.000 10\.000 20\.000 30\.000\n/, "reverse line");
+  assert.doesNotMatch(nova, /9\.000 9\.000 9\.000/, "only this player's own starts");
+
+  // Upsert is most-recent-wins in place (PK = player,map,mode): one race line.
+  await race.upsertPlayerSavedStart({ map: M, name: "Nova", mode: "race", origin: [5, 5, 5], angles: [0, 0, 0] });
+  const nova2 = await race.savedStartText(M, "nova");
+  assert.match(nova2, /\nrace 5\.000 5\.000 5\.000 0\.000 0\.000 0\.000\n/, "race start replaced");
+  assert.equal((nova2.match(/\nrace /g) || []).length, 1, "still exactly one race line");
+
+  // Canonical grouping is already proven above: the race start was saved under
+  // "^3Nova" and the reverse under "Nova" — both colour-strip to "nova" and come
+  // back together for that clean nick (they share one canonical player). A nick
+  // the player never actually used does NOT match (same posture as the ranks /
+  // player-record boards: match is by an existing colour-stripped alias).
+  assert.equal(await race.savedStartText(M, "someone-else"), "//starts\n", "an unused nick matches nothing");
+
+  // Fail-open + guards: no start => bare header; unknown/unsafe map => null.
+  assert.equal(await race.savedStartText(M, "nobody"), "//starts\n", "no saved start => bare header");
+  assert.equal(await race.savedStartText("no_such_map", "nova"), null, "unknown map => null");
+  assert.equal(await race.savedStartText("../etc/passwd", "nova"), null, "unsafe map => null");
+
+  // Delete one direction; the other survives. Deleting again => false.
+  assert.equal(await race.deletePlayerSavedStart({ map: M, name: "Nova", mode: "race" }), true);
+  const afterDel = await race.savedStartText(M, "nova");
+  assert.doesNotMatch(afterDel, /\nrace /, "race start removed");
+  assert.match(afterDel, /\nreverse /, "reverse start survives");
+  assert.equal(await race.deletePlayerSavedStart({ map: M, name: "Nova", mode: "race" }), false, "already gone => false");
+  assert.equal(await race.deletePlayerSavedStart({ map: "no_such_map", name: "Nova", mode: "race" }), false, "unknown map => false");
+});

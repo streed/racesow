@@ -70,6 +70,15 @@ function fmtNum(n) {
   return (n || 0).toLocaleString("en-US");
 }
 
+/* bytes -> human size, e.g. 5242880 -> "5.0 MB" */
+function fmtBytes(n) {
+  if (n == null || isNaN(n)) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let v = Number(n), i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v : v.toFixed(1)) + " " + u[i];
+}
+
 /* milliseconds -> race clock, e.g. 10238 -> "10.238", 92560 -> "1:32.560" */
 function fmtTime(ms) {
   if (ms == null) return "—";
@@ -1324,6 +1333,14 @@ const ABOUT_CMDS = [
     ],
   },
   {
+    title: "Your saved start",
+    note: "Pick where you begin a map and keep it. Your start is saved per map and comes back the next time you join the server — normal and reverse races each keep their own.",
+    rows: [
+      ["/savestart", "Save your current spot and facing as your personal start for this map. You'll spawn here on join, /kill and restarts instead of the map's default start. In reverse mode it saves your reverse start."],
+      ["/clearstart", "Forget your saved start for this map (in the direction you're in) and go back to the map's default spawn."],
+    ],
+  },
+  {
     title: "Practice mode",
     note: "Times are NOT recorded while any of these are in effect. Use /kill to get back to a clean start and race for real.",
     rows: [
@@ -1343,7 +1360,7 @@ const ABOUT_CMDS = [
     title: "Reverse mode",
     note: "Race the map backwards. Cross the FINISH line to start your timer, run the checkpoints in reverse, and cross the START line to finish. Prejump rules still apply. Your time is saved on a separate “<map>-reversed” leaderboard (shown with a REVERSE badge on this site) and never mixes with the normal times.",
     rows: [
-      ["/reverse", "Race the map backwards. Teleports you to the finish line (your reverse start) and drops you into noclip to fine-tune the spot; leave noclip (/noclip, or /reverse again) to lock it in as your spawn. Then cross the finish to start."],
+      ["/reverse", "Race the map backwards. Teleports you to your saved reverse start (or the finish line, if you haven't saved one with /savestart) and drops you into noclip to fine-tune the spot; leave noclip (/noclip, or /reverse again) to lock it in as your spawn. Then cross the finish to start."],
       ["/showtriggers", "Toggle markers at the start and finish trigger planes so you can see where to cross. Only you see them."],
       ["/reverse off", "Leave reverse mode and go back to a normal run. /kill and restarts return you to your saved reverse start."],
     ],
@@ -1399,6 +1416,22 @@ const ABOUT_FAQ = [
 ];
 
 async function viewAbout() {
+  // Render every registered, joinable server (any with a connect address) rather
+  // than a hardcoded pair, so new boxes — e.g. the Warfork nodes — show up here
+  // automatically. Same set + order as the Live page. Falls back to the static
+  // list if the API is unreachable so the section is never empty.
+  let joinServers;
+  try {
+    const { servers } = await api("/servers");
+    joinServers = (servers || [])
+      .filter((s) => s.address)
+      .sort((a, b) => (isWarforkServer(a) - isWarforkServer(b)) || (a.id - b.id))
+      .map((s) => ({ name: s.name, region: isWarforkServer(s) ? "Warfork" : "Warsow", connect: s.address }));
+    if (!joinServers.length) joinServers = ABOUT_SERVERS;
+  } catch {
+    joinServers = ABOUT_SERVERS;
+  }
+
   app.innerHTML = `
     <div class="crumbs">Racesow / About</div>
     <div class="page-title"><span class="accent">ABOUT</span> RACESOW</div>
@@ -1418,7 +1451,7 @@ async function viewAbout() {
         <div class="about-body">
           <p>Open the Warsow console with <b>~</b> and paste a connect line. Missing maps download from the server on join.</p>
           <div class="srv-cards">
-            ${ABOUT_SERVERS.map((s) => `
+            ${joinServers.map((s) => `
               <div class="srv-card">
                 <div class="srv-name">${esc(s.name)}</div>
                 <div class="srv-region muted">${esc(s.region)}</div>
@@ -1428,7 +1461,16 @@ async function viewAbout() {
                 </div>
               </div>`).join("")}
           </div>
-          <p class="muted about-fineprint">The two servers are meshed: you'll see players on the other one as ghosts and can race them across the Atlantic. See <b>/who</b>, <b>/watch</b> and <b>/meshvote</b> below.</p>
+          <p class="muted about-fineprint">The servers are meshed: whenever two share the same map you'll see players on the others as ghosts and can race them across the Atlantic. See <b>/who</b>, <b>/watch</b> and <b>/meshvote</b> below.</p>
+        </div>
+      </div>
+
+      <div class="panel" id="db-download">
+        <h3><span class="dot"></span> Download the database</h3>
+        <div class="about-body">
+          <p>The whole public race database is published as a downloadable PostgreSQL dump so you can run your own racesow server or dig into the data yourself. It's a full mirror — every record and finish, all checkpoint splits, players, maps, replays, Skill-Rating history and the weapon index — refreshed weekly. Private data (accounts, API tokens, server IPs, moderation reports) is stripped out.</p>
+          <div id="db-download-meta" class="db-meta muted">Loading the latest snapshot…</div>
+          <p class="muted about-fineprint">Restore into an empty PostgreSQL 16 database: <span class="mono">createdb racesow</span>, unzip the archive, then <span class="mono">psql racesow &lt; racesow-db-*.sql</span> — and point a fresh racesow instance at it. Each archive includes a README with full steps and a <span class="mono">manifest.json</span> listing exactly what's in and out.</p>
         </div>
       </div>
 
@@ -1483,6 +1525,33 @@ async function viewAbout() {
       } catch (e) { /* clipboard blocked — the string is still selectable */ }
     });
   });
+
+  // Fill the DB-download panel from the live backup manifest (/api/backup):
+  // a working download button + snapshot stats, or a graceful note if no
+  // backup exists yet (a fresh instance before the sidecar's first run).
+  (async () => {
+    const box = document.getElementById("db-download-meta");
+    if (!box) return;
+    try {
+      const b = await api("/backup");
+      const gen = b.generated_at ? new Date(b.generated_at) : null;
+      const rc = b.row_counts || {};
+      const stat = (n, lbl) => (n != null ? `<span>${fmtNum(n)} ${lbl}</span>` : "");
+      box.classList.remove("muted");
+      box.innerHTML = `
+        <a class="btn db-dl-btn" href="${esc(b.download_url || "/backup/racesow-db-latest.zip")}" download rel="noopener">⬇ Download database${b.bytes != null ? ` (${esc(fmtBytes(b.bytes))} zip)` : ""}</a>
+        <div class="db-stats">
+          ${gen ? `<span title="${esc(gen.toISOString())}">Updated ${esc(gen.toISOString().slice(0, 10))}</span>` : ""}
+          ${stat(rc.race, "records")}
+          ${stat(rc.finish, "finishes")}
+          ${stat(rc.player, "players")}
+          ${stat(rc.map, "maps")}
+        </div>
+        ${b.sha256 ? `<div class="db-sha mono" title="SHA-256 of the zip">sha256 ${esc(b.sha256)}</div>` : ""}`;
+    } catch (e) {
+      box.textContent = "The public snapshot is being generated — check back shortly.";
+    }
+  })();
 }
 
 /* --------------------------- shared widgets ------------------------------ */

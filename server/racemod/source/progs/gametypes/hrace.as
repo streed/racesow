@@ -243,6 +243,10 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_Flag( client, cmdString, argsString, argc );
     else if ( cmdString == "lastmaps" )
         return Cmd_LastMaps( client, cmdString, argsString, argc );
+    else if ( cmdString == "savestart" )
+        return Cmd_SaveStart( client, cmdString, argsString, argc );
+    else if ( cmdString == "clearstart" )
+        return Cmd_ClearStart( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -376,6 +380,16 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
                 client.team = TEAM_PLAYERS;
                 client.respawn( false );
             }
+
+            // Seed this player's own PB (rank + time + checkpoint splits) from
+            // the central DB so their scoreboard Pos/time shows and the live
+            // checkpoint comparison is ready even when they are ranked past the
+            // local top-50 board (playerrecord.as; no-op when the feature is off).
+            RACE_TriggerPlayerRecordFetch( RACE_GetPlayer( client ) );
+
+            // Pull this player's saved START for this map so they spawn where
+            // they left off (savedstarts.as; no-op when the feature is off).
+            RACE_TriggerSavedStartFetch( RACE_GetPlayer( client ) );
         }
 
         RACE_ShowRules(client, 2000);
@@ -441,6 +455,9 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
             // re-finished this session.) Then stamp the true global rank.
             player.seedBestFromBoard();
             RACE_ApplyGlobalRankTo( player );
+            // A rename changes which DB record is "theirs": re-fetch on the new
+            // clean name so best_recordTime/Pos follow the current nick.
+            RACE_TriggerPlayerRecordFetch( player );
             player.setName();
         }
     }
@@ -490,6 +507,12 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
         player.seedBestFromBoard();
         player.updatePos();
         RACE_ApplyGlobalRankTo( player );
+        // Also pull this player's own PB (splits included) from the central DB
+        // so an outside-top-50 racer gets their Pos/time + checkpoint comparison.
+        RACE_TriggerPlayerRecordFetch( player );
+        // ...and their saved START, so a returning player spawns where they left
+        // off (applied from the think loop once they are a live prerace body).
+        RACE_TriggerSavedStartFetch( player );
     }
 
     if ( ent.isGhosting() )
@@ -628,6 +651,17 @@ void GT_ThinkRules()
     // is empty); gives every connected player a true scoreboard "Pos" — even
     // those ranked past the local top-50 board
     RACE_ApiRanksThink();
+
+    // per-player PB fetched on join (no-op when rs_api_player_record_url is
+    // empty): applies each joiner's own record — rank, time and checkpoint
+    // splits — so an outside-top-50 racer's scoreboard row and live per-CP
+    // comparison work from their first run without re-finishing
+    RACE_ApiPlayerRecordThink();
+
+    // per-player saved START fetched on join (no-op when rs_api_savedstart_get_url
+    // is empty): teleports each returning player to their saved spot on their
+    // first prerace spawn so they begin where they left off (savedstarts.as)
+    RACE_ApiSavedStartThink();
 
     // in-game WR ghost racer (no-op unless rs_wr_ghost + its URL are set); also
     // before the early-return so the ghost keeps looping while the scoreboard
@@ -1326,6 +1360,8 @@ void GT_InitGametype()
     G_RegisterCommand( "rules" );
     G_RegisterCommand( "flag" );
     G_RegisterCommand( "lastmaps" );
+    G_RegisterCommand( "savestart" );
+    G_RegisterCommand( "clearstart" );
 
     RACE_MirrorInit(); // registers "who" and "watch"
     RACE_GhostInit();

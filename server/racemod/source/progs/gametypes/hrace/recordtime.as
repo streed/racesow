@@ -155,6 +155,36 @@ class RecordTime
     }
 }
 
+// Build one finished RecordTime from parsed topscores-format tokens, normalized
+// to the LIVE map's checkpoint count (numCheckpoints + 1, the extra slot being
+// the finish). This is the ONLY correct sizing for a record that will be indexed
+// by this map's checkpoint ids — checkpoint.as reads
+// player.best_recordTime.checkpoints[checkpoint_id], so a record sized to the
+// stored sector count (as RACE_ReadTopScoresFile does, for display of another
+// map) would throw Index Out of Bounds on every live per-CP compare. Stored
+// sectors past this map's count are dropped; missing ones stay Unused (the
+// comparison code already handles that). Shared by RACE_LoadTopScores (the
+// top-50 board) and hrace/playerrecord.as (a single player's PB fetched on join).
+RecordTime RACE_RecordFromTokens( const String &in timeToken, const String &in loginToken, const String &in nameToken, uint numSectors, const uint[] &in sectorTimes )
+{
+    RecordTime record;
+    record.setupArrays( numCheckpoints + 1 );
+    for ( uint j = 0; j < numSectors && j < numCheckpoints && j < sectorTimes.length(); j++ )
+    {
+        uint sectorTime = sectorTimes[ j ];
+        if ( sectorTime != 0 )
+            record.checkpoints[ j ] = Checkpoint( sectorTime, CheckpointType_Normal );
+    }
+
+    record.ident = RecordTimeIdent( nameToken, loginToken );
+    record.type = RecordTimeType_Finished;
+
+    uint finishTime = uint( timeToken.toInt() );
+    record.checkpoints[ numCheckpoints ] = Checkpoint( finishTime, CheckpointType_Finish );
+    record.deduceCheckpointOrder();
+    return record;
+}
+
 void RACE_LoadTopScores( bool reversed = false )
 {
     String topScores;
@@ -202,35 +232,21 @@ void RACE_LoadTopScores( bool reversed = false )
             if ( numSectors > 512 )
                 break;
 
-            // Normalize the record to the LIVE map's checkpoint count. The
-            // file/API payload can carry records from another version of this
-            // map with a different sector count (the API serves sectors across
-            // all versions of a map name); code all over indexes these arrays
-            // with this map's checkpoint ids, so a mismatched size throws
-            // Index Out of Bounds on every CP touch and board write. Extra
-            // sectors are dropped, missing ones stay Unused (the comparison
-            // code already handles that); every one of the line's numSectors
-            // tokens is still consumed so the token stream stays in sync.
-            RecordTime record;
-            record.setupArrays( numCheckpoints + 1 );
+            // Read every one of the line's numSectors tokens so the token
+            // stream stays in sync, then normalize to the LIVE map's checkpoint
+            // count via RACE_RecordFromTokens (see its comment: a mismatched
+            // sector count would otherwise throw Index Out of Bounds on every
+            // per-CP touch). An early empty token leaves the rest 0 (Unused).
+            uint[] sectorTimes( numSectors );
             for ( uint j = 0; j < numSectors; j++ )
             {
                 sectorToken = topScores.getToken( count++ );
                 if ( sectorToken.length() == 0 )
                     break;
-
-                uint sectorTime = uint( sectorToken.toInt() );
-                if( sectorTime != 0 && j < numCheckpoints )
-                    record.checkpoints[ j ] = Checkpoint( sectorTime, CheckpointType_Normal );
+                sectorTimes[ j ] = uint( sectorToken.toInt() );
             }
 
-            record.ident = RecordTimeIdent( nameToken, loginToken );
-            record.type = RecordTimeType_Finished;
-
-            uint finishTime = uint( timeToken.toInt() );
-            record.checkpoints[ numCheckpoints ] = Checkpoint( finishTime, CheckpointType_Finish );
-            record.deduceCheckpointOrder();
-
+            RecordTime record = RACE_RecordFromTokens( timeToken, loginToken, nameToken, numSectors, sectorTimes );
             RACE_AddTopScore( record, reversed, false );
         }
 

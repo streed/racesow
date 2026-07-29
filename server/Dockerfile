@@ -74,6 +74,9 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "asFunc_RS_ApiFetchRanks" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchMapWeapons" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchLastMaps" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchPlayerRecord" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchSavedStart" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiSaveStart" game/g_ascript.cpp \
     && grep -q "curl pthread" game/CMakeLists.txt
 
 # 7. Cross-server player mirroring: the RS_Mirror* natives (UDP mesh on a
@@ -147,6 +150,13 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
     # live MOTD: the fetch native + its worker log string.
     && strings /libgame_x86_64.so | grep -q "RS_ApiFetchMotd" \
     && strings /libgame_x86_64.so | grep -q "rs_api: motd fetch failed" \
+    # per-player PB on join: the fetch native + its worker log string.
+    && strings /libgame_x86_64.so | grep -q "RS_ApiFetchPlayerRecord" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: player-record fetch failed" \
+    # per-player saved START on join + /savestart POST: the natives + worker log.
+    && strings /libgame_x86_64.so | grep -q "RS_ApiFetchSavedStart" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: saved-start fetch failed" \
+    && strings /libgame_x86_64.so | grep -q "RS_ApiSaveStart" \
     && strings /libgame_x86_64.so | grep -q "racerecord" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: configured" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: bot slot" \

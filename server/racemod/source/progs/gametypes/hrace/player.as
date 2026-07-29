@@ -55,6 +55,23 @@ class Player
     // Preferred over `pos` in the scoreboard because it covers players ranked
     // past the local top-50 board.
     int globalRank;
+    // Per-player PB fetch on join (hrace/playerrecord.as): while a fetch for this
+    // player's own record on the current map is in flight, pendingRecordFetch is
+    // true and recordFetchName is the clean name it was keyed on (so a rename can
+    // re-trigger a fresh fetch). Cleared on clear() so every (re)join re-fetches.
+    bool pendingRecordFetch;
+    String recordFetchName;
+    // Persistent saved START position for this map (hrace/savedstarts.as): a
+    // per-player fetch on join lands the player's saved race/reverse start here.
+    // pendingSavedStartFetch gates the poll; savedRaceStart is teleported to on
+    // the first prerace spawn (savedStartApplied then latches so it never repeats
+    // or overrides a hand save); savedReverseStart is what /reverse restores.
+    bool pendingSavedStartFetch;
+    bool savedStartApplied;
+    Position savedRaceStart;
+    bool savedRaceStartValid;
+    Position savedReverseStart;
+    bool savedReverseStartValid;
     RecordTime current_recordTime;
     uint currentCheckpoint;
 
@@ -240,6 +257,12 @@ class Player
         this.lastDashTime = 0;
         this.pos = -1;
         this.globalRank = -1;
+        this.pendingRecordFetch = false;
+        this.recordFetchName = "";
+        this.pendingSavedStartFetch = false;
+        this.savedStartApplied = false;
+        this.savedRaceStartValid = false;
+        this.savedReverseStartValid = false;
         this.noclipSpawn = false;
 
         this.practicePositionStore.clear();
@@ -613,9 +636,23 @@ class Player
 
         // Teleport to the reverse start and save it as a TENTATIVE spawn (so a
         // death during setup returns here); the final spawn is committed when the
-        // player leaves the fine-tune noclip below.
+        // player leaves the fine-tune noclip below. Prefer the player's own saved
+        // reverse start (hrace/savedstarts.as) over the auto-computed spot so a
+        // returning player begins where they left off; still drops into the
+        // fine-tune noclip so they can nudge it.
         Vec3 origin, angles;
-        if ( this.computeReverseStart( origin, angles ) )
+        bool haveSpot;
+        if ( this.savedReverseStartValid )
+        {
+            origin = this.savedReverseStart.location;
+            angles = this.savedReverseStart.angles;
+            haveSpot = true;
+        }
+        else
+        {
+            haveSpot = this.computeReverseStart( origin, angles );
+        }
+        if ( haveSpot )
         {
             ent.origin = origin;
             ent.angles = angles;

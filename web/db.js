@@ -940,6 +940,204 @@ class RaceDB {
     return body;
   }
 
+  // One player's personal best on a map for game servers (GET
+  // /api/game/player-record?map=&name=). The hrace gametype fetches this the
+  // moment a player joins (hrace/playerrecord.as, via the RS_ApiFetchPlayerRecord
+  // native) and seeds that player's best_recordTime — rank, finish time AND the
+  // checkpoint splits — so the scoreboard "Pos"/time works for players ranked
+  // PAST the local top-50 board, and the live per-checkpoint comparison is ready
+  // from their first run this session (no re-finish needed).
+  //
+  // `name` is a colour-stripped, lowercased nick the game derived with
+  // removeColorTokens().tolower(); we normalise it with identKey() — the SAME
+  // basis canonical grouping uses (strip ^N, lower, drop a trailing "(N)"
+  // collision suffix, trim) — and match it against every nick that finished this
+  // map, then resolve to that nick's CANONICAL group so a player's colour/(N)
+  // variants collapse to their single best (identical grouping to gameRanksText
+  // / the site). The rank is that group's RANK() over the field — the same
+  // number gameRanksText would emit for the player's line in the ranks blob.
+  //
+  // Format reuses the topscores single-record line so the game's existing
+  // token-based loader parses it unchanged, behind a leading "//" the fetch
+  // native uses to reject captive-portal / proxy error bodies:
+  //   //playerrec <rank> <total_finishers>
+  //   "<time>" "<cleanName>" "<numSectors>" "<sector0>" "<sector1>" ...
+  // Two fail-open return values: null = unknown/unsafe map (a 404 upstream,
+  // matching the other game payloads); "" (empty body, 200) = known map but this
+  // player has no findable record here — the game leaves its board seed untouched
+  // (the fetch native rejects a non-"//" body, so an empty body reads as "none").
+  async gamePlayerRecordText(mapName, playerName) {
+    const name = String(mapName || "").toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
+    const map = await this.one("SELECT id FROM map WHERE name = $1", [name]);
+    if (!map) return null;
+    // identKey() is the JS twin of the game's removeColorTokens().tolower() AND
+    // the basis canonical grouping uses (strip ^N, lower, drop a trailing "(N)"
+    // collision suffix, trim); the SQL below applies the same transform to
+    // player.name so a PB set under a colour/(N) variant is still found.
+    const clean = identKey(playerName);
+    if (!clean) return ""; // name normalised to nothing => no findable record
+
+    // Fastest race per canonical group (rn=1), ranked by time across all groups
+    // (identical bests/RANK() shape to gameRanksText, so the rank is byte-equal
+    // to this player's line in the ranks blob); `match` is the canonical group(s)
+    // that finished this map under a nick whose identKey form equals the request.
+    const row = await this.one(
+      `WITH k AS (
+         SELECT pl.canonical_id cid, r.id rid, r.time,
+                ROW_NUMBER() OVER (PARTITION BY pl.canonical_id ORDER BY r.time, r.id) rn
+         FROM race r JOIN player pl ON pl.id = r.player_id
+         WHERE r.map_id = $1
+       ),
+       winners AS ( SELECT cid, rid, time FROM k WHERE rn = 1 ),
+       ranked AS (
+         SELECT cid, rid, time,
+                RANK() OVER (ORDER BY time) rank,
+                COUNT(*) OVER () total
+         FROM winners
+       ),
+       match AS (
+         SELECT DISTINCT pl.canonical_id cid
+         FROM race r JOIN player pl ON pl.id = r.player_id
+         WHERE r.map_id = $1
+           AND trim(regexp_replace(
+                 lower(regexp_replace(pl.name, '\\^[0-9]', '', 'g')),
+                 '\\s*\\(\\d+\\)\\s*$', '')) = $2
+       )
+       SELECT rk.rank, rk.time, rk.rid, rk.cid, rk.total, rep.name AS name
+       FROM ranked rk
+       JOIN player rep ON rep.id = rk.cid
+       WHERE rk.cid IN (SELECT cid FROM match)
+       ORDER BY rk.time
+       LIMIT 1`,
+      [map.id, clean]
+    );
+    if (!row) return ""; // known map, this player has no record
+
+    const sanitize = (n) => String(n).replace(/["\r\n\t]/g, "").slice(0, 64);
+    const cleanName = sanitize(this._cn(row.name, row.cid));
+    if (!cleanName) return ""; // unmatchable name token => treat as no record
+
+    const sectors = (
+      await this.all(
+        "SELECT time FROM checkpoint WHERE race_id = $1 ORDER BY number",
+        [num(row.rid)]
+      )
+    ).map((c) => c.time | 0);
+
+    let body = `//playerrec ${num(row.rank)} ${num(row.total)}\n`;
+    let line = `"${num(row.time)}" "${cleanName}" "${sectors.length}" `;
+    for (const s of sectors) line += `"${s}" `;
+    return body + line + "\n";
+  }
+
+  // --------------------------------------------------------------------------
+  // Saved START positions: where a player wants to spawn on a map -----------
+  // Set in-game with /savestart and restored on rejoin. One row per (canonical
+  // player, map, direction). See migration 20260728140000000_player_saved_start.
+
+  // One player's saved start(s) for a map, as the plain-text blob the game polls
+  // per player on join (hrace/savedstarts.as via RS_ApiFetchSavedStart). Matches
+  // the player by clean nick exactly like gamePlayerRecordText, resolves to their
+  // canonical group, and emits a "//starts" header (the fetch native rejects
+  // non-"//" bodies) then one line per saved direction, most-recent wins:
+  //   //starts
+  //   race <x> <y> <z> <pitch> <yaw> <roll>
+  //   reverse <x> <y> <z> <pitch> <yaw> <roll>
+  // A bare "//starts\n" = this player has no saved start here (fail-open: the game
+  // leaves them at the map default). null (unknown/invalid map) => 404 upstream.
+  async savedStartText(mapName, playerName) {
+    const name = String(mapName || "").toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
+    const map = await this.one("SELECT id FROM map WHERE name = $1", [name]);
+    if (!map) return null;
+    const clean = simplifyName(playerName).toLowerCase();
+    if (!clean) return "//starts\n";
+
+    const rows = await this.all(
+      `SELECT s.mode AS mode, s.loc_x, s.loc_y, s.loc_z, s.ang_x, s.ang_y, s.ang_z
+       FROM player_saved_start s
+       WHERE s.map_id = $1
+         AND s.player_id IN (
+           SELECT DISTINCT pl.canonical_id FROM player pl
+           WHERE lower(regexp_replace(pl.name, '\\^[0-9]', '', 'g')) = $2
+         )
+       ORDER BY s.updated_at DESC`,
+      [map.id, clean]
+    );
+
+    const fmt = (v) => Number(v).toFixed(3);
+    const seen = {};
+    let body = "//starts\n";
+    for (const r of rows) {
+      if (r.mode !== "race" && r.mode !== "reverse") continue;
+      if (seen[r.mode]) continue; // one line per direction (most-recent first)
+      seen[r.mode] = true;
+      body += `${r.mode} ${fmt(r.loc_x)} ${fmt(r.loc_y)} ${fmt(r.loc_z)} ${fmt(r.ang_x)} ${fmt(r.ang_y)} ${fmt(r.ang_z)}\n`;
+    }
+    return body;
+  }
+
+  // Store (or replace) a player's saved start for a map+direction. Resolves the
+  // raw (name, login) to its CANONICAL player id — like the replay upserts — so
+  // aliases share one row and a returning player matches by nick. `origin` and
+  // `angles` are [x,y,z]. Most-recent-wins (the player is explicitly moving their
+  // spawn). Creates the map row if new (a start can be saved on a never-finished
+  // map). Returns true.
+  async upsertPlayerSavedStart({ map, name, login = "", mode, origin, angles, serverId = null }) {
+    const m = String(mode) === "reverse" ? "reverse" : "race";
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const q1 = async (sql, params) => (await client.query(sql, params)).rows[0];
+      const mapRow = await q1(
+        `INSERT INTO map (name) VALUES ($1)
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+        [String(map).toLowerCase()]
+      );
+      const rawPlayerId = await this._resolvePlayer(client, { name, login });
+      const cRow = (await client.query("SELECT canonical_id FROM player WHERE id = $1", [rawPlayerId])).rows[0];
+      const playerId = cRow && cRow.canonical_id != null ? num(cRow.canonical_id) : rawPlayerId;
+      await client.query(
+        `INSERT INTO player_saved_start
+           (player_id, map_id, mode, loc_x, loc_y, loc_z, ang_x, ang_y, ang_z, server_id, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (player_id, map_id, mode) DO UPDATE SET
+           loc_x = EXCLUDED.loc_x, loc_y = EXCLUDED.loc_y, loc_z = EXCLUDED.loc_z,
+           ang_x = EXCLUDED.ang_x, ang_y = EXCLUDED.ang_y, ang_z = EXCLUDED.ang_z,
+           server_id = EXCLUDED.server_id, updated_at = EXCLUDED.updated_at`,
+        [
+          playerId, num(mapRow.id), m,
+          Number(origin[0]), Number(origin[1]), Number(origin[2]),
+          Number(angles[0]), Number(angles[1]), Number(angles[2]),
+          serverId, Math.floor(Date.now() / 1000),
+        ]
+      );
+      await client.query("COMMIT");
+      return true;
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Remove a player's saved start for a map+direction (in-game /clearstart). Looks
+  // up existing ids only (never creates rows). Returns true if a row was removed.
+  async deletePlayerSavedStart({ map, name, login = "", mode }) {
+    const m = String(mode) === "reverse" ? "reverse" : "race";
+    const mapRow = await this.one("SELECT id FROM map WHERE name = $1", [String(map).toLowerCase()]);
+    if (!mapRow) return false;
+    const rep = await this.one("SELECT player_id FROM canonical WHERE key = $1", [canonKey(simplifyName(name), login)]);
+    if (!rep) return false;
+    const r = await this.pool.query(
+      "DELETE FROM player_saved_start WHERE player_id = $1 AND map_id = $2 AND mode = $3",
+      [num(rep.player_id), num(mapRow.id), m]
+    );
+    return r.rowCount > 0;
+  }
+
   // --------------------------------------------------------------------------
   // Replays: per-player demo metadata + ghost trajectories ------------------
   // One row per (player, map) = that player's fastest recorded run; the map WR

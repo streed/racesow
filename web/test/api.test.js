@@ -314,6 +314,38 @@ test("/api/game/topscores serves the EXACT topscores file format the gametype pa
   assert.equal((await fetch(`${base}/api/game/topscores`)).status, 404);
 });
 
+test("/api/game/player-record serves one player's PB (rank + splits) the gametype seeds on join", async () => {
+  // testmap1 was populated by the ingest test above: Nova 48000 (rank 1), Wave 49000.
+  const r = await fetch(`${base}/api/game/player-record?map=testmap1&name=nova`);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type"), /text\/plain/);
+  const lines = (await r.text()).split("\n");
+  assert.match(lines[0], /^\/\/playerrec 1 2$/, "header: rank 1 of 2 finishers");
+  // Data line is byte-identical to the topscores line (trailing space intact).
+  assert.equal(lines[1], '"48000" "^1No^7va" "2" "10000" "28000" ');
+
+  // Fail-open: known map, no such player => 200 with an EMPTY body (the game
+  // keeps its board seed; the fetch native reads a non-"//" body as "no record").
+  const none = await fetch(`${base}/api/game/player-record?map=testmap1&name=ghostwho`);
+  assert.equal(none.status, 200);
+  assert.equal(await none.text(), "");
+
+  // Names are URL-encoded by the native and decoded by Express: a spaced nick
+  // round-trips (identKey keeps spaces, so "ka zoo" matches).
+  assert.equal((await ingest(gameBody({ map: "prmap", name: "Ka Zoo", time: 20000, cps: [5000, 12000] }))).status, 200);
+  const enc = await fetch(`${base}/api/game/player-record?map=prmap&name=ka%20zoo`);
+  assert.equal(enc.status, 200);
+  assert.equal(await enc.text(), `//playerrec 1 1\n"20000" "Ka Zoo" "2" "5000" "12000" \n`);
+
+  // Guards: unknown/unsafe/missing map => 404; missing/oversized/control-char name => 404.
+  assert.equal((await fetch(`${base}/api/game/player-record?map=doesnotexist&name=nova`)).status, 404);
+  assert.equal((await fetch(`${base}/api/game/player-record?map=..%2F..%2Fetc%2Fpasswd&name=nova`)).status, 404);
+  assert.equal((await fetch(`${base}/api/game/player-record?name=nova`)).status, 404);
+  assert.equal((await fetch(`${base}/api/game/player-record?map=testmap1`)).status, 404);
+  assert.equal((await fetch(`${base}/api/game/player-record?map=testmap1&name=${"x".repeat(65)}`)).status, 404);
+  assert.equal((await fetch(`${base}/api/game/player-record?map=testmap1&name=%00bad`)).status, 404);
+});
+
 test("/api/game/motd serves the RSMOTD-prefixed seeded default", async () => {
   const r = await fetch(`${base}/api/game/motd`);
   assert.equal(r.status, 200);
@@ -470,4 +502,52 @@ test("stream heartbeat: unauth 401 (pre-parse), shared token cannot target a str
   // The shared token has no server identity, so it can't post a heartbeat for a
   // specific stream id (would otherwise spoof any stream's status/POV).
   assert.equal((await post(TOKEN)).status, 403);
+});
+
+test("/api/game/saved-start round-trips /savestart via /api/ingest/saved-start (auth + validate + clear)", async () => {
+  const post = (body, token = TOKEN) =>
+    fetch(`${base}/api/ingest/saved-start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+    });
+  const getText = (qs) => fetch(`${base}/api/game/saved-start?${qs}`);
+
+  // Auth runs before body parsing: no token => 401.
+  assert.equal((await post({ map: "startmap", name: "Nova", mode: "race", coords: "1 2 3 0 0 0" }, null)).status, 401);
+
+  // Store a race start (colour-coded nick) and a reverse start.
+  assert.equal((await post({ map: "startmap", name: "^3Nova", mode: "race", coords: "100.5 -200.25 16 0 90 0" })).status, 200);
+  assert.equal((await post({ map: "startmap", name: "Nova", mode: "reverse", coords: "1 2 3 10 20 30" })).status, 200);
+
+  // GET returns both directions, matched by clean nick, behind the //starts header.
+  const g = await getText("map=startmap&name=nova");
+  assert.equal(g.status, 200);
+  const text = await g.text();
+  assert.match(text, /^\/\/starts\n/);
+  assert.match(text, /\nrace 100\.500 -200\.250 16\.000 0\.000 90\.000 0\.000\n/);
+  assert.match(text, /\nreverse 1\.000 2\.000 3\.000 10\.000 20\.000 30\.000\n/);
+
+  // Unknown player => bare header (fail-open, 200).
+  assert.equal(await (await getText("map=startmap&name=ghostwho")).text(), "//starts\n");
+
+  // POST validation: coords must be six finite numbers, origin in worldspace.
+  assert.equal((await post({ map: "startmap", name: "Nova", mode: "race", coords: "1 2 3" })).status, 400);
+  assert.equal((await post({ map: "startmap", name: "Nova", mode: "race", coords: "1 2 3 4 5 nan" })).status, 400);
+  assert.equal((await post({ map: "startmap", name: "Nova", mode: "race", coords: "999999 0 0 0 0 0" })).status, 400);
+  assert.equal((await post({ map: "startmap", mode: "race", coords: "1 2 3 0 0 0" })).status, 400); // no name
+  assert.equal((await post({ name: "Nova", mode: "race", coords: "1 2 3 0 0 0" })).status, 400); // no map
+
+  // GET guards: missing map/name or unsafe map => 404.
+  assert.equal((await getText("map=startmap")).status, 404);
+  assert.equal((await getText("name=nova")).status, 404);
+  assert.equal((await getText("map=..%2Fetc&name=nova")).status, 404);
+
+  // /clearstart: empty coords deletes just that direction.
+  const clr = await post({ map: "startmap", name: "Nova", mode: "race", coords: "" });
+  assert.equal(clr.status, 200);
+  assert.equal((await clr.json()).cleared, true);
+  const after = await (await getText("map=startmap&name=nova")).text();
+  assert.doesNotMatch(after, /\nrace /, "race start cleared");
+  assert.match(after, /\nreverse /, "reverse start survives");
 });

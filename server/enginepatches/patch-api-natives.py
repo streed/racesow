@@ -471,6 +471,139 @@ LASTMAPS_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, LASTMAPS_ENTRY, "asGlobFuncs lastmaps entry")
 
+# --- 1k. per-player PB on join: pull ONE player's record for the current map ---
+# Adds RS_ApiFetchPlayerRecord / RS_ApiPollPlayerRecord / RS_PlayerRecordText
+# (impl in g_rs_api.cpp). Unlike the map-wide fetches, this is PER PLAYER: the
+# fetch + poll + text natives take a playerNum so several joining players can be
+# in flight at once (the native keeps a per-slot result). The gametype
+# (hrace/playerrecord.as) fetches on join and seeds that player's best_recordTime
+# - rank, finish time AND checkpoint splits - so the scoreboard "Pos"/time works
+# for players ranked past the local top-50 board and the live per-checkpoint
+# comparison is ready from their first run. The int->String poll/text wrappers
+# mirror RS_GhostFrameAt. Anchors re-emitted so they stay unique. The Dockerfile
+# asserts on "asFunc_RS_ApiFetchPlayerRecord".
+PLAYERREC_WRAPPER = (
+    "// racesow-docker: per-player PB on join - GETs the central\n"
+    "// /api/game/player-record text (a \"//playerrec <rank> <total>\" header, then\n"
+    "// ONE topscores-format record line) into a per-player slot; the gametype polls\n"
+    "// RS_ApiPollPlayerRecord(playerNum) and reads RS_PlayerRecordText(playerNum),\n"
+    "// then seeds that player's best_recordTime (rank + time + checkpoint splits).\n"
+    "void RS_ApiFetchPlayerRecord( const char *url, const char *token, const char *mapname,\n"
+    "\tconst char *cleanName, int playerNum );\n"
+    "int RS_ApiPollPlayerRecord( int playerNum );\n"
+    "const char *RS_PlayerRecordText( int playerNum );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchPlayerRecord( asstring_t *url, asstring_t *token,\n"
+    "\tasstring_t *mapname, asstring_t *name, int playerNum )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !mapname || !mapname->buffer || !name || !name->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchPlayerRecord( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tmapname->buffer, name->buffer, playerNum );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollPlayerRecord( int playerNum ) { return RS_ApiPollPlayerRecord( playerNum ); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_PlayerRecordText( int playerNum )\n"
+    "{\n"
+    "\tconst char *s = RS_PlayerRecordText( playerNum );\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, PLAYERREC_WRAPPER, "asFunc playerrecord wrapper")
+
+PLAYERREC_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchPlayerRecord( const String &in url, const String &in token, "
+    "const String &in map, const String &in name, int playerNum )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchPlayerRecord), NULL },\n"
+    "\t{ \"int RS_ApiPollPlayerRecord( int playerNum )\", asFUNCTION(asFunc_RS_ApiPollPlayerRecord), NULL },\n"
+    "\t{ \"const String @RS_PlayerRecordText( int playerNum )\", asFUNCTION(asFunc_RS_PlayerRecordText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, PLAYERREC_ENTRY, "asGlobFuncs playerrecord entry")
+
+# --- 1l. per-player saved START on join: pull ONE player's saved start(s) ------
+# Adds RS_ApiFetchSavedStart / RS_ApiPollSavedStart / RS_SavedStartText (impl in
+# g_rs_api.cpp). PER PLAYER (playerNum-keyed per-slot result), the same shape as
+# the player-record trio: the gametype (hrace/savedstarts.as) fetches on join and
+# teleports the returning player to their saved spot. Anchors re-emitted so they
+# stay unique. The Dockerfile asserts on "asFunc_RS_ApiFetchSavedStart".
+SAVEDSTART_WRAPPER = (
+    "// racesow-docker: per-player saved START on join - GETs the central\n"
+    "// /api/game/saved-start text (a \"//starts\" header, then a\n"
+    "// \"<race|reverse> x y z pitch yaw roll\" line per saved direction) into a\n"
+    "// per-player slot; the gametype polls RS_ApiPollSavedStart(playerNum) and\n"
+    "// reads RS_SavedStartText(playerNum), then spawns the player at their start.\n"
+    "void RS_ApiFetchSavedStart( const char *url, const char *token, const char *mapname,\n"
+    "\tconst char *cleanName, int playerNum );\n"
+    "int RS_ApiPollSavedStart( int playerNum );\n"
+    "const char *RS_SavedStartText( int playerNum );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchSavedStart( asstring_t *url, asstring_t *token,\n"
+    "\tasstring_t *mapname, asstring_t *name, int playerNum )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !mapname || !mapname->buffer || !name || !name->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchSavedStart( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tmapname->buffer, name->buffer, playerNum );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollSavedStart( int playerNum ) { return RS_ApiPollSavedStart( playerNum ); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_SavedStartText( int playerNum )\n"
+    "{\n"
+    "\tconst char *s = RS_SavedStartText( playerNum );\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, SAVEDSTART_WRAPPER, "asFunc savedstart wrapper")
+
+SAVEDSTART_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchSavedStart( const String &in url, const String &in token, "
+    "const String &in map, const String &in name, int playerNum )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchSavedStart), NULL },\n"
+    "\t{ \"int RS_ApiPollSavedStart( int playerNum )\", asFUNCTION(asFunc_RS_ApiPollSavedStart), NULL },\n"
+    "\t{ \"const String @RS_SavedStartText( int playerNum )\", asFUNCTION(asFunc_RS_SavedStartText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, SAVEDSTART_ENTRY, "asGlobFuncs savedstart entry")
+
+# --- 1m. /savestart POST: persist (or clear) a player's saved start -----------
+# Adds RS_ApiSaveStart (impl in g_rs_api.cpp). Fire-and-forget POST like RS_ApiFlag
+# (no poll); an empty coords string = delete that direction. Anchors re-emitted so
+# they stay unique. The Dockerfile asserts on "asFunc_RS_ApiSaveStart".
+SAVESTART_WRAPPER = (
+    "// racesow-docker: /savestart - POST a player's saved start (empty coords =\n"
+    "// clear) to /api/ingest/saved-start (queued + sent on the worker thread).\n"
+    "void RS_ApiSaveStart( const char *url, const char *token, const char *mapname,\n"
+    "\tconst char *player, const char *login, const char *mode, const char *coords );\n"
+    "\n"
+    "static void asFunc_RS_ApiSaveStart( asstring_t *url, asstring_t *token, asstring_t *mapname,\n"
+    "\tasstring_t *player, asstring_t *login, asstring_t *mode, asstring_t *coords )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !mapname || !mapname->buffer || !player || !player->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiSaveStart( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tmapname->buffer, player->buffer,\n"
+    "\t\tlogin && login->buffer ? login->buffer : \"\",\n"
+    "\t\tmode && mode->buffer ? mode->buffer : \"\",\n"
+    "\t\tcoords && coords->buffer ? coords->buffer : \"\" );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, SAVESTART_WRAPPER, "asFunc savestart wrapper")
+
+SAVESTART_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiSaveStart( const String &in url, const String &in token, "
+    "const String &in map, const String &in player, const String &in login, "
+    "const String &in mode, const String &in coords )\", "
+    "asFUNCTION(asFunc_RS_ApiSaveStart), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, SAVESTART_ENTRY, "asGlobFuncs savestart entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

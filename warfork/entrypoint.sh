@@ -124,6 +124,9 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         echo "set rs_api_mapweapons_url \"${base}/api/game/map-weapons\""
         echo "set rs_api_motd_url \"${base}/api/game/motd\""
         echo "set rs_api_ranks_url \"${base}/api/game/ranks\""
+        echo "set rs_api_player_record_url \"${base}/api/game/player-record\""
+        echo "set rs_api_savedstart_get_url \"${base}/api/game/saved-start\""
+        echo "set rs_api_savedstart_post_url \"${base}/api/ingest/saved-start\""
         echo "set rs_api_lastmaps_url \"${base}/api/game/last-maps\""
     fi
     # Cross-server (cross-GAME) player mesh. Empty peers/tag = off. Uses the same
