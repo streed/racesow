@@ -420,6 +420,15 @@ void RACE_MirrorPublish()
         if ( client.state() < CS_SPAWNED )
             continue;
 
+        // Never mirror the local TV camera to peers. It is infra (the website
+        // stream's server-side spectator, rs_tv_name), already excluded from the
+        // player counts, /who and getstatus. A peer receiving it would collide
+        // with its OWN local RACESOW-TV, forcing an engine "(1)" dup-suffix that
+        // no longer exact-name-matches rs_tv_name and so breaks that peer's TV
+        // auto-director. Keep the camera strictly local to each box.
+        if ( RACE_IsTvClient( client ) )
+            continue;
+
         Player@ player = RACE_GetPlayer( client );
         Entity@ ent = client.getEnt();
 
