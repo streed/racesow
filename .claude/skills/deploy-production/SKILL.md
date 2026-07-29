@@ -14,11 +14,17 @@ can clobber live config.
 
 | Box | Host | Runs | Notes |
 |-----|----|------|-------|
-| EU / central | `eu.frankfurt.racesow.org` | web (web + web2 + heatmaps), Postgres, redis, discord, **warsow-race**, warsow-tv | The central stats DB + the site. All migrations + data scans happen here. |
-| US | `us.east.racesow.org` | **warsow-race** only (+ tv-hls, pakserver) | No DB/web. The game fetches central endpoints (`rs_api_*_url`) over Cloudflare→EU. Deploy = code + game rebuild only. |
+| EU / central | `eu.frankfurt.racesow.org` | web (web + web2 + heatmaps), Postgres, redis, discord, **warsow-race**, **warfork-race**, warsow-tv-capture | The central stats DB + the site. All migrations + data scans happen here. |
+| US | `us.east.racesow.org` | **warsow-race**, **warfork-race** (+ warsow-tv-capture, tv-hls, pakserver, sftp) | No DB/web. The game fetches central endpoints (`rs_api_*_url`) over Cloudflare→EU. Deploy = code + game rebuild only. |
 
 Repo on each box: `~/racesow`, tracking `origin/main`. Deploy = box pulls `main`,
-then rebuild/recreate the affected containers.
+then rebuild/recreate the affected containers. Both boxes now run **two** game
+servers (Warsow + Warfork; §6 has the per-server compose files) and a
+**`racesow-xpiry-heartbeat`** systemd timer pushing uptime to xpiry.dev (its
+`XPIRY_*` + `XPIRY_API_KEY` live in each box's `.env`, gitignored — untouched by
+a pull). Set `DEPLOY_USER`/`DEPLOY_KEY` from the placeholder block below (not
+committed here); add `-o IdentityAgent=none -o IdentitiesOnly=yes` to every ssh
+call if the local agent interferes.
 
 **The deploy login + SSH key are provisioned out of this (public) repo** (see
 `docs/live-stream-rollout.md` — "user to provision"). Set them locally and use
@@ -122,6 +128,26 @@ to the user** — do not guess. (Memory: "never `git add -A` on prod box".)
 > EU `server/docker-compose.yml` (published `44450` port + `EXTRA_ARGS +set
 > rs_tv_name RACESOW-TV`), US `docker-compose.agent.yml`. Blocking-untracked
 > (identical to main → `rm` first): `server/docker-compose.tv.yml`.
+>
+> **Verified 2026-07-29 reconcile (both boxes `bc148db`→`11fc57d`):** the pull
+> blocks on prior rsync-overlay files that later landed in main — classify each
+> against `origin/main` and `rm` only the byte-identical ones (this loop is safe):
+> ```bash
+> git fetch origin main -q
+> for f in $(git diff --name-only <boxHEAD>..origin/main); do
+>   if [ -e "$f" ] && ! git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+>     git show "origin/main:$f" | diff -q - "$f" >/dev/null 2>&1 \
+>       && { echo "rm $f"; rm -f "$f"; } || echo "DIFFERS (keep, review): $f"
+>   fi
+> done
+> git pull --ff-only origin main
+> ```
+> Files seen: EU — the 3 xpiry files (`scripts/xpiry-heartbeat.sh`,
+> `systemd/racesow-xpiry-heartbeat.{service,timer}`). US — those plus the sftp/
+> demo overlay (`scripts/ingest-demos.sh`, `server/docker-compose.sftp.yml`,
+> `server/sftp/*`, `systemd/racesow-demo-ingest.*`, `web/demo-meta.mjs`); all 8
+> were identical → rm'd. Real box edit kept (pull doesn't touch it): US
+> `docker-compose.agent.yml`. `.env` (XPIRY_* etc.) is gitignored → never touched.
 
 ## 3. Notify players of downtime — REQUIRED before any game restart
 
@@ -177,17 +203,70 @@ fetches the central endpoint. Re-run after `fetch-maps.sh` pulls new packs.
 
 ## 6. Rebuild + restart the game servers (both boxes — interrupts players)
 
-Only when engine/racemod/entrypoint/Dockerfile changed. Do §3 first.
+Only when engine/racemod/entrypoint/Dockerfile OR warfork/* changed. Do §3 first.
+**Each box now runs TWO game servers — Warsow AND Warfork — and each is a
+distinct compose project/file. Get these exactly right or you rebuild/recreate
+the wrong thing (or spawn a duplicate that fails silently):**
+
+| Box  | Server       | compose file                 | `-p` project | working_dir        | image tag              |
+|------|--------------|------------------------------|--------------|--------------------|------------------------|
+| EU   | warsow-race  | `server/docker-compose.yml`  | `server`     | `~/racesow/server` | `warsow-race:2.1.2`    |
+| US   | warsow-race  | `docker-compose.agent.yml`   | `racesow`    | `~/racesow`        | `warsow-race:2.1.2`    |
+| both | warfork-race | `docker-compose.warfork.yml` | `racesow`    | `~/racesow`        | `warfork-race:racesow` |
+
+Confirm on the box:
+`docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' <name>`.
+The racemod `.as` is **baked into the image**, and Warfork runs the SAME racemod,
+so ANY racemod change means rebuilding BOTH games. Use explicit `-p`/`-f` (don't
+rely on cwd) and `build` then a **`--force-recreate`**:
 
 ```bash
-cd ~/racesow
-docker compose -f server/docker-compose.yml build warsow-race   # compiles engine+racemod
-docker compose -f server/docker-compose.yml up -d warsow-race   # recreate (kicks players)
-docker logs --tail 40 warsow-race                               # expect "Gametype 'Race' initialized", no AS errors
+# EU warsow
+docker compose -p server  -f ~/racesow/server/docker-compose.yml   build warsow-race
+docker compose -p server  -f ~/racesow/server/docker-compose.yml   up -d --force-recreate warsow-race
+# US warsow  (NOT server/docker-compose.yml — an older version of this doc was wrong)
+docker compose -p racesow -f ~/racesow/docker-compose.agent.yml    build warsow-race
+docker compose -p racesow -f ~/racesow/docker-compose.agent.yml    up -d --force-recreate warsow-race
+# Warfork (both boxes)
+docker compose -p racesow -f ~/racesow/docker-compose.warfork.yml  build warfork-race
+docker compose -p racesow -f ~/racesow/docker-compose.warfork.yml  up -d --force-recreate warfork-race
 ```
-US uses the same commands (its compose is `server/docker-compose.yml`; the agent
-bundle `docker-compose.agent.yml` is for third-party operators, not this box).
-New `rs_api_*` cvars in `entrypoint.sh` take effect on this recreate.
+
+Gotchas that WILL bite you:
+- **`--force-recreate` is mandatory.** The image tag is reused, so a plain
+  `up -d` sees "same tag" and does NOT swap to the freshly-built image — the
+  container keeps running OLD code and reports success. Verify the swap:
+  `[ "$(docker inspect -f '{{.Image}}' warsow-race)" = "$(docker image inspect -f '{{.Id}}' warsow-race:2.1.2)" ] && echo FRESH || echo STALE`.
+- **`docker compose exec -T … node admin.js` reads stdin — it eats heredocs.** If
+  you script the §3 notify and the recreate together in one `ssh 'bash -s' <<'EOF'`,
+  the `exec -T` consumes the rest of the heredoc and the recreate lines silently
+  never run (exit 0, no output). Do the notify as its OWN ssh call, or append
+  `</dev/null` to the exec.
+- **Warsow boot takes 60-90s on prod** (loads the 4000+ pak livesow mirror). No
+  `Gametype 'Race' initialized` within 45s is NOT a failure if the container is
+  `running`, on the FRESH image, with no AS errors — wait and re-check the logs.
+  Warfork boots in seconds.
+- Boot-test each: `docker logs <name> | grep -E "Gametype 'Race' initialized"`,
+  scan for AS errors, and confirm `rs_mirror: configured … peers=N`.
+
+**Stagger the boxes:** builds are non-disruptive (old container keeps serving), so
+build BOTH boxes first, then recreate EU (both games) and confirm healthy BEFORE
+recreating US — keeps the EU↔US mesh from going down on both ends at once.
+Rollback: `docker tag warsow-race:2.1.2 warsow-race:prev` (and
+`warfork-race:racesow`→`:prev`) before building; recreate from `:prev` if a
+boot-test fails. New `rs_api_*` cvars in `entrypoint.sh` take effect on recreate.
+
+**PRE-FLIGHT (strongly recommended for racemod/engine):** build + boot-test
+LOCALLY first — `.as` compiles at BOOT not build, so a green build can still fail
+gametype init (memory: Warsow AS is stricter than Warfork; a bad ternary passed
+Warfork build but broke Warsow at boot). Validates the shared racemod before any
+prod downtime:
+```bash
+docker compose -f server/docker-compose.yml build warsow-race
+docker run -d --name wsw-boot --tty -e SV_PUBLIC=0 --ulimit nofile=16384:16384 \
+  warsow-race:2.1.2 +map wbomb1
+docker logs wsw-boot | grep "Gametype 'Race' initialized"   # + no AS errors; then: docker rm -f wsw-boot
+```
 
 ## 7. All clear + verify
 
