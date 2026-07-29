@@ -123,7 +123,14 @@ void RACE_ApplyPlayerRecord( Player@ player, const String &in text )
     if ( player.globalRank <= 0 )
     {
         uint nl = text.locate( "\n", 0 );
-        String header = ( nl <= text.length() ) ? text.substr( 0, nl ) : text;
+        // NB: assign-then-narrow, NOT a ?: — the older Warsow AngelScript rejects
+        // a ternary whose branches are a String value (substr) and a const String&
+        // (text) as different types ("Both expressions must have the same type");
+        // Warfork's newer AS accepts it. Both branches here are plain String
+        // assignments, so this compiles on both engines.
+        String header = text;
+        if ( nl <= text.length() )
+            header = text.substr( 0, nl );
         int rank = RACE_ParsePlayerRecRank( header );
         if ( rank > 0 )
             player.globalRank = rank;
