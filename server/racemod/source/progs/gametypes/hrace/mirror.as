@@ -389,6 +389,11 @@ void RACE_MirrorPlayerJoined( Client@ client )
     // would report a remote player as a new local join on their origin server.
     if ( RACE_MirrorIsFakeClient( client ) )
         return;
+    // The server-side TV camera (rs_tv_name / RACESOW-TV) is infra, not a real
+    // player: keep its join off the mesh so peers don't announce it (it is
+    // already excluded from mirroring, player counts and /who).
+    if ( RACE_IsTvClient( client ) )
+        return;
     RS_MirrorEvent( "J", client.name, "" );
 }
 
@@ -398,6 +403,8 @@ void RACE_MirrorPlayerLeft( Client@ client )
         return;
     if ( RACE_MirrorIsFakeClient( client ) )
         return; // mirror bots are peer players, not local ones (see Joined)
+    if ( RACE_IsTvClient( client ) )
+        return; // the TV camera is infra; keep its leave off the mesh (see Joined)
     RS_MirrorEvent( "L", client.name, "" );
 }
 
