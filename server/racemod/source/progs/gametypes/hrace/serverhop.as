@@ -33,7 +33,7 @@ bool hopEverParsed = false; // forces the first parse even when rs_hop_servers i
 // returns >= length, which ends the walk with the trailing field.
 String[] RACE_HopSplit( const String &in s, const String &in sep )
 {
-    String[] out;
+    String[] parts; // NB: 'out' is a reserved AngelScript keyword, don't use it
     uint n = s.length();
     uint start = 0;
     while ( true )
@@ -42,19 +42,19 @@ String[] RACE_HopSplit( const String &in s, const String &in sep )
         // final empty field and stop WITHOUT calling locate() at start == length.
         if ( start >= n )
         {
-            out.insertLast( "" );
+            parts.insertLast( "" );
             break;
         }
         uint p = s.locate( sep, start );
         if ( p >= n )
         {
-            out.insertLast( s.substr( start, n - start ) );
+            parts.insertLast( s.substr( start, n - start ) );
             break;
         }
-        out.insertLast( s.substr( start, p - start ) );
+        parts.insertLast( s.substr( start, p - start ) );
         start = p + sep.length();
     }
-    return out;
+    return parts;
 }
 
 // (Re)parse rs_hop_servers into the hop* arrays when the cvar has changed.
