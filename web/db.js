@@ -101,12 +101,12 @@ export const SR_MIN_FIELD = 5;
 // shows a 30-day trend. See the 20260723130000000_sr_history migration.
 export const SR_HISTORY_DAYS = 30;
 
-// How many days of air-strafe-quality trend to show on the profile. Unlike SR
-// (snapshotted daily), strafe quality is derived on read by averaging the per-run
-// strafe_quality stored on each finish, bucketed by UTC day. Finishes are sparser
-// than daily snapshots, so a wider window gives casual racers enough points to
-// draw a trend. See migration 20260730120000000_strafe_quality.
-export const STRAFE_HISTORY_DAYS = 90;
+// How many days of air-strafe-quality trend to show on the profile — one per-day
+// rating point per UTC day, matching the SR-history window. Unlike SR (snapshotted
+// daily), the per-day rating is derived on read by averaging the per-run
+// strafe_quality stored on each finish, bucketed by UTC day. See migration
+// 20260730120000000_strafe_quality.
+export const STRAFE_HISTORY_DAYS = 30;
 
 // Schema is managed by node-pg-migrate: versioned files in ./migrations run at
 // startup (see openDatabase). The baseline (0001) reflects the former SQLite

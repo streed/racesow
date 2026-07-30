@@ -436,18 +436,18 @@ function strafeQualityCard(history) {
   const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
   const disp = (delta > 0 ? "+" : "") + (Math.round(delta * 10) / 10).toFixed(1) + "%";
   return `
-    <div class="page-title" style="font-size:20px">STRAFE QUALITY <span class="accent">·</span> last 90 days</div>
+    <div class="page-title" style="font-size:20px">STRAFE QUALITY <span class="accent">·</span> last 30 days</div>
     <div class="panel srhist">
       <div class="srhist-head">
         <div class="srhist-now"><div class="n">${pct(latest.quality)}</div><div class="l">latest</div></div>
-        <div class="srhist-delta ${trend}" title="Change over the ${history.length} days tracked">${arrow} ${disp}<span class="l">trend</span></div>
+        <div class="srhist-delta ${trend}" title="Change over the ${history.length} days tracked">${arrow} ${disp}<span class="l">30-day change</span></div>
       </div>
       ${trendSparkline(history, {
         get: (p) => p.quality,
         fmtAxis: (v) => Math.round(v) + "%",
         minBand: 8,
         chartClass: "strafechart",
-        ariaLabel: `Air-strafe quality over the last 90 days, ${history[0].day} to ${latest.day}`,
+        ariaLabel: `Air-strafe quality over the last 30 days, ${history[0].day} to ${latest.day}`,
       })}
     </div>`;
 }
