@@ -793,6 +793,13 @@ void RACE_MirrorUpdateBots()
             rp.botIsSpectator = ( wantKind == 1 );
             rp.appliedScore = -1;  // force a scoreboard-time refresh onto the new bot
             rp.hasRender = false;  // (re)seed smoothing on a fresh bot
+            // Pull this remote player's global Skill Rating for the scoreboard's
+            // SR column (playerrecord.as applies ONLY the rating to a bot — its
+            // time comes from the peer over the mesh, not from our map's board).
+            // Racer bots only: spectator bots are not on the players team the
+            // record poller walks, so a fetch for one would never be collected.
+            if ( wantKind == 0 )
+                RACE_TriggerMirrorBotRecordFetch( rp.botSlot );
         }
         botCount++;
 

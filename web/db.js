@@ -946,6 +946,36 @@ class RaceDB {
     return body;
   }
 
+  // One player's current Skill Rating, looked up by the identKey() form of a
+  // nick (the same normalisation gamePlayerRecordText matches records with), or
+  // 0 when they have none. Several canonical groups can share one identKey form
+  // (historic logins that never merged), so the best rating of the matches wins
+  // — the same "best of the matches" posture the record lookup takes with time.
+  //
+  // `standings` is built by the aggregate refresh, not by a migration, so on a
+  // brand-new database it does not exist yet: a failed lookup degrades to 0
+  // (blank SR column) rather than failing the whole player-record fetch, which
+  // seeds records and checkpoint splits the game needs more than a rating.
+  async playerSkillRating(cleanKey) {
+    if (!cleanKey) return 0;
+    try {
+      const row = await this.one(
+        `SELECT MAX(s.sr)::int AS sr
+         FROM standings s
+         WHERE s.player_id IN (
+           SELECT DISTINCT pl.canonical_id FROM player pl
+           WHERE trim(regexp_replace(
+                   lower(regexp_replace(pl.name, '\\^[0-9]', '', 'g')),
+                   '\\s*\\(\\d+\\)\\s*$', '')) = $1
+         )`,
+        [cleanKey]
+      );
+      return row && row.sr != null ? num(row.sr) : 0;
+    } catch {
+      return 0; // no standings table yet (pre-first-refresh) => unrated
+    }
+  }
+
   // One player's personal best on a map for game servers (GET
   // /api/game/player-record?map=&name=). The hrace gametype fetches this the
   // moment a player joins (hrace/playerrecord.as, via the RS_ApiFetchPlayerRecord
@@ -963,15 +993,25 @@ class RaceDB {
   // / the site). The rank is that group's RANK() over the field — the same
   // number gameRanksText would emit for the player's line in the ranks blob.
   //
+  // The header also carries the player's GLOBAL Skill Rating (see the SR_* block
+  // at the top of this file), which the gametype shows in its own scoreboard
+  // column. SR is map-independent, so this per-player fetch is the natural
+  // carrier: it already fires once per join/rename, for exactly the players the
+  // scoreboard lists. 0 = unrated/unknown (the game leaves the column blank).
+  //
   // Format reuses the topscores single-record line so the game's existing
   // token-based loader parses it unchanged, behind a leading "//" the fetch
   // native uses to reject captive-portal / proxy error bodies:
-  //   //playerrec <rank> <total_finishers>
+  //   //playerrec <rank> <total_finishers> <sr>
   //   "<time>" "<cleanName>" "<numSectors>" "<sector0>" "<sector1>" ...
+  // A player with an SR but no record HERE (never finished this map, or a mirror
+  // bot racing on a peer server) still gets the header alone — "//playerrec 0 0
+  // <sr>": rank 0 reads as "no rank" on the game side, so only the SR lands.
   // Two fail-open return values: null = unknown/unsafe map (a 404 upstream,
-  // matching the other game payloads); "" (empty body, 200) = known map but this
-  // player has no findable record here — the game leaves its board seed untouched
-  // (the fetch native rejects a non-"//" body, so an empty body reads as "none").
+  // matching the other game payloads); "" (empty body, 200) = known map and
+  // nothing at all to say about this player (no record here AND no rating) — the
+  // game leaves its board seed untouched (the fetch native rejects a non-"//"
+  // body, so an empty body reads as "none").
   async gamePlayerRecordText(mapName, playerName) {
     const name = String(mapName || "").toLowerCase();
     if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
@@ -983,6 +1023,9 @@ class RaceDB {
     // player.name so a PB set under a colour/(N) variant is still found.
     const clean = identKey(playerName);
     if (!clean) return ""; // name normalised to nothing => no findable record
+
+    // Global rating for the scoreboard's SR column (0 = unrated/unknown).
+    const sr = await this.playerSkillRating(clean);
 
     // Fastest race per canonical group (rn=1), ranked by time across all groups
     // (identical bests/RANK() shape to gameRanksText, so the rank is byte-equal
@@ -1018,11 +1061,15 @@ class RaceDB {
        LIMIT 1`,
       [map.id, clean]
     );
-    if (!row) return ""; // known map, this player has no record
+    // Known map, no record for this player here: still worth a header-only body
+    // when they carry a rating, so the scoreboard's SR column fills in for a
+    // player who has never finished THIS map. Rank 0 => the game stamps no Pos.
+    if (!row) return sr > 0 ? `//playerrec 0 0 ${sr}\n` : "";
 
     const sanitize = (n) => String(n).replace(/["\r\n\t]/g, "").slice(0, 64);
     const cleanName = sanitize(this._cn(row.name, row.cid));
-    if (!cleanName) return ""; // unmatchable name token => treat as no record
+    // Unmatchable name token => treat as no record (SR still travels).
+    if (!cleanName) return sr > 0 ? `//playerrec 0 0 ${sr}\n` : "";
 
     const sectors = (
       await this.all(
@@ -1031,7 +1078,7 @@ class RaceDB {
       )
     ).map((c) => c.time | 0);
 
-    let body = `//playerrec ${num(row.rank)} ${num(row.total)}\n`;
+    let body = `//playerrec ${num(row.rank)} ${num(row.total)} ${sr}\n`;
     let line = `"${num(row.time)}" "${cleanName}" "${sectors.length}" `;
     for (const s of sectors) line += `"${s}" `;
     return body + line + "\n";

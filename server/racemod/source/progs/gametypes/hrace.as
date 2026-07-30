@@ -1349,9 +1349,14 @@ void GT_InitGametype()
     for ( int team = TEAM_PLAYERS; team < GS_MAX_TEAMS; team++ )
         gametype.setTeamSpawnsystem( team, SPAWNSYSTEM_INSTANT, 0, 0, false );
 
-    // define the scoreboard layout
-    G_ConfigString( CS_SCB_PLAYERTAB_LAYOUT, "%n 112 %s 52 %s 32 %t 80 %s 36 %s 48 %l 40 %s 48" );
-    G_ConfigString( CS_SCB_PLAYERTAB_TITLES, "Name Clan Pos Time Diff Speed Ping Racing" );
+    // Scoreboard layout. Column order/width here MUST stay in lockstep with the
+    // fields Player.scoreboardEntry() emits (player.as) — the client walks both
+    // in the same order, so an extra column with no matching field silently
+    // shifts every value after it. "SR" is the player's global Skill Rating
+    // (hrace/playerrecord.as); 40px fits its 4-digit ceiling like Ping. The client
+    // derives the panel width by summing these, so the board simply gets wider.
+    G_ConfigString( CS_SCB_PLAYERTAB_LAYOUT, "%n 112 %s 52 %s 32 %s 40 %t 80 %s 36 %s 48 %l 40 %s 48" );
+    G_ConfigString( CS_SCB_PLAYERTAB_TITLES, "Name Clan Pos SR Time Diff Speed Ping Racing" );
 
     // add commands
     G_RegisterCommand( "gametype" );

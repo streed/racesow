@@ -764,18 +764,20 @@ test("gamePlayerRecordText: one player's PB — rank+total header + exact topsco
     ],
   });
 
-  // Exact bytes: header "//playerrec <rank> <total>", then the topscores
+  // Exact bytes: header "//playerrec <rank> <total> <sr>", then the topscores
   // per-record line — every field quoted, sectors in `number` order, and the
   // SINGLE trailing space after the last sector preserved (the game's getToken
-  // loader keeps it; do NOT trimEnd the assertion).
+  // loader keeps it; do NOT trimEnd the assertion). SR is 0 here: `standings` is
+  // built by refreshAggregates, which this test deliberately never runs (see the
+  // dedicated SR test below), so every player reads as unrated.
   assert.equal(
     await race.gamePlayerRecordText(MAP, "nova"),
-    `//playerrec 1 5\n"30000" "Nova" "2" "10000" "20000" \n`,
+    `//playerrec 1 5 0\n"30000" "Nova" "2" "10000" "20000" \n`,
     "leader: rank 1 of 5, checkpoints ascending by number"
   );
   assert.equal(
     await race.gamePlayerRecordText(MAP, "beta"),
-    `//playerrec 2 5\n"32000" "Beta" "2" "11000" "21000" \n`,
+    `//playerrec 2 5 0\n"32000" "Beta" "2" "11000" "21000" \n`,
     "dense-tie rank matches the ranks blob (Beta shares rank 2)"
   );
 
@@ -783,7 +785,7 @@ test("gamePlayerRecordText: one player's PB — rank+total header + exact topsco
   // it must resolve to ^3Zeta's canonical group (SQL strips ^N the same way).
   assert.equal(
     await race.gamePlayerRecordText(MAP, "zeta"),
-    `//playerrec 4 5\n"35000" "^3Zeta" "2" "13000" "26000" \n`,
+    `//playerrec 4 5 0\n"35000" "^3Zeta" "2" "13000" "26000" \n`,
     "colour-stripped name still finds the record; emitted name keeps ^ codes"
   );
 
@@ -808,8 +810,47 @@ test("gamePlayerRecordText: one player's PB — rank+total header + exact topsco
   const viaBase = await race.gamePlayerRecordText(MAP, "nova");
   const viaSuffix = await race.gamePlayerRecordText(MAP, "nova(2)");
   assert.equal(viaBase, viaSuffix, "the (N) collision suffix resolves to the same canonical group");
-  assert.match(viaBase, /^\/\/playerrec 1 5\n"25000" /, "faster variant run becomes the group PB, still rank 1");
+  assert.match(viaBase, /^\/\/playerrec 1 5 0\n"25000" /, "faster variant run becomes the group PB, still rank 1");
   assert.match(viaBase, /"2" "8000" "16000" \n$/, "the variant run's checkpoints are the ones served");
+});
+
+test("gamePlayerRecordText: the header carries the player's global Skill Rating", async (t) => {
+  const race = await freshDb(t);
+  const OTHER = "testmap2";
+  // Five finishers make the map contested (SR_MIN_FIELD), so the aggregate
+  // refresh gives everyone who finished it a real rating.
+  await race.ingest({
+    version: VER, map: MAP, source: "racelog",
+    records: [
+      finish("Nova", 30000, [10000, 20000]),
+      finish("Beta", 32000),
+      finish("Gamma", 34000),
+      finish("Delta", 36000),
+      finish("Epsilon", 38000),
+    ],
+  });
+  // Rho races only the OTHER map: rated, but with nothing on MAP.
+  await race.ingest({ version: VER, map: OTHER, source: "racelog", records: [finish("Rho", 20000)] });
+  await race.refreshAggregates();
+
+  const nova = await race.gamePlayerRecordText(MAP, "nova");
+  const novaSr = Number(nova.split("\n")[0].split(" ")[3]);
+  assert.equal(
+    novaSr,
+    Number((await race.one("SELECT sr FROM standings s JOIN player p ON p.id = s.player_id WHERE p.name = 'Nova'")).sr),
+    "the header SR is exactly the standings value the site shows"
+  );
+  assert.ok(novaSr > 0, "a finisher on a contested map is rated");
+  assert.match(nova, /^\/\/playerrec 1 5 \d+\n"30000" /, "rank/total are untouched by the added field");
+
+  // Rated, but no record on THIS map: a header-only body — rank 0 (the game
+  // stamps no Pos from it) with the rating still delivered.
+  const rho = await race.gamePlayerRecordText(MAP, "rho");
+  assert.match(rho, /^\/\/playerrec 0 0 \d+\n$/, "no record here => header-only SR payload");
+  assert.ok(Number(rho.split(" ")[3]) > 0, "the SR is a real rating, not the 0 placeholder");
+
+  // A name nobody has raced under stays an empty body: nothing to say at all.
+  assert.equal(await race.gamePlayerRecordText(MAP, "nobody"), "", "unrated unknown player => empty body");
 });
 
 test("saved starts: upsert, per-player text, canonical match, replace, delete", async (t) => {

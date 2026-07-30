@@ -13,37 +13,42 @@
 // keyed by their player slot so several joiners can be in flight at once. The API
 // answers (web/db.js gamePlayerRecordText) with the player's rank + finish time +
 // checkpoint splits in the topscores line format behind a header:
-//   //playerrec <rank> <total>
+//   //playerrec <rank> <total> <sr>
 //   "<time>" "<cleanName>" "<numSectors>" "<sector0>" "<sector1>" ...
 // The think poller seeds the player's best_recordTime from it (with checkpoints,
 // normalized to the live map via the shared RACE_RecordFromTokens), so the
 // scoreboard Pos/time works for players ranked past the top-50 board and the
 // checkpoint comparison is ready from their first run.
 //
+// The header's third field is the player's GLOBAL Skill Rating, which the
+// scoreboard shows in its own "SR" column (player.as scoreboardEntry). Being
+// global it is the one part of the payload that is true regardless of the map or
+// the direction being raced, so it is applied to EVERY player a fetch was issued
+// for, while the record/rank is applied only to a player this map's standard
+// board actually describes. That widens who is worth fetching for:
+//   - reversed racers: fetched (SR only) where they used to be skipped entirely
+//   - mirror bots: fetched (SR only) from mirror.as as each bot is created, so
+//     peer-server players on the scoreboard carry a rating too
+// A player with a rating but no record here gets a header-only answer with rank
+// 0, so nothing but the SR lands.
+//
 // Fail-open by design: no-op when rs_api_player_record_url is empty; on a failed
-// fetch OR a "no record here" answer (the native reports -1 for both) the
-// player's existing seed is left untouched — nothing is ever cleared on failure.
-// Standard board only (like ranks.as): a reversed player keeps their local
-// reverse best, so no fetch is issued for them.
+// fetch OR a "nothing known about this player" answer (the native reports -1 for
+// both) the player's existing seed is left untouched — nothing is ever cleared
+// on failure, and a web still serving the old two-field header simply leaves the
+// SR column blank.
 
 Cvar rsApiPlayerRecordUrl( "rs_api_player_record_url", "", 0 );
 
-// Issue a per-player PB fetch for the given player on the current map. No-op when
-// the feature is off (empty cvar), for a reversed player (standard board only),
-// or for an empty clean name. Re-keys on the CURRENT clean name so a rename
-// re-fetches the record that now belongs to the player.
-void RACE_TriggerPlayerRecordFetch( Player@ player )
+// Issue the fetch for one player, keyed on their CURRENT clean name (so a rename
+// re-fetches what now belongs to them) and on their client slot. No-op when the
+// feature is off (empty cvar) or the clean name is empty. Shared by both entry
+// points below; WHO is worth fetching for is their decision, not this one's.
+void RACE_IssuePlayerRecordFetch( Player@ player )
 {
     if ( rsApiPlayerRecordUrl.string.length() == 0 )
         return;
     if ( player is null || player.client is null )
-        return;
-    if ( player.reversed )
-        return;
-    // Mirror bots (peer-server players) and the TV director are not real local
-    // racers — never fetch a record for them (mirrors the enterGame auto-join
-    // and GT_PlayerRespawn mirror-bot guards).
-    if ( RACE_MirrorIsFakeClient( player.client ) || RACE_IsTvClient( player.client ) )
         return;
 
     String cleanName = player.client.name.removeColorTokens().tolower();
@@ -58,25 +63,123 @@ void RACE_TriggerPlayerRecordFetch( Player@ player )
         cleanName, player.client.playerNum );
 }
 
-// Parse the "//playerrec <rank> <total>" header line and return <rank>, or -1 if
-// the line carries no rank (a header-only no-record marker, defensive only).
+// Join hook for a real local player: seeds their record + checkpoints, or (when
+// reversed — the payload describes the standard board) just their Skill Rating.
+void RACE_TriggerPlayerRecordFetch( Player@ player )
+{
+    if ( player is null || player.client is null )
+        return;
+    // Fake clients never enter through this path as themselves: mirror bots come
+    // in through RACE_TriggerMirrorBotRecordFetch below, and the WR ghost racer /
+    // TV director are infrastructure with no rating to show (the ghost is hidden
+    // from the scoreboard entirely). Mirrors the enterGame auto-join and
+    // GT_PlayerRespawn mirror-bot guards.
+    if ( RACE_MirrorIsFakeClient( player.client ) || RACE_IsTvClient( player.client ) )
+        return;
+
+    RACE_IssuePlayerRecordFetch( player );
+}
+
+// Mirror bots stand in for players racing on a PEER server: there is no local
+// record to seed for them, but they DO occupy a scoreboard row, and Skill Rating
+// is global — so fetch it once per bot as mirror.as creates it (racer bots only;
+// spectator bots are not on the players team the poller walks). The apply path
+// takes only the SR from the answer.
+void RACE_TriggerMirrorBotRecordFetch( int botSlot )
+{
+    if ( botSlot < 0 )
+        return;
+    Client@ bc = G_GetClient( botSlot );
+    if ( @bc == null )
+        return;
+    RACE_IssuePlayerRecordFetch( RACE_GetPlayer( bc ) );
+}
+
+// Nth space-separated field of the "//playerrec <rank> <total> <sr>" header line
+// ("//playerrec" itself is field 0), or "" when the header is shorter than that.
+// getToken() is no help here: it treats the whole "//" line as a comment and
+// skips straight to the data line, which is exactly why the header is read by
+// hand. Tolerates runs of spaces and a header with fields we do not know yet.
+String RACE_PlayerRecHeaderField( const String &in header, uint index )
+{
+    uint total = header.length();
+    uint pos = 0;
+    uint field = 0;
+    while ( pos < total )
+    {
+        while ( pos < total && header.substr( pos, 1 ) == " " )
+            pos++;
+        if ( pos >= total )
+            break;
+        // locate() returns the string length when the token is not found, so the
+        // final field of an unterminated line still reads whole.
+        uint sp = header.locate( " ", pos );
+        if ( sp > total )
+            sp = total;
+        if ( field == index )
+            return header.substr( pos, sp - pos );
+        pos = sp;
+        field++;
+    }
+    return "";
+}
+
+// <rank> from the header, or -1 if the line carries none (a header-only
+// no-record marker: the web sends rank 0 when it has only a rating to report).
 int RACE_ParsePlayerRecRank( const String &in header )
 {
-    uint sp = header.locate( " ", 0 );
-    if ( sp >= header.length() )
+    String field = RACE_PlayerRecHeaderField( header, 1 );
+    if ( field.length() == 0 )
         return -1;
-    int rank = header.substr( sp + 1 ).toInt();
+    int rank = field.toInt();
     return rank > 0 ? rank : -1;
 }
 
-// Apply a fetched player-record payload to the player: seed best_recordTime (with
-// checkpoints) and, if ranks.as has not already given a Pos, the header rank.
+// <sr> from the header, or -1 when absent (an older web serving the two-field
+// header) or 0 (the web's "unrated / unknown player" value) — either way the
+// scoreboard column stays blank rather than showing a made-up number.
+int RACE_ParsePlayerRecSr( const String &in header )
+{
+    String field = RACE_PlayerRecHeaderField( header, 3 );
+    if ( field.length() == 0 )
+        return -1;
+    int sr = field.toInt();
+    return sr > 0 ? sr : -1;
+}
+
+// Apply a fetched player-record payload to the player: the header's global Skill
+// Rating always, then — for a player this map's standard board really describes —
+// best_recordTime (with checkpoints) and, if ranks.as has not already given a
+// Pos, the header rank.
 void RACE_ApplyPlayerRecord( Player@ player, const String &in text )
 {
     if ( player is null || player.client is null )
         return;
     if ( text.length() < 2 || text.substr( 0, 2 ) != "//" )
         return; // not a record payload (the native already gates on "//")
+
+    // Header line, read before anything else: it carries the Skill Rating, which
+    // is global and so applies even when the record below does not.
+    // NB: assign-then-narrow, NOT a ?: — the older Warsow AngelScript rejects a
+    // ternary whose branches are a String value (substr) and a const String&
+    // (text) as different types ("Both expressions must have the same type");
+    // Warfork's newer AS accepts it. Both branches here are plain String
+    // assignments, so this compiles on both engines.
+    uint nl = text.locate( "\n", 0 );
+    String header = text;
+    if ( nl <= text.length() )
+        header = text.substr( 0, nl );
+
+    int sr = RACE_ParsePlayerRecSr( header );
+    if ( sr > 0 )
+        player.skillRating = sr;
+
+    // Everything below describes THIS map's standard board. A reversed racer runs
+    // a different board, and a mirror bot is racing on a peer server entirely, so
+    // for them the rating above is all that lands (matching how ranks.as refuses
+    // to stamp a standard Pos onto a reversed player).
+    if ( player.reversed || RACE_MirrorIsFakeClient( player.client ) )
+        return;
 
     // Data line: getToken skips the leading "//playerrec ..." comment line, so
     // token 0 is the finish time, 1 the name, 2 the sector count, 3.. the sectors
@@ -122,15 +225,6 @@ void RACE_ApplyPlayerRecord( Player@ player, const String &in text )
     // first-frame fallback so a player past the top-50 board sees a rank at once.
     if ( player.globalRank <= 0 )
     {
-        uint nl = text.locate( "\n", 0 );
-        // NB: assign-then-narrow, NOT a ?: — the older Warsow AngelScript rejects
-        // a ternary whose branches are a String value (substr) and a const String&
-        // (text) as different types ("Both expressions must have the same type");
-        // Warfork's newer AS accepts it. Both branches here are plain String
-        // assignments, so this compiles on both engines.
-        String header = text;
-        if ( nl <= text.length() )
-            header = text.substr( 0, nl );
         int rank = RACE_ParsePlayerRecRank( header );
         if ( rank > 0 )
             player.globalRank = rank;
@@ -138,9 +232,10 @@ void RACE_ApplyPlayerRecord( Player@ player, const String &in text )
 }
 
 // Poll for landed per-player fetches and apply them. Called from GT_ThinkRules; a
-// no-op when rs_api_player_record_url is unset. Iterates racing players (where a
-// seeded record actually matters); a fetch issued while a player was elsewhere is
-// harmlessly re-issued when they next join.
+// no-op when rs_api_player_record_url is unset. Iterates the players team — where
+// a seeded record actually matters, and where mirror racer bots sit too, so their
+// SR-only answers land here as well; a fetch issued while a player was elsewhere
+// is harmlessly re-issued when they next join.
 void RACE_ApiPlayerRecordThink()
 {
     if ( rsApiPlayerRecordUrl.string.length() == 0 )

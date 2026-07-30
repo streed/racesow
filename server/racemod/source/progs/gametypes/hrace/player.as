@@ -62,6 +62,11 @@ class Player
     // Preferred over `pos` in the scoreboard because it covers players ranked
     // past the local top-50 board.
     int globalRank;
+    // Global Skill Rating from the central DB (hrace/playerrecord.as carries it
+    // in the per-player record fetch), or -1 when unknown: the API is off or
+    // unreachable, the player is unrated, or nobody ever fetched for this slot.
+    // Map-independent, unlike globalRank — shown in its own scoreboard column.
+    int skillRating;
     // Per-player PB fetch on join (hrace/playerrecord.as): while a fetch for this
     // player's own record on the current map is in flight, pendingRecordFetch is
     // true and recordFetchName is the clean name it was keyed on (so a rename can
@@ -264,6 +269,7 @@ class Player
         this.lastDashTime = 0;
         this.pos = -1;
         this.globalRank = -1;
+        this.skillRating = -1;
         this.pendingRecordFetch = false;
         this.recordFetchName = "";
         this.pendingSavedStartFetch = false;
@@ -381,6 +387,7 @@ class Player
         int playerID = ( ent.isGhosting() && ( match.getState() == MATCH_STATE_PLAYTIME ) ) ? -( ent.playerNum + 1 ) : ent.playerNum;
         String racing;
         String pos = "\u00A0";
+        String sr = "\u00A0";
         String speed;
 
         // Scoreboard rank ("Pos"): prefer the true global rank from the central
@@ -391,6 +398,14 @@ class Player
             pos = this.globalRank;
         else if ( this.pos != -1 )
             pos = this.pos;
+
+        // Skill Rating ("SR"): the player's GLOBAL rating from the central DB
+        // (hrace/playerrecord.as fetches it alongside their record on join), so
+        // unlike "Pos" it says nothing about this map. Blank while unknown — the
+        // API is off/unreachable, the player is unrated, or this is a fake client
+        // nobody fetched for.
+        if ( this.skillRating > 0 )
+            sr = this.skillRating;
 
         if ( this.practicing && this.recalled && ent.health > 0 && ent.moveType == MOVETYPE_PLAYER )
             racing = S_COLOR_CYAN + "Yes";
@@ -428,7 +443,7 @@ class Player
         else
             speed = "\u00A0";
 
-        return "&p " + playerID + " " + ent.client.clanName + " " + pos + " " + this.best_recordTime.getFinishTime() + " " + diff + " " + speed + " " + ent.client.ping + " " + racing + " ";
+        return "&p " + playerID + " " + ent.client.clanName + " " + pos + " " + sr + " " + this.best_recordTime.getFinishTime() + " " + diff + " " + speed + " " + ent.client.ping + " " + racing + " ";
     }
 
     bool preRace()

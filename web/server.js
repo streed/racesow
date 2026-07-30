@@ -514,11 +514,13 @@ api.get("/game/ranks", cache(60, { key: (req) => ranksCacheKey(req.query.map) })
 // player on join via the RS_ApiFetchPlayerRecord native). Carries the player's
 // rank, finish time AND checkpoint splits so the scoreboard "Pos"/time works
 // for players ranked past the local top-50 board and the live per-checkpoint
-// comparison is ready from their first run. Cached per (map, name); the record
-// only changes when THAT player finishes (updated live in-game anyway), so the
-// short TTL without ingest eviction is fine — a stale seed is harmless. The name
-// arrives already URL-decoded by Express; a 200 empty body = no record for that
-// player (fail-open), a 404 = unknown map or malformed name.
+// comparison is ready from their first run — plus their global Skill Rating for
+// the scoreboard's "SR" column. Cached per (map, name); the record only changes
+// when THAT player finishes (updated live in-game anyway) and SR only moves on
+// an aggregate refresh, so the short TTL without ingest eviction is fine — a
+// stale seed is harmless. The name arrives already URL-decoded by Express; a 200
+// empty body = nothing known about that player (fail-open), a 404 = unknown map
+// or malformed name.
 const playerRecCacheKey = (map, name) =>
   `/api/game/player-record?map=${String(map || "").toLowerCase()}&name=${String(name || "").slice(0, 64)}`;
 api.get("/game/player-record", cache(60, { key: (req) => playerRecCacheKey(req.query.map, req.query.name) }), wrap(async (req, res) => {

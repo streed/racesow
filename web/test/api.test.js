@@ -320,7 +320,9 @@ test("/api/game/player-record serves one player's PB (rank + splits) the gametyp
   assert.equal(r.status, 200);
   assert.match(r.headers.get("content-type"), /text\/plain/);
   const lines = (await r.text()).split("\n");
-  assert.match(lines[0], /^\/\/playerrec 1 2$/, "header: rank 1 of 2 finishers");
+  // Header: rank, finisher count, and the player's global SR for the scoreboard's
+  // SR column (0 when this database has no standings/rating for them yet).
+  assert.match(lines[0], /^\/\/playerrec 1 2 \d+$/, "header: rank 1 of 2 finishers, then SR");
   // Data line is byte-identical to the topscores line (trailing space intact).
   assert.equal(lines[1], '"48000" "^1No^7va" "2" "10000" "28000" ');
 
@@ -335,7 +337,7 @@ test("/api/game/player-record serves one player's PB (rank + splits) the gametyp
   assert.equal((await ingest(gameBody({ map: "prmap", name: "Ka Zoo", time: 20000, cps: [5000, 12000] }))).status, 200);
   const enc = await fetch(`${base}/api/game/player-record?map=prmap&name=ka%20zoo`);
   assert.equal(enc.status, 200);
-  assert.equal(await enc.text(), `//playerrec 1 1\n"20000" "Ka Zoo" "2" "5000" "12000" \n`);
+  assert.match(await enc.text(), /^\/\/playerrec 1 1 \d+\n"20000" "Ka Zoo" "2" "5000" "12000" \n$/);
 
   // Guards: unknown/unsafe/missing map => 404; missing/oversized/control-char name => 404.
   assert.equal((await fetch(`${base}/api/game/player-record?map=doesnotexist&name=nova`)).status, 404);
