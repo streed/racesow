@@ -366,6 +366,36 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .srchart.strafechart .srline { stroke: var(--cyan); }
 .srchart.strafechart .srdot { fill: var(--cyan); }
 
+/* ---------- "which maps make up this rating" dropdown ---------- */
+/* Collapsed inside the SR card; the marker is our own caret so the summary can
+   be styled like the rest of the site's condensed labels. */
+.srbd { border-top: 1px solid var(--line); margin: 12px -18px 0; }
+.srbd > summary {
+  list-style: none; cursor: pointer; user-select: none; padding: 12px 18px;
+  font-family: var(--cond); text-transform: uppercase; letter-spacing: 1.2px;
+  font-size: 12px; color: var(--muted); display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.srbd > summary::-webkit-details-marker { display: none; }
+.srbd > summary:hover { color: var(--text); }
+.srbd .srbd-caret { color: var(--orange); display: inline-block; transition: transform .15s; }
+.srbd[open] .srbd-caret { transform: rotate(90deg); }
+.srbd .srbd-hint { color: var(--faint); text-transform: none; letter-spacing: .3px; font-size: 12px; }
+.srbd-body { border-top: 1px solid var(--line); }
+.srbd-note { color: var(--muted); font-size: 13px; line-height: 1.55; padding: 12px 18px; }
+.srbd-note b { color: var(--text); }
+.srbd-table { font-size: 13px; }
+.srbd-table tbody td { padding: 8px 14px; }
+.srbd-table .srbd-i { color: var(--faint); font-family: var(--mono); font-size: 12px; width: 34px; }
+.srbd-table .srbd-run { font-family: var(--mono); color: var(--faint); }
+.srbd-table .srbd-run.on { color: var(--gold); }
+/* Considered but left out of the winning prefix — dimmed, still readable. */
+.srbd-table tr.srbd-out td { opacity: .45; }
+.srbd-table tr.srbd-cut td {
+  padding: 8px 14px; background: var(--bg-2); color: var(--faint);
+  font-family: var(--cond); text-transform: uppercase; letter-spacing: 1px; font-size: 11px;
+}
+.srbd-table tr.srbd-cut:hover td { background: var(--bg-2); }
+
 /* ---------- misc ---------- */
 .loading, .empty { text-align: center; color: var(--muted); padding: 40px; font-family: var(--cond); text-transform: uppercase; letter-spacing: 2px; }
 .spinner { display: inline-block; width: 26px; height: 26px; border: 3px solid var(--line-2); border-top-color: var(--orange); border-radius: 50%; animation: spin .7s linear infinite; }

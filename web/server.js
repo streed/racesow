@@ -370,6 +370,18 @@ api.get("/players/:id", cache(60, { edge: true }), wrap(async (req, res) => {
   res.json(detail);
 }));
 
+// The maps behind a player's Skill Rating — the strongest contested maps in
+// ranking order, flagged with which prefix the rating was actually taken from.
+// Fetched lazily by the profile's SR dropdown, so it stays off the profile's
+// critical path.
+api.get("/players/:id/sr", cache(60, { edge: true }), wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).json({ error: "invalid player id" });
+  const bd = await race.srBreakdown(id);
+  if (!bd) return res.status(404).json({ error: "player not found" });
+  res.json(bd);
+}));
+
 // Head-to-head comparison of two players (a vs b): overall standings plus the
 // direct record on every shared map. Both ids may be any name variant; the DB
 // resolves them to canonical.

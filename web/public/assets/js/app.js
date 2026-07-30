@@ -349,14 +349,20 @@ function finishFeed(list, { showMap = true, showPlayer = true, emptyMsg } = {}) 
 // `minBand` is the smallest y-range shown so a near-flat series doesn't magnify
 // tiny wiggles; `chartClass` lets a caller theme the line/area colour. Expects
 // history = [{day:'YYYY-MM-DD', ...}] oldest -> newest, length >= 1.
-function trendSparkline(history, { get, fmtAxis, ariaLabel, minBand = 40, chartClass = "" }) {
+function trendSparkline(history, { get, fmtAxis, ariaLabel, minBand = 40, chartClass = "", band = null }) {
   // Layout in SVG user units; the element scales to its container width via CSS
   // while keeping this aspect ratio (so text scales uniformly and stays crisp).
   const W = 660, H = 150, padL = 38, padR = 14, padT = 14, padB = 22;
   const xs = history.map((p) => Date.parse(p.day + "T00:00:00Z"));
   const ys = history.map((p) => get(p));
+  // Optional per-point envelope (e.g. each day's min..max strafe rating), drawn as
+  // a shaded band behind the main (average) line.
+  const los = band ? history.map((p) => band.lo(p)) : null;
+  const his = band ? history.map((p) => band.hi(p)) : null;
   const xMin = xs[0], xMax = xs[xs.length - 1];
-  const dataMin = Math.min(...ys), dataMax = Math.max(...ys);
+  // Domain spans the band envelope when present so the min/max fit on-chart.
+  const dataMin = band ? Math.min(...los) : Math.min(...ys);
+  const dataMax = band ? Math.max(...his) : Math.max(...ys);
   // Give a flat/near-flat series a sane band so tiny wiggles don't read as huge
   // swings, then pad the top/bottom so the line never glues to an edge.
   let yLo = dataMin, yHi = dataMax;
@@ -368,7 +374,17 @@ function trendSparkline(history, { get, fmtAxis, ariaLabel, minBand = 40, chartC
   const n = (v) => v.toFixed(1);
   const line = pts.map(([x, y], i) => `${i ? "L" : "M"}${n(x)} ${n(y)}`).join(" ");
   const baseY = n(H - padB);
-  const area = `M${n(pts[0][0])} ${baseY} ${pts.map(([x, y]) => `L${n(x)} ${n(y)}`).join(" ")} L${n(pts[pts.length - 1][0])} ${baseY} Z`;
+  // Fill: a min..max envelope (across the highs, back along the lows) when a band
+  // is given; otherwise the classic area down to the baseline.
+  let area;
+  if (band) {
+    const top = history.map((p, i) => `${i ? "L" : "M"}${n(xToPx(xs[i]))} ${n(yToPx(his[i]))}`).join(" ");
+    const bot = history.map((p, i) => [xToPx(xs[i]), yToPx(los[i])]).reverse()
+      .map(([x, y]) => `L${n(x)} ${n(y)}`).join(" ");
+    area = `${top} ${bot} Z`;
+  } else {
+    area = `M${n(pts[0][0])} ${baseY} ${pts.map(([x, y]) => `L${n(x)} ${n(y)}`).join(" ")} L${n(pts[pts.length - 1][0])} ${baseY} Z`;
+  }
   const last = pts[pts.length - 1];
   const gY = { hi: n(yToPx(dataMax)), lo: n(yToPx(dataMin)) };
   const first = history[0], latest = history[history.length - 1];
@@ -396,14 +412,18 @@ function srSparkline(history) {
   });
 }
 
-function srHistoryCard(history) {
+// The card also carries the collapsed "which maps make this rating" dropdown
+// (see srBreakdownPanel): the breakdown is fetched only when it's first opened.
+function srHistoryCard(history, playerId) {
   if (!history || !history.length) return "";
   const latest = history[history.length - 1];
   const enough = history.length >= 2;
   if (!enough)
     return `
     <div class="page-title" style="font-size:20px">SKILL RATING <span class="accent">·</span> tracking</div>
-    <div class="panel srhist"><div class="srhist-empty">Now tracking your Skill Rating daily — a 30-day trend line appears here once there are a couple of days to compare. Current rating <b>${fmtNum(latest.sr)}</b>.</div></div>`;
+    <div class="panel srhist"><div class="srhist-empty">Now tracking your Skill Rating daily — a 30-day trend line appears here once there are a couple of days to compare. Current rating <b>${fmtNum(latest.sr)}</b>.</div>
+      ${srBreakdownPanel()}
+    </div>`;
   const delta = latest.sr - history[0].sr;
   const trend = delta > 0 ? "up" : delta < 0 ? "down" : "flat";
   const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
@@ -416,21 +436,106 @@ function srHistoryCard(history) {
         <div class="srhist-delta ${trend}" title="Change over the ${history.length} days tracked">${arrow} ${disp}<span class="l">30-day change</span></div>
       </div>
       ${srSparkline(history)}
+      ${srBreakdownPanel()}
     </div>`;
+}
+
+/* ---- "which maps make up this rating" dropdown -------------------------- *
+ * Collapsed <details> inside the SR card. Opening it fetches
+ * /players/:id/sr once and renders the ranked contributions: the maps inside
+ * the counted prefix (what the rating is made of) followed by the ones that
+ * were considered and didn't help, greyed out.                              */
+function srBreakdownPanel() {
+  return `
+    <details class="srbd" id="srbd">
+      <summary><span class="srbd-caret">▸</span> Which maps make up this rating?<span class="srbd-hint">your strongest contested maps, in order</span></summary>
+      <div class="srbd-body"><div class="srbd-note">Loading…</div></div>
+    </details>`;
+}
+
+function renderSrBreakdown(d) {
+  if (!d.rows || !d.rows.length)
+    return `<div class="srbd-note">No contested maps yet — a map only counts once <b>${fmtNum(d.minField)}</b> players have a time on it, so this rating is still the starting prior of <b>${fmtNum(d.sr)}</b>. Race a busy map and it'll start building.</div>`;
+
+  const pct = (v) => `${(v * 100).toFixed(1)}%`;
+  const counted = d.rows.filter((r) => r.counted).length;
+  // Where the counted prefix stops — a divider row explains the cut-off rather
+  // than leaving the greyed rows unexplained.
+  const cutIdx = counted < d.rows.length ? counted : -1;
+
+  const row = (r, i) => `
+    <tr class="clickable ${r.counted ? "" : "srbd-out"}" data-nav="#/map/${r.map_id}">
+      <td class="num srbd-i">${i + 1}</td>
+      <td class="mapname">${mapNameHtml(r.map_name)}</td>
+      <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
+      <td class="num ${rankClass(r.rank)}">${r.rank === 1 ? '<span class="pill wr">WR</span>' : "#" + fmtNum(r.rank)}</td>
+      <td class="num"><span class="muted">${fmtTime(r.wr_time)}</span></td>
+      <td class="num" title="Your time as a fraction of the world record — 100% is the record itself">${pct(r.ratio)}</td>
+      <td class="num" title="${fmtNum(r.field)} players have a time on this map">${fmtNum(r.field)}</td>
+      <td class="num srbd-run ${r.counted ? "on" : ""}" title="${r.counted ? "Rating after counting this map" : "What the rating would drop to if this map counted"}">${fmtNum(r.running)}</td>
+    </tr>`;
+
+  const cutRow = `
+    <tr class="srbd-cut"><td colspan="8">
+      ▼ everything below was considered and left out — counting it would pull the rating <b>down</b>, so it doesn't
+    </td></tr>`;
+
+  return `
+    <div class="srbd-note">
+      Your rating is built from the <b>${fmtNum(counted)}</b> strongest of your
+      <b>${fmtNum(d.contested)}</b> contested map${d.contested === 1 ? "" : "s"}
+      (up to ${fmtNum(d.topK)} count; a map is contested once ${fmtNum(d.minField)}+ players have a time).
+      Each map is scored on how close you are to its world record and weighted by
+      how big the field is, and the running total is where the rating stands after
+      each one — the best it ever reaches <b>is</b> your rating, so extra maps can
+      only raise it, never dilute it.
+    </div>
+    <div class="tscroll"><table class="data srbd-table">
+      <thead><tr>
+        <th class="num">#</th><th>Map</th><th class="num">Your Time</th><th class="num">Rank</th>
+        <th class="num">WR</th><th class="num" title="Your time as a fraction of the world record">% of WR</th>
+        <th class="num" title="Players with a time on this map">Field</th>
+        <th class="num" title="The rating after counting this map and everything above it">Running SR</th>
+      </tr></thead>
+      <tbody>
+        ${d.rows.map((r, i) => (i === cutIdx ? cutRow + row(r, i) : row(r, i))).join("")}
+      </tbody>
+    </table></div>`;
+}
+
+// Lazy-load on first open; a failed fetch stays retryable (close + reopen).
+function wireSrBreakdown(playerId) {
+  const det = document.getElementById("srbd");
+  if (!det) return;
+  let loaded = false;
+  det.addEventListener("toggle", async () => {
+    if (!det.open || loaded) return;
+    loaded = true;
+    track("View SR breakdown");
+    const body = det.querySelector(".srbd-body");
+    try {
+      body.innerHTML = renderSrBreakdown(await api(`/players/${playerId}/sr`));
+    } catch (e) {
+      loaded = false;
+      body.innerHTML = `<div class="srbd-note">Couldn't load the breakdown (${esc(e.message)}). Close and reopen to retry.</div>`;
+    }
+  });
 }
 
 // Air-strafe quality trend: the by-day average accel efficiency (how close the
 // player stays to the ideal strafe angle) over the rolling window, mirroring the
 // SR-history card but themed distinctly and formatted as a percentage.
 function strafeQualityCard(history) {
-  if (!history || !history.length) return "";
-  const latest = history[history.length - 1];
+  // Always render (like the Skill Rating card), even before any strafe data:
+  // an empty history shows the tracking state rather than hiding the card.
+  const pts = history || [];
+  const latest = pts.length ? pts[pts.length - 1] : null;
   const pct = (v) => `${(Math.round(v * 10) / 10).toFixed(1)}%`;
-  const enough = history.length >= 2;
+  const enough = pts.length >= 2;
   if (!enough)
     return `
     <div class="page-title" style="font-size:20px">STRAFE QUALITY <span class="accent">·</span> tracking</div>
-    <div class="panel srhist"><div class="srhist-empty">Now tracking your air-strafe quality — how close your acceleration stays to the ideal strafe angle each run. A trend line appears here once you've finished runs on a couple of different days. Latest <b>${pct(latest.quality)}</b>.</div></div>`;
+    <div class="panel srhist"><div class="srhist-empty">Now tracking your air-strafe quality — how close your acceleration stays to the ideal strafe angle each run. A daily average, high and low appear here once you've finished runs on a couple of different days.${latest ? ` Latest <b>${pct(latest.quality)}</b>.` : ""}</div></div>`;
   const delta = latest.quality - history[0].quality;
   const trend = delta > 0 ? "up" : delta < 0 ? "down" : "flat";
   const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
@@ -439,15 +544,18 @@ function strafeQualityCard(history) {
     <div class="page-title" style="font-size:20px">STRAFE QUALITY <span class="accent">·</span> last 30 days</div>
     <div class="panel srhist">
       <div class="srhist-head">
-        <div class="srhist-now"><div class="n">${pct(latest.quality)}</div><div class="l">latest</div></div>
-        <div class="srhist-delta ${trend}" title="Change over the ${history.length} days tracked">${arrow} ${disp}<span class="l">30-day change</span></div>
+        <div class="srhist-now"><div class="n">${pct(latest.quality)}</div><div class="l">latest avg</div></div>
+        <div class="srhist-now"><div class="n">${pct(latest.max)}</div><div class="l">day high</div></div>
+        <div class="srhist-now"><div class="n">${pct(latest.min)}</div><div class="l">day low</div></div>
+        <div class="srhist-delta ${trend}" title="Change in daily average over the ${history.length} days tracked">${arrow} ${disp}<span class="l">30-day change</span></div>
       </div>
       ${trendSparkline(history, {
         get: (p) => p.quality,
+        band: { lo: (p) => p.min, hi: (p) => p.max },
         fmtAxis: (v) => Math.round(v) + "%",
         minBand: 8,
         chartClass: "strafechart",
-        ariaLabel: `Air-strafe quality over the last 30 days, ${history[0].day} to ${latest.day}`,
+        ariaLabel: `Air-strafe quality over the last 30 days (daily average line with min–max band), ${history[0].day} to ${latest.day}`,
       })}
     </div>`;
 }
@@ -880,12 +988,14 @@ async function viewPlayer(id, params) {
       ${d.metrics.strafeQuality != null ? `<div class="s" title="Average accel efficiency across your finished runs — how close your strafing stays to the ideal angle (higher is better)"><div class="n">${(Math.round(d.metrics.strafeQuality * 10) / 10).toFixed(1)}%</div><div class="l">Strafe Quality</div></div>` : ""}
     </div>` : ""}
 
-    ${srHistoryCard(d.srHistory)}
+    <div class="grid-2">
+      <div>${srHistoryCard(d.srHistory, d.id)}</div>
+      <div>${strafeQualityCard(d.strafeHistory)}</div>
+    </div>
 
-    ${strafeQualityCard(d.strafeHistory)}
 
     ${d.recentFinishes && d.recentFinishes.length ? `
-    <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> every run</div>
+    <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> last 5</div>
     <div class="panel" style="margin-bottom:24px">${finishFeed(d.recentFinishes, { showMap: true, showPlayer: false })}</div>` : ""}
 
     <div class="page-title" style="font-size:20px">RECORDS <span class="accent">·</span> ${fmtNum(rec.total)}</div>
@@ -925,6 +1035,7 @@ async function viewPlayer(id, params) {
       go(`#/player/${id}` + buildQuery({ ...pageParams(state), version: vsel.value, offset: 0 }))
     );
   wireSort(`#/player/${id}`, state, ["map", "time", "rank", "attempts"]);
+  wireSrBreakdown(d.id); // canonical id — the breakdown endpoint resolves either, but keep the link stable
   // (The address bar is already the clean /player/<id> path from pushState —
   // where the server-rendered OG tags for Discord/social unfurls live.)
 }
@@ -1503,7 +1614,7 @@ const ABOUT_FAQ = [
   ["Can I watch a record?",
     "Yes. Open any map and look for a <b>▶ replay</b> badge to watch the ghost right in your browser, or <b>⬇ demo</b> to download it. To play a demo back in Warsow, drop the file in your <span class=\"mono\">racemod/demos</span> folder and run <span class=\"mono\">demo &lt;file&gt;</span> in the console."],
   ["How is the ranking worked out?",
-    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: on each map it measures how close your time is to the world record, weighted by how many players you beat, and your rating is built from up to <b>50 of your strongest maps</b> on a 0–1000 scale — weaker runs simply don't count, so racing more can only ever raise it, and a 30-map career competes fairly with a 3000-map one. Because every run is measured against the current world record, your SR can also drift down even when you haven't raced. If someone lowers a record on one of your best maps, you sit a little further from the top. Only contested maps count (5+ players with a time), and a thin record won't reach the top until it's proven across a real sample. World records and podium finishes are tracked separately on your profile."],
+    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: on each map it measures how close your time is to the world record, weighted by how many players you beat, and your rating is built from up to <b>50 of your strongest maps</b> on a 0–1000 scale — weaker runs simply don't count, so racing more can only ever raise it, and a 30-map career competes fairly with a 3000-map one. Because every run is measured against the current world record, your SR can also drift down even when you haven't raced. If someone lowers a record on one of your best maps, you sit a little further from the top. Only contested maps count (5+ players with a time), and a thin record won't reach the top until it's proven across a real sample. Any profile's Skill Rating card has a <b>“Which maps make up this rating?”</b> dropdown that lists exactly which maps went into the number, in order. World records and podium finishes are tracked separately on your profile."],
   ["A map is broken or shouldn't be here — what do I do?",
     "Flag it for review. In-game, type <span class=\"mono\">/flag</span> while you're on the map (add a reason if you like, e.g. <span class=\"mono\">/flag broken</span>). Or open the map on this site and hit <b>⚑ Flag this map for review</b>. Moderators check flagged maps and can pull a bad one from the vote pool and map cycle."],
 ];

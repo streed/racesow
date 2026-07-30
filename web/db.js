@@ -1917,13 +1917,18 @@ class RaceDB {
     const strafeHistory = (
       await this.all(
         `SELECT to_char(to_timestamp(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
-                AVG(strafe_quality) q
+                AVG(strafe_quality) q, MAX(strafe_quality) mx, MIN(strafe_quality) mn
          FROM finish
          WHERE ${groupWhere} AND strafe_quality IS NOT NULL AND created_at >= $2
          GROUP BY day ORDER BY day ASC`,
         [canonId, strafeCutoff]
       )
-    ).map((r) => ({ day: r.day, quality: num(r.q) / 100 }));
+    ).map((r) => ({
+      day: r.day,
+      quality: num(r.q) / 100, // per-day average (percent)
+      max: num(r.mx) / 100, // best run that day
+      min: num(r.mn) / 100, // worst run that day
+    }));
 
     const col = RECORD_SORTS[sort] || RECORD_SORTS.time;
     const direction = dir(order, "ASC");
@@ -2035,9 +2040,113 @@ class RaceDB {
       finishes,
       attempts,
       metrics,
-      recentFinishes: await this.recentFinishes({ limit: 20, playerId: canonId }),
+      recentFinishes: await this.recentFinishes({ limit: 5, playerId: canonId }),
       versions,
       records: { total, limit: lim, offset: off, rows: records },
+    };
+  }
+
+  // The per-map contributions behind a player's Skill Rating: their SR_TOP_K
+  // strongest contested maps, ranked exactly as the standings build ranks them
+  // (see the SR_* block at the top of this file), each with the running
+  // Bayesian mean the rating would take if the prefix ended there. The prefix
+  // that MAXIMISES that running mean IS the rating, so rows up to `counted` are
+  // the maps the number is actually made of and the rest were considered and
+  // didn't help — the UI greys them out rather than hiding them, because "why
+  // doesn't map X count?" is the whole question this view answers.
+  //
+  // The running mean is recomputed here in JS instead of re-deriving the SQL
+  // window: same doubles, same order, but the arithmetic stays next to the
+  // explanation. It's a lazy per-profile read (the dropdown fetches it on open),
+  // so the field sizes are re-aggregated for just this player's maps rather than
+  // the whole `best` table.
+  async srBreakdown(id) {
+    let canonId = id;
+    const c = await this.one("SELECT canonical_id FROM player WHERE id = $1", [id]);
+    if (c && c.canonical_id != null) canonId = num(c.canonical_id);
+    const player = await this.one("SELECT id, name, simplified FROM player WHERE id = $1", [canonId]);
+    if (!player) return null;
+
+    const standing = await this.one("SELECT sr, maps FROM standings WHERE player_id = $1", [canonId]);
+
+    // COUNT(*) OVER () is evaluated before LIMIT, so `contested` is the full
+    // number of qualifying maps even though only the top K rows come back.
+    const raw = await this.all(
+      `WITH mine AS (
+         SELECT map_id, time, rank, version_id FROM best WHERE player_id = $1 AND time > 0
+       ),
+       mm AS (
+         SELECT map_id,
+                MIN(time)                                AS wr_time,
+                COUNT(*)::int                            AS n,
+                log(2.0, (1 + COUNT(*))::numeric)::float AS fw
+         FROM best WHERE map_id IN (SELECT map_id FROM mine)
+         GROUP BY map_id
+       )
+       SELECT mine.map_id, m.name AS map_name, mine.time, mine.rank, mine.version_id,
+              mm.wr_time, mm.n, mm.fw,
+              power(mm.wr_time::float / mine.time, ${SR_GAMMA}) AS p,
+              COUNT(*) OVER ()::int AS contested
+       FROM mine
+       JOIN mm ON mm.map_id = mine.map_id
+       JOIN map m ON m.id = mine.map_id
+       WHERE mm.n >= ${SR_MIN_FIELD}
+       ORDER BY p DESC, mm.fw DESC, mine.map_id
+       LIMIT ${SR_TOP_K}`,
+      [canonId]
+    );
+
+    // Walk the prefixes, keeping the best Bayesian mean seen so far.
+    let sumPw = 0, sumW = 0, bestV = -1, counted = 0;
+    const rows = raw.map((r, i) => {
+      const p = Number(r.p), fw = Number(r.fw);
+      sumPw += p * fw;
+      sumW += fw;
+      const v = (sumPw + SR_KAPPA * SR_MU) / (sumW + SR_KAPPA);
+      if (v > bestV) { bestV = v; counted = i + 1; }
+      return this._censorMapped(
+        {
+          map_id: num(r.map_id),
+          map_name: r.map_name,
+          time: num(r.time),
+          rank: num(r.rank),
+          version: num(r.version_id),
+          versionName: this.versions[num(r.version_id)] || String(r.version_id),
+          wr_time: num(r.wr_time),
+          field: num(r.n),
+          weight: fw,
+          // (wr/t) before the gamma sharpening — "how fast, as a fraction of the
+          // record" is the intuitive number; `perf` is what the formula uses.
+          ratio: num(r.wr_time) / num(r.time),
+          perf: p,
+          running: Math.round(1000 * v),
+        },
+        num(r.map_id),
+        "map_name"
+      );
+    });
+    for (let i = 0; i < rows.length; i++) rows[i].counted = i < counted;
+
+    this._censorNamed(player, num(player.id));
+    return {
+      id: num(player.id),
+      name: player.name,
+      simplified: player.simplified,
+      // The board's own number, so the dropdown can never silently disagree with
+      // the headline; `computed` is what these rows add up to (they match — this
+      // is the same arithmetic on the same inputs).
+      sr: standing ? num(standing.sr) : Math.round(1000 * SR_MU),
+      computed: rows.length ? Math.round(1000 * bestV) : Math.round(1000 * SR_MU),
+      counted,
+      // Contested maps this player has a PB on (may exceed the rows returned).
+      contested: raw.length ? num(raw[0].contested) : 0,
+      maps: standing ? num(standing.maps) : 0,
+      topK: SR_TOP_K,
+      minField: SR_MIN_FIELD,
+      gamma: SR_GAMMA,
+      mu: SR_MU,
+      kappa: SR_KAPPA,
+      rows,
     };
   }
 

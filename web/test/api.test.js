@@ -277,10 +277,13 @@ test("strafe quality rides a finish through ingest onto the player profile", asy
   await new Promise((r) => setTimeout(r, 3600)); // aggregate debounce for /search
   const found = await get("/players?q=Glider");
   const pd = await get(`/players/${found.rows[0].id}`);
-  // Lifetime average of the two valid runs (85% and 70%) = 77.5%.
+  // Lifetime average of the two valid runs (85% and 70%) = 77.5%; the day bucket
+  // also carries that day's best (max) and worst (min) run.
   assert.equal(pd.metrics.strafeQuality, 77.5);
   assert.equal(pd.strafeHistory.length, 1);
   assert.equal(pd.strafeHistory[0].quality, 77.5);
+  assert.equal(pd.strafeHistory[0].max, 85);
+  assert.equal(pd.strafeHistory[0].min, 70);
 });
 
 test("player profile carries a 30-day Skill Rating history ending at the current SR", async () => {
@@ -321,6 +324,23 @@ test("Skill Rating history returns stored daily points oldest->newest, capped to
   const todays = pd.srHistory.filter((p) => p.day === isoDay(0));
   assert.equal(todays.length, 1, "exactly one 'today' point");
   assert.equal(todays[0].sr, pd.standing.sr);
+});
+
+test("SR breakdown endpoint serves the maps behind a player's rating", async () => {
+  const id = (await get("/players?q=Strafer")).rows[0].id;
+  const bd = await get(`/players/${id}/sr`);
+  assert.equal(bd.id, id);
+  assert.equal(bd.sr, (await get(`/players/${id}`)).standing.sr, "matches the profile's headline SR");
+  assert.ok(Array.isArray(bd.rows), "rows array");
+  assert.ok(bd.rows.length <= bd.topK, `rows capped at topK ${bd.topK}`);
+  assert.equal(bd.counted, bd.rows.filter((r) => r.counted).length, "counted matches the flagged prefix");
+  for (const r of bd.rows) {
+    assert.ok(r.map_id > 0 && typeof r.map_name === "string", "row identifies its map");
+    assert.ok(r.field >= bd.minField, "only contested maps qualify");
+    assert.ok(r.wr_time <= r.time, "the WR is never slower than the player's PB");
+  }
+  assert.equal((await fetch(`${base}/api/players/99999999/sr`)).status, 404);
+  assert.equal((await fetch(`${base}/api/players/abc/sr`)).status, 400);
 });
 
 test("re-sending the same finish is idempotent for records", async () => {

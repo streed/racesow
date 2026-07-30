@@ -183,9 +183,12 @@ test("strafe quality: lifetime average and daily trend across the canonical grou
   // Lifetime average of the two reported runs (80% and 60%) as a percentage —
   // proving aliases merge into one series and NULL runs are skipped.
   assert.equal(pd.metrics.strafeQuality, 70);
-  // Every finish is "today", so the by-day trend has one bucket at the same value.
+  // Every finish is "today", so the by-day trend has one bucket carrying that
+  // day's average plus its best (max) and worst (min) run.
   assert.equal(pd.strafeHistory.length, 1);
   assert.equal(pd.strafeHistory[0].quality, 70);
+  assert.equal(pd.strafeHistory[0].max, 80);
+  assert.equal(pd.strafeHistory[0].min, 60);
 });
 
 test("strafe quality is null when a player has no reported runs", async (t) => {
@@ -283,6 +286,71 @@ test("SR counts only your strongest maps: no tourist tops, no grind dilution", a
   // Racing 20 extra maps casually changed nothing: Champ's SR equals his
   // stay-at-home twin's. Grinding can never lower a rating.
   assert.equal(champ.sr, clone.sr, `Champ SR ${champ.sr} = Clone SR ${clone.sr}`);
+});
+
+test("SR breakdown lists the maps the rating is actually made of", async (t) => {
+  const race = await freshDb(t);
+
+  // Same shape as the test above: 12 contested maps Champ WRs, plus 20 more
+  // contested maps he cruises far off the pace (and one two-player map that is
+  // below SR_MIN_FIELD, so it never qualifies at all).
+  for (let m = 0; m < 12; m++) {
+    const field = [finish("Champ", 30000)];
+    for (let i = 0; i < 10; i++) field.push(finish(`pack${i}`, 45000 + i * 500));
+    await race.ingest({ version: VER, map: `comp${m}`, source: "racelog", records: field });
+  }
+  for (let m = 0; m < 20; m++) {
+    const field = [finish("CruiseWr", 20000), finish("Champ", 60000)];
+    for (let i = 0; i < 10; i++) field.push(finish(`pack${i}`, 25000 + i * 500));
+    await race.ingest({ version: VER, map: `cruise${m}`, source: "racelog", records: field });
+  }
+  await race.ingest({ version: VER, map: "empty", source: "racelog", records: [finish("Champ", 10000), finish("Solo", 11000)] });
+  await race.refreshAggregates();
+
+  const champ = (await race.players({ sort: "sr", limit: 200 })).rows.find((r) => r.simplified === "Champ");
+  const bd = await race.srBreakdown(champ.id);
+
+  // The dropdown can never disagree with the board: the same arithmetic on the
+  // same inputs, and the last counted row IS the rating.
+  assert.equal(bd.sr, champ.sr, "breakdown reports the standings SR");
+  assert.equal(bd.computed, champ.sr, `recomputed ${bd.computed} = standings ${champ.sr}`);
+  assert.equal(bd.rows[bd.counted - 1].running, champ.sr, "the last counted row's running total is the rating");
+
+  // 32 contested maps (the 2-player "empty" doesn't qualify), all under the
+  // top-K cap, and only the 12 WR maps are inside the winning prefix.
+  assert.equal(bd.contested, 32);
+  assert.equal(bd.rows.length, 32);
+  assert.equal(bd.counted, 12, `counted ${bd.counted} maps`);
+  assert.ok(bd.rows.every((r, i) => r.counted === (i < bd.counted)), "counted flags mark exactly the prefix");
+  for (const r of bd.rows.slice(0, 12)) {
+    assert.ok(r.map_name.startsWith("comp"), `${r.map_name} is one of the WR maps`);
+    assert.equal(r.rank, 1);
+    assert.equal(r.time, r.wr_time);
+    assert.equal(r.ratio, 1);
+    assert.equal(r.field, 11);
+  }
+  // Rows are ranked strongest-first, and the running total only ever climbs to
+  // the cut-off then falls (that's why the tail is excluded).
+  for (let i = 1; i < bd.rows.length; i++)
+    assert.ok(bd.rows[i].perf <= bd.rows[i - 1].perf, "rows ordered by performance desc");
+  assert.ok(bd.rows[bd.counted].running < bd.sr, "the first excluded map would pull the rating down");
+
+  // Unknown player -> null (the endpoint turns this into a 404).
+  assert.equal(await race.srBreakdown(999999), null);
+});
+
+test("SR breakdown of a player with no contested maps is empty at the prior", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({ version: VER, map: "lonely", source: "racelog", records: [finish("Hermit", 30000)] });
+  await race.refreshAggregates();
+
+  const hermit = (await race.players({ limit: 50 })).rows.find((r) => r.simplified === "Hermit");
+  const bd = await race.srBreakdown(hermit.id);
+  assert.deepEqual(bd.rows, []);
+  assert.equal(bd.counted, 0);
+  assert.equal(bd.contested, 0);
+  assert.equal(bd.sr, Math.round(1000 * SR_MU));
+  assert.equal(bd.computed, Math.round(1000 * SR_MU));
 });
 
 test("compare: head-to-head on shared maps drives the verdict", async (t) => {
