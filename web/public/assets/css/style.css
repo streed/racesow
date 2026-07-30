@@ -370,6 +370,19 @@ footer.site { border-top: 1px solid var(--line); color: var(--muted); font-size:
 footer.site .fi { max-width: 1180px; margin: 0 auto; padding: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px 18px; }
 footer.site .foot-right { display: flex; align-items: center; gap: 16px; }
 footer.site a { color: var(--cyan); }
+/* Shrink the injected Buy-Me-a-Coffee widget so the footer stays on one line.
+   BMC's own <style> (injected after ours, so needs !important to beat it) forces
+   .bmc-btn { min-width: 210px } and .bmc-btn svg { height: 32px !important } —
+   the two things making it oversized. Scope under the footer for specificity. */
+footer.site .foot-right .bmc-btn {
+  min-width: 0 !important;
+  padding: 4px 12px !important;
+  height: auto !important;
+  font-size: 12px !important;
+  line-height: 1.2 !important;
+}
+footer.site .foot-right .bmc-btn svg { height: 18px !important; }
+footer.site .foot-right .bmc-btn-text { font-size: 12px !important; }
 .hide { display: none !important; }
 
 /* ---------- Live page ---------- */
