@@ -1,4 +1,11 @@
-const int MAX_POSITIONS = 400;
+// Recall buffer: snapshots of the current run, taken every POSITION_INTERVAL ms
+// (see saveRunPosition), that practicemode can rewind through. Capture STOPS
+// once the buffer is full, so MAX_POSITIONS * POSITION_INTERVAL is how much of a
+// run stays recallable — at 800 x 500 ms that is ~6:40, which covers even long
+// maps. Each player holds two of these arrays (current run + best run) and both
+// are allocated for every client slot at map load, so raising it is not free:
+// measured at ~1 KB per snapshot, i.e. ~1.6 MB per client slot at 800.
+const int MAX_POSITIONS = 800;
 const int POSITION_INTERVAL = 500;
 const float POSITION_HEIGHT = 24;
 
@@ -1437,12 +1444,12 @@ class Player
             return false;
         }
 
-        if ( !this.noclipBackup.saved )
+        bool entering = !this.noclipBackup.saved;
+        if ( entering )
         {
             this.noclipBackup.copy( this.currentPosition() );
             this.noclipBackup.saved = true;
             ent.moveType = MOVETYPE_NONE;
-            G_CenterPrintMsg( ent, S_COLOR_CYAN + "Entered recall mode" );
         }
 
         this.positionCycle += offset;
@@ -1461,6 +1468,27 @@ class Player
         saved.skipWeapons = false;
 
         this.startTime = this.timeStamp() - position.currentTime;
+
+        // Scrub feedback: cycling the buffer is otherwise blind (the world moves
+        // and nothing says where in the run you landed). Print where this sample
+        // sits, and on entry the controls too — recall is keyboard-driven in
+        // noclip, which nothing on screen would otherwise tell you.
+        String status = S_COLOR_CYAN + "recall " + S_COLOR_WHITE + ( this.positionCycle + 1 )
+                        + S_COLOR_CYAN + "/" + S_COLOR_WHITE + this.runPositionCount
+                        + S_COLOR_CYAN + "  t " + S_COLOR_WHITE + RACE_TimeToString( position.currentTime );
+        if ( numCheckpoints > 0 )
+            status += S_COLOR_CYAN + "  cp " + S_COLOR_WHITE + position.currentCheckpoint
+                      + S_COLOR_CYAN + "/" + S_COLOR_WHITE + numCheckpoints;
+        status += S_COLOR_CYAN + "  " + S_COLOR_WHITE + uint( HorizontalSpeed( position.velocity ) ) + S_COLOR_CYAN + "ups";
+
+        if ( entering )
+            status = S_COLOR_CYAN + "Entered recall mode\n" + status
+                     + S_COLOR_WHITE + "\nforward/back" + S_COLOR_CYAN + " step   "
+                     + S_COLOR_WHITE + "left/right" + S_COLOR_CYAN + " jump 5   "
+                     + S_COLOR_WHITE + "attack" + S_COLOR_CYAN + " leave"
+                     + S_COLOR_CYAN + "\n/kill restarts the run from the spot you pick";
+
+        G_CenterPrintMsg( ent, status );
 
         this.setQuickMenu();
 
@@ -1822,7 +1850,9 @@ class Player
         if ( this.runPositionCount == 0 )
         {
             if ( keys & Key_Attack != 0 )
-                G_CenterPrintMsg( ent, "No positions saved" );
+                G_CenterPrintMsg( ent, S_COLOR_CYAN + "Nothing to recall yet\n"
+                                       + S_COLOR_WHITE + "positions are recorded while you RACE" + S_COLOR_CYAN + " (not in practicemode)\n"
+                                       + S_COLOR_CYAN + "or copy someone: " + S_COLOR_WHITE + "/position recall best <player>" );
             return;
         }
 

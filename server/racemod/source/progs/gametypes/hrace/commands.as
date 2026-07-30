@@ -378,6 +378,7 @@ bool Cmd_Position( Client@ client, const String &cmdString, const String &argsSt
     else
     {
         G_PrintMsg( client.getEnt(), "position <save [name] | load [name] | list | find <type> [info] | join <player> | speed <value> [name] | recall <offset> | clear [name]>\n" );
+        G_PrintMsg( client.getEnt(), "Rewind and retry your last run: " + S_COLOR_YELLOW + "/help position recall" + S_COLOR_WHITE + "\n" );
         return false;
     }
 }
@@ -634,6 +635,9 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/position clear" );
         cmdlist.addCell( "Resets your weapons and spawn position to their defaults." );
 
+        cmdlist.addCell( "/position recall" );
+        cmdlist.addCell( "Rewind through your last run and retry from any point (practicemode). /help position recall" );
+
         cmdlist.addCell( "/top <map>" );
         cmdlist.addCell( "Shows the top record times for the current map, or the given map." );
 
@@ -820,36 +824,50 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
     }
     else if ( command == "position" && subcommand == "recall" )
     {
-        client.printMessage( S_COLOR_YELLOW + "/position recall exit" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Leave recall mode." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall best [player]" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Loads positions from your best run, or a matching player." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall current <player>" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Loads the in-progress run from a matching player." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall steal" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Loads current positions from the player you are spectating." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall fake [time]" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Marks your saved position as a recalled-run start at the given time." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall extend [on|off]" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Toggles auto-recall: extend a recalled run by moving forward." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall interval [n|auto]" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Sets ms between recall samples ('auto' fits a full best run)." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall delay [n]" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Sets frames frozen after respawning into a recalled position." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall start" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Moves to the first recalled position." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall end" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Moves to the last recalled position." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall cpX" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Moves to the first position past checkpoint X." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall rl" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Moves to the first position with a rocket launcher." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall pg" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Moves to the first position with a plasma gun." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/position recall gl" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Moves to the first position with a grenade launcher." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall" + S_COLOR_WHITE + " - rewind your run and retry from any point." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- While you RACE (not in practicemode) the server quietly snapshots your position, speed and" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  weapons twice a second. Afterwards, in practicemode, you can step back through those snapshots" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  and restart the run from any one of them - so you can drill the jump you keep missing without" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  running the map from the start every time." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- The usual loop: race until you mess up, " + S_COLOR_YELLOW + "/practicemode" + S_COLOR_WHITE + ", " + S_COLOR_YELLOW + "/noclip" + S_COLOR_WHITE + ", then hold " + S_COLOR_YELLOW + "attack" + S_COLOR_WHITE + " to enter recall." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  Rewind to just before the mistake, then " + S_COLOR_YELLOW + "/kill" + S_COLOR_WHITE + " - you respawn right there with your speed, weapons" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  and race clock intact and can retry that section. Repeat as often as you like." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "Controls in recall (noclip, practicemode):" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- " + S_COLOR_YELLOW + "attack" + S_COLOR_WHITE + ": enter recall / leave it again.  " + S_COLOR_YELLOW + "forward" + S_COLOR_WHITE + " and " + S_COLOR_YELLOW + "back" + S_COLOR_WHITE + ": step one snapshot." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- " + S_COLOR_YELLOW + "left" + S_COLOR_WHITE + " and " + S_COLOR_YELLOW + "right" + S_COLOR_WHITE + ": jump five at a time." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- The display shows which snapshot you are on, the run time, the checkpoint and your speed." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "Commands:" + "\n" );
         client.printMessage( S_COLOR_YELLOW + "/position recall <offset>" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Cycles through automatically saved positions from your previous run." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Steps <offset> snapshots through the run (negative goes back, e.g. -10). Enters recall if you" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  aren't in it yet, so this works without the noclip keys - handy to bind." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall start" + S_COLOR_WHITE + " / " + S_COLOR_YELLOW + "end" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Jumps to the first / last snapshot of the run." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall cpX" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Jumps to just after checkpoint X, e.g. /position recall cp2." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall rl" + S_COLOR_WHITE + " / " + S_COLOR_YELLOW + "pg" + S_COLOR_WHITE + " / " + S_COLOR_YELLOW + "gl" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Jumps to the first snapshot where you were carrying that weapon (rocket, plasma, grenade)." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall exit" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Leaves recall and puts you back where you were before you entered (same as pressing attack)." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall best [player]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Recalls your best run of this session instead of your last one. With a name, recalls THAT" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  player's best run - the easiest way to learn a route someone faster is using." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall current <player>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Same, but takes the run that player is in the middle of right now." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall steal" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- While spectating someone, takes the run they are on. No name needed." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall extend [on|off]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- When on, retrying from a recalled spot records over the rest of the run, so the snapshots" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  follow your improved line instead of the old one. Off by default." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall interval [n|auto]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Milliseconds between snapshots (500 by default; lower = finer rewind, but the buffer holds" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  800 of them, so it covers less of the run). 'auto' spreads them evenly over your best time." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  With no value it prints the current setting." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall delay [n]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Frames you stay frozen after respawning into a recalled spot (20 by default) so walljump and" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  dash timing is the same every retry. With no value it prints the current setting." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/position recall fake [time]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Advanced: treats your hand-saved position (/position save) as if it came from a run at the" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  given time in milliseconds, so restarting from it starts the clock there." + "\n" );
     }
     else if ( command == "top" )
     {
