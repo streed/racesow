@@ -658,6 +658,20 @@ a.replay-badge { text-decoration: none; }
 .about-body p:last-child { margin-bottom: 0; }
 .about-body a.extlink { color: var(--cyan); }
 .about-lead .about-body p:first-child { font-size: 15px; }
+
+/* Donate CTA at the top of the About page — a real "Buy me a coffee" button in
+   BMC brand yellow (this one's a plain link to the BMC page, not their injected
+   widget, so it lays out cleanly inside the SPA). */
+.panel > h3 .dot.gold { background: var(--gold); }
+.about-donate .donate-body { display: flex; align-items: center; justify-content: space-between; gap: 14px 24px; flex-wrap: wrap; }
+.about-donate .donate-body p { margin: 0; max-width: 52ch; }
+.bmc-cta {
+  display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
+  background: #FFDD00; color: #0d0e13; font-weight: 700; font-size: 15px;
+  padding: 11px 20px; border-radius: 10px; border: 1px solid #e6c700;
+  text-decoration: none; box-shadow: var(--shadow);
+}
+.bmc-cta:hover { filter: brightness(1.05); color: #0d0e13; }
 .about-fineprint { font-size: 13px; margin-top: 14px !important; }
 /* Section headings between panels — pull the shared .page-title down a touch. */
 .about-h2 { margin-top: 14px; font-size: 24px; }

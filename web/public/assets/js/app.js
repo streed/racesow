@@ -1438,6 +1438,14 @@ async function viewAbout() {
     <p class="page-sub">Warsow race: go from the start line to the finish as fast as movement will carry you. This is the network, the commands, and the answers to the usual questions.</p>
 
     <div class="about">
+      <div class="panel about-donate">
+        <h3><span class="dot gold"></span> Support the servers</h3>
+        <div class="about-body donate-body">
+          <p>Racesow runs on rented EU + US game servers and this stats site, paid out of pocket. If it's brought you some fun, buying a coffee helps keep the lights on — thank you.</p>
+          <a class="bmc-cta" href="https://buymeacoffee.com/streed" target="_blank" rel="noopener external">☕ Buy me a coffee</a>
+        </div>
+      </div>
+
       <div class="panel about-lead">
         <h3><span class="dot"></span> What this is</h3>
         <div class="about-body">
