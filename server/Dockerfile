@@ -71,6 +71,7 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "asFunc_RS_ApiFlag" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchBlocked" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchMotd" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchAnnounce" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchRanks" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchMapWeapons" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchLastMaps" game/g_ascript.cpp \
@@ -160,6 +161,9 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
     # live MOTD: the fetch native + its worker log string.
     && strings /libgame_x86_64.so | grep -q "RS_ApiFetchMotd" \
     && strings /libgame_x86_64.so | grep -q "rs_api: motd fetch failed" \
+    # rotating announcements: the fetch native + its worker log string.
+    && strings /libgame_x86_64.so | grep -q "RS_ApiFetchAnnounce" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: announce fetch failed" \
     # per-player PB on join: the fetch native + its worker log string.
     && strings /libgame_x86_64.so | grep -q "RS_ApiFetchPlayerRecord" \
     && strings /libgame_x86_64.so | grep -q "rs_api: player-record fetch failed" \

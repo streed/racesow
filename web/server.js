@@ -603,6 +603,18 @@ api.get("/game/motd", cache(30), wrap(async (_req, res) => {
   res.type("text/plain").send("RSMOTD\n" + (s ? s.value : ""));
 }));
 
+// Rotating in-game announcements for the game servers: the gametype polls this
+// (~60s, hrace/announcement.as) and broadcasts one message every
+// rs_announce_interval seconds, rotating through the list, so an admin edit at
+// /admin/announcements rotates in without a restart. One message per line; the
+// "RSANN" first line lets the game-side native reject captive-portal / proxy
+// error bodies that answer 200 (same idea as the RSMOTD header). An empty body
+// after the header is a real state — "no announcements" — not an error.
+api.get("/game/announcements", cache(30), wrap(async (_req, res) => {
+  const s = await race.getSetting("announcements");
+  res.type("text/plain").send("RSANN\n" + (s ? s.value : ""));
+}));
+
 api.get("/health", (_req, res) => res.json({ ok: true }));
 
 // Metadata for the latest public database backup: size, sha256, when it was
@@ -1610,7 +1622,7 @@ admin.get("/flags", requireAuth, wrap(async (req, res) => {
   sendAdmin(res, "Flag queue", `
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
-      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a>` : ""} · <a href="/admin/account">account</a></p>
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a>` : ""} · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
 }));
 
@@ -1974,6 +1986,84 @@ admin.post("/motd", requireAdmin, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   await race.setSetting("motd", sanitizeMotd(req.body && req.body.motd), req.session.username);
   res.redirect(303, "/admin/motd?ok=1");
+}));
+
+// Rotating in-game announcements: one message per line. Normalise newlines,
+// strip control characters (keep the newline separators), trim + drop blank
+// lines, cap each line and the number of lines. Quotes are kept: the text goes
+// straight to G_PrintMsg in-game, not into a quoted game command like the MOTD.
+function sanitizeAnnouncements(raw) {
+  return String(raw || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, "")
+    .split("\n")
+    .map((l) => l.trim().slice(0, 200))
+    .filter((l) => l.length > 0)
+    .slice(0, 20)
+    .join("\n");
+}
+
+admin.get("/announcements", requireAdmin, wrap(async (req, res) => {
+  const done = req.query.ok ? `<div class="msg ok">Saved. Game servers pick it up within ~2 minutes and rotate through the messages.</div>` : "";
+  const s = await race.getSetting("announcements");
+  const meta = s && s.updated_at
+    ? `<p class="sub">last changed ${fmtWhen(s.updated_at)}${s.updated_by ? ` by ${escHtml(s.updated_by)}` : ""}</p>`
+    : "";
+  // Inline live preview: renders each line with Warsow ^colors exactly as it
+  // appears in-game. Written without template literals / ${} so it embeds
+  // safely inside this server-side backtick template.
+  const previewScript = `<script>
+(function(){
+  var pal={"0":"#1a1a1a","1":"#ff3d3d","2":"#4dff5a","3":"#ffe23d","4":"#4d74ff","5":"#35e0ff","6":"#ff5ce0","7":"#ffffff","8":"#ff9a3d","9":"#9099ad"};
+  var ta=document.getElementById("ann"), pv=document.getElementById("annprev");
+  if(!ta||!pv)return;
+  function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
+  function render_line(str){
+    var out="",color="7",buf="";
+    function flush(){ if(buf){ out+='<span style="color:'+pal[color]+(color==="0"?";text-shadow:0 0 1px #888,0 0 2px #666":"")+'">'+esc(buf)+"</span>"; buf=""; } }
+    for(var i=0;i<str.length;i++){
+      if(str[i]==="^"&&/[0-9]/.test(str[i+1]||"")){ flush(); color=str[++i]; }
+      else buf+=str[i];
+    }
+    flush();
+    return out||'<span style="opacity:.4">(empty line)</span>';
+  }
+  function render(){
+    var lines=ta.value.replace(/\\r\\n?/g,"\\n").split("\\n").filter(function(l){return l.trim().length;});
+    if(!lines.length){ pv.innerHTML='<div style="opacity:.5">No messages — the rotation is off.</div>'; return; }
+    pv.innerHTML=lines.map(function(l,i){return '<div class="annrow"><span class="annnum">'+(i+1)+'</span><span>'+render_line(l)+"</span></div>";}).join("");
+  }
+  ta.addEventListener("input",render); render();
+})();
+</script>`;
+  sendAdmin(res, "Announcements", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <style>
+      #annprev{background:#171717;border-radius:8px;padding:12px 14px;margin-top:8px;font-family:monospace;line-height:1.7;color:#fff}
+      #annprev .annrow{display:flex;gap:10px;align-items:baseline}
+      #annprev .annnum{color:#6b6257;min-width:1.4em;text-align:right;font-size:12px}
+    </style>
+    <h1>In-game announcements</h1>
+    <p class="sub">Broadcast to players on every game server, one message per line, rotating every few minutes ·
+      served at <span style="font-family:monospace">/api/game/announcements</span> ·
+      empty = rotation off · Warsow <span style="font-family:monospace">^</span>colors work ·
+      <a href="/colors" target="_blank" rel="noopener">compose colors with the tester ↗</a></p>
+    ${done}${meta}
+    <form class="card" method="post" action="/admin/announcements" style="max-width:720px">
+      <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+      <label for="ann">Messages (one per line · up to 20 lines · 200 chars each)</label>
+      <textarea id="ann" name="text" rows="8" maxlength="4400"
+        style="width:100%;box-sizing:border-box;font-family:monospace">${escHtml(s ? s.value : "")}</textarea>
+      <label style="margin-top:10px">Live preview (as players see it in-game)</label>
+      <div id="annprev"></div>
+      <div class="actions"><button class="primary" type="submit">Save</button></div>
+    </form>
+    ${previewScript}`, req.session);
+}));
+
+admin.post("/announcements", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  await race.setSetting("announcements", sanitizeAnnouncements(req.body && req.body.text), req.session.username);
+  res.redirect(303, "/admin/announcements?ok=1");
 }));
 
 // --- Account (self-service password change) ---

@@ -676,6 +676,13 @@ void GT_ThinkRules()
     // is up
     RACE_GhostThink();
 
+    // rotating in-game announcements from the web admin (no-op when
+    // rs_api_announce_url is empty); polls/refreshes the message list and
+    // broadcasts one message every rs_announce_interval seconds. Before the
+    // early-return so the cadence is steady across match states, and self-gated
+    // so it's silent on an empty server (announcement.as)
+    RACE_ApiAnnounceThink();
+
     if ( match.getState() >= MATCH_STATE_POSTMATCH )
     {
         // Keep the website TV camera managed during the scoreboard window too;

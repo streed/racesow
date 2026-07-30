@@ -341,6 +341,49 @@ MOTD_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, MOTD_ENTRY, "asGlobFuncs motd entry")
 
+# --- 1g2. rotating in-game announcements: pull the central message list -------
+# Adds RS_ApiFetchAnnounce / RS_ApiPollAnnounce / RS_AnnounceText (impl in
+# g_rs_api.cpp). The gametype polls every ~60s (hrace/announcement.as), splits
+# the list on newlines and broadcasts one message per rotation interval, so a
+# message edited in the web admin rotates in without a restart. Same shape as
+# the MOTD native above. Anchors re-emitted so they stay unique. The Dockerfile
+# asserts on "asFunc_RS_ApiFetchAnnounce".
+ANNOUNCE_WRAPPER = (
+    "// racesow-docker: rotating announcements - GETs the central\n"
+    "// /api/game/announcements list (an RSANN header line, then one message\n"
+    "// per line) into memory; the gametype polls RS_ApiPollAnnounce and reads\n"
+    "// RS_AnnounceText, then broadcasts one message per rotation interval, so a\n"
+    "// message edited in the web admin rotates in without a restart.\n"
+    "void RS_ApiFetchAnnounce( const char *url, const char *token );\n"
+    "int RS_ApiPollAnnounce( void );\n"
+    "const char *RS_AnnounceText( void );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchAnnounce( asstring_t *url, asstring_t *token )\n"
+    "{\n"
+    "\tif( !url || !url->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchAnnounce( url->buffer, token && token->buffer ? token->buffer : \"\" );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollAnnounce( void ) { return RS_ApiPollAnnounce(); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_AnnounceText( void )\n"
+    "{\n"
+    "\tconst char *s = RS_AnnounceText();\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, ANNOUNCE_WRAPPER, "asFunc announce wrapper")
+
+ANNOUNCE_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchAnnounce( const String &in url, const String &in token )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchAnnounce), NULL },\n"
+    "\t{ \"int RS_ApiPollAnnounce()\", asFUNCTION(asFunc_RS_ApiPollAnnounce), NULL },\n"
+    "\t{ \"const String @RS_AnnounceText()\", asFUNCTION(asFunc_RS_AnnounceText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, ANNOUNCE_ENTRY, "asGlobFuncs announce entry")
+
 # --- 1h. live per-map global ranks: pull every finisher's rank ---------------
 # Adds RS_ApiFetchRanks / RS_ApiPollRanks / RS_RanksText (impl in g_rs_api.cpp).
 # The gametype (hrace/ranks.as) polls this ~60s and applies each connected

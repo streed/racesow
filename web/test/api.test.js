@@ -359,6 +359,20 @@ test("/api/game/motd serves the RSMOTD-prefixed seeded default", async () => {
   assert.equal(body.slice("RSMOTD\n".length), "Welcome to a Dockerized Warsow race server - go fast!");
 });
 
+test("/api/game/announcements serves the RSANN-prefixed seeded rotation", async () => {
+  const r = await fetch(`${base}/api/game/announcements`);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type"), /text\/plain/);
+  const body = await r.text();
+  // Contract with the game module's RS_ApiFetchAnnounce native: a fixed "RSANN"
+  // header line (so a proxy error page answering 200 can never become the
+  // rotation), then one message per line. The migration seeds three defaults.
+  assert.ok(body.startsWith("RSANN\n"), `missing RSANN header: ${JSON.stringify(body)}`);
+  const lines = body.slice("RSANN\n".length).split("\n").filter((l) => l.length);
+  assert.equal(lines.length, 3, `expected 3 seeded messages: ${JSON.stringify(lines)}`);
+  assert.ok(lines[0].includes("racesow.org"), `first message should point at the site: ${lines[0]}`);
+});
+
 test("/api/live returns the (empty) presence snapshot shape", async () => {
   const live = await get("/live");
   assert.ok(Array.isArray(live.servers));

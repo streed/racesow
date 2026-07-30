@@ -45,6 +45,7 @@ enum RequestType {
 	REQ_GET_GHOST,     // WR ghost trajectory -> parsed into memory (RS_ApiPollGhost)
 	REQ_GET_BLOCKED,   // live map blocklist -> stored in memory (RS_ApiPollBlocked)
 	REQ_GET_MOTD,      // live message of the day -> stored in memory (RS_ApiPollMotd)
+	REQ_GET_ANNOUNCE,  // rotating in-game announcements -> stored in memory (RS_ApiPollAnnounce)
 	REQ_GET_RANKS,      // live per-map global ranks -> stored in memory (RS_ApiPollRanks)
 	REQ_GET_MAPWEAPONS, // per-map weapon inventory -> stored in memory (RS_ApiPollMapWeapons)
 	REQ_GET_LASTMAPS,   // recently-played maps -> stored in memory (RS_ApiPollLastMaps)
@@ -130,6 +131,18 @@ struct ApiState {
 	std::mutex motdMutex;
 	std::string motdRaw;
 
+	// Announcements fetch handshake (same shape as MOTD). announceRaw holds the
+	// raw payload INCLUDING its "RSANN\n" header line: one message per following
+	// line, which the gametype rotates through and broadcasts to everyone at a
+	// low frequency. Empty = never fetched; a bare header = fetched but no
+	// messages configured. Deduped on change so the gametype only re-parses the
+	// list when an admin actually edits it. The script thread reads the
+	// header-stripped text with RS_AnnounceText after RS_ApiPollAnnounce reports 1.
+	std::atomic<unsigned> fetchAnnounceGen;
+	std::atomic<int> fetchAnnounceResult;
+	std::mutex announceMutex;
+	std::string announceRaw;
+
 	// Ranks fetch handshake (same shape as the blocked/motd ones). ranksText
 	// holds the raw payload ("//ranks <total>\n<rank> <name>\n..."); the script
 	// thread copies it out with RS_RanksText after RS_ApiPollRanks reports 1.
@@ -190,6 +203,7 @@ struct ApiState {
 		: stop( false ), fetchGen( 0 ), fetchResult( 0 ), fetchGhostGen( 0 ), fetchGhostResult( 0 ),
 		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ),
 		  fetchBlockedGen( 0 ), fetchBlockedResult( 0 ), fetchMotdGen( 0 ), fetchMotdResult( 0 ),
+		  fetchAnnounceGen( 0 ), fetchAnnounceResult( 0 ),
 		  fetchRanksGen( 0 ), fetchRanksResult( 0 ),
 		  fetchMapWeaponsGen( 0 ), fetchMapWeaponsResult( 0 ),
 		  fetchLastMapsGen( 0 ), fetchLastMapsResult( 0 )
@@ -724,6 +738,50 @@ void workerMain( ApiState *s )
 					fprintf( stderr, "rs_api: motd fetch failed for good, status %ld: %s\n",
 						status, req.url.c_str() );
 				s->fetchMotdResult.store( -1 );
+				continue;
+			}
+			// transient: fall through to the requeue below
+		} else if( req.type == REQ_GET_ANNOUNCE ) {
+			// A fetch queued once shutdown is under way is worthless: nobody
+			// will ever poll the result.
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchAnnounceGen.load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded while in flight — drop silently
+				// The web always prefixes the list with an "RSANN" header line,
+				// so a captive portal / proxy error page answering 200 can never
+				// become the announcement rotation.
+				if( payload.compare( 0, 6, "RSANN\n" ) != 0 ) {
+					fprintf( stderr, "rs_api: rejecting non-announce payload from %s\n",
+						req.url.c_str() );
+					s->fetchAnnounceResult.store( -1 );
+					continue;
+				}
+				{
+					std::lock_guard<std::mutex> lock( s->announceMutex );
+					// Unchanged since the last swap: skip the signal — the
+					// gametype would only re-parse the same list (same idea as
+					// the MOTD compare).
+					if( payload == s->announceRaw )
+						continue;
+					s->announceRaw.swap( payload );
+				}
+				s->fetchAnnounceResult.store( 1 );
+				continue;
+			}
+			if( !current )
+				continue; // superseded — do not burn retries on a stale fetch
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				if( status != 404 )
+					fprintf( stderr, "rs_api: announce fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchAnnounceResult.store( -1 );
 				continue;
 			}
 			// transient: fall through to the requeue below
@@ -1647,7 +1705,7 @@ void RS_ApiFetchMapWeapons( const char *url, const char *token )
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
 				if( it->type == REQ_GET_MAPWEAPONS || it->type == REQ_GET_RANKS ||
-					it->type == REQ_GET_MOTD || it->type == REQ_GET_BLOCKED ||
+					it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE || it->type == REQ_GET_BLOCKED ||
 					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
 					evicted = true;
@@ -1719,7 +1777,7 @@ void RS_ApiFetchLastMaps( const char *url, const char *token )
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
 				if( it->type == REQ_GET_LASTMAPS || it->type == REQ_GET_MAPWEAPONS ||
-					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD ||
+					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
 					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
 					it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
@@ -1792,7 +1850,7 @@ void RS_ApiFetchMotd( const char *url, const char *token )
 			// one-shot race report
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_MOTD || it->type == REQ_GET_BLOCKED ||
+				if( it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE || it->type == REQ_GET_BLOCKED ||
 					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
 					evicted = true;
@@ -1850,6 +1908,87 @@ const char *RS_MotdText( void )
 }
 
 /*
+ * RS_ApiFetchAnnounce / RS_ApiPollAnnounce / RS_AnnounceText
+ *
+ * Fetch the rotating in-game announcements from <url> (the public
+ * /api/game/announcements endpoint: an "RSANN" header line, then one message
+ * per following line — possibly none, meaning "no announcements") into memory.
+ * RS_ApiPollAnnounce() returns 1 when a CHANGED payload has landed (read it
+ * with RS_AnnounceText, split on newlines and rotate), -1 when the last fetch
+ * failed for good, 0 otherwise. The gametype refreshes this every ~60s so a
+ * message edited in the web admin rotates in without a server restart. A newer
+ * fetch supersedes an in-flight one; a failed fetch leaves the last good list
+ * in place. No-op when url is empty. Same handshake as RS_ApiFetchMotd.
+ */
+void RS_ApiFetchAnnounce( const char *url, const char *token )
+{
+	if( !url || !url[0] )
+		return;
+
+	ApiState *s = ensureStarted();
+	unsigned gen = s->fetchAnnounceGen.fetch_add( 1 ) + 1;
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			// evict another fetch (fully reproducible next interval) before a
+			// one-shot race report
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE || it->type == REQ_GET_BLOCKED ||
+					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				// No fetch to evict: the whole queue is reports. Spool the
+				// oldest instead of silently losing a finish.
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
+			REQ_GET_ANNOUNCE, "", gen, 0 } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollAnnounce( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	return s->fetchAnnounceResult.exchange( 0 );
+}
+
+// Copy out the last-fetched announcement list (header stripped). Called from the
+// script thread after a poll of 1; the AngelScript wrapper copies the static
+// buffer immediately (no reentrancy on the single script thread). Newlines are
+// KEPT — they separate the individual messages the gametype rotates through —
+// while other control characters are dropped. Quotes are left intact: the text
+// goes straight to G_PrintMsg, not into a quoted game command.
+const char *RS_AnnounceText( void )
+{
+	static std::string buf;
+	buf.clear();
+	ApiState *s = g_state;
+	if( !s )
+		return buf.c_str();
+	std::lock_guard<std::mutex> lock( s->announceMutex );
+	if( s->announceRaw.compare( 0, 6, "RSANN\n" ) != 0 )
+		return buf.c_str(); // never fetched
+	buf.reserve( s->announceRaw.size() );
+	for( size_t i = 6; i < s->announceRaw.size(); i++ ) {
+		unsigned char c = (unsigned char)s->announceRaw[i];
+		if( c == '\n' || c >= 0x20 )
+			buf += (char)c;
+	}
+	return buf.c_str();
+}
+
+/*
  * RS_ApiFetchRanks / RS_ApiPollRanks / RS_RanksText
  *
  * Fetch the map's live global ranks from <url> (the central /api/game/ranks
@@ -1889,7 +2028,7 @@ void RS_ApiFetchRanks( const char *url, const char *token, const char *mapname )
 			// one-shot race report
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD ||
+				if( it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
 					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
 					it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
 					s->queue.erase( it );
@@ -1993,7 +2132,7 @@ void RS_ApiFetchPlayerRecord( const char *url, const char *token, const char *ma
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
 				if( it->type == REQ_GET_PLAYERREC || it->type == REQ_GET_RANKS ||
-					it->type == REQ_GET_MOTD || it->type == REQ_GET_BLOCKED ||
+					it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE || it->type == REQ_GET_BLOCKED ||
 					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
 					s->queue.erase( it );
 					evicted = true;
@@ -2082,7 +2221,7 @@ void RS_ApiFetchSavedStart( const char *url, const char *token, const char *mapn
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
 				if( it->type == REQ_GET_SAVEDSTART || it->type == REQ_GET_PLAYERREC ||
-					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD ||
+					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
 					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
 					it->type == REQ_GET_TOPSCORES ) {
 					s->queue.erase( it );

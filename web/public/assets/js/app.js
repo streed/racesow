@@ -1701,6 +1701,87 @@ document.addEventListener("click", (e) => {
   }
 });
 
+// Warsow name/color tester. Type "^" + a digit 0-9 to colour the text that
+// follows; this renders it live exactly as it appears in-game, reusing wname()
+// (the same renderer the leaderboards use) and the .wc0-.wc9 palette. Handy for
+// players building a coloured name and for admins composing coloured /admin
+// announcement messages. Pure client-side — no API call, so no loading().
+function viewColors() {
+  const example = "^1R^2a^3c^4e^5s^6o^7w";
+  const examples = ["^1Nova^7Racer", "^3speed^7demon", "^4B^5l^6u^7e^7Shift", "^2go ^7fast ^1!!"];
+  app.innerHTML = `
+    <div class="crumbs">Racesow / Colors</div>
+    <div class="page-title"><span class="accent">NAME</span> COLORS</div>
+    <p class="page-sub">Warsow colours your name and chat with <b>^</b> codes: type <code>^</code> then a digit <b>0–9</b>. Build a name below and watch it render exactly as it shows in-game, then copy it into your Warsow <code>name</code> setting (open the console with <b>~</b>, or Options → Player).</p>
+
+    <div class="panel colors-card">
+      <h3><span class="dot"></span> Your name</h3>
+      <div class="about-body">
+        <input id="cinput" type="text" value="${esc(example)}" maxlength="200" spellcheck="false"
+          aria-label="Text with ^ colour codes" />
+        <div class="cprev-label muted">Preview</div>
+        <div id="cpreview" class="cpreview"></div>
+        <div class="cactions">
+          <button id="ccopy" type="button" class="cbtn">Copy</button>
+          <button id="cclear" type="button" class="cbtn ghost">Clear</button>
+          <span id="ccopied" class="muted"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel colors-card">
+      <h3><span class="dot teal"></span> Palette</h3>
+      <div class="about-body">
+        <div id="cpalette" class="cpalette"></div>
+        <p class="muted cpal-note">Click a swatch to append its code. <code>^7</code> is the default white; <code>^0</code> is black (shown with a faint outline so it stays legible).</p>
+      </div>
+    </div>
+
+    <div class="panel colors-card">
+      <h3><span class="dot"></span> Examples</h3>
+      <div class="about-body" id="cexamples"></div>
+    </div>`;
+
+  const input = document.getElementById("cinput");
+  const preview = document.getElementById("cpreview");
+  const copied = document.getElementById("ccopied");
+  const render = () => {
+    preview.innerHTML = input.value ? wname(input.value) : `<span class="muted">(empty)</span>`;
+  };
+  input.addEventListener("input", render);
+  render();
+
+  document.getElementById("cpalette").innerHTML = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    .map((n) => `<button type="button" class="cswatch wc${n}" data-code="^${n}">^${n}</button>`)
+    .join("");
+  document.querySelectorAll("#cpalette .cswatch").forEach((b) =>
+    b.addEventListener("click", () => {
+      input.value += b.dataset.code;
+      input.focus();
+      render();
+    })
+  );
+
+  document.getElementById("cexamples").innerHTML = examples
+    .map((e) => `<div class="cexrow"><code>${esc(e)}</code><span class="cexarrow muted">→</span>${wname(e)}</div>`)
+    .join("");
+
+  document.getElementById("ccopy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(input.value);
+      copied.textContent = "Copied!";
+    } catch {
+      copied.textContent = "Select the text and press Ctrl+C";
+    }
+    setTimeout(() => (copied.textContent = ""), 2000);
+  });
+  document.getElementById("cclear").addEventListener("click", () => {
+    input.value = "";
+    input.focus();
+    render();
+  });
+}
+
 async function router() {
   stopLiveRefresh();
   stopReplay();
@@ -1720,6 +1801,7 @@ async function router() {
     else if (path === "/compare") await viewCompare(params);
     else if (path === "/live") await viewLive();
     else if (path === "/about") await viewAbout();
+    else if (path === "/colors") viewColors();
     else if (path.startsWith("/server/")) await viewServer(parseInt(path.split("/")[2], 10));
     else if (path.startsWith("/replay/")) await viewReplay(parseInt(path.split("/")[2], 10), parseInt(path.split("/")[3], 10) || null);
     else if (path.startsWith("/map/")) await viewMap(parseInt(path.split("/")[2], 10));

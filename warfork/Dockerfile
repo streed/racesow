@@ -78,6 +78,7 @@ RUN cd source \
     && grep -q 'asFunc_RS_ApiReportRace'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_MirrorRefresh'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchRanks'  game/g_ascript.cpp \
+    && grep -q 'asFunc_RS_ApiFetchAnnounce' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchPlayerRecord' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchSavedStart' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiSaveStart' game/g_ascript.cpp \
@@ -98,6 +99,7 @@ RUN export CC=clang CXX=clang++ \
     && SO=source/build/basewf/libgame_x86_64.so \
     && strings "$SO" | grep -q 'RS_ApiReportRace' \
     && strings "$SO" | grep -q 'RS_ApiFetchPlayerRecord' \
+    && strings "$SO" | grep -q 'RS_ApiFetchAnnounce' \
     && strings "$SO" | grep -q 'RS_ApiFetchSavedStart' \
     && strings "$SO" | grep -q 'RS_ApiSaveStart' \
     && strings "$SO" | grep -q 'rs_api: spooled undeliverable report' \

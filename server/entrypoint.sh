@@ -327,6 +327,11 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # to connecting players without a restart. Until the first successful
         # fetch the server.cfg default applies.
         echo "set rs_api_motd_url \"${INGEST_URL%/api/ingest}/api/game/motd\""
+        # Rotating in-game announcements (hrace/announcement.as): the gametype
+        # polls this every ~60s and broadcasts one message every
+        # rs_announce_interval seconds (default 600). Editable live at
+        # /admin/announcements. Empty url = no-op (no announcements broadcast).
+        echo "set rs_api_announce_url \"${INGEST_URL%/api/ingest}/api/game/announcements\""
         # Live per-map global ranks (hrace/ranks.as): the gametype polls this
         # every ~60s and shows each connected player's true rank in the
         # scoreboard "Pos" column - including players ranked past the local

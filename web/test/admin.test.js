@@ -81,6 +81,25 @@ function cookieValue(res, name) {
   return null;
 }
 
+// Memoised admin login: the POST /admin/login route is rate-limited to 10/min
+// per IP (loginLimiter), and every test in this file hits it from 127.0.0.1
+// inside one window, so tests that only need "an admin session" share a single
+// login instead of each spending one against that budget.
+let _adminCookie = null;
+async function adminCookie() {
+  if (_adminCookie) return _adminCookie;
+  const login = await fetch(`${base}/admin/login`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ username: ADMIN_USER, password: ADMIN_PASS }),
+  });
+  const token = cookieValue(login, "rs_admin");
+  assert.ok(token, "shared admin login failed");
+  _adminCookie = `rs_admin=${token}`;
+  return _adminCookie;
+}
+
 async function postJson(p, body) {
   const r = await fetch(`${base}/api${p}`, {
     method: "POST",
@@ -346,13 +365,7 @@ test("admin blocks a map: it appears on the game + JSON blocked endpoints, its f
 });
 
 test("admin edits the MOTD: sanitized, then served on /api/game/motd", async () => {
-  const login = await fetch(`${base}/admin/login`, {
-    method: "POST",
-    redirect: "manual",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ username: ADMIN_USER, password: ADMIN_PASS }),
-  });
-  const cookie = `rs_admin=${cookieValue(login, "rs_admin")}`;
+  const cookie = await adminCookie();
 
   // Anonymous access bounces to login; the editor shows the seeded default.
   const anon = await fetch(`${base}/admin/motd`, { redirect: "manual" });
@@ -393,6 +406,51 @@ test("admin edits the MOTD: sanitized, then served on /api/game/motd", async () 
   });
   assert.equal(clear.status, 303);
   assert.equal(await (await fetch(`${base}/api/game/motd`)).text(), "RSMOTD\n");
+});
+
+test("admin edits announcements: one per line, sanitized, then served on /api/game/announcements", async () => {
+  const cookie = await adminCookie();
+
+  // Anonymous access bounces to login; the editor shows the seeded rotation.
+  const anon = await fetch(`${base}/admin/announcements`, { redirect: "manual" });
+  assert.equal(anon.status, 302);
+  const page = await (await fetch(`${base}/admin/announcements`, { headers: { cookie } })).text();
+  assert.match(page, /In-game announcements/);
+  assert.match(page, /racesow\.org/);
+  const csrf = page.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
+  assert.ok(csrf);
+
+  // Missing CSRF -> 403, nothing saved.
+  const forged = await fetch(`${base}/admin/announcements`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ text: "hax" }),
+  });
+  assert.equal(forged.status, 403);
+
+  // Save a messy list: CRLF newlines, a blank line (dropped), a control char
+  // (stripped), and leading/trailing whitespace (trimmed) per line.
+  const save = await fetch(`${base}/admin/announcements`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ _csrf: csrf, text: "  ^1First message  \r\n\r\n\tSecond line\x07  \r\n" }),
+  });
+  assert.equal(save.status, 303);
+
+  const body = await (await fetch(`${base}/api/game/announcements`)).text();
+  assert.equal(body, "RSANN\n^1First message\nSecond line");
+
+  // Clearing is a real state (rotation off), not an error.
+  const clear = await fetch(`${base}/admin/announcements`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ _csrf: csrf, text: "" }),
+  });
+  assert.equal(clear.status, 303);
+  assert.equal(await (await fetch(`${base}/api/game/announcements`)).text(), "RSANN\n");
 });
 
 // --- Admin / moderator role tiers ---
@@ -440,6 +498,7 @@ test("moderator tier: flags + map-block + restart allowed; admin-only surface is
   assert.ok(!/\/rcon"/.test(serversHtml), "no RCON console link for moderator");
   const flagsHtml = await pageText(mod, "/admin/flags");
   assert.ok(!/href="\/admin\/motd"/.test(flagsHtml), "no MOTD link for moderator");
+  assert.ok(!/href="\/admin\/announcements"/.test(flagsHtml), "no announcements link for moderator");
   assert.ok(!/href="\/admin\/logs"/.test(flagsHtml), "no logs link for moderator");
 
   // Allowed action: block then unblock a map (CSRF from any moderator page).
@@ -465,7 +524,7 @@ test("moderator tier: flags + map-block + restart allowed; admin-only surface is
   );
 
   // Denied (admin-only) GETs -> 403 "Admins only".
-  for (const p of ["/admin/motd", "/admin/logs", "/admin/servers/987654/rcon"]) {
+  for (const p of ["/admin/motd", "/admin/announcements", "/admin/logs", "/admin/servers/987654/rcon"]) {
     assert.equal(
       (await fetch(`${base}${p}`, { headers: { cookie: mod }, redirect: "manual" })).status,
       403,
@@ -474,9 +533,9 @@ test("moderator tier: flags + map-block + restart allowed; admin-only surface is
   }
   // Denied (admin-only) POSTs -> 403 (the role gate runs before CSRF/handler,
   // so a valid CSRF token does not help a moderator here).
-  for (const p of ["/admin/motd", "/admin/maintenance", "/admin/broadcast", "/admin/servers/987654/rcon"]) {
+  for (const p of ["/admin/motd", "/admin/announcements", "/admin/maintenance", "/admin/broadcast", "/admin/servers/987654/rcon"]) {
     assert.equal(
-      (await fetch(`${base}${p}`, form(mod, { action: "on", message: "x", motd: "x", command: "status" }))).status,
+      (await fetch(`${base}${p}`, form(mod, { action: "on", message: "x", motd: "x", text: "x", command: "status" }))).status,
       403,
       `moderator POST ${p} should be forbidden`
     );
@@ -485,7 +544,7 @@ test("moderator tier: flags + map-block + restart allowed; admin-only surface is
   // The admin tier (ADMIN_USER was seeded WITHOUT a role column -> DEFAULT
   // 'admin', proving backward compatibility) keeps the full admin-only surface.
   const adm = await login(ADMIN_USER, ADMIN_PASS);
-  for (const p of ["/admin/motd", "/admin/logs"]) {
+  for (const p of ["/admin/motd", "/admin/announcements", "/admin/logs"]) {
     assert.equal(
       (await fetch(`${base}${p}`, { headers: { cookie: adm }, redirect: "manual" })).status,
       200,

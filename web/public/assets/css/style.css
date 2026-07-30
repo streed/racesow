@@ -241,6 +241,38 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .wc4 { color: #4d74ff; } .wc5 { color: #35e0ff; } .wc6 { color: #ff5ce0; }
 .wc7 { color: #ffffff; } .wc8 { color: #ff9a3d; } .wc9 { color: #9099ad; }
 
+/* ---------- Colours tester page ---------- */
+.colors-card { max-width: 720px; margin-bottom: 16px; }
+#cinput {
+  width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: 16px;
+  padding: 10px 12px; color: var(--text); background: var(--bg-2);
+  border: 1px solid var(--line-2); border-radius: 8px;
+}
+#cinput:focus { outline: none; border-color: var(--orange); }
+.cprev-label { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; margin: 14px 0 6px; }
+.cpreview {
+  font-size: 30px; line-height: 1.4; min-height: 44px; word-break: break-word;
+  padding: 10px 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+}
+.cactions { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.cbtn {
+  font-family: var(--sans); font-size: 13px; cursor: pointer; padding: 7px 14px; border-radius: 8px;
+  color: #fff; border: 1px solid var(--orange-dim);
+  background: linear-gradient(180deg, var(--orange), var(--orange-dim));
+}
+.cbtn.ghost { background: var(--panel-2); color: var(--muted); border-color: var(--line-2); }
+.cbtn:hover { filter: brightness(1.08); }
+.cpalette { display: flex; flex-wrap: wrap; gap: 8px; }
+.cswatch {
+  font-family: var(--mono); font-size: 15px; cursor: pointer; padding: 8px 12px; min-width: 42px;
+  background: #0d0e13; border: 1px solid var(--line-2); border-radius: 8px; font-weight: 700;
+}
+.cswatch:hover { border-color: var(--orange); }
+.cpal-note { margin-top: 10px; font-size: 13px; }
+.cexrow { display: flex; align-items: center; gap: 12px; padding: 5px 0; font-size: 18px; }
+.cexrow code { font-size: 13px; color: var(--muted); min-width: 150px; }
+.cexarrow { font-size: 13px; }
+
 /* ---------- Detail pages ---------- */
 .wr-banner {
   position: relative; overflow: hidden; border: 1px solid rgba(255,210,74,.35); border-radius: 16px;
