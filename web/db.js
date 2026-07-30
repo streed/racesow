@@ -101,6 +101,13 @@ export const SR_MIN_FIELD = 5;
 // shows a 30-day trend. See the 20260723130000000_sr_history migration.
 export const SR_HISTORY_DAYS = 30;
 
+// How many days of air-strafe-quality trend to show on the profile. Unlike SR
+// (snapshotted daily), strafe quality is derived on read by averaging the per-run
+// strafe_quality stored on each finish, bucketed by UTC day. Finishes are sparser
+// than daily snapshots, so a wider window gives casual racers enough points to
+// draw a trend. See migration 20260730120000000_strafe_quality.
+export const STRAFE_HISTORY_DAYS = 90;
+
 // Schema is managed by node-pg-migrate: versioned files in ./migrations run at
 // startup (see openDatabase). The baseline (0001) reflects the former SQLite
 // era's final shape and adopts the existing production DB idempotently; future
@@ -1894,6 +1901,30 @@ class RaceDB {
       restarts: num(mrow.rs),
     };
 
+    // Air-strafe quality (accel efficiency, stored per finish as basis points
+    // 0..10000). Lifetime average across every nick variant for the headline
+    // number, then a per-UTC-day average over a rolling window for the trend
+    // chart. Both span the canonical group and skip NULLs (pre-column / older
+    // servers), matching the SR-history read below. Reported as a percent.
+    const sqRow = await this.one(
+      `SELECT AVG(strafe_quality) q, COUNT(strafe_quality) n
+       FROM finish WHERE ${groupWhere} AND strafe_quality IS NOT NULL`,
+      [canonId]
+    );
+    metrics.strafeQuality = num(sqRow.n) > 0 ? num(sqRow.q) / 100 : null;
+    // finish.created_at is epoch SECONDS (db.js _ingestTx: Math.floor(Date.now()/1000)).
+    const strafeCutoff = Math.floor(Date.now() / 1000) - STRAFE_HISTORY_DAYS * 86400;
+    const strafeHistory = (
+      await this.all(
+        `SELECT to_char(to_timestamp(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day,
+                AVG(strafe_quality) q
+         FROM finish
+         WHERE ${groupWhere} AND strafe_quality IS NOT NULL AND created_at >= $2
+         GROUP BY day ORDER BY day ASC`,
+        [canonId, strafeCutoff]
+      )
+    ).map((r) => ({ day: r.day, quality: num(r.q) / 100 }));
+
     const col = RECORD_SORTS[sort] || RECORD_SORTS.time;
     const direction = dir(order, "ASC");
     const lim = clampLimit(limit, 50, 500);
@@ -2000,6 +2031,7 @@ class RaceDB {
       aliases,
       standing,
       srHistory,
+      strafeHistory,
       finishes,
       attempts,
       metrics,
@@ -3037,9 +3069,9 @@ class RaceDB {
           // (source=racelog live finishes): a topscores re-sync resends the whole
           // top-50 each interval and would otherwise duplicate the log every run.
           const fin = await q1(
-            `INSERT INTO finish (player_id, map_id, version_id, time, server_id, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-            [playerId, mapRow.id, versionRow.id, rec.time, serverId, now]
+            `INSERT INTO finish (player_id, map_id, version_id, time, server_id, created_at, strafe_quality)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+            [playerId, mapRow.id, versionRow.id, rec.time, serverId, now, rec.strafe_quality ?? null]
           );
           const cps = Array.isArray(rec.checkpoints) ? rec.checkpoints : [];
           if (cps.length) {

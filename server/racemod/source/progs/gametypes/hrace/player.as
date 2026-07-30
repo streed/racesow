@@ -35,6 +35,18 @@ const float WALLJUMP_VZ = 100;         // |velocity.z| above this at +Special =>
 const uint WALLJUMP_DEBOUNCE = 1100;   // ms between counted wall jumps (approx cooldown)
 const uint DASH_DEBOUNCE = 500;        // ms between counted dashes (approx cooldown)
 
+// Air-strafe-quality sampling (see Player.sampleStrafe). Each airborne frame the
+// player is strafing, we score the horizontal speed actually gained against the
+// maximum a perfect strafe angle would give (accel efficiency, 0..1 — the same
+// ratio the green accel HUD shows). STRAFE_MIN_SPEED gates out crawl-speed frames
+// where the ratio is meaningless; STRAFE_IMPULSE_FACTOR rejects frames whose gain
+// is far past the strafe max (jump pads / rocket jumps / teleports — not strafing);
+// STRAFE_GROUND_TRACE is the short downward box-trace distance used to skip
+// grounded frames (air accel is the strafe regime).
+const float STRAFE_MIN_SPEED = 100;    // ups; below this the accel ratio is noise
+const float STRAFE_IMPULSE_FACTOR = 3; // gain > this * maxGain => external impulse, skip
+const float STRAFE_GROUND_TRACE = 8;   // units; ground within this => not airborne
+
 // Noclip point-pull ("grapple"): in practice-mode noclip, holding Attack+Special
 // eases the player toward whatever surface they are aiming at. POINT_PULL is the
 // per-ms pull fraction; PULL_MARGIN keeps it from snapping onto a point-blank
@@ -192,6 +204,15 @@ class Player
     uint lastWallJumpTime;
     uint lastDashTime;
 
+    // Air-strafe-quality sampling state (see sampleStrafe). prevStrafeSpeed is the
+    // horizontal speed at the previous sampled frame; the sum/weight pair is a
+    // frame-time-weighted running total of per-frame accel efficiency, averaged
+    // into the run's strafe score on finish (strafeQualityBasisPoints).
+    bool haveStrafePrev;
+    float prevStrafeSpeed;
+    double strafeQualitySum;
+    double strafeQualityWeight;
+
     void setupArrays( int size )
     {
         this.messageTimes.resize( MAX_FLOOD_MESSAGES );
@@ -267,6 +288,10 @@ class Player
         this.prevSpecial = false;
         this.lastWallJumpTime = 0;
         this.lastDashTime = 0;
+        this.haveStrafePrev = false;
+        this.prevStrafeSpeed = 0;
+        this.strafeQualitySum = 0;
+        this.strafeQualityWeight = 0;
         this.pos = -1;
         this.globalRank = -1;
         this.skillRating = -1;
@@ -1685,6 +1710,12 @@ class Player
         this.nextRunPositionTime = this.timeStamp() + this.positionInterval;
         this.ghostCount = 0;
         this.ghostCpCount = 0;
+        // Fresh run: clear the air-strafe-quality accumulators so the reported
+        // score covers only this run.
+        this.haveStrafePrev = false;
+        this.prevStrafeSpeed = 0;
+        this.strafeQualitySum = 0;
+        this.strafeQualityWeight = 0;
 
         if ( RS_QueryPjState( this.client.playerNum )  )
         {
@@ -1831,6 +1862,109 @@ class Player
             }
         }
         this.prevSpecial = special;
+    }
+
+    // Per-frame (GT_ThinkRules): sample air-strafe quality during a race. Compares
+    // the horizontal speed actually gained this frame to the maximum a perfect
+    // strafe angle would yield (the accel-efficiency ratio the green accel HUD
+    // shows, %ACCELERATION / %PROGRESS_SELF), and frame-time-weight-accumulates it
+    // over the run. Only genuine races, and only airborne frames where the player
+    // holds a movement key at meaningful speed, are sampled; external impulses
+    // (jump pads, rocket jumps, teleports) are rejected. The per-run average is
+    // read on finish (strafeQualityBasisPoints) and reported via RS_ApiReportRace.
+    void sampleStrafe()
+    {
+        if ( !this.inRace )
+        {
+            this.haveStrafePrev = false;
+            return;
+        }
+        if ( frameTime <= 0 )
+            return;
+
+        Entity@ ent = this.client.getEnt();
+        if ( @ent == null )
+            return;
+
+        float dt = float( frameTime ) / 1000.0f;
+        float cur = HorizontalSpeed( ent.velocity );
+
+        // First sampled frame of the run only seeds the baseline speed.
+        if ( !this.haveStrafePrev )
+        {
+            this.prevStrafeSpeed = cur;
+            this.haveStrafePrev = true;
+            return;
+        }
+        float prev = this.prevStrafeSpeed;
+        this.prevStrafeSpeed = cur;
+
+        // Air-strafe frames only: a movement key held (there is a wish direction),
+        // moving fast enough for the ratio to mean something, and airborne.
+        uint keys = this.client.pressedKeys;
+        if ( ( keys & ( Key_Forward | Key_Backward | Key_Left | Key_Right ) ) == 0 )
+            return;
+        if ( prev < STRAFE_MIN_SPEED )
+            return;
+        if ( this.onStrafeGround() )
+            return;
+
+        // Ideal (max) horizontal-speed gain this frame — the same formula the HUD's
+        // %PROGRESS_SELF uses (hrace.as GT_ThinkRules), evaluated at the frame-start
+        // speed so it matches the gain measured across that frame.
+        float base = float( this.client.pmoveMaxSpeed );
+        float baseAccel = base * dt;
+        // float() around sqrt mirrors hrace.as's explicit cast (sqrt is double) so
+        // this stays a float expression with no implicit narrowing.
+        float maxGain = float( sqrt( prev * prev + baseAccel * ( 2 * base - baseAccel ) ) ) - prev;
+        if ( maxGain <= 0.001f )
+            return;
+
+        float gain = cur - prev;
+        // Reject frames dominated by an external impulse (jump pad, rocket jump,
+        // teleport): a gain far past the strafe maximum is not a strafe measurement.
+        if ( gain > maxGain * STRAFE_IMPULSE_FACTOR )
+            return;
+
+        float q = gain / maxGain;
+        if ( q < 0 )
+            q = 0; // pointing wrong / bleeding speed while strafing = poor
+        if ( q > 1 )
+            q = 1; // cap residual over-unity (ground/impulse edge)
+
+        // Frame-time weighted so variable server fps doesn't bias the average
+        // (float terms widen into the double accumulators).
+        this.strafeQualitySum += q * dt;
+        this.strafeQualityWeight += dt;
+    }
+
+    // True when the player is on (or within STRAFE_GROUND_TRACE units of) the
+    // ground — a short downward box trace, the same idiom saveRunPosition uses.
+    // Keeps sampleStrafe to airborne frames.
+    bool onStrafeGround()
+    {
+        Entity@ ent = this.client.getEnt();
+        Vec3 mins, maxs;
+        ent.getSize( mins, maxs );
+        Vec3 down = ent.origin;
+        down.z -= STRAFE_GROUND_TRACE;
+        Trace tr;
+        return tr.doTrace( ent.origin, mins, maxs, down, ent.entNum, MASK_DEADSOLID );
+    }
+
+    // The run's average air-strafe quality as basis points (0..10000 = 0..100%),
+    // or -1 when no strafe frames were sampled (a very short or non-airborne run) —
+    // the "omit" sentinel RS_ApiReportRace understands.
+    int strafeQualityBasisPoints()
+    {
+        if ( this.strafeQualityWeight <= 0 )
+            return -1;
+        int bp = int( ( this.strafeQualitySum / this.strafeQualityWeight ) * 10000.0 + 0.5 );
+        if ( bp < 0 )
+            bp = 0;
+        if ( bp > 10000 )
+            bp = 10000;
+        return bp;
     }
 
     void checkNoclipAction()
@@ -2068,6 +2202,20 @@ class Player
         // send the final time to MM
         if ( !this.practicing )
             this.client.setRaceTime( -1, finishTime );
+
+        // Give the player their air-strafe quality for the run they just finished
+        // (accel efficiency averaged over the run). -1 = no strafe frames sampled
+        // (e.g. a very short or non-airborne run), in which case we say nothing.
+        if ( !this.practicing )
+        {
+            int strafeBp = this.strafeQualityBasisPoints();
+            if ( strafeBp >= 0 )
+            {
+                int tenths = ( strafeBp + 5 ) / 10; // tenths of a percent, rounded
+                this.client.printMessage( S_COLOR_CYAN + "Strafe quality: "
+                        + ( tenths / 10 ) + "." + ( tenths % 10 ) + "%\n" );
+            }
+        }
 
         this.current_recordTime.checkpoints[ numCheckpoints ] = Checkpoint( finishTime, this.getSpeed(), this.maxSpeed, CheckpointType_Finish );
         // Same bound as touchCheckPoint: a recalled/loaded Position can seed

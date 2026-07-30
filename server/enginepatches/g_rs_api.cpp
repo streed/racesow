@@ -1151,12 +1151,15 @@ static void rsQueuePost( const char *url, const char *token, std::string &&body 
  * (the finish time is not part of the list). attemptsSinceLast is the number
  * of race STARTS since this player's last flush, including the start that
  * produced this finish (pass a negative value to omit — the API then counts
- * the finish as a single attempt). No-op when url is empty.
+ * the finish as a single attempt). strafeQuality is the run's average accel
+ * efficiency in basis points (0..10000 = 0..100%; negative = omit). No-op when
+ * url is empty.
  */
 void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	const char *mapname, const char *player, const char *login,
 	int timeMs, int attemptsSinceLast, const char *cpsCsv,
-	int wallJumps, int dashes, int prejumpFails, int restarts )
+	int wallJumps, int dashes, int prejumpFails, int restarts,
+	int strafeQuality )
 {
 	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] || timeMs <= 0 )
 		return;
@@ -1203,6 +1206,10 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	if( dashes >= 0 ) { body += ",\"dashes\":"; body += std::to_string( dashes ); }
 	if( prejumpFails >= 0 ) { body += ",\"prejump_failures\":"; body += std::to_string( prejumpFails ); }
 	if( restarts >= 0 ) { body += ",\"restarts\":"; body += std::to_string( restarts ); }
+	// Per-run air-strafe quality (accel efficiency) as basis points 0..10000
+	// (negative = omit; the API stores it per finish, never summed like the
+	// counters above). Snapshot, not a monotonic tally.
+	if( strafeQuality >= 0 ) { body += ",\"strafe_quality\":"; body += std::to_string( strafeQuality ); }
 	body += "}]}";
 
 	rsQueuePost( url, token, std::move( body ) );

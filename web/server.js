@@ -876,6 +876,19 @@ function sanitizeMetric(v) {
   return Number.isInteger(n) && n > 0 ? Math.min(n, MAX_METRIC_PER_ENTRY) : 0;
 }
 
+// Per-run air-strafe quality as basis points (0..10000 = 0.00%..100.00%). Unlike
+// the movement counters this is a per-run SNAPSHOT, not an additive tally: it is
+// stored on the finish row (never summed into run_tally, never part of metricSum),
+// and null when absent/invalid so it stays distinct from a real 0% and so older
+// servers that don't report it contribute nothing. See migration 20260730120000000.
+const MAX_STRAFE_QUALITY = 10000;
+function sanitizeStrafeQuality(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) return null;
+  return Math.min(n, MAX_STRAFE_QUALITY);
+}
+
 function sanitizeRecord(r) {
   if (!r || typeof r.name !== "string" || r.name.length === 0) return null;
   const time = Number(r.time);
@@ -903,6 +916,9 @@ function sanitizeRecord(r) {
     dashes: sanitizeMetric(r.dashes),
     prejump_failures: sanitizeMetric(r.prejump_failures),
     restarts: sanitizeMetric(r.restarts),
+    // Per-run air-strafe quality snapshot (basis points), stored on the finish
+    // row. null when unreported; NOT part of the additive metricSum below.
+    strafe_quality: sanitizeStrafeQuality(r.strafe_quality),
   };
 }
 

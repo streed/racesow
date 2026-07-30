@@ -344,18 +344,23 @@ function finishFeed(list, { showMap = true, showPlayer = true, emptyMsg } = {}) 
 /* ---- Skill Rating trend (last 30 days) ---------------------------------- *
  * A player's daily SR points arrive oldest -> newest, already capped to the
  * retention window server side, with the current value carried onto "today".  */
-function srSparkline(history) {
+// Inline-SVG trend sparkline shared by the SR-history and strafe-quality cards.
+// `get(point)` pulls the numeric y; `fmtAxis(v)` labels the min/max gridlines;
+// `minBand` is the smallest y-range shown so a near-flat series doesn't magnify
+// tiny wiggles; `chartClass` lets a caller theme the line/area colour. Expects
+// history = [{day:'YYYY-MM-DD', ...}] oldest -> newest, length >= 1.
+function trendSparkline(history, { get, fmtAxis, ariaLabel, minBand = 40, chartClass = "" }) {
   // Layout in SVG user units; the element scales to its container width via CSS
   // while keeping this aspect ratio (so text scales uniformly and stays crisp).
   const W = 660, H = 150, padL = 38, padR = 14, padT = 14, padB = 22;
   const xs = history.map((p) => Date.parse(p.day + "T00:00:00Z"));
-  const ys = history.map((p) => p.sr);
+  const ys = history.map((p) => get(p));
   const xMin = xs[0], xMax = xs[xs.length - 1];
   const dataMin = Math.min(...ys), dataMax = Math.max(...ys);
   // Give a flat/near-flat series a sane band so tiny wiggles don't read as huge
   // swings, then pad the top/bottom so the line never glues to an edge.
   let yLo = dataMin, yHi = dataMax;
-  if (yHi - yLo < 40) { const mid = (yHi + yLo) / 2; yLo = mid - 20; yHi = mid + 20; }
+  if (yHi - yLo < minBand) { const mid = (yHi + yLo) / 2; yLo = mid - minBand / 2; yHi = mid + minBand / 2; }
   const yPad = (yHi - yLo) * 0.15; yLo -= yPad; yHi += yPad;
   const xToPx = (x) => padL + (xMax === xMin ? 0.5 : (x - xMin) / (xMax - xMin)) * (W - padL - padR);
   const yToPx = (y) => padT + (1 - (y - yLo) / (yHi - yLo)) * (H - padT - padB);
@@ -368,18 +373,27 @@ function srSparkline(history) {
   const gY = { hi: n(yToPx(dataMax)), lo: n(yToPx(dataMin)) };
   const first = history[0], latest = history[history.length - 1];
   return `
-    <svg class="srchart" viewBox="0 0 ${W} ${H}" role="img"
-         aria-label="Skill Rating over the last 30 days, ${first.day} to ${latest.day}">
+    <svg class="srchart ${chartClass}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${ariaLabel}">
       <line class="srgrid" x1="${padL}" y1="${gY.hi}" x2="${W - padR}" y2="${gY.hi}"/>
       <line class="srgrid" x1="${padL}" y1="${gY.lo}" x2="${W - padR}" y2="${gY.lo}"/>
-      <text class="sraxl" x="${padL - 7}" y="${gY.hi}" text-anchor="end" dominant-baseline="middle">${dataMax}</text>
-      <text class="sraxl" x="${padL - 7}" y="${gY.lo}" text-anchor="end" dominant-baseline="middle">${dataMin}</text>
+      <text class="sraxl" x="${padL - 7}" y="${gY.hi}" text-anchor="end" dominant-baseline="middle">${fmtAxis(dataMax)}</text>
+      <text class="sraxl" x="${padL - 7}" y="${gY.lo}" text-anchor="end" dominant-baseline="middle">${fmtAxis(dataMin)}</text>
       <path class="srarea" d="${area}"/>
       <path class="srline" d="${line}"/>
       <circle class="srdot" cx="${n(last[0])}" cy="${n(last[1])}" r="4"/>
       <text class="sraxd" x="${padL}" y="${H - 6}" text-anchor="start">${first.day.slice(5)}</text>
       <text class="sraxd" x="${W - padR}" y="${H - 6}" text-anchor="end">${latest.day.slice(5)}</text>
     </svg>`;
+}
+
+function srSparkline(history) {
+  const first = history[0], latest = history[history.length - 1];
+  return trendSparkline(history, {
+    get: (p) => p.sr,
+    fmtAxis: (v) => String(Math.round(v)),
+    minBand: 40,
+    ariaLabel: `Skill Rating over the last 30 days, ${first.day} to ${latest.day}`,
+  });
 }
 
 function srHistoryCard(history) {
@@ -402,6 +416,39 @@ function srHistoryCard(history) {
         <div class="srhist-delta ${trend}" title="Change over the ${history.length} days tracked">${arrow} ${disp}<span class="l">30-day change</span></div>
       </div>
       ${srSparkline(history)}
+    </div>`;
+}
+
+// Air-strafe quality trend: the by-day average accel efficiency (how close the
+// player stays to the ideal strafe angle) over the rolling window, mirroring the
+// SR-history card but themed distinctly and formatted as a percentage.
+function strafeQualityCard(history) {
+  if (!history || !history.length) return "";
+  const latest = history[history.length - 1];
+  const pct = (v) => `${(Math.round(v * 10) / 10).toFixed(1)}%`;
+  const enough = history.length >= 2;
+  if (!enough)
+    return `
+    <div class="page-title" style="font-size:20px">STRAFE QUALITY <span class="accent">·</span> tracking</div>
+    <div class="panel srhist"><div class="srhist-empty">Now tracking your air-strafe quality — how close your acceleration stays to the ideal strafe angle each run. A trend line appears here once you've finished runs on a couple of different days. Latest <b>${pct(latest.quality)}</b>.</div></div>`;
+  const delta = latest.quality - history[0].quality;
+  const trend = delta > 0 ? "up" : delta < 0 ? "down" : "flat";
+  const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
+  const disp = (delta > 0 ? "+" : "") + (Math.round(delta * 10) / 10).toFixed(1) + "%";
+  return `
+    <div class="page-title" style="font-size:20px">STRAFE QUALITY <span class="accent">·</span> last 90 days</div>
+    <div class="panel srhist">
+      <div class="srhist-head">
+        <div class="srhist-now"><div class="n">${pct(latest.quality)}</div><div class="l">latest</div></div>
+        <div class="srhist-delta ${trend}" title="Change over the ${history.length} days tracked">${arrow} ${disp}<span class="l">trend</span></div>
+      </div>
+      ${trendSparkline(history, {
+        get: (p) => p.quality,
+        fmtAxis: (v) => Math.round(v) + "%",
+        minBand: 8,
+        chartClass: "strafechart",
+        ariaLabel: `Air-strafe quality over the last 90 days, ${history[0].day} to ${latest.day}`,
+      })}
     </div>`;
 }
 
@@ -830,9 +877,12 @@ async function viewPlayer(id, params) {
       <div class="s"><div class="n">${fmtNum(d.metrics.dashes)}</div><div class="l">Dashes</div></div>
       <div class="s"><div class="n">${fmtNum(d.metrics.prejumpFailures)}</div><div class="l">Prejump Fails</div></div>
       <div class="s"><div class="n">${fmtNum(d.metrics.restarts)}</div><div class="l">Restarts</div></div>
+      ${d.metrics.strafeQuality != null ? `<div class="s" title="Average accel efficiency across your finished runs — how close your strafing stays to the ideal angle (higher is better)"><div class="n">${(Math.round(d.metrics.strafeQuality * 10) / 10).toFixed(1)}%</div><div class="l">Strafe Quality</div></div>` : ""}
     </div>` : ""}
 
     ${srHistoryCard(d.srHistory)}
+
+    ${strafeQualityCard(d.strafeHistory)}
 
     ${d.recentFinishes && d.recentFinishes.length ? `
     <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> every run</div>

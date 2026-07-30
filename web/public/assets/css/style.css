@@ -361,6 +361,10 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .srchart .srline { fill: none; stroke: var(--orange); stroke-width: 2.2; stroke-linejoin: round; stroke-linecap: round; }
 .srchart .srdot { fill: var(--orange-2); stroke: var(--bg); stroke-width: 2; }
 .srchart .sraxl, .srchart .sraxd { fill: var(--faint); font-family: var(--mono); font-size: 11px; }
+/* strafe-quality trend: same chart, a distinct cyan accent so it reads apart from SR */
+.srchart.strafechart .srarea { fill: rgba(34,211,238,.12); }
+.srchart.strafechart .srline { stroke: var(--cyan); }
+.srchart.strafechart .srdot { fill: var(--cyan); }
 
 /* ---------- misc ---------- */
 .loading, .empty { text-align: center; color: var(--muted); padding: 40px; font-family: var(--cond); text-transform: uppercase; letter-spacing: 2px; }

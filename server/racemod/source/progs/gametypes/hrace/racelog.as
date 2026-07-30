@@ -203,7 +203,8 @@ void RACE_LogFinish( Player @player )
                 int( attempts ),
                 cps,
                 int( wallJumps ), int( dashes ),
-                int( prejumpFails ), int( restarts ) );
+                int( prejumpFails ), int( restarts ),
+                player.strafeQualityBasisPoints() );
     }
 
     bool ok = G_AppendToFile( RACELOG_FILE, "R1\t" + mapName

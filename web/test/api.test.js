@@ -236,7 +236,7 @@ test("movement metrics ride finishes and standalone flushes into player totals",
   await new Promise((r) => setTimeout(r, 3600)); // aggregate debounce for /search
   const found = await get("/players?q=Strafer");
   const pd = await get(`/players/${found.rows[0].id}`);
-  assert.deepEqual(pd.metrics, { wallJumps: 10, dashes: 4, prejumpFailures: 1, restarts: 2 + 3 });
+  assert.deepEqual(pd.metrics, { wallJumps: 10, dashes: 4, prejumpFailures: 1, restarts: 2 + 3, strafeQuality: null });
 
   // A flush with neither starts nor any metric is nothing to record -> rejected.
   assert.equal(
@@ -246,6 +246,41 @@ test("movement metrics ride finishes and standalone flushes into player totals",
     )).status,
     400
   );
+});
+
+test("strafe quality rides a finish through ingest onto the player profile", async () => {
+  // Finishes carrying strafe_quality (basis points) — the exact JSON RS_ApiReportRace builds.
+  assert.equal(
+    (await ingest(
+      `{"version":"wsw 2.1","map":"sqmap","source":"racelog","records":[{"name":"Glider",` +
+        `"login":"","time":30000,"attempts":1,"checkpoints":[],"strafe_quality":8500}]}`
+    )).status,
+    200
+  );
+  assert.equal(
+    (await ingest(
+      `{"version":"wsw 2.1","map":"sqmap2","source":"racelog","records":[{"name":"Glider",` +
+        `"login":"","time":31000,"attempts":1,"checkpoints":[],"strafe_quality":7000}]}`
+    )).status,
+    200
+  );
+  // An out-of-range / invalid strafe value is treated as UNREPORTED (stored NULL),
+  // never clamped into the average nor counted as 0%.
+  assert.equal(
+    (await ingest(
+      `{"version":"wsw 2.1","map":"sqmap3","source":"racelog","records":[{"name":"Glider",` +
+        `"login":"","time":32000,"attempts":1,"checkpoints":[],"strafe_quality":-5}]}`
+    )).status,
+    200
+  );
+
+  await new Promise((r) => setTimeout(r, 3600)); // aggregate debounce for /search
+  const found = await get("/players?q=Glider");
+  const pd = await get(`/players/${found.rows[0].id}`);
+  // Lifetime average of the two valid runs (85% and 70%) = 77.5%.
+  assert.equal(pd.metrics.strafeQuality, 77.5);
+  assert.equal(pd.strafeHistory.length, 1);
+  assert.equal(pd.strafeHistory[0].quality, 77.5);
 });
 
 test("player profile carries a 30-day Skill Rating history ending at the current SR", async () => {

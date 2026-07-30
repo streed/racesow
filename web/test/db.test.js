@@ -165,6 +165,38 @@ test("inherited Object.prototype sort keys fall back to default, never error", a
   assert.equal((await race.maps({ sort: "constructor" })).rows.length, 1);
 });
 
+test("strafe quality: lifetime average and daily trend across the canonical group", async (t) => {
+  const race = await freshDb(t);
+  // One person under two nick variants finishes with a per-run strafe quality
+  // (basis points 0..10000 as the game reports it). A third run reports no value
+  // (older server / pre-column) and must be EXCLUDED from the average, never
+  // counted as 0%.
+  await race.ingest({ version: VER, map: "s1", source: "racelog",
+    records: [{ name: "Strafer", login: "", time: 30000, checkpoints: [], strafe_quality: 8000 }] });
+  await race.ingest({ version: VER, map: "s2", source: "racelog",
+    records: [{ name: "^3Strafer(1)", login: "", time: 31000, checkpoints: [], strafe_quality: 6000 }] });
+  await race.ingest({ version: VER, map: "s3", source: "racelog",
+    records: [{ name: "Strafer", login: "", time: 32000, checkpoints: [] }] });
+  await race.refreshAggregates();
+
+  const pd = await race.playerDetail(1, {});
+  // Lifetime average of the two reported runs (80% and 60%) as a percentage —
+  // proving aliases merge into one series and NULL runs are skipped.
+  assert.equal(pd.metrics.strafeQuality, 70);
+  // Every finish is "today", so the by-day trend has one bucket at the same value.
+  assert.equal(pd.strafeHistory.length, 1);
+  assert.equal(pd.strafeHistory[0].quality, 70);
+});
+
+test("strafe quality is null when a player has no reported runs", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({ version: VER, map: "n1", source: "racelog", records: [finish("Plain", 30000)] });
+  await race.refreshAggregates();
+  const pd = await race.playerDetail(1, {});
+  assert.equal(pd.metrics.strafeQuality, null);
+  assert.deepEqual(pd.strafeHistory, []);
+});
+
 test("skill rating (SR) rewards closeness to the WR over breadth of maps", async (t) => {
   const race = await freshDb(t);
 
@@ -544,6 +576,7 @@ test("player detail sums movement metrics across maps and flush types", async (t
     dashes: 5 + 3 + 1,
     prejumpFailures: 1 + 0 + 3,
     restarts: 2 + 4 + 1,
+    strafeQuality: null, // these finishes reported no strafe quality
   });
 });
 
@@ -560,7 +593,7 @@ test("movement metrics are racelog-only (topscores ingest never counts them)", a
   });
   const pid = N((await race.one("SELECT id FROM player LIMIT 1")).id);
   const d = await race.playerDetail(pid);
-  assert.deepEqual(d.metrics, { wallJumps: 0, dashes: 0, prejumpFailures: 0, restarts: 0 });
+  assert.deepEqual(d.metrics, { wallJumps: 0, dashes: 0, prejumpFailures: 0, restarts: 0, strafeQuality: null });
 });
 
 test("player detail exposes game version per record and filters by map + version", async (t) => {
