@@ -441,30 +441,37 @@ function srHistoryCard(history, playerId) {
 }
 
 /* ---- "which maps make up this rating" dropdown -------------------------- *
- * Collapsed <details> inside the SR card. Opening it fetches
- * /players/:id/sr once and renders the ranked contributions: the maps inside
- * the counted prefix (what the rating is made of) followed by the ones that
- * were considered and didn't help, greyed out.                              */
+ * Collapsed <details> inside the SR card. Opening it fetches /players/:id/sr
+ * once and lists every map in the rating, strongest first, with the running
+ * rating after each one — so the maps dragging the number down are as visible
+ * as the ones holding it up.                                                */
 function srBreakdownPanel() {
   return `
     <details class="srbd" id="srbd">
-      <summary><span class="srbd-caret">▸</span> Which maps make up this rating?<span class="srbd-hint">your strongest contested maps, in order</span></summary>
+      <summary><span class="srbd-caret">▸</span> Which maps make up this rating?<span class="srbd-hint">all 50, strongest first</span></summary>
       <div class="srbd-body"><div class="srbd-note">Loading…</div></div>
     </details>`;
 }
 
 function renderSrBreakdown(d) {
   if (!d.rows || !d.rows.length)
-    return `<div class="srbd-note">No contested maps yet — a map only counts once <b>${fmtNum(d.minField)}</b> players have a time on it, so this rating is still the starting prior of <b>${fmtNum(d.sr)}</b>. Race a busy map and it'll start building.</div>`;
+    return `<div class="srbd-note">No contested maps yet — a map only counts once <b>${fmtNum(d.minField)}</b> players (you and ${fmtNum(d.minField - 1)} others) have a time on it. All <b>${fmtNum(d.topK)}</b> rating slots are still empty, so this sits at the starting rating of <b>${fmtNum(d.sr)}</b>. Race a map a couple of other people have run and it'll start building.</div>`;
 
   const pct = (v) => `${(v * 100).toFixed(1)}%`;
-  const counted = d.rows.filter((r) => r.counted).length;
-  // Where the counted prefix stops — a divider row explains the cut-off rather
-  // than leaving the greyed rows unexplained.
-  const cutIdx = counted < d.rows.length ? counted : -1;
+  // Everyone is scored over the same ${d.topK} slots; the tail past it is what a
+  // deep catalog leaves on the table, and unfilled slots sit at the prior.
+  const spare = Math.max(0, d.contested - d.counted);
+  const empty = d.emptySlots != null ? d.emptySlots : Math.max(0, d.topK - d.counted);
+  const prior = Math.round(1000 * d.mu);
+  // Each row's running value vs the one above it: green when the map lifted the
+  // rating, red when it pulled it down. The first row is measured against the
+  // starting prior, which is where every rating begins.
+  const drift = (r, i) => (i === 0 ? r.running - Math.round(1000 * d.mu) : r.running - d.rows[i - 1].running);
 
-  const row = (r, i) => `
-    <tr class="clickable ${r.counted ? "" : "srbd-out"}" data-nav="#/map/${r.map_id}">
+  const row = (r, i) => {
+    const dv = drift(r, i);
+    return `
+    <tr class="clickable" data-nav="#/map/${r.map_id}">
       <td class="num srbd-i">${i + 1}</td>
       <td class="mapname">${mapNameHtml(r.map_name)}</td>
       <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
@@ -472,23 +479,34 @@ function renderSrBreakdown(d) {
       <td class="num"><span class="muted">${fmtTime(r.wr_time)}</span></td>
       <td class="num" title="Your time as a fraction of the world record — 100% is the record itself">${pct(r.ratio)}</td>
       <td class="num" title="${fmtNum(r.field)} players have a time on this map">${fmtNum(r.field)}</td>
-      <td class="num srbd-run ${r.counted ? "on" : ""}" title="${r.counted ? "Rating after counting this map" : "What the rating would drop to if this map counted"}">${fmtNum(r.running)}</td>
+      <td class="num srbd-run" title="The rating after this map and everything above it">${fmtNum(r.running)}
+        <span class="srbd-d ${dv > 0 ? "up" : dv < 0 ? "down" : ""}">${dv > 0 ? "+" : ""}${fmtNum(dv)}</span>
+      </td>
     </tr>`;
+  };
 
-  const cutRow = `
-    <tr class="srbd-cut"><td colspan="8">
-      ▼ everything below was considered and left out — counting it would pull the rating <b>down</b>, so it doesn't
-    </td></tr>`;
+  // Unfilled slots are IN the rating at the starting value, so show them as a
+  // real row — otherwise the last map's running number looks unexplained.
+  const emptyRow = empty
+    ? `<tr class="srbd-empty">
+         <td class="num srbd-i">${fmtNum(d.counted + 1)}–${fmtNum(d.topK)}</td>
+         <td colspan="6">${fmtNum(empty)} slot${empty === 1 ? "" : "s"} still to fill — each one counts at the starting rating of ${fmtNum(prior)} until you race a ${fmtNum(d.minField)}-player map you don't already have</td>
+         <td class="num srbd-run">${fmtNum(d.sr)}</td>
+       </tr>`
+    : "";
 
   return `
     <div class="srbd-note">
-      Your rating is built from the <b>${fmtNum(counted)}</b> strongest of your
-      <b>${fmtNum(d.contested)}</b> contested map${d.contested === 1 ? "" : "s"}
-      (up to ${fmtNum(d.topK)} count; a map is contested once ${fmtNum(d.minField)}+ players have a time).
-      Each map is scored on how close you are to its world record and weighted by
-      how big the field is, and the running total is where the rating stands after
-      each one — the best it ever reaches <b>is</b> your rating, so extra maps can
-      only raise it, never dilute it.
+      Every player is rated on the same <b>${fmtNum(d.topK)}</b> slots, so a deep catalog
+      and a short one are the same measurement. Yours holds <b>${fmtNum(d.counted)}</b> map${d.counted === 1 ? "" : "s"}${
+        spare ? ` — ${fmtNum(spare)} more qualified but didn't make the cut` : ""
+      }${
+        empty ? `, with ${fmtNum(empty)} slot${empty === 1 ? "" : "s"} still empty at the starting rating of ${fmtNum(prior)}` : ""
+      }. A map is contested once you and ${fmtNum(d.minField - 1)} other players have a time on it.
+      Each map scores on how close you are to its world record, weighted by how big
+      the field is, and <b>all ${fmtNum(d.topK)} slots count</b> — the running column is
+      where the rating stands after each map, so anything with a red number beside it
+      is dragging you down and is worth another run.
     </div>
     <div class="tscroll"><table class="data srbd-table">
       <thead><tr>
@@ -498,7 +516,8 @@ function renderSrBreakdown(d) {
         <th class="num" title="The rating after counting this map and everything above it">Running SR</th>
       </tr></thead>
       <tbody>
-        ${d.rows.map((r, i) => (i === cutIdx ? cutRow + row(r, i) : row(r, i))).join("")}
+        ${d.rows.map(row).join("")}
+        ${emptyRow}
       </tbody>
     </table></div>`;
 }
@@ -1614,7 +1633,7 @@ const ABOUT_FAQ = [
   ["Can I watch a record?",
     "Yes. Open any map and look for a <b>▶ replay</b> badge to watch the ghost right in your browser, or <b>⬇ demo</b> to download it. To play a demo back in Warsow, drop the file in your <span class=\"mono\">racemod/demos</span> folder and run <span class=\"mono\">demo &lt;file&gt;</span> in the console."],
   ["How is the ranking worked out?",
-    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: on each map it measures how close your time is to the world record, weighted by how many players you beat, and your rating is built from up to <b>50 of your strongest maps</b> on a 0–1000 scale — weaker runs simply don't count, so racing more can only ever raise it, and a 30-map career competes fairly with a 3000-map one. Because every run is measured against the current world record, your SR can also drift down even when you haven't raced. If someone lowers a record on one of your best maps, you sit a little further from the top. Only contested maps count (5+ players with a time), and a thin record won't reach the top until it's proven across a real sample. Any profile's Skill Rating card has a <b>“Which maps make up this rating?”</b> dropdown that lists exactly which maps went into the number, in order. World records and podium finishes are tracked separately on your profile."],
+    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: on each map it measures how close your time is to the world record, weighted by how many players you beat, and your rating is the average across <b>50 map slots</b> on a 0–1000 scale, filled by your strongest maps. Everyone is measured on the same 50, so a deep catalog and a short one are compared like for like — but that also means all 50 count: a slow run inside them pulls the number down, and it's worth going back to improve your weakest. Any slot you haven't filled yet sits at the starting rating, so a short catalog climbs as you race more maps. Because every run is measured against the current world record, your SR can also drift down even when you haven't raced. If someone lowers a record on one of your best maps, you sit a little further from the top. Only contested maps count (you and at least two other players with a time on it). Any profile's Skill Rating card has a <b>“Which maps make up this rating?”</b> dropdown that lists exactly which maps went into the number, in order. World records and podium finishes are tracked separately on your profile."],
   ["A map is broken or shouldn't be here — what do I do?",
     "Flag it for review. In-game, type <span class=\"mono\">/flag</span> while you're on the map (add a reason if you like, e.g. <span class=\"mono\">/flag broken</span>). Or open the map on this site and hit <b>⚑ Flag this map for review</b>. Moderators check flagged maps and can pull a bad one from the vote pool and map cycle."],
 ];

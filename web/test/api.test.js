@@ -333,7 +333,8 @@ test("SR breakdown endpoint serves the maps behind a player's rating", async () 
   assert.equal(bd.sr, (await get(`/players/${id}`)).standing.sr, "matches the profile's headline SR");
   assert.ok(Array.isArray(bd.rows), "rows array");
   assert.ok(bd.rows.length <= bd.topK, `rows capped at topK ${bd.topK}`);
-  assert.equal(bd.counted, bd.rows.filter((r) => r.counted).length, "counted matches the flagged prefix");
+  assert.equal(bd.counted, bd.rows.length, "every returned map is in the rating");
+  if (bd.rows.length) assert.equal(bd.rows[bd.rows.length - 1].running, bd.sr, "last row is the rating");
   for (const r of bd.rows) {
     assert.ok(r.map_id > 0 && typeof r.map_name === "string", "row identifies its map");
     assert.ok(r.field >= bd.minField, "only contested maps qualify");

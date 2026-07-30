@@ -386,15 +386,17 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .srbd-table { font-size: 13px; }
 .srbd-table tbody td { padding: 8px 14px; }
 .srbd-table .srbd-i { color: var(--faint); font-family: var(--mono); font-size: 12px; width: 34px; }
-.srbd-table .srbd-run { font-family: var(--mono); color: var(--faint); }
-.srbd-table .srbd-run.on { color: var(--gold); }
-/* Considered but left out of the winning prefix — dimmed, still readable. */
-.srbd-table tr.srbd-out td { opacity: .45; }
-.srbd-table tr.srbd-cut td {
-  padding: 8px 14px; background: var(--bg-2); color: var(--faint);
-  font-family: var(--cond); text-transform: uppercase; letter-spacing: 1px; font-size: 11px;
-}
-.srbd-table tr.srbd-cut:hover td { background: var(--bg-2); }
+.srbd-table .srbd-run { font-family: var(--mono); color: var(--gold); white-space: nowrap; }
+/* Per-map movement: did this map lift the running rating or drag it down? */
+.srbd-table .srbd-d { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-left: 6px; }
+.srbd-table .srbd-d.up { color: var(--green); }
+.srbd-table .srbd-d.down { color: #ff6b6b; }
+/* The last row IS the rating — give it a little weight. */
+.srbd-table tbody tr:last-child .srbd-run { font-weight: 700; }
+/* Slots not yet filled: in the rating at the starting value, not a raced map. */
+.srbd-table tr.srbd-empty td { color: var(--faint); font-style: italic; background: var(--bg-2); }
+.srbd-table tr.srbd-empty:hover td { background: var(--bg-2); }
+.srbd-table tr.srbd-empty .srbd-i { font-style: normal; }
 
 /* ---------- misc ---------- */
 .loading, .empty { text-align: center; color: var(--muted); padding: 40px; font-family: var(--cond); text-transform: uppercase; letter-spacing: 2px; }

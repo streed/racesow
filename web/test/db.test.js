@@ -6,7 +6,7 @@
 // so tests are independent and order-free.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { openDatabase, simplifyName, normToken, identKey, canonKey, rebuildCanonical, sha256, SR_MU } from "../db.js";
+import { openDatabase, simplifyName, normToken, identKey, canonKey, rebuildCanonical, sha256, SR_MU, SR_MIN_FIELD } from "../db.js";
 import { createTestDb } from "./pg-util.js";
 
 async function freshDb(t) {
@@ -250,7 +250,7 @@ test("skill rating (SR) rewards closeness to the WR over breadth of maps", async
   for (let i = 1; i < board.length; i++) assert.ok(board[i - 1] >= board[i], "players sorted by SR desc");
 });
 
-test("SR counts only your strongest maps: no tourist tops, no grind dilution", async (t) => {
+test("SR averages the top 50: same sample for everyone, weak maps included", async (t) => {
   const race = await freshDb(t);
 
   // 12 contested maps (12-strong fields). Champ WRs every one; Clone matches
@@ -262,9 +262,8 @@ test("SR counts only your strongest maps: no tourist tops, no grind dilution", a
     for (let i = 0; i < 10; i++) field.push(finish(`pack${i}`, 45000 + i * 500));
     await race.ingest({ version: VER, map: `comp${m}`, source: "racelog", records: field });
   }
-  // Champ ALSO cruises 20 more contested maps far off the pace. Under the old
-  // all-maps average these diluted his WR-laden rating to below the tourist's
-  // (~590 vs ~900); under prefix-max they simply don't count.
+  // Champ ALSO cruises 20 more contested maps far off the pace. All 32 of his
+  // maps are under the top-50 cap, so every one of them lands in his rating.
   for (let m = 0; m < 20; m++) {
     const field = [finish("CruiseWr", 20000), finish("Champ", 60000)];
     for (let i = 0; i < 10; i++) field.push(finish(`pack${i}`, 25000 + i * 500));
@@ -279,13 +278,137 @@ test("SR counts only your strongest maps: no tourist tops, no grind dilution", a
   const clone = byName.get("Clone");
   const tourist = byName.get("Tourist");
 
-  // Twelve WRs against real fields outrank four near-WRs: a thin sample
-  // regresses toward the prior until it's proven.
-  assert.ok(champ.sr > tourist.sr, `Champ SR ${champ.sr} > Tourist SR ${tourist.sr}`);
+  // The deliberate trade-off of a fixed top-50: those 20 casual maps DO count,
+  // so Champ now rates below his stay-at-home twin despite identical WR runs.
+  // (Under the old prefix-max they were dropped and the two tied.)
+  assert.ok(champ.sr < clone.sr, `Champ SR ${champ.sr} < Clone SR ${clone.sr} — weak maps count`);
 
-  // Racing 20 extra maps casually changed nothing: Champ's SR equals his
-  // stay-at-home twin's. Grinding can never lower a rating.
-  assert.equal(champ.sr, clone.sr, `Champ SR ${champ.sr} = Clone SR ${clone.sr}`);
+  // Same trade-off, sharper edge, pinned here so nobody has to rediscover it:
+  // Tourist's four near-WR maps are a SHORT sample, and short samples are only
+  // regressed by kappa, so he outranks a player with 12 WRs and 20 slow maps.
+  // Under prefix-max the ordering was the other way round. If that ever wants
+  // fixing, the lever is padding unused slots toward the prior (or a bigger
+  // kappa), not the top-50 rule itself.
+  assert.ok(tourist.sr > champ.sr, `Tourist SR ${tourist.sr} > Champ SR ${champ.sr} — short samples ride high`);
+
+  // A WR-on-everything catalog still tops a mixed one.
+  const cruiseWr = byName.get("CruiseWr");
+  assert.ok(cruiseWr.sr > champ.sr, `CruiseWr ${cruiseWr.sr} > Champ ${champ.sr}`);
+  assert.ok(clone.sr > tourist.sr, `Clone (12 WRs) ${clone.sr} > Tourist (4 near-WRs) ${tourist.sr}`);
+});
+
+test("empty slots are held at the prior: a short catalog can't ride high", async (t) => {
+  const race = await freshDb(t);
+
+  // Two players who are equally fast — both WR their maps against identical
+  // 12-strong fields. The only difference is how many slots they've filled:
+  // Deep has 20 maps, Thin has 3.
+  for (let m = 0; m < 20; m++) {
+    const field = [finish("Deep", 30000)];
+    if (m < 3) field.push(finish("Thin", 30000));
+    for (let i = 0; i < 11; i++) field.push(finish(`pack${m}_${i}`, 45000 + i * 500));
+    await race.ingest({ version: VER, map: `m${m}`, source: "racelog", records: field });
+  }
+  await race.refreshAggregates();
+
+  const byName = new Map((await race.players({ sort: "sr", limit: 200 })).rows.map((r) => [r.simplified, r]));
+  const deep = byName.get("Deep");
+  const thin = byName.get("Thin");
+
+  // Identical per-map quality (both hold the WR on every map they've raced), so
+  // WITHOUT slot padding these two would sit within a few points of each other.
+  // With it, the 17 extra unfilled slots cost Thin real rating.
+  assert.ok(deep.sr > thin.sr + 50, `Deep ${deep.sr} clearly ahead of Thin ${thin.sr} on the same per-map quality`);
+
+  // Neither is at the prior — both have real, contested WRs.
+  assert.ok(thin.sr > Math.round(1000 * SR_MU), `Thin ${thin.sr} still above the prior`);
+
+  // And the empty slots are exactly the difference the breakdown reports.
+  const bdThin = await race.srBreakdown(thin.id);
+  const bdDeep = await race.srBreakdown(deep.id);
+  assert.equal(bdThin.counted, 3);
+  assert.equal(bdThin.emptySlots, bdThin.topK - 3);
+  assert.equal(bdDeep.counted, 20);
+  assert.equal(bdDeep.emptySlots, bdDeep.topK - 20);
+  assert.equal(bdThin.rows[bdThin.rows.length - 1].running, thin.sr, "last row already includes the empty slots");
+});
+
+test("SR is the weighted mean over 50 slots, empty ones held at the prior", async (t) => {
+  const race = await freshDb(t);
+
+  // One strong map and one weak one, both contested. Under prefix-max the weak
+  // map would be dropped (it lowers the mean) and SR would be the strong map's
+  // value alone; under a fixed top-50 both are in the average.
+  const strong = [finish("Duo", 30000)];
+  for (let i = 0; i < 10; i++) strong.push(finish(`p${i}`, 45000 + i * 500));
+  await race.ingest({ version: VER, map: "strong", source: "racelog", records: strong });
+
+  const weak = [finish("Rocket", 20000), finish("Duo", 60000)];
+  for (let i = 0; i < 10; i++) weak.push(finish(`p${i}`, 30000 + i * 500));
+  await race.ingest({ version: VER, map: "weak", source: "racelog", records: weak });
+  await race.refreshAggregates();
+
+  const duo = (await race.players({ sort: "sr", limit: 50 })).rows.find((r) => r.simplified === "Duo");
+  const bd = await race.srBreakdown(duo.id);
+  assert.equal(bd.counted, 2, "both maps are in the rating");
+  assert.equal(bd.rows.length, 2);
+
+  // Recompute the Bayesian weighted mean by hand from the exposed inputs,
+  // including the 48 unfilled slots sitting at the prior.
+  assert.equal(bd.emptySlots, bd.topK - 2, "the rest of the 50 slots are empty");
+  const sumPw = bd.rows.reduce((a, r) => a + r.perf * r.weight, 0);
+  const sumW = bd.rows.reduce((a, r) => a + r.weight, 0);
+  const fill = bd.emptySlots * bd.fillWeight;
+  const expected = Math.round(
+    (1000 * (sumPw + bd.kappa * bd.mu + fill * bd.mu)) / (sumW + bd.kappa + fill)
+  );
+  assert.equal(duo.sr, expected, `SR ${duo.sr} is the mean over BOTH maps + empty slots (${expected})`);
+  assert.equal(bd.sr, duo.sr);
+  assert.equal(bd.computed, duo.sr);
+  assert.equal(bd.rows[bd.rows.length - 1].running, duo.sr, "the last row's running value is the rating");
+  // The weak map genuinely costs: the rating sits below the strong map alone.
+  assert.ok(bd.rows[0].running > duo.sr, `strong-map-only ${bd.rows[0].running} > final ${duo.sr}`);
+});
+
+test("a map counts toward SR once the player and two others have a time on it", async (t) => {
+  const race = await freshDb(t);
+
+  // Two players is not a contest: nothing qualifies, so the rating is the bare
+  // prior even though this player holds the WR.
+  await race.ingest({
+    version: VER,
+    map: "duo",
+    source: "racelog",
+    records: [finish("Local", 30000), finish("Rival", 40000)],
+  });
+  await race.refreshAggregates();
+  let bd = await race.srBreakdown((await race.players({ limit: 50 })).rows.find((r) => r.simplified === "Local").id);
+  assert.equal(bd.contested, 0, "a 2-player map is below the threshold");
+  assert.equal(bd.sr, Math.round(1000 * SR_MU), "still the prior");
+
+  // A third finisher shows up and the same map starts counting — the threshold
+  // is the player plus SR_MIN_FIELD - 1 others (3 total), not a big field.
+  await race.ingest({ version: VER, map: "duo", source: "racelog", records: [finish("Third", 50000)] });
+  await race.refreshAggregates();
+  const local = (await race.players({ limit: 50 })).rows.find((r) => r.simplified === "Local");
+  bd = await race.srBreakdown(local.id);
+  assert.equal(SR_MIN_FIELD, 3, "threshold is you + 2 others");
+  assert.equal(bd.contested, 1, "the 3-player map now qualifies");
+  assert.equal(bd.rows[0].field, 3);
+  assert.equal(bd.counted, 1);
+  assert.equal(bd.sr, local.sr);
+  assert.ok(local.sr > Math.round(1000 * SR_MU), `WR on a contested map beats the prior (${local.sr})`);
+
+  // The field weight still scales with size, so a 3-player map is worth much
+  // less than a big one: the WR holder on a 30-player map outranks this WR.
+  const big = [finish("Big", 30000)];
+  for (let i = 0; i < 29; i++) big.push(finish(`crowd${i}`, 40000 + i * 200));
+  await race.ingest({ version: VER, map: "packed", source: "racelog", records: big });
+  await race.refreshAggregates();
+  const rows = (await race.players({ sort: "sr", limit: 50 })).rows;
+  const bigSr = rows.find((r) => r.simplified === "Big").sr;
+  const smallSr = rows.find((r) => r.simplified === "Local").sr;
+  assert.ok(bigSr > smallSr, `WR on a 30-player field ${bigSr} > WR on a 3-player field ${smallSr}`);
 });
 
 test("SR breakdown lists the maps the rating is actually made of", async (t) => {
@@ -311,17 +434,16 @@ test("SR breakdown lists the maps the rating is actually made of", async (t) => 
   const bd = await race.srBreakdown(champ.id);
 
   // The dropdown can never disagree with the board: the same arithmetic on the
-  // same inputs, and the last counted row IS the rating.
+  // same inputs, and the LAST row IS the rating (every row counts now).
   assert.equal(bd.sr, champ.sr, "breakdown reports the standings SR");
   assert.equal(bd.computed, champ.sr, `recomputed ${bd.computed} = standings ${champ.sr}`);
-  assert.equal(bd.rows[bd.counted - 1].running, champ.sr, "the last counted row's running total is the rating");
+  assert.equal(bd.rows[bd.rows.length - 1].running, champ.sr, "the last row's running total is the rating");
 
   // 32 contested maps (the 2-player "empty" doesn't qualify), all under the
-  // top-K cap, and only the 12 WR maps are inside the winning prefix.
+  // top-K cap, so all 32 are in the rating — the 12 WR maps lead the ranking.
   assert.equal(bd.contested, 32);
   assert.equal(bd.rows.length, 32);
-  assert.equal(bd.counted, 12, `counted ${bd.counted} maps`);
-  assert.ok(bd.rows.every((r, i) => r.counted === (i < bd.counted)), "counted flags mark exactly the prefix");
+  assert.equal(bd.counted, 32, `counted ${bd.counted} maps`);
   for (const r of bd.rows.slice(0, 12)) {
     assert.ok(r.map_name.startsWith("comp"), `${r.map_name} is one of the WR maps`);
     assert.equal(r.rank, 1);
@@ -329,11 +451,11 @@ test("SR breakdown lists the maps the rating is actually made of", async (t) => 
     assert.equal(r.ratio, 1);
     assert.equal(r.field, 11);
   }
-  // Rows are ranked strongest-first, and the running total only ever climbs to
-  // the cut-off then falls (that's why the tail is excluded).
+  // Rows are ranked strongest-first, and the 20 cruise maps at the tail visibly
+  // drag the running rating down from its 12-WR peak.
   for (let i = 1; i < bd.rows.length; i++)
     assert.ok(bd.rows[i].perf <= bd.rows[i - 1].perf, "rows ordered by performance desc");
-  assert.ok(bd.rows[bd.counted].running < bd.sr, "the first excluded map would pull the rating down");
+  assert.ok(bd.rows[11].running > bd.sr, `peak after the WR maps ${bd.rows[11].running} > final ${bd.sr}`);
 
   // Unknown player -> null (the endpoint turns this into a 404).
   assert.equal(await race.srBreakdown(999999), null);

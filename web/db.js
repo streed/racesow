@@ -61,21 +61,43 @@ const POINTS_CASE = `CASE rank
 // population into ~0.85-1.0, so the board barely discriminated). Each perf is
 // weighted by the strength of the field it was set against,
 //   fw   = log2(1 + N)      N = players with a PB on that map
-// and only contested maps count (N >= SR_MIN_FIELD): with nobody to beat, a
-// time proves nothing, and solo-map WRs were free perf=1.0 samples.
+// and only contested maps count (N >= SR_MIN_FIELD, i.e. you plus at least two
+// other finishers): with nobody to beat, a time proves nothing, and solo-map
+// WRs were free perf=1.0 samples.
 //
-// A player is scored on their strongest maps only, never ALL of them: sort
-// their perfs descending and take whichever prefix of length 1..SR_TOP_K
-// maximizes the Bayesian weighted mean
-//   SR = 1000 * ( Σ perf*fw + κ*μ ) / ( Σ fw + κ )
-// (κ = SR_KAPPA regresses a thin sample toward the prior μ = SR_MU, IMDb
-// style, so a couple of lucky near-WRs can't top the board). The prefix-max
-// subset — provably "include a run iff it holds up at your proven level" — is
-// what makes SR safe to grind: casually cruising map 500 can only ever raise
-// it, never dilute a rating earned on your best 50, so a 30-map career and a
-// 3000-map one compete fairly. The prefix minimum of 1 keeps below-prior
-// players ranked by their best run instead of clamping half the board at the
-// prior; only players with NO contested map sit at exactly 1000*SR_MU.
+// A player is scored on SR_TOP_K slots — the same sample size for EVERYONE.
+// Sort their qualifying perfs descending, take the first K, and average them as
+// a Bayesian weighted mean; any slot they haven't filled counts as a minimum-
+// field map raced at the prior (weight SR_FILL_W, value μ), so a 50-map catalog
+// and a 5-map one are the same measurement:
+//
+//   e   = SR_TOP_K - n           empty slots (n = qualifying maps used, <= K)
+//   SR  = 1000 * ( Σ perf*fw + κ*μ + e*SR_FILL_W*μ )
+//              / ( Σ fw       + κ   + e*SR_FILL_W  )
+//
+// (κ = SR_KAPPA regresses even a full sample toward the prior μ = SR_MU, IMDb
+// style.) Every one of the 50 slots counts, weak maps included — the rating
+// answers "how fast are you across 50 maps", not "what's the flattering
+// subset". A player with no qualifying map at all sits at exactly 1000*SR_MU,
+// which is what 50 empty slots average to.
+//
+// Consequences, deliberately chosen. (1) SR is no longer grind-proof: until
+// 2026-07-30 it was the MAX over prefixes 1..K, so a map entered the rating
+// only if it held up at the player's proven level and cruising a 51st map could
+// never lower it. Now a slow run inside your top 50 does pull the number down —
+// improving your weakest counted map is real progress, and the profile
+// breakdown exists to show you which one that is. (2) A short catalog can no
+// longer ride high on a handful of near-WRs; it climbs as it fills slots.
+//
+// Measured on the 2026-07-30 production DB (9,193 ranked players) BEFORE the
+// empty-slot padding was added: 4,618 players moved, every one downward, and
+// the top 10 was bit-identical (they all hold a full 50). Only 600 players had
+// 50 qualifying maps — the other 8,588 were still being compared on shorter
+// samples, which is exactly what the fixed-K rule set out to stop; that gap is
+// what SR_FILL_W closes. A soft fill weight (a minimum-field map) was chosen
+// over a typical one (the median fw, ~6.2): the strict version dropped an
+// 8-map player from 863 to 444 but squeezed the whole mid-board into p90=375 /
+// median=345 / p10=331, so SR stopped discriminating below the top few hundred.
 //
 // Calibrated against the 2026-07 production snapshot (236k races, 9.2k
 // players): the proven multi-WR names hold the top-10 in a credible order,
@@ -84,15 +106,36 @@ const POINTS_CASE = `CASE rank
 // spreads to p1=898 / median=319 / p90=224 instead of bunching at 850-980.
 //
 // SR_TOP_K was widened from 20 to 50 so deep, consistently-strong catalogs get
-// full credit for their depth. Because SR is the MAX over prefixes 1..K, raising
-// the cap is monotone: it can only raise or hold a rating, never lower one. On
-// the 2026-07 snapshot it moved 130 of 9.2k players, every one a gain of +1..+27
-// (top-heavy; players with <20 contested maps are untouched), nudging p1 895->898.
+// full credit for their depth.
+//
+// Why the fixed 50 instead of the old prefix-max: under prefix-max the SAMPLE
+// SIZE varied per player — one racer's rating was the mean of their best 50,
+// another's of their best 20, whichever flattered each of them most. Comparing
+// those two numbers on one leaderboard is comparing different measurements, and
+// the deeper catalog was effectively penalised for the maps it had to leave in.
+// A common denominator (everyone's top 50) is the point, accepted with open eyes
+// that it lowers most ratings and makes a lazy run cost something.
+//
+// SR_MIN_FIELD was relaxed from 5 to 3 at the same time — a map qualifies once
+// the player plus two others have set a time on it. Five was tuned when the cap
+// was 20 and mainly guarded against thin samples, a job the Bayesian prior
+// already does; the stricter bar was silently disqualifying a lot of smaller
+// community maps where a 3-strong field is still a real contest, and with a
+// fixed top-50 the wider pool matters more (more players actually reach 50
+// qualifying maps). The field weight log2(1+N) still counts a 3-player map for
+// far less than a 30-player one. Both changes reshuffle the board; ratings move
+// in both directions and are NOT comparable to pre-2026-07-30 numbers, including
+// the daily sr_history points already stored (the trend line will show a step).
 export const SR_MU = 0.35;
 export const SR_KAPPA = 10;
 export const SR_GAMMA = 3;
 export const SR_TOP_K = 50;
-export const SR_MIN_FIELD = 5;
+export const SR_MIN_FIELD = 3;
+// What one unfilled slot weighs: exactly a minimum-field map's field weight, so
+// "you haven't raced this slot yet" costs the same as having raced the least
+// contested map that qualifies — deliberately the gentlest fill that still
+// enforces a common sample size.
+export const SR_FILL_W = Math.log2(1 + SR_MIN_FIELD);
 
 // How many days of per-player Skill Rating history to retain (rolling window).
 // One SR value is snapshotted per player per UTC day at the tail of an aggregate
@@ -375,8 +418,10 @@ async function buildAggregates(client) {
     CREATE UNLOGGED TABLE standings_new AS
       -- SR inputs (see the SR_* constants' comment): per contested map
       -- (field >= SR_MIN_FIELD), each player's sharpened perf (w/t)^gamma and
-      -- field weight, ranked best-first; each rn is a candidate prefix end,
-      -- and the player's SR is the best Bayesian mean over prefixes <= TOP_K.
+      -- field weight, ranked best-first; the player's SR is the Bayesian
+      -- weighted mean over SR_TOP_K slots — the top K qualifying maps plus a
+      -- prior-valued placeholder for every slot they haven't filled, so every
+      -- player is measured on the same sample size.
       WITH mm AS (
         SELECT map_id,
                MIN(time)                                AS wr_time,
@@ -397,15 +442,15 @@ async function buildAggregates(client) {
         WHERE mm.n >= ${SR_MIN_FIELD} AND b.time > 0
       ),
       skill AS (
-        SELECT player_id, ROUND(1000.0 * MAX(v))::int AS sr
-        FROM (
-          SELECT player_id,
-                 (SUM(p * fw) OVER w + ${SR_KAPPA} * ${SR_MU})
-               / (SUM(fw) OVER w + ${SR_KAPPA}) AS v
-          FROM contrib
-          WHERE rn <= ${SR_TOP_K}
-          WINDOW w AS (PARTITION BY player_id ORDER BY rn)
-        ) pf
+        -- (SR_TOP_K - COUNT(*)) is the empty-slot count; the WHERE caps COUNT(*)
+        -- at SR_TOP_K, so it can never go negative.
+        SELECT player_id,
+               ROUND(1000.0 * (SUM(p * fw) + ${SR_KAPPA} * ${SR_MU}
+                               + (${SR_TOP_K} - COUNT(*)) * ${SR_FILL_W} * ${SR_MU})
+                            / (SUM(fw) + ${SR_KAPPA}
+                               + (${SR_TOP_K} - COUNT(*)) * ${SR_FILL_W}))::int AS sr
+        FROM contrib
+        WHERE rn <= ${SR_TOP_K}
         GROUP BY player_id
       )
       SELECT s.*, ROW_NUMBER() OVER (ORDER BY points DESC, wr DESC, player_id) AS rank
@@ -2046,14 +2091,23 @@ class RaceDB {
     };
   }
 
-  // The per-map contributions behind a player's Skill Rating: their SR_TOP_K
-  // strongest contested maps, ranked exactly as the standings build ranks them
-  // (see the SR_* block at the top of this file), each with the running
-  // Bayesian mean the rating would take if the prefix ended there. The prefix
-  // that MAXIMISES that running mean IS the rating, so rows up to `counted` are
-  // the maps the number is actually made of and the rest were considered and
-  // didn't help — the UI greys them out rather than hiding them, because "why
-  // doesn't map X count?" is the whole question this view answers.
+  // The per-map contributions behind a player's Skill Rating: the SR_TOP_K
+  // strongest contested maps that the rating is the weighted mean of, ranked
+  // exactly as the standings build ranks them (see the SR_* block at the top of
+  // this file). EVERY row returned counts — the last row's running value is the
+  // rating — so the view answers both "which maps is this made of" and "which
+  // of my weak maps is holding it down".
+  //
+  // `contested` is how many maps qualified in total: when it exceeds the rows
+  // returned, the surplus is the tail that missed the top-K cut; when it falls
+  // short of SR_TOP_K, the shortfall is `emptySlots` and those slots are in the
+  // rating at the prior. The UI says which.
+  //
+  // Each row's `running` is "what your rating would be if this were your whole
+  // catalog" — the maps down to that row, with EVERY remaining slot still
+  // empty. That makes the last row exactly the live rating (its remaining slots
+  // are the real empty ones) and each step's movement honest: a map above the
+  // prior lifts the number, a map below it drags.
   //
   // The running mean is recomputed here in JS instead of re-deriving the SQL
   // window: same doubles, same order, but the arithmetic stays next to the
@@ -2096,14 +2150,15 @@ class RaceDB {
       [canonId]
     );
 
-    // Walk the prefixes, keeping the best Bayesian mean seen so far.
-    let sumPw = 0, sumW = 0, bestV = -1, counted = 0;
+    // Accumulate the weighted mean row by row, each step padded out to SR_TOP_K
+    // slots; the value after the LAST row is the rating.
+    let sumPw = 0, sumW = 0, running = SR_MU;
     const rows = raw.map((r, i) => {
       const p = Number(r.p), fw = Number(r.fw);
       sumPw += p * fw;
       sumW += fw;
-      const v = (sumPw + SR_KAPPA * SR_MU) / (sumW + SR_KAPPA);
-      if (v > bestV) { bestV = v; counted = i + 1; }
+      const empty = Math.max(0, SR_TOP_K - (i + 1)) * SR_FILL_W;
+      running = (sumPw + SR_KAPPA * SR_MU + empty * SR_MU) / (sumW + SR_KAPPA + empty);
       return this._censorMapped(
         {
           map_id: num(r.map_id),
@@ -2119,13 +2174,12 @@ class RaceDB {
           // record" is the intuitive number; `perf` is what the formula uses.
           ratio: num(r.wr_time) / num(r.time),
           perf: p,
-          running: Math.round(1000 * v),
+          running: Math.round(1000 * running),
         },
         num(r.map_id),
         "map_name"
       );
     });
-    for (let i = 0; i < rows.length; i++) rows[i].counted = i < counted;
 
     this._censorNamed(player, num(player.id));
     return {
@@ -2136,8 +2190,13 @@ class RaceDB {
       // the headline; `computed` is what these rows add up to (they match — this
       // is the same arithmetic on the same inputs).
       sr: standing ? num(standing.sr) : Math.round(1000 * SR_MU),
-      computed: rows.length ? Math.round(1000 * bestV) : Math.round(1000 * SR_MU),
-      counted,
+      computed: Math.round(1000 * running),
+      // Maps in the rating = rows returned (the top-K cut). Kept as its own
+      // field so the UI never has to infer it from the array length.
+      counted: rows.length,
+      // Slots still to fill, each sitting in the rating at the prior.
+      emptySlots: Math.max(0, SR_TOP_K - rows.length),
+      fillWeight: SR_FILL_W,
       // Contested maps this player has a PB on (may exceed the rows returned).
       contested: raw.length ? num(raw[0].contested) : 0,
       maps: standing ? num(standing.maps) : 0,
