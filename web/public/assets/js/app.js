@@ -16,6 +16,27 @@ const REPLAY_V = (() => {
 
 const app = document.getElementById("app");
 
+/* ---------------------- analytics (Tastatur) ----------------------------- */
+// Privacy-friendly usage analytics. The loader (t.js, in index.html) auto-
+// tracks pageviews by patching history.pushState — go() drives every in-app
+// navigation through it, so path routes (/maps, /map/5, /player/5, /replay/…)
+// are all counted with no extra calls here. track() sends NAMED events for the
+// discrete actions a URL alone can't describe: searching, watching a replay,
+// downloading a demo, copying a connect string, following an outbound link.
+//
+// This queue-stub matches the one t.js drains on load (it runs first — a
+// parser-inserted <script> at the end of <body> executes before the deferred
+// loader), so events fired early aren't lost, and track() stays a silent no-op
+// when the script is blocked (adblock / offline / localhost dev).
+window.tastatur = window.tastatur || function () {
+  (window.tastatur.q = window.tastatur.q || []).push(arguments);
+};
+function track(name, props) {
+  try {
+    window.tastatur("event", name, props ? { props } : undefined);
+  } catch (e) { /* analytics must never break the app */ }
+}
+
 /* ----------------------------- helpers ----------------------------------- */
 async function api(path) {
   const res = await fetch("/api" + path);
@@ -530,6 +551,7 @@ async function viewMap(id) {
   // limit=10000 = "everyone": the leaderboard lists every player's PR on the
   // map (the busiest map has ~180), not a top-100 cut.
   const d = await api(`/maps/${id}?limit=10000`);
+  track("View map", { map: d.name });
   const wr = d.wr;
 
   // WR splits as absolute -> per-segment deltas for a fair compare to perfect.
@@ -728,6 +750,7 @@ async function viewReplay(id, playerId = null) {
   // Only the WR replay shows a demo button here; per-run demos live on the
   // leaderboard / player-profile rows.
   const demo = !playerId && d.wr && d.wr.demo && d.wr.demo.url ? d.wr.demo : null;
+  track("Watch replay", { map: d.name, kind: isWr ? "wr" : "pb" });
   app.innerHTML = `
     <div class="crumbs"><a data-nav="#/maps">Maps</a> / <a data-nav="#/map/${id}">${esc(d.name)}</a> / Replay</div>
     <div class="replay-head">
@@ -763,6 +786,7 @@ async function viewPlayer(id, params) {
       buildQuery({ q: state.q, version: state.version, sort: state.sort, order: state.order, limit: PAGE, offset: state.offset })
   );
   const s = d.standing;
+  track("View player", { player: (d.name || "").replace(/\^[0-9]/g, "") });
   const rec = d.records;
   const hasAttempts = d.attempts != null; // legacy DBs have no attempts column
   const cols = 5 + (hasAttempts ? 1 : 0); // Map, Time, Rank, Version, Replay (+Attempts)
@@ -1666,6 +1690,7 @@ function initGlobalSearch() {
   });
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && input.value.trim()) {
+      track("Search", { q: input.value.trim() });
       go("#/maps" + buildQuery({ q: input.value.trim() }));
       box.classList.remove("show");
       input.blur();
@@ -1689,6 +1714,7 @@ document.addEventListener("click", (e) => {
   if (copyEl) {
     e.preventDefault();
     const txt = copyEl.getAttribute("data-copy");
+    track("Copy connect", { server: txt.replace(/^connect\s+/, "") });
     (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject())
       .then(() => {
         copyEl.classList.add("copied");
@@ -1698,6 +1724,19 @@ document.addEventListener("click", (e) => {
     return;
   }
   const link = e.target.closest("a[href]");
+  if (link) {
+    // Real links keep their native behaviour (below), but note the action first:
+    // a download (demo/DB export) or a click off-site to a different origin.
+    const href = link.getAttribute("href") || "";
+    if (link.hasAttribute("download")) {
+      track("Download demo", { url: href });
+    } else if (/^https?:\/\//i.test(href)) {
+      try {
+        const u = new URL(href, location.origin);
+        if (u.origin !== location.origin) track("Outbound", { url: u.hostname + u.pathname });
+      } catch (err) { /* malformed href — ignore */ }
+    }
+  }
   if (link && !link.hasAttribute("data-nav")) return;
   const el = e.target.closest("[data-nav]");
   if (el) {
@@ -1705,7 +1744,14 @@ document.addEventListener("click", (e) => {
     go(el.getAttribute("data-nav"));
     document.getElementById("gresults")?.classList.remove("show");
     const gs = document.getElementById("gsearch");
-    if (gs && el.closest(".gsearch")) gs.value = "";
+    if (gs && el.closest(".gsearch")) {
+      gs.value = "";
+      // Picking a hit from the global search dropdown — record what type.
+      const nav = el.getAttribute("data-nav") || "";
+      track("Search result click", {
+        type: nav.startsWith("#/player") ? "player" : nav.startsWith("#/map") ? "map" : "other",
+      });
+    }
   }
 });
 

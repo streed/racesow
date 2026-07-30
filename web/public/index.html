@@ -27,6 +27,13 @@
     }
   }
   </script>
+  <!-- Tastatur privacy-friendly analytics. Auto-tracks pageviews by patching
+       history.pushState — the SPA router (app.js go()) drives every in-app
+       navigation through it, so /maps, /map/5, /player/5, /replay/… are all
+       counted. Named action events (search, replay, demo download, connect
+       copy, outbound clicks) are sent from app.js via track(). Needs
+       script-src + connect-src https://tastatur.dev in the nginx CSP. -->
+  <script defer data-site="FB1WRC5D0PFFHKZ5" src="https://tastatur.dev/t.js"></script>
 </head>
 <body>
   <header class="site">
