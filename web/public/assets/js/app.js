@@ -692,7 +692,7 @@ async function viewDemos(params) {
         </tr></thead>
         <tbody>
           ${data.rows.map((m) => `
-            <tr class="clickable" data-nav="#/demos/${m.id}">
+            <tr class="clickable" data-nav="#/demo/${m.id}">
               <td class="mapname">${mapNameHtml(m.name)}</td>
               <td class="num">${fmtNum(m.demos)}</td>
               <td class="num"><span class="time">${m.fastest != null ? fmtTime(m.fastest) : "—"}</span></td>
@@ -700,8 +700,8 @@ async function viewDemos(params) {
             </tr>`).join("") || `<tr><td colspan="4" class="empty">No demos ${state.q ? `match “${esc(state.q)}”` : "recorded yet"}.</td></tr>`}
         </tbody>
       </table>
-    </div>${pager(state, data, "#/demos")}</div>`;
-  wireFilter("dfilter", "#/demos", state);
+    </div>${pager(state, data, "#/demo")}</div>`;
+  wireFilter("dfilter", "#/demo", state);
 }
 
 // One map's demos: per-player PBs, fastest first, each with its own download
@@ -711,7 +711,7 @@ async function viewDemosMap(id) {
   const d = await api("/demos/" + id);
   const anyDl = d.demos.some((x) => x.url);
   app.innerHTML = `
-    <div class="crumbs"><a data-nav="#/demos">Demos</a> / ${esc(baseMapName(d.map.name))}${isReversedMap(d.map.name) ? " (reverse)" : ""}</div>
+    <div class="crumbs"><a data-nav="#/demo">Demos</a> / ${esc(baseMapName(d.map.name))}${isReversedMap(d.map.name) ? " (reverse)" : ""}</div>
     <div class="page-title" style="font-size:34px">${mapNameHtml(d.map.name)}</div>
     <p class="page-sub">${fmtNum(d.demos.length)} demo${d.demos.length === 1 ? "" : "s"} — one per player, their personal best. <a data-nav="#/map/${d.map.id}">Open the full leaderboard ↗</a></p>
     <div class="table-wrap"><div class="tscroll">
@@ -2118,8 +2118,8 @@ async function router() {
   try {
     if (path === "/") await viewOverview();
     else if (path === "/maps") await viewMaps(params);
-    else if (path === "/demos") await viewDemos(params);
-    else if (path.startsWith("/demos/")) await viewDemosMap(parseInt(path.split("/")[2], 10));
+    else if (path === "/demo") await viewDemos(params);
+    else if (path.startsWith("/demo/")) await viewDemosMap(parseInt(path.split("/")[2], 10));
     else if (path === "/players") await viewPlayers(params);
     else if (path === "/compare") await viewCompare(params);
     else if (path === "/live") await viewLive();
