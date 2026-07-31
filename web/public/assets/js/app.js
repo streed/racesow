@@ -554,7 +554,7 @@ function strafeQualityCard(history) {
   if (!enough)
     return `
     <div class="page-title" style="font-size:20px">STRAFE QUALITY <span class="accent">·</span> tracking</div>
-    <div class="panel srhist"><div class="srhist-empty">Now tracking your air-strafe quality — how close your acceleration stays to the ideal strafe angle each run. A daily average, high and low appear here once you've finished runs on a couple of different days.${latest ? ` Latest <b>${pct(latest.quality)}</b>.` : ""}</div></div>`;
+    <div class="panel srhist"><div class="srhist-empty">Now tracking your air-strafe quality — how close your acceleration stays to the ideal strafe angle, measured while you are actually strafing (forward + left or right) at 600&nbsp;ups or more. A daily average, high and low appear here once you've finished runs on a couple of different days.${latest ? ` Latest <b>${pct(latest.quality)}</b>.` : ""}</div></div>`;
   const delta = latest.quality - history[0].quality;
   const trend = delta > 0 ? "up" : delta < 0 ? "down" : "flat";
   const arrow = delta > 0 ? "▲" : delta < 0 ? "▼" : "—";
@@ -1072,7 +1072,7 @@ async function viewPlayer(id, params) {
       <div class="s"><div class="n">${fmtNum(d.metrics.dashes)}</div><div class="l">Dashes</div></div>
       <div class="s"><div class="n">${fmtNum(d.metrics.prejumpFailures)}</div><div class="l">Prejump Fails</div></div>
       <div class="s"><div class="n">${fmtNum(d.metrics.restarts)}</div><div class="l">Restarts</div></div>
-      ${d.metrics.strafeQuality != null ? `<div class="s" title="Average accel efficiency across your finished runs — how close your strafing stays to the ideal angle (higher is better)"><div class="n">${(Math.round(d.metrics.strafeQuality * 10) / 10).toFixed(1)}%</div><div class="l">Strafe Quality</div></div>` : ""}
+      ${d.metrics.strafeQuality != null ? `<div class="s" title="Average accel efficiency across your finished runs — how close your strafing stays to the ideal angle, sampled only while actually strafing (forward + left or right) at 600+ ups (higher is better)"><div class="n">${(Math.round(d.metrics.strafeQuality * 10) / 10).toFixed(1)}%</div><div class="l">Strafe Quality</div></div>` : ""}
     </div>` : ""}
 
     <div class="grid-2">

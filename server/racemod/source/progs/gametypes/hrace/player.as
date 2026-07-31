@@ -38,12 +38,13 @@ const uint DASH_DEBOUNCE = 500;        // ms between counted dashes (approx cool
 // Air-strafe-quality sampling (see Player.sampleStrafe). Each airborne frame the
 // player is strafing, we score the horizontal speed actually gained against the
 // maximum a perfect strafe angle would give (accel efficiency, 0..1 — the same
-// ratio the green accel HUD shows). STRAFE_MIN_SPEED gates out crawl-speed frames
-// where the ratio is meaningless; STRAFE_IMPULSE_FACTOR rejects frames whose gain
-// is far past the strafe max (jump pads / rocket jumps / teleports — not strafing);
-// STRAFE_GROUND_TRACE is the short downward box-trace distance used to skip
-// grounded frames (air accel is the strafe regime).
-const float STRAFE_MIN_SPEED = 100;    // ups; below this the accel ratio is noise
+// ratio the green accel HUD shows). STRAFE_MIN_SPEED keeps the score to the
+// high-speed regime people actually call strafing (below it the ratio is easy to
+// max out and says nothing about skill); STRAFE_IMPULSE_FACTOR rejects frames
+// whose gain is far past the strafe max (jump pads / rocket jumps / teleports —
+// not strafing); STRAFE_GROUND_TRACE is the short downward box-trace distance
+// used to skip grounded frames (air accel is the strafe regime).
+const float STRAFE_MIN_SPEED = 600;    // ups; only score genuine high-speed strafing
 const float STRAFE_IMPULSE_FACTOR = 3; // gain > this * maxGain => external impulse, skip
 const float STRAFE_GROUND_TRACE = 8;   // units; ground within this => not airborne
 
@@ -205,11 +206,13 @@ class Player
     uint lastDashTime;
 
     // Air-strafe-quality sampling state (see sampleStrafe). prevStrafeSpeed is the
-    // horizontal speed at the previous sampled frame; the sum/weight pair is a
-    // frame-time-weighted running total of per-frame accel efficiency, averaged
+    // horizontal speed at the previous sampled frame and prevStrafeYaw the view yaw
+    // there (so we can tell which way the mouse is turning); the sum/weight pair is
+    // a frame-time-weighted running total of per-frame accel efficiency, averaged
     // into the run's strafe score on finish (strafeQualityBasisPoints).
     bool haveStrafePrev;
     float prevStrafeSpeed;
+    float prevStrafeYaw;
     double strafeQualitySum;
     double strafeQualityWeight;
 
@@ -290,6 +293,7 @@ class Player
         this.lastDashTime = 0;
         this.haveStrafePrev = false;
         this.prevStrafeSpeed = 0;
+        this.prevStrafeYaw = 0;
         this.strafeQualitySum = 0;
         this.strafeQualityWeight = 0;
         this.pos = -1;
@@ -1714,6 +1718,7 @@ class Player
         // score covers only this run.
         this.haveStrafePrev = false;
         this.prevStrafeSpeed = 0;
+        this.prevStrafeYaw = 0;
         this.strafeQualitySum = 0;
         this.strafeQualityWeight = 0;
 
@@ -1869,8 +1874,9 @@ class Player
     // strafe angle would yield (the accel-efficiency ratio the green accel HUD
     // shows, %ACCELERATION / %PROGRESS_SELF), and frame-time-weight-accumulates it
     // over the run. Only genuine races, and only airborne frames where the player
-    // holds a movement key at meaningful speed, are sampled; external impulses
-    // (jump pads, rocket jumps, teleports) are rejected. The per-run average is
+    // is actually strafing — forward + a side key, mouse turning into that side,
+    // at or above STRAFE_MIN_SPEED — are sampled; external impulses (jump pads,
+    // rocket jumps, teleports) are rejected. The per-run average is
     // read on finish (strafeQualityBasisPoints) and reported via RS_ApiReportRace.
     void sampleStrafe()
     {
@@ -1888,22 +1894,53 @@ class Player
 
         float dt = float( frameTime ) / 1000.0f;
         float cur = HorizontalSpeed( ent.velocity );
+        float curYaw = ent.angles.y;
 
-        // First sampled frame of the run only seeds the baseline speed.
+        // First sampled frame of the run only seeds the baseline speed + view yaw.
         if ( !this.haveStrafePrev )
         {
             this.prevStrafeSpeed = cur;
+            this.prevStrafeYaw = curYaw;
             this.haveStrafePrev = true;
             return;
         }
         float prev = this.prevStrafeSpeed;
+        float prevYaw = this.prevStrafeYaw;
         this.prevStrafeSpeed = cur;
+        this.prevStrafeYaw = curYaw;
 
-        // Air-strafe frames only: a movement key held (there is a wish direction),
-        // moving fast enough for the ratio to mean something, and airborne.
+        // Air-strafe frames only: the player must actually be STRAFING — forward
+        // held together with a side key. These bits come from the SIGN of the
+        // usercmd's forwardmove/sidemove (p_client.cpp G_SetClientStats), not from
+        // raw key state, so they already encode net intent: holding both left and
+        // right zeroes sidemove and sets NEITHER bit, and forward+back sets neither
+        // forward nor backward. The left != right test therefore means "a real side
+        // input this frame". Plus genuine strafing speed, and airborne.
         uint keys = this.client.pressedKeys;
-        if ( ( keys & ( Key_Forward | Key_Backward | Key_Left | Key_Right ) ) == 0 )
+        bool holdLeft = ( keys & Key_Left ) != 0;
+        bool holdRight = ( keys & Key_Right ) != 0;
+        if ( ( keys & Key_Forward ) == 0 )
             return;
+        if ( holdLeft == holdRight ) // no net side input (neither, or cancelled out)
+            return;
+
+        // ...and the mouse must be turning INTO that side key — that pairing IS the
+        // strafe. Warsow yaw increases counter-clockwise (AngleVectors builds
+        // right = (sin yaw, -cos yaw, 0), so at yaw 0 the player's right is -Y):
+        // turning RIGHT therefore DECREASES yaw. Strafing right wants a negative
+        // delta, strafing left a positive one. Shortest-arc, so crossing the +-180
+        // wrap doesn't read as a huge turn the wrong way. A still mouse (delta 0)
+        // is not strafing either, and falls out of the strict comparisons.
+        float yawDelta = curYaw - prevYaw;
+        while ( yawDelta > 180 )
+            yawDelta -= 360;
+        while ( yawDelta < -180 )
+            yawDelta += 360;
+        if ( holdRight && yawDelta >= 0 )
+            return;
+        if ( holdLeft && yawDelta <= 0 )
+            return;
+
         if ( prev < STRAFE_MIN_SPEED )
             return;
         if ( this.onStrafeGround() )
