@@ -111,9 +111,9 @@ String RACE_PlayerRecHeaderField( const String &in header, uint index )
             pos++;
         if ( pos >= total )
             break;
-        // locate() returns the string length when the token is not found, so the
-        // final field of an unterminated line still reads whole.
-        uint sp = header.locate( " ", pos );
+        // RACE_LocateFrom returns the string length when the token is not
+        // found, so the final field of an unterminated line still reads whole.
+        uint sp = RACE_LocateFrom( header, " ", pos );
         if ( sp > total )
             sp = total;
         if ( field == index )

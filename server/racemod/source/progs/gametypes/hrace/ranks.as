@@ -63,10 +63,10 @@ void RACE_ParseRanks( const String &in text )
     uint pos = 0;
     while ( pos < total )
     {
-        // locate() returns the string length when the token is not found (same
-        // idiom as the topscores parser), so the final unterminated line still
-        // gets read.
-        uint nl = text.locate( "\n", pos );
+        // RACE_LocateFrom returns the string length when the token is not
+        // found (same idiom as the topscores parser), so the final unterminated
+        // line still gets read.
+        uint nl = RACE_LocateFrom( text, "\n", pos );
         if ( nl > total )
             nl = total;
         String line = text.substr( pos, nl - pos );

@@ -124,9 +124,10 @@ void RACE_ParseMapWeapons( const String &in text )
     uint pos = 0;
     while ( pos < total )
     {
-        // locate() returns the string length when not found (same idiom as the
-        // ranks/topscores parsers), so the final unterminated line is still read.
-        uint nl = text.locate( "\n", pos );
+        // RACE_LocateFrom returns the string length when not found (same idiom
+        // as the ranks/topscores parsers), so the final unterminated line is
+        // still read.
+        uint nl = RACE_LocateFrom( text, "\n", pos );
         if ( nl > total )
             nl = total;
         String line = text.substr( pos, nl - pos );

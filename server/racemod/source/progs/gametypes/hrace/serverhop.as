@@ -45,7 +45,7 @@ String[] RACE_HopSplit( const String &in s, const String &in sep )
             parts.insertLast( "" );
             break;
         }
-        uint p = s.locate( sep, start );
+        uint p = RACE_LocateFrom( s, sep, start );
         if ( p >= n )
         {
             parts.insertLast( s.substr( start, n - start ) );

@@ -47,9 +47,9 @@ void RACE_ParseAnnouncements( const String &in text )
     uint pos = 0;
     while ( pos < total && raceAnnounceMsgs.length() < 32 )
     {
-        // locate() returns the string length when "\n" isn't found, so the final
-        // unterminated line still gets read (same idiom as ranks.as).
-        uint nl = text.locate( "\n", pos );
+        // RACE_LocateFrom returns the string length when "\n" isn't found, so
+        // the final unterminated line still gets read (same idiom as ranks.as).
+        uint nl = RACE_LocateFrom( text, "\n", pos );
         if ( nl > total )
             nl = total;
         String line = text.substr( pos, nl - pos );

@@ -28,6 +28,20 @@ bool PatternMatch( String str, String pattern, Wildcard wildcard = Wildcard_No )
     return str.locate( pattern, 0 ) < str.length();
 }
 
+// Find `token` at or after byte offset `start`; returns str.length() when it
+// is absent (locate's own not-found convention). String.locate's second
+// argument is a count of MATCHES TO SKIP from the start of the string, not a
+// start offset (engine addon_string.cpp, objectString_Locate) — passing a
+// byte offset there jumps to the wrong match, or "not found" once the offset
+// exceeds the matches remaining, silently merging the rest of the payload
+// into one token. Every offset-walking parser must go through this instead.
+uint RACE_LocateFrom( const String &in str, const String &in token, uint start )
+{
+    if ( start >= str.length() )
+        return str.length();
+    return start + str.substr( start ).locate( token, 0 );
+}
+
 String[] GetMapsByPattern( String@ pattern, String@ ignore = null )
 {
     String[] maps;
