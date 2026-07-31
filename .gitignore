@@ -39,6 +39,8 @@ backups/
 # The committed public keys (server/sftp/keys/*.pub) + users.conf stay tracked.
 server/sftp-uploads/
 server/sftp/hostkeys/
+# Minted uploader credentials awaiting hand-off (private keys — never commit).
+server/sftp/handouts/
 # Client-demo ingestion watcher runtime (scripts/ingest-demos.sh)
 demo-ingest.log
 .demo-ingest.lock

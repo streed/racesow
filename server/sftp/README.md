@@ -25,21 +25,46 @@ sudo ufw allow 2222/tcp          # dedicated port, distinct from admin SSH (22)
 
 ## Add / remove an uploader
 
-Uploaders authenticate with an SSH **public** key — passwords are disabled.
+Uploaders authenticate with an SSH **public** key — passwords are disabled. Run
+both scripts from a dev checkout (they drive the box over SSH); `sync-keys.sh`
+needs your `~/.ssh/warsow` box key.
 
 ```sh
-# add: drop their public key and recreate the container
-cp their_key.pub sftp/keys/alice.pub
-docker compose -f docker-compose.sftp.yml up -d      # re-reads keys on start
-
-# remove: delete the .pub and recreate
-rm sftp/keys/alice.pub
-docker compose -f docker-compose.sftp.yml up -d
+# mint credentials for someone (keypair + ready-to-send instruction sheet)
+server/sftp/new-uploader.sh alice
+server/sftp/sync-keys.sh                 # install on the box
+git add server/sftp/keys/alice.pub       # the public half is tracked
 ```
 
+`new-uploader.sh` writes the public half to `sftp/keys/alice.pub` and leaves the
+private key + a `README.txt` for the uploader in `sftp/handouts/alice/`
+(gitignored). Send that folder over a private channel, then delete it — we never
+need the private key again.
+
+```sh
+# revoke: delete the .pub and sync (rsync --delete removes it on the box too)
+rm server/sftp/keys/alice.pub
+server/sftp/sync-keys.sh
+```
+
+To bring your own key instead of minting one, drop the `.pub` straight into
+`sftp/keys/` and run `sync-keys.sh`.
+
 All `*.pub` in `sftp/keys/` are appended to the shared `demos` jail's
-`authorized_keys` at container start. `admin.pub` is a bootstrap key — replace it
-with the real uploaders' keys.
+`authorized_keys`. **This happens in atmoz's entrypoint on first run only**, so a
+plain `up -d` (a no-op when nothing changed) or `restart` (the user already
+exists) will *not* pick up a new key — the container must be recreated, which is
+what `sync-keys.sh` does:
+
+```sh
+docker compose -f docker-compose.sftp.yml up -d --force-recreate
+```
+
+Host keys and `incoming/` are bind-mounted, so the server identity and any queued
+uploads survive the recreate.
+
+`admin.pub` is the bootstrap key — it is a copy of the `warsow` box-admin key, so
+prefer per-person keys for actual uploaders and keep this one only as a fallback.
 
 To give people **separate** jails instead of one shared account, add
 `bob::1501:1501:incoming` lines to `users.conf` and matching

@@ -21,7 +21,9 @@
 #   ssh-keygen -t rsa -b 4096 -f sftp/hostkeys/ssh_host_rsa_key -N ''   # once
 #   docker compose -f docker-compose.sftp.yml up -d
 #   sudo ufw allow ${SFTP_PORT:-2222}/tcp                               # once
-# Add an uploader: drop their pubkey in sftp/keys/<name>.pub, re-run `up -d`.
+# Add an uploader: sftp/new-uploader.sh <name> && sftp/sync-keys.sh (from a dev
+# checkout). authorized_keys is built in atmoz's entrypoint on FIRST run only, so
+# picking up a new .pub needs `up -d --force-recreate`, not a plain `up -d`.
 # Connect:  sftp -P 2222 demos@us.east.racesow.org   then  put run.wdz20 incoming/
 name: racesow-sftp
 
