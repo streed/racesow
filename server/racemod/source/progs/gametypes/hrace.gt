@@ -47,5 +47,6 @@ hrace/serverhop.as;
 hrace/checkpoint.as;
 hrace/table.as;
 hrace/announcement.as;
+hrace/maprotate.as;
 
 hrace.as;

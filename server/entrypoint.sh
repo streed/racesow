@@ -289,6 +289,13 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     echo "set g_gametype \"${G_GAMETYPE}\""
     echo "set g_maprotation \"${MAP_ROTATION}\""
     echo "set g_maplist \"${MAPLIST}\""
+    # Idle map rotation (hrace/maprotate.as) reads this custom copy of the
+    # rotation list so an empty server can cycle every rs_idle_rotate_minutes.
+    # It deliberately does NOT read g_maplist: putting an AngelScript Cvar handle
+    # on that engine-owned cvar re-registers it with an empty default and wipes
+    # the value (which nothing re-sets), breaking the engine's own rotation and
+    # the vote pool. A private cvar like this is safe (same pattern as rs_api_*).
+    echo "set rs_idle_pool \"${MAPLIST}\""
     [ -n "${RCON_PASSWORD}" ]      && echo "set rcon_password \"${RCON_PASSWORD}\""
     # HTTP pak mirror: when set, the engine redirects pak downloads there
     # instead of the (patched) UDP transfer. Must be reachable by game clients.
