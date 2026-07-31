@@ -257,8 +257,14 @@ binding structure (the design doc's "moved to `g_as_gametypes.cpp`" was wrong).
   native needed.
 - **NEW native work — 3 DenMSC-SDK base natives Warfork lacks** (Warsow inherits
   these from DenMSC's fork; they are *not* in our patches):
-  - `RS_QueryPjState` / `RS_ResetPjState` (projectile-state save/restore, used by
-    position/practice restore). Warfork has no equivalent.
+  - `RS_QueryPjState` / `RS_ResetPjState` (**PRE-JUMP** state — "pj", not
+    projectile: per-client jump/dash/walljump counters that `startRace()` gates
+    every run on). Warfork has no equivalent. **They are useless without the
+    `gs_pmove.c` counter hooks that feed them** — binding the natives alone makes
+    `RS_QueryPjState` answer false forever and silently disables the prejump rule.
+    (That is exactly what happened: hooks deferred at port time, prejump
+    unenforced on both Warfork nodes until 2026-07-30 —
+    `warfork/enginepatches/patch-pjcount-hooks.py`.)
   - `G_RemoveProjectiles( Entity@ )` (per-owner, called once at `hrace.as:507`).
     Warfork offers only global `G_RemoveAllProjectiles()` — different signature
     *and* semantics (all vs owner's).

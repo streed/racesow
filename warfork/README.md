@@ -48,5 +48,9 @@ then expand the live Warsow `MIRROR_PEERS`+retag and tear down the old
 `warfork-test` spike.
 
 **Deferred** (not launch blockers): client UI pak + `sv_pure 1` delivery, per-client
-demo natives, prejump `gs_pmove.c` hooks, weapon-def physics parity, public Steam
-listing (`BUILD_STEAMLIB=1` + GSLT).
+demo natives, weapon-def physics parity, public Steam listing (`BUILD_STEAMLIB=1`
++ GSLT).
+
+The prejump `gs_pmove.c` hooks are no longer deferred — they shipped 2026-07-30
+(`enginepatches/patch-pjcount-hooks.py`). Until then the prejump rule was
+unenforced on Warfork: the natives bound, but nothing incremented the counters.

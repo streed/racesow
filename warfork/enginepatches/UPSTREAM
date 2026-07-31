@@ -14,5 +14,6 @@ Files (GPLv2, same license as qfusion/Warfork):
 
 These are lifted onto CURRENT vanilla warfork-qfusion 2.16 (proto 27), NOT built
 from Gelmo's 2.15 tree (proto 26, incompatible with current clients). The
-g_ascript.cpp binding + include wiring + (deferred) gs_pmove.c prejump hooks are
-applied by patch-pjstate-natives.py.
+g_ascript.cpp binding + include wiring are applied by patch-pjstate-natives.py;
+the gs_pmove.c prejump-counter hooks (lifted byte-for-byte from the same
+upstream tree) by patch-pjcount-hooks.py.

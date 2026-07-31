@@ -42,9 +42,18 @@ COPY warfork/enginepatches/g_racesow.h    source/game/g_racesow.h
 COPY warfork/enginepatches/gs_racesow.c   source/gameshared/gs_racesow.c
 COPY warfork/enginepatches/gs_racesow.h   source/gameshared/gs_racesow.h
 COPY warfork/enginepatches/patch-pjstate-natives.py /tmp/patch-pjstate-natives.py
+# The pmove counters that FEED RS_QueryPjState. Without them the natives bind
+# but always answer false, so the prejump rule (1 jump / 1 dash / 1 walljump
+# before the start line) is silently unenforced. Warsow's module is built from
+# DenMSC/racemod_2.1, which already carries these hooks; vanilla Warfork does
+# not. Anchors verified byte-identical on 2.15.1.
+COPY warfork/enginepatches/patch-pjcount-hooks.py /tmp/patch-pjcount-hooks.py
 RUN cd source && python3 /tmp/patch-pjstate-natives.py \
+    && python3 /tmp/patch-pjcount-hooks.py \
     && grep -q 'asFunc_RS_ResetPjState' game/g_ascript.cpp \
-    && grep -q 'G_RemoveProjectiles( Entity @ )' game/g_ascript.cpp
+    && grep -q 'G_RemoveProjectiles( Entity @ )' game/g_ascript.cpp \
+    && [ "$(grep -c 'racesow - pjcount' gameshared/gs_pmove.c)" = 4 ] \
+    && grep -q 'clear prejump counters' gameshared/gs_pmove.c
 
 # --- (2) our RS_Api* reporting + RS_Mirror* mesh + WR-ghost cull natives -------
 COPY server/enginepatches/g_rs_api.cpp        source/game/g_rs_api.cpp
@@ -106,6 +115,16 @@ RUN export CC=clang CXX=clang++ \
     && strings "$SO" | grep -q 'rs_mirror: configured' \
     && strings "$SO" | grep -q 'RS_SetHideWrGhost' \
     && strings "$SO" | grep -q 'RS_QueryPjState' \
+    # The prejump counters must be CALLED, not merely present: `strings` would
+    # pass on a build where patch-pjcount-hooks.py silently no-op'd, and the
+    # symptom (prejump unenforced) is invisible until a player exploits it.
+    # Call-site COUNT is not asserted — clang tail-merges PM_Jump's two
+    # increments into one call — only that each is reached at least once.
+    && objdump -d "$SO" > /tmp/libgame.dis \
+    && grep -q 'call.*<RS_IncrementJumps>'     /tmp/libgame.dis \
+    && grep -q 'call.*<RS_IncrementDashes>'    /tmp/libgame.dis \
+    && grep -q 'call.*<RS_IncrementWallJumps>' /tmp/libgame.dis \
+    && rm -f /tmp/libgame.dis \
     && objdump -p "$SO" | grep -qi 'NEEDED.*curl'
 
 # --- pak the base assets into basewf (no `deploy` target in 2.15.1) -----------

@@ -21,9 +21,12 @@ because those anchor on the `{ "bool RS_ResetPjState( int playerNum )", ... }`
 asGlobFuncs entry this patch creates (byte-identical to the DenMSC/Warsow anchor,
 so our existing patches apply unchanged).
 
+The gs_pmove.c RS_Increment{Jumps,Dashes,WallJumps} hooks that actually FEED
+RS_QueryPjState live in patch-pjcount-hooks.py — run it after this script (it
+needs the gs_public.h include added below). They were deferred at port time,
+which left the prejump rule unenforced on Warfork until 2026-07-30.
+
 DEFERRED (not needed to compile the gametype, so not done here):
-  - the gs_pmove.c RS_Increment{Jumps,Dashes,WallJumps} hooks (prejump DETECTION;
-    without them RS_QueryPjState always returns false but the native still binds).
   - wiring g_racesow.cpp's rs_* weapon-def cvars into weapon firing (physics parity).
 
 Run from source/ (cwd = warfork-qfusion/source). Fails loudly if any anchor is
