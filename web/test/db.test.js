@@ -524,13 +524,16 @@ test("compare: head-to-head on shared maps drives the verdict", async (t) => {
 test("every finish counts as an attempt; only the best is kept as the PR", async (t) => {
   const race = await freshDb(t);
 
-  // Three finishes by the same player: 52s, then a PR at 48s, then a slower 50s.
+  // Three finishes by the same player: 52s, then a PR at 48s, then a slower
+  // 50s. Alongside the counts, ingest reports which player rows the batch
+  // touched (playerIds — the achievements evaluator's input).
   let c = await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova", 52000, [11000, 30000])] });
-  assert.deepEqual(c, { inserted: 1, improved: 0, unchanged: 0 });
+  assert.deepEqual(c, { inserted: 1, improved: 0, unchanged: 0, playerIds: c.playerIds });
+  assert.equal(c.playerIds.length, 1);
   c = await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova", 48000, [10000, 28000])] });
-  assert.deepEqual(c, { inserted: 0, improved: 1, unchanged: 0 });
+  assert.deepEqual(c, { inserted: 0, improved: 1, unchanged: 0, playerIds: c.playerIds });
   c = await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova", 50000, [10500, 29000])] });
-  assert.deepEqual(c, { inserted: 0, improved: 0, unchanged: 1 });
+  assert.deepEqual(c, { inserted: 0, improved: 0, unchanged: 1, playerIds: c.playerIds });
 
   // Attempts: all three finishes tallied.
   assert.equal(N((await race.one("SELECT SUM(finishes) f FROM run_tally")).f), 3);
@@ -766,6 +769,9 @@ test("player detail sums movement metrics across maps and flush types", async (t
     dashes: 5 + 3 + 1,
     prejumpFailures: 1 + 0 + 3,
     restarts: 2 + 4 + 1,
+    distance: 0, // none of these finishes reported the v2 metrics
+    strafes: 0,
+    maxSpeed: null,
     strafeQuality: null, // these finishes reported no strafe quality
   });
 });
@@ -783,7 +789,16 @@ test("movement metrics are racelog-only (topscores ingest never counts them)", a
   });
   const pid = N((await race.one("SELECT id FROM player LIMIT 1")).id);
   const d = await race.playerDetail(pid);
-  assert.deepEqual(d.metrics, { wallJumps: 0, dashes: 0, prejumpFailures: 0, restarts: 0, strafeQuality: null });
+  assert.deepEqual(d.metrics, {
+    wallJumps: 0,
+    dashes: 0,
+    prejumpFailures: 0,
+    restarts: 0,
+    distance: 0,
+    strafes: 0,
+    maxSpeed: null,
+    strafeQuality: null,
+  });
 });
 
 test("player detail exposes game version per record and filters by map + version", async (t) => {
@@ -849,7 +864,10 @@ test("concurrent ingests of the same NEW map/player/version do not collide", asy
       })
     )
   );
-  for (const c of results) assert.deepEqual(c, { inserted: 1, improved: 0, unchanged: 0 });
+  for (const c of results) {
+    assert.deepEqual(c, { inserted: 1, improved: 0, unchanged: 0, playerIds: c.playerIds });
+    assert.equal(c.playerIds.length, 1);
+  }
   assert.equal(N((await race.one("SELECT COUNT(*) c FROM map WHERE name='brandnew'")).c), 1);
   assert.equal(N((await race.one("SELECT COUNT(*) c FROM race")).c), 8);
   assert.equal(N((await race.one("SELECT COUNT(*) c FROM player")).c), 8);

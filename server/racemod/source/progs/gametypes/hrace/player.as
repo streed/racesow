@@ -48,6 +48,14 @@ const float STRAFE_MIN_SPEED = 600;    // ups; only score genuine high-speed str
 const float STRAFE_IMPULSE_FACTOR = 3; // gain > this * maxGain => external impulse, skip
 const float STRAFE_GROUND_TRACE = 8;   // units; ground within this => not airborne
 
+// Distance + strafe-count metrics (see sampleDistance and the tail of
+// sampleStrafe). A frame whose origin delta implies more than
+// DIST_MAX_FRAME_SPEED is a teleporter hop, not travel — skipped, baseline
+// reseeded. A sampled-strafe gap longer than STRAFE_GAP_MS (or a direction
+// flip) ends one counted strafe segment and starts the next.
+const float DIST_MAX_FRAME_SPEED = 20000; // ups; fastest plausible genuine travel
+const uint STRAFE_GAP_MS = 400;           // ms without a sampled strafe frame => segment over
+
 // Noclip point-pull ("grapple"): in practice-mode noclip, holding Attack+Special
 // eases the player toward whatever surface they are aiming at. POINT_PULL is the
 // per-ms pull fraction; PULL_MARGIN keeps it from snapping onto a point-blank
@@ -216,6 +224,19 @@ class Player
     double strafeQualitySum;
     double strafeQualityWeight;
 
+    // Distance-raced sampling state (see sampleDistance): previous frame's
+    // origin + the sub-unit remainder not yet pushed into the pending tally.
+    bool haveDistPrev;
+    Vec3 prevDistOrigin;
+    float distCarry;
+    // Strafe-segment counting state (see sampleStrafe): direction of the last
+    // sampled strafe frame (0 none / 1 left / 2 right) + when it was sampled.
+    int lastStrafeDir;
+    uint lastStrafeMs;
+    // Horizontal speed when this run's timer started (ups; -1 = no run yet —
+    // the omit sentinel RS_ApiReportRace understands).
+    int raceStartSpeed;
+
     void setupArrays( int size )
     {
         this.messageTimes.resize( MAX_FLOOD_MESSAGES );
@@ -296,6 +317,11 @@ class Player
         this.prevStrafeYaw = 0;
         this.strafeQualitySum = 0;
         this.strafeQualityWeight = 0;
+        this.haveDistPrev = false;
+        this.distCarry = 0;
+        this.lastStrafeDir = 0;
+        this.lastStrafeMs = 0;
+        this.raceStartSpeed = -1;
         this.pos = -1;
         this.globalRank = -1;
         this.skillRating = -1;
@@ -1721,6 +1747,14 @@ class Player
         this.prevStrafeYaw = 0;
         this.strafeQualitySum = 0;
         this.strafeQualityWeight = 0;
+        // ...and the distance/strafe-segment state. Pending tallies in
+        // racelog.as deliberately survive (they are flush-period deltas, not
+        // per-run values), but the baselines restart with the run. The
+        // starting speed is the run's snapshot for the finish report.
+        this.haveDistPrev = false;
+        this.distCarry = 0;
+        this.lastStrafeDir = 0;
+        this.raceStartSpeed = int( HorizontalSpeed( this.client.getEnt().velocity ) );
 
         if ( RS_QueryPjState( this.client.playerNum )  )
         {
@@ -1973,6 +2007,57 @@ class Player
         // (float terms widen into the double accumulators).
         this.strafeQualitySum += q * dt;
         this.strafeQualityWeight += dt;
+
+        // Lifetime "strafes" metric: this frame fully qualified as strafing, so
+        // count a NEW segment when the direction flipped or the last sampled
+        // strafe frame is more than STRAFE_GAP_MS behind (segment ended).
+        int dir = holdRight ? 2 : 1;
+        if ( dir != this.lastStrafeDir || levelTime - this.lastStrafeMs > STRAFE_GAP_MS )
+            RACE_Strafe( this );
+        this.lastStrafeDir = dir;
+        this.lastStrafeMs = levelTime;
+    }
+
+    // Accumulate distance travelled during a race for the lifetime "distance"
+    // metric. Whole units flow into the pending tally (racelog.as
+    // RACE_AddDistance) every frame; the sub-unit remainder carries on the
+    // player so nothing is lost to truncation. A frame whose origin delta
+    // implies an impossible speed is a teleporter hop — skipped, and the
+    // baseline is simply the new position (already stored) so the jump itself
+    // never counts as travel.
+    void sampleDistance()
+    {
+        if ( !this.inRace )
+        {
+            this.haveDistPrev = false;
+            return;
+        }
+        Entity@ ent = this.client.getEnt();
+        Vec3 cur = ent.origin;
+        if ( !this.haveDistPrev )
+        {
+            this.prevDistOrigin = cur;
+            this.haveDistPrev = true;
+            return;
+        }
+        Vec3 step = cur - this.prevDistOrigin;
+        this.prevDistOrigin = cur;
+        float dt = float( frameTime ) / 1000.0f;
+        if ( dt <= 0 )
+            return;
+        // Squared-length compare first (the codebase's d*d idiom) so the
+        // common teleport skip costs no sqrt.
+        float maxStep = DIST_MAX_FRAME_SPEED * dt;
+        float sq = step * step;
+        if ( sq > maxStep * maxStep )
+            return;
+        this.distCarry += float( sqrt( sq ) );
+        int whole = int( this.distCarry );
+        if ( whole > 0 )
+        {
+            this.distCarry -= whole;
+            RACE_AddDistance( this, whole );
+        }
     }
 
     // True when the player is on (or within STRAFE_GROUND_TRACE units of) the

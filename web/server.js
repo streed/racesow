@@ -16,6 +16,7 @@ import { createStreamRegistry } from "./streams.js";
 import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js";
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
 import { cache, invalidate } from "./cache.js";
+import { RULE_KINDS, WINDOWS, TIERS, validateDefinition, describeRule } from "./achievements.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -394,6 +395,22 @@ api.get("/players/:id/sr", cache(60, { edge: true }), wrap(async (req, res) => {
   res.json(bd);
 }));
 
+// Public achievements directory: every active definition with rarity + recent
+// earners. Hidden achievements come back masked (tier + earner count only).
+api.get("/achievements", cache(300, { edge: true }), wrap(async (_req, res) => {
+  res.json(await race.achievementsDirectory());
+}));
+
+// A player's earned awards + progress toward the visible unearned ones.
+// Fetched lazily by the profile's achievements panel (like /players/:id/sr).
+api.get("/players/:id/achievements", cache(60, { edge: true }), wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).json({ error: "invalid player id" });
+  const out = await race.playerAchievements(id);
+  if (!out) return res.status(404).json({ error: "player not found" });
+  res.json(out);
+}));
+
 // Head-to-head comparison of two players (a vs b): overall standings plus the
 // direct record on every shared map. Both ids may be any name variant; the DB
 // resolves them to canonical.
@@ -703,6 +720,58 @@ function scheduleAggregateRefresh() {
   refreshTimer = setTimeout(doRefresh, wait);
 }
 
+// ===================== Achievements evaluation ==============================
+// Post-ingest, debounced: evaluate the active achievement definitions for just
+// the players an ingest touched (db.js evaluateAchievements — awards are
+// idempotent). This runs on EVERY racelog ingest, not only PB-changing ones,
+// because a plain finish can complete "100 finishes"-style rules that the
+// aggregate refresh (which only fires on inserted/improved) would never see.
+// The debounce sits a little behind the aggregate one so standings-based rules
+// usually read the freshly rebuilt standings; the daily sweep (whole field,
+// claimed once per UTC day across replicas — db.js achievementsDailySweep) is
+// the correctness backstop for anything a race with the rebuild missed.
+const ACH_EVAL_DEBOUNCE_MS = 5000;
+const pendingAchPlayers = new Set();
+let achTimer = null;
+let achRunning = false;
+let achAgain = false;
+async function doAchievementEval() {
+  achTimer = null;
+  if (achRunning) {
+    achAgain = true;
+    return;
+  }
+  achRunning = true;
+  try {
+    const ids = [...pendingAchPlayers];
+    pendingAchPlayers.clear();
+    try {
+      const n = ids.length ? await race.evaluateAchievements(ids) : 0;
+      if (n) recordEvent(null, `achievements: ${n} new award${n === 1 ? "" : "s"}`, "system");
+    } catch (e) {
+      console.error("achievement evaluation failed:", e?.message ?? e);
+    }
+    try {
+      const n = await race.achievementsDailySweep();
+      if (n) recordEvent(null, `achievements: ${n} new award${n === 1 ? "" : "s"} (daily sweep)`, "system");
+    } catch (e) {
+      console.error("achievement daily sweep failed:", e?.message ?? e);
+    }
+  } finally {
+    achRunning = false;
+    if (achAgain) {
+      achAgain = false;
+      scheduleAchievementEval();
+    }
+  }
+}
+function scheduleAchievementEval() {
+  if (!achTimer) achTimer = setTimeout(doAchievementEval, ACH_EVAL_DEBOUNCE_MS);
+}
+// One pass shortly after boot so the daily sweep runs even on a day with no
+// ingest traffic to this replica (e.g. right after a deploy).
+setTimeout(scheduleAchievementEval, 15_000).unref();
+
 // ===================== Operator log stream + maintenance ====================
 // The admin "servers" page (server-rendered, no client JS) is an operator
 // console: it ships game-server stdout into /admin/logs, sends RCON broadcasts,
@@ -913,6 +982,28 @@ function sanitizeStrafeQuality(v) {
   return Math.min(n, MAX_STRAFE_QUALITY);
 }
 
+// Per-run speed snapshots in ups (max over the run / at the start line). Same
+// posture as strafe_quality: stored on the finish row, null when absent or
+// invalid so older servers contribute nothing.
+const MAX_SPEED_UPS = 100000;
+function sanitizeSpeed(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) return null;
+  return Math.min(n, MAX_SPEED_UPS);
+}
+
+// Distance travelled per flush period (game units). Additive like the movement
+// counters but orders of magnitude larger, so it gets its own per-entry cap and
+// its own per-request budget instead of joining metricSum (where it would eat
+// the whole MAX_TALLY_PER_REQUEST allowance).
+const MAX_DISTANCE_PER_ENTRY = 100_000_000;
+const MAX_DISTANCE_PER_REQUEST = 500_000_000;
+function sanitizeDistance(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? Math.min(n, MAX_DISTANCE_PER_ENTRY) : 0;
+}
+
 function sanitizeRecord(r) {
   if (!r || typeof r.name !== "string" || r.name.length === 0) return null;
   const time = Number(r.time);
@@ -940,9 +1031,17 @@ function sanitizeRecord(r) {
     dashes: sanitizeMetric(r.dashes),
     prejump_failures: sanitizeMetric(r.prejump_failures),
     restarts: sanitizeMetric(r.restarts),
-    // Per-run air-strafe quality snapshot (basis points), stored on the finish
-    // row. null when unreported; NOT part of the additive metricSum below.
+    // Counter deltas since the last flush (added into run_tally like the
+    // metrics above; distance has its own request budget, strafes joins
+    // metricSum).
+    distance: sanitizeDistance(r.distance),
+    strafes: sanitizeMetric(r.strafes),
+    // Per-run snapshots stored on the finish row: air-strafe quality (basis
+    // points) + max/starting speed (ups). null when unreported; NOT part of
+    // the additive metricSum below.
     strafe_quality: sanitizeStrafeQuality(r.strafe_quality),
+    max_speed: sanitizeSpeed(r.max_speed),
+    start_speed: sanitizeSpeed(r.start_speed),
   };
 }
 
@@ -1016,9 +1115,19 @@ function sanitizeAttempt(a) {
   const dashes = sanitizeMetric(a.dashes);
   const prejump_failures = sanitizeMetric(a.prejump_failures);
   const restarts = sanitizeMetric(a.restarts);
+  const distance = sanitizeDistance(a.distance);
+  const strafes = sanitizeMetric(a.strafes);
   // A metrics-only flush (e.g. a lone /kill) carries count 0 but real metrics —
   // keep it. Drop only when there is genuinely nothing to record.
-  if (count === 0 && wall_jumps === 0 && dashes === 0 && prejump_failures === 0 && restarts === 0)
+  if (
+    count === 0 &&
+    wall_jumps === 0 &&
+    dashes === 0 &&
+    prejump_failures === 0 &&
+    restarts === 0 &&
+    distance === 0 &&
+    strafes === 0
+  )
     return null;
   return {
     name: a.name.slice(0, MAX_NAME_LEN),
@@ -1028,6 +1137,8 @@ function sanitizeAttempt(a) {
     dashes,
     prejump_failures,
     restarts,
+    distance,
+    strafes,
   };
 }
 
@@ -1100,17 +1211,26 @@ api.post(
     if (totalCheckpoints > MAX_TOTAL_CHECKPOINTS) {
       return res.status(400).json({ error: `too many checkpoints (max ${MAX_TOTAL_CHECKPOINTS} total)` });
     }
-    // Reject an implausibly large sum of monotonic tally deltas (counter inflation).
-    const metricSum = (e) => e.wall_jumps + e.dashes + e.prejump_failures + e.restarts;
+    // Reject an implausibly large sum of monotonic tally deltas (counter
+    // inflation). Distance is budgeted separately — its plausible magnitude
+    // (units, not events) would otherwise eat the whole allowance.
+    const metricSum = (e) => e.wall_jumps + e.dashes + e.prejump_failures + e.restarts + e.strafes;
     const totalTally =
       clean.reduce((n, r) => n + (r.attempts != null ? r.attempts : 1) + metricSum(r), 0) +
       cleanAttempts.reduce((n, a) => n + a.count + metricSum(a), 0);
     if (totalTally > MAX_TALLY_PER_REQUEST) {
       return res.status(400).json({ error: `implausible counter totals (max ${MAX_TALLY_PER_REQUEST} per request)` });
     }
+    const totalDistance =
+      clean.reduce((n, r) => n + r.distance, 0) + cleanAttempts.reduce((n, a) => n + a.distance, 0);
+    if (totalDistance > MAX_DISTANCE_PER_REQUEST) {
+      return res.status(400).json({ error: `implausible distance total (max ${MAX_DISTANCE_PER_REQUEST} per request)` });
+    }
 
     try {
-      const counts = await race.ingest({
+      // playerIds (raw ids the batch touched) stays out of the HTTP response —
+      // it only feeds the achievements pass below.
+      const { playerIds = [], ...counts } = await race.ingest({
         version,
         map: map.toLowerCase(),
         records: clean,
@@ -1132,6 +1252,13 @@ api.post(
         // recomputes it. `map` already carries the effective name (incl. any
         // "-reversed" variant the game reported under). ranksCacheKey lowercases.
         invalidate(ranksCacheKey(map));
+      }
+      // Live finishes may complete achievement rules even when no PB changed,
+      // so this triggers on every racelog batch (topscores re-syncs excluded —
+      // they replay existing records on an interval).
+      if (source === "racelog" && playerIds.length) {
+        for (const pid of playerIds) pendingAchPlayers.add(pid);
+        scheduleAchievementEval();
       }
       res.json(counts);
     } catch (e) {
@@ -1664,7 +1791,7 @@ admin.get("/flags", requireAuth, wrap(async (req, res) => {
   sendAdmin(res, "Flag queue", `
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
-      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a>` : ""} · <a href="/admin/account">account</a></p>
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a>` : ""} · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
 }));
 
@@ -2106,6 +2233,316 @@ admin.post("/announcements", requireAdmin, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   await race.setSetting("announcements", sanitizeAnnouncements(req.body && req.body.text), req.session.username);
   res.redirect(303, "/admin/announcements?ok=1");
+}));
+
+// --- Achievements (admin + moderator) ---
+// Definitions are composed from the vetted rule catalog (web/achievements.js)
+// and created INACTIVE; the preview page dry-runs "who would earn this right
+// now?" before an admin flips it on. Activation triggers a full retroactive
+// evaluation, then the post-ingest pass + daily sweep keep awards current.
+
+function fmtNumAdmin(n) {
+  return (Number(n) || 0).toLocaleString("en-US");
+}
+
+// One kind's parameter inputs, hidden/shown by the kind <select> below. Field
+// names are namespaced per kind (p_<kind>_<key>) so switching kinds never
+// bleeds a value across.
+function achParamFieldsHtml(kindKey, spec, rule) {
+  const cur = rule && rule.kind === kindKey ? rule : {};
+  const fields = spec.params
+    .map((f) => {
+      const name = `p_${kindKey}_${f.key}`;
+      const val = cur[f.key];
+      if (f.type === "bool") {
+        return `<label style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="${name}" style="width:auto" ${val ? "checked" : ""}> ${escHtml(f.label)}</label>`;
+      }
+      if (f.type === "select") {
+        const opts = f.options
+          .map((o) => `<option value="${escHtml(o.value)}" ${val === o.value ? "selected" : ""}>${escHtml(o.label)}</option>`)
+          .join("");
+        return `<label>${escHtml(f.label)}</label><select name="${name}">${opts}</select>`;
+      }
+      const mode = f.type === "int" ? `inputmode="numeric"` : f.type === "pct" ? `inputmode="decimal"` : "";
+      return `<label>${escHtml(f.label)}${f.optional ? ` <span style="color:#8f857a">(optional)</span>` : ""}</label>
+        <input name="${name}" value="${val != null ? escHtml(String(val)) : ""}" ${mode} maxlength="128">`;
+    })
+    .join("");
+  return `<div class="achkind" data-kind="${escHtml(kindKey)}" data-windows="${spec.windows.join(",")}">
+    <p class="sub" style="margin:8px 0 0">${escHtml(spec.help || "")}</p>${fields}</div>`;
+}
+
+// The create/edit form. The inline script (same no-template-literal idiom as
+// the announcements preview) shows only the chosen kind's params and disables
+// time-window options the kind doesn't support; validateDefinition re-checks
+// everything server-side regardless.
+function achFormHtml(session, def, action) {
+  const rule = def ? def.rule : null;
+  const curKind = rule && Object.prototype.hasOwnProperty.call(RULE_KINDS, rule.kind) ? rule.kind : Object.keys(RULE_KINDS)[0];
+  const kindOpts = Object.entries(RULE_KINDS)
+    .map(([k, s]) => `<option value="${k}" ${k === curKind ? "selected" : ""}>${escHtml(s.label)}</option>`)
+    .join("");
+  const winOpts = Object.entries(WINDOWS)
+    .map(([k, label]) => `<option value="${k}" ${def && def.time_window === k ? "selected" : ""}>${escHtml(label)}</option>`)
+    .join("");
+  const tierOpts = TIERS.map((t) => `<option value="${t}" ${def && def.tier === t ? "selected" : ""}>${t}</option>`).join("");
+  const paramBlocks = Object.entries(RULE_KINDS)
+    .map(([k, s]) => achParamFieldsHtml(k, s, rule))
+    .join("");
+  return `
+  <form class="card" method="post" action="${action}" style="max-width:720px">
+    <input type="hidden" name="_csrf" value="${escHtml(session.csrf)}">
+    <label for="atitle">Title (shown to players)</label>
+    <input id="atitle" name="title" maxlength="120" required value="${def ? escHtml(def.title) : ""}">
+    <label for="aslug">Slug (a–z, 0–9, dashes · blank = derived from the title)</label>
+    <input id="aslug" name="slug" maxlength="64" value="${def ? escHtml(def.slug) : ""}">
+    <label for="adesc">Description (shown to players)</label>
+    <textarea id="adesc" name="description" rows="2" maxlength="500">${def ? escHtml(def.description) : ""}</textarea>
+    <label for="atier">Tier</label>
+    <select id="atier" name="tier">${tierOpts}</select>
+    <label for="akind">Rule</label>
+    <select id="akind" name="kind">${kindOpts}</select>
+    ${paramBlocks}
+    <label for="awindow">Time window</label>
+    <select id="awindow" name="window">${winOpts}</select>
+    <label style="display:flex;align-items:center;gap:8px;margin:12px 0 0"><input type="checkbox" name="repeatable" style="width:auto" ${def && def.repeatable ? "checked" : ""}> Repeatable — earnable again each calendar month / day (windowed rules only)</label>
+    <label style="display:flex;align-items:center;gap:8px;margin:10px 0 0"><input type="checkbox" name="hidden" style="width:auto" ${def && def.hidden ? "checked" : ""}> Hidden — players only see it once they earn it</label>
+    <div class="actions"><button class="primary" type="submit">${def ? "Save changes" : "Create (inactive)"}</button></div>
+  </form>
+  <script>
+(function(){
+  var sel=document.getElementById("akind"), winSel=document.getElementById("awindow");
+  if(!sel||!winSel)return;
+  function upd(){
+    var k=sel.value, blocks=document.querySelectorAll(".achkind"), allowed="";
+    for(var i=0;i<blocks.length;i++){
+      var on=blocks[i].getAttribute("data-kind")===k;
+      blocks[i].style.display=on?"":"none";
+      if(on)allowed=blocks[i].getAttribute("data-windows")||"";
+    }
+    var list=allowed.split(","), opts=winSel.querySelectorAll("option"), anySel=false;
+    for(var j=0;j<opts.length;j++){
+      var ok=list.indexOf(opts[j].value)>=0;
+      opts[j].disabled=!ok;
+      if(!ok&&opts[j].selected)opts[j].selected=false;
+      if(opts[j].selected&&!opts[j].disabled)anySel=true;
+    }
+    if(!anySel){for(var m=0;m<opts.length;m++){if(!opts[m].disabled){opts[m].selected=true;break;}}}
+  }
+  sel.addEventListener("change",upd);upd();
+})();
+  </script>`;
+}
+
+// Pull the chosen kind's namespaced params back out of a form body.
+function achInput(body) {
+  const kind = String((body && body.kind) || "");
+  const params = {};
+  if (Object.prototype.hasOwnProperty.call(RULE_KINDS, kind)) {
+    for (const f of RULE_KINDS[kind].params) params[f.key] = body[`p_${kind}_${f.key}`];
+  }
+  return {
+    title: body.title,
+    slug: body.slug,
+    description: body.description,
+    tier: String(body.tier || ""),
+    kind,
+    params,
+    window: String(body.window || ""),
+    repeatable: Boolean(body.repeatable),
+    hidden: Boolean(body.hidden),
+  };
+}
+
+admin.get("/achievements", requireAuth, wrap(async (req, res) => {
+  const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
+  const err = req.query.error ? `<div class="msg err">${escHtml(String(req.query.error))}</div>` : "";
+  const defs = await race.listAchievements();
+  const rows = defs
+    .map(
+      (d) => `<tr>
+        <td><a href="/admin/achievements/${d.id}">${escHtml(d.title)}</a>${d.hidden ? ` <span class="tag">hidden</span>` : ""}</td>
+        <td>${escHtml(d.tier)}</td>
+        <td class="meta">${escHtml(describeRule(d))}</td>
+        <td class="${d.active ? "st-resolved" : "st-dismissed"}">${d.active ? "active" : "inactive"}</td>
+        <td class="meta">${fmtNumAdmin(d.earners)}</td>
+        <td class="meta">${escHtml(d.updated_by || d.created_by || "")}</td>
+      </tr>`
+    )
+    .join("");
+  const body = defs.length
+    ? `<table><thead><tr><th>Achievement</th><th>Tier</th><th>Rule</th><th>Status</th><th>Earned by</th><th>By</th></tr></thead><tbody>${rows}</tbody></table>`
+    : `<div class="empty">No achievements defined yet.</div>`;
+  sendAdmin(res, "Achievements", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Achievements</h1>
+    <p class="sub">Admin-defined awards, evaluated automatically as players play ·
+      shown on player profiles and at <a href="/achievements" target="_blank" rel="noopener">/achievements ↗</a> ·
+      new definitions start <b>inactive</b> — preview who qualifies, then activate.</p>
+    ${done}${err}
+    <div class="actions" style="margin-bottom:14px"><a class="btn" href="/admin/achievements/new">+ New achievement</a></div>
+    ${body}`, req.session);
+}));
+
+admin.get("/achievements/new", requireAuth, wrap(async (req, res) => {
+  const err = req.query.error ? `<div class="msg err">${escHtml(String(req.query.error))}</div>` : "";
+  sendAdmin(res, "New achievement", `<div class="crumbs"><a href="/admin/achievements">← achievements</a></div>
+    <h1>New achievement</h1>
+    <p class="sub">Created inactive — you'll preview who qualifies before switching it on.</p>
+    ${err}${achFormHtml(req.session, null, "/admin/achievements/new")}`, req.session);
+}));
+
+admin.post("/achievements/new", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const v = validateDefinition(achInput(req.body));
+  if (v.error) return res.redirect(303, `/admin/achievements/new?error=${encodeURIComponent(v.error)}`);
+  const id = await race.createAchievement(v.value, req.session.username);
+  if (!id)
+    return res.redirect(303, `/admin/achievements/new?error=${encodeURIComponent("That slug is already taken.")}`);
+  res.redirect(303, `/admin/achievements/${id}?done=${encodeURIComponent("Created (inactive). Preview who qualifies, then activate.")}`);
+}));
+
+admin.get("/achievements/:id", requireAuth, wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  const def = id != null ? await race.getAchievement(id) : null;
+  if (!def) return res.status(404).type("text/plain").send("No such achievement.");
+  const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
+  const err = req.query.error ? `<div class="msg err">${escHtml(String(req.query.error))}</div>` : "";
+  const csrf = escHtml(req.session.csrf);
+  const earners = await race.listAchievementAwards(def.id, 50);
+  const earnerRows = earners
+    .map(
+      (e) => `<tr>
+        <td><a href="/player/${e.player_id}" target="_blank" rel="noopener">${escHtml(e.simplified || e.name)}</a></td>
+        <td class="meta">${e.period ? escHtml(e.period) : "—"}</td>
+        <td class="meta">${e.value != null ? fmtNumAdmin(e.value) : ""}</td>
+        <td class="meta">${fmtWhen(e.awarded_at)}</td>
+        <td><form class="inline" method="post" action="/admin/achievements/${def.id}/revoke">
+          <input type="hidden" name="_csrf" value="${csrf}">
+          <input type="hidden" name="player_id" value="${e.player_id}">
+          <input type="hidden" name="period" value="${escHtml(e.period)}">
+          <button class="danger" type="submit">Revoke</button>
+        </form></td>
+      </tr>`
+    )
+    .join("");
+  const statusCard = `<div class="card">
+    <div class="flag-head"><span class="mapname">${escHtml(def.title)}</span>
+      <span class="meta">${def.active ? "ACTIVE" : "inactive"} · ${escHtml(describeRule(def))}</span></div>
+    <div class="actions">
+      <a class="btn" href="/admin/achievements/${def.id}/preview">Preview who qualifies</a>
+      <form class="inline" method="post" action="/admin/achievements/${def.id}/active">
+        <input type="hidden" name="_csrf" value="${csrf}">
+        <input type="hidden" name="on" value="${def.active ? "0" : "1"}">
+        <button class="${def.active ? "warn" : "ok"}" type="submit">${def.active ? "Deactivate" : "Activate now"}</button>
+      </form>
+      ${earners.length === 0 ? `<form class="inline" method="post" action="/admin/achievements/${def.id}/delete">
+        <input type="hidden" name="_csrf" value="${csrf}">
+        <button class="danger" type="submit">Delete</button>
+      </form>` : ""}
+    </div>
+  </div>`;
+  sendAdmin(res, `Achievement · ${def.title}`, `<div class="crumbs"><a href="/admin/achievements">← achievements</a></div>
+    <h1>Edit achievement</h1>
+    ${done}${err}${statusCard}
+    ${achFormHtml(req.session, def, `/admin/achievements/${def.id}`)}
+    <h2>Recent earners${earners.length ? ` (${earners.length})` : ""}</h2>
+    ${earners.length
+      ? `<table><thead><tr><th>Player</th><th>Period</th><th>Value</th><th>Awarded</th><th></th></tr></thead><tbody>${earnerRows}</tbody></table>`
+      : `<div class="empty">Nobody has earned this yet.</div>`}`, req.session);
+}));
+
+admin.post("/achievements/:id", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null || !(await race.getAchievement(id)))
+    return res.status(404).type("text/plain").send("No such achievement.");
+  const v = validateDefinition(achInput(req.body));
+  if (v.error) return res.redirect(303, `/admin/achievements/${id}?error=${encodeURIComponent(v.error)}`);
+  const r = await race.updateAchievement(id, v.value, req.session.username);
+  if (r === false)
+    return res.redirect(303, `/admin/achievements/${id}?error=${encodeURIComponent("That slug is already taken.")}`);
+  res.redirect(303, `/admin/achievements/${id}?done=Saved.`);
+}));
+
+admin.get("/achievements/:id/preview", requireAuth, wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  const def = id != null ? await race.getAchievement(id) : null;
+  if (!def) return res.status(404).type("text/plain").send("No such achievement.");
+  const pv = await race.previewAchievement(id, { sample: 20 });
+  const csrf = escHtml(req.session.csrf);
+  const sampleRows = pv.sample
+    .map(
+      (s) => `<tr>
+        <td><a href="/player/${s.id}" target="_blank" rel="noopener">${escHtml(s.simplified || s.name)}</a></td>
+        <td class="meta">${s.value != null ? fmtNumAdmin(s.value) : ""}</td>
+      </tr>`
+    )
+    .join("");
+  sendAdmin(res, `Preview · ${def.title}`, `<div class="crumbs"><a href="/admin/achievements/${def.id}">← ${escHtml(def.title)}</a></div>
+    <h1>Who qualifies right now?</h1>
+    <p class="sub">${escHtml(describeRule(def))} · dry run — nothing has been awarded.</p>
+    <div class="card">
+      <div class="tags">
+        <span class="tag"><b>${fmtNumAdmin(pv.newlyQualifying)}</b> would be newly awarded</span>
+        <span class="tag"><b>${fmtNumAdmin(pv.alreadyHolding)}</b> already hold it</span>
+      </div>
+      ${def.active
+        ? `<p class="sub">This achievement is already active — the evaluator awards qualifiers automatically.</p>`
+        : `<div class="actions"><form class="inline" method="post" action="/admin/achievements/${def.id}/active">
+            <input type="hidden" name="_csrf" value="${csrf}">
+            <input type="hidden" name="on" value="1">
+            <button class="ok" type="submit">Looks right — activate</button>
+          </form></div>`}
+    </div>
+    ${pv.sample.length
+      ? `<h2>Sample of the newly qualifying (${pv.sample.length} of ${fmtNumAdmin(pv.newlyQualifying)})</h2>
+         <table><thead><tr><th>Player</th><th>Value</th></tr></thead><tbody>${sampleRows}</tbody></table>`
+      : `<div class="empty">Nobody newly qualifies right now.</div>`}`, req.session);
+}));
+
+admin.post("/achievements/:id/active", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  const def = id != null ? await race.getAchievement(id) : null;
+  if (!def) return res.status(404).type("text/plain").send("No such achievement.");
+  const on = req.body.on === "1";
+  await race.setAchievementActive(id, on, req.session.username);
+  recordEvent(null, `achievement "${def.slug}" ${on ? "activated" : "deactivated"} by ${req.session.username}`, "system");
+  if (on) {
+    // Retroactive pass in the background: everyone already qualifying gets the
+    // award now instead of at the next ingest/daily sweep.
+    race
+      .evaluateAchievements(null)
+      .then((n) => {
+        if (n) recordEvent(null, `achievements: ${n} award${n === 1 ? "" : "s"} on activation of "${def.slug}"`, "system");
+      })
+      .catch((e) => console.error("activation evaluation failed:", e?.message ?? e));
+  }
+  res.redirect(303, `/admin/achievements/${id}?done=${encodeURIComponent(on ? "Activated — retroactive awards are being applied." : "Deactivated. Existing awards are kept.")}`);
+}));
+
+admin.post("/achievements/:id/delete", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(404).type("text/plain").send("No such achievement.");
+  const r = await race.deleteAchievement(id);
+  if (!r)
+    return res.redirect(303, `/admin/achievements/${id}?error=${encodeURIComponent("Not deleted — it has been earned. Deactivate (and hide) it instead.")}`);
+  res.redirect(303, `/admin/achievements?done=Deleted.`);
+}));
+
+admin.post("/achievements/:id/revoke", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  const playerId = asInt(req.body.player_id);
+  if (id == null || playerId == null) return res.status(400).type("text/plain").send("Bad revoke request.");
+  const r = await race.revokeAward(id, playerId, typeof req.body.period === "string" ? req.body.period : "");
+  recordEvent(null, `achievement award revoked (ach ${id}, player ${playerId}) by ${req.session.username}`, "system");
+  res.redirect(303, `/admin/achievements/${id}?done=${encodeURIComponent(
+    r
+      ? "Award revoked. Note: if the player still qualifies on the underlying data, the evaluator will re-award it — fix the data (or deactivate the achievement) for a permanent removal."
+      : "Nothing to revoke."
+  )}`);
 }));
 
 // --- Account (self-service password change) ---

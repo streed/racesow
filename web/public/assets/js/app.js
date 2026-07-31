@@ -91,6 +91,16 @@ function fmtNum(n) {
   return (n || 0).toLocaleString("en-US");
 }
 
+/* game units -> compact distance, e.g. 12500 -> "12.5k u", 3200000 -> "3.2M u" */
+function fmtDist(u) {
+  if (u == null) return "—";
+  const n = Number(u);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B u";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M u";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "k u";
+  return fmtNum(n) + " u";
+}
+
 /* bytes -> human size, e.g. 5242880 -> "5.0 MB" */
 function fmtBytes(n) {
   if (n == null || isNaN(n)) return "—";
@@ -577,6 +587,96 @@ function strafeQualityCard(history) {
         ariaLabel: `Air-strafe quality over the last 30 days (daily average line with min–max band), ${history[0].day} to ${latest.day}`,
       })}
     </div>`;
+}
+
+/* ---- achievements (profile badges + progress + directory) --------------- */
+const ACH_TIER_ORDER = ["legend", "gold", "silver", "bronze"];
+const ACH_WINDOW_TEXT = {
+  lifetime: "all-time",
+  month: "each calendar month",
+  day: "in a single day",
+  rolling30: "over a rolling 30 days",
+};
+
+/* Format a progress/award value by the server's display hint. */
+function achValue(v, format) {
+  if (v == null) return "—";
+  if (format === "pct-bp") return (v / 100).toFixed(1) + "%"; // basis points
+  if (format === "ms") return fmtTime(v);
+  if (format === "rank") return "#" + fmtNum(v);
+  if (format === "ups") return fmtNum(v) + " ups";
+  return fmtNum(v);
+}
+
+/* Progress fraction 0..100. better:'low' rules (beat a time, reach a rank)
+ * count down toward the target instead of up. */
+function achPct(p) {
+  if (p.value == null || !p.target) return 0;
+  if (p.better === "low") return p.value <= p.target ? 100 : Math.max(0, Math.min(100, (p.target / p.value) * 100));
+  return Math.max(0, Math.min(100, (p.value / p.target) * 100));
+}
+
+/* Earned badges ride the main profile payload; progress toward the rest is
+ * fetched lazily on first open (same shape as the SR breakdown dropdown). */
+function achievementsCard(list) {
+  const earned = list || [];
+  const pills = earned
+    .map((a) => {
+      const when = a.awarded_at ? new Date(a.awarded_at * 1000).toISOString().slice(0, 10) : "";
+      const tip = `${a.description || a.title}${a.period ? ` · ${a.period}` : ""}${when ? ` · earned ${when}` : ""}`;
+      return `<span class="ach ${esc(a.tier)}" title="${esc(tip)}">${esc(a.title)}</span>`;
+    })
+    .join("");
+  return `
+    <div class="page-title" style="font-size:20px">ACHIEVEMENTS <span class="accent">·</span> ${earned.length ? fmtNum(earned.length) + " earned" : "none yet"}</div>
+    <div class="panel achpanel">
+      ${earned.length
+        ? `<div class="achlist">${pills}</div>`
+        : `<div class="srhist-empty">No achievements earned yet — <a data-nav="#/achievements">see what's up for grabs</a>.</div>`}
+      <details class="srbd" id="achbd">
+        <summary><span class="srbd-caret">▸</span> Progress toward the rest</summary>
+        <div class="srbd-body"><div class="srbd-note">Loading…</div></div>
+      </details>
+    </div>`;
+}
+
+function renderAchProgress(d) {
+  const items = (d && d.progress) || [];
+  if (!items.length)
+    return `<div class="srbd-note">Nothing left to chase — every visible achievement is earned, or none are defined yet. <a data-nav="#/achievements">Browse the directory</a>.</div>`;
+  return items
+    .map((p) => {
+      const pct = achPct(p);
+      return `
+      <div class="achprog">
+        <div class="achprog-head">
+          <span class="ach ${esc(p.tier)} sm">${esc(p.title)}</span>
+          <span class="achprog-nums">${achValue(p.value, p.format)} <span class="muted">/ ${achValue(p.target, p.format)}</span></span>
+        </div>
+        ${p.description ? `<div class="achprog-desc muted">${esc(p.description)}</div>` : ""}
+        <div class="achbar"><div class="achbar-fill" style="width:${pct.toFixed(1)}%"></div></div>
+      </div>`;
+    })
+    .join("");
+}
+
+// Lazy-load on first open; a failed fetch stays retryable (close + reopen).
+function wireAchievements(playerId) {
+  const det = document.getElementById("achbd");
+  if (!det) return;
+  let loaded = false;
+  det.addEventListener("toggle", async () => {
+    if (!det.open || loaded) return;
+    loaded = true;
+    track("View achievements progress");
+    const body = det.querySelector(".srbd-body");
+    try {
+      body.innerHTML = renderAchProgress(await api(`/players/${playerId}/achievements`));
+    } catch (e) {
+      loaded = false;
+      body.innerHTML = `<div class="srbd-note">Couldn't load progress (${esc(e.message)}). Close and reopen to retry.</div>`;
+    }
+  });
 }
 
 /* ---- generic sortable header ---- */
@@ -1073,6 +1173,9 @@ async function viewPlayer(id, params) {
       <div class="s"><div class="n">${fmtNum(d.metrics.prejumpFailures)}</div><div class="l">Prejump Fails</div></div>
       <div class="s"><div class="n">${fmtNum(d.metrics.restarts)}</div><div class="l">Restarts</div></div>
       ${d.metrics.strafeQuality != null ? `<div class="s" title="Average accel efficiency across your finished runs — how close your strafing stays to the ideal angle, sampled only while actually strafing (forward + left or right) at 600+ ups (higher is better)"><div class="n">${(Math.round(d.metrics.strafeQuality * 10) / 10).toFixed(1)}%</div><div class="l">Strafe Quality</div></div>` : ""}
+      ${d.metrics.distance ? `<div class="s" title="Total distance travelled while racing, in game units"><div class="n">${fmtDist(d.metrics.distance)}</div><div class="l">Distance Raced</div></div>` : ""}
+      ${d.metrics.strafes ? `<div class="s" title="Air-strafe segments counted while racing — genuine strafing (forward + left or right, mouse turning with it) at 600+ ups"><div class="n">${fmtNum(d.metrics.strafes)}</div><div class="l">Strafes</div></div>` : ""}
+      ${d.metrics.maxSpeed ? `<div class="s" title="Fastest speed hit in any finished run (ups)"><div class="n">${fmtNum(d.metrics.maxSpeed)}</div><div class="l">Top Speed</div></div>` : ""}
     </div>` : ""}
 
     <div class="grid-2">
@@ -1080,6 +1183,7 @@ async function viewPlayer(id, params) {
       <div>${strafeQualityCard(d.strafeHistory)}</div>
     </div>
 
+    ${achievementsCard(d.achievements)}
 
     ${d.recentFinishes && d.recentFinishes.length ? `
     <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> last 5</div>
@@ -1123,6 +1227,7 @@ async function viewPlayer(id, params) {
     );
   wireSort(`#/player/${id}`, state, ["map", "time", "rank", "attempts"]);
   wireSrBreakdown(d.id); // canonical id — the breakdown endpoint resolves either, but keep the link stable
+  wireAchievements(d.id);
   // (The address bar is already the clean /player/<id> path from pushState —
   // where the server-rendered OG tags for Discord/social unfurls live.)
 }
@@ -2103,6 +2208,51 @@ function viewColors() {
   });
 }
 
+/* ------------------------- achievements directory ------------------------ */
+// Every active achievement with rarity + recent earners. Hidden achievements
+// show as a masked card until somebody earns them.
+async function viewAchievements() {
+  loading();
+  const d = await api("/achievements");
+  const groups = ACH_TIER_ORDER.map((tier) => ({
+    tier,
+    items: (d.achievements || []).filter((a) => a.tier === tier),
+  })).filter((g) => g.items.length);
+
+  const card = (a) => {
+    const rarity = a.earners
+      ? `earned by ${fmtNum(a.earners)} of ${fmtNum(d.players)} ranked players (${(a.rarity * 100).toFixed(1)}%)`
+      : "nobody has earned this yet";
+    if (a.hidden)
+      return `<div class="panel achdir">
+        <div class="achdir-head"><span class="ach ${esc(a.tier)}">???</span><span class="muted achdir-meta">${rarity}</span></div>
+        <div class="muted">Hidden achievement — earn it to reveal what it is.</div>
+      </div>`;
+    const recent = (a.recent || [])
+      .map((r) => `<a data-nav="#/player/${r.id}">${wname(r.name)}</a>`)
+      .join('<span class="sep">·</span>');
+    return `<div class="panel achdir">
+      <div class="achdir-head"><span class="ach ${esc(a.tier)}">${esc(a.title)}</span><span class="muted achdir-meta">${rarity}</span></div>
+      ${a.description ? `<div class="achdir-desc">${esc(a.description)}</div>` : ""}
+      <div class="muted achdir-meta">${esc(ACH_WINDOW_TEXT[a.window] || "all-time")}${a.repeatable ? " · repeatable" : ""}</div>
+      ${recent ? `<div class="achdir-recent muted">recently earned by ${recent}</div>` : ""}
+    </div>`;
+  };
+
+  app.innerHTML = `
+    <div class="page-title">ACHIEVEMENTS</div>
+    <p class="page-sub">Awards earned automatically as you race, across every server. Earned badges show on your player profile, along with your progress toward the rest.</p>
+    ${groups.length
+      ? groups
+          .map(
+            (g) => `
+        <div class="page-title" style="font-size:20px">${g.tier.toUpperCase()}</div>
+        <div class="achdir-grid">${g.items.map(card).join("")}</div>`
+          )
+          .join("")
+      : `<div class="empty">No achievements have been defined yet — check back soon.</div>`}`;
+}
+
 async function router() {
   stopLiveRefresh();
   stopReplay();
@@ -2122,6 +2272,7 @@ async function router() {
     else if (path.startsWith("/demo/")) await viewDemosMap(parseInt(path.split("/")[2], 10));
     else if (path === "/players") await viewPlayers(params);
     else if (path === "/compare") await viewCompare(params);
+    else if (path === "/achievements") await viewAchievements();
     else if (path === "/live") await viewLive();
     else if (path === "/about") await viewAbout();
     else if (path === "/colors") viewColors();

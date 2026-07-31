@@ -67,6 +67,12 @@ uint[] pendingWallJumps( maxClients );
 uint[] pendingDashes( maxClients );
 uint[] pendingPrejumpFails( maxClients );
 uint[] pendingRestarts( maxClients );
+// Distance travelled while racing (whole game units, fractional remainder is
+// carried on the Player — see sampleDistance) and discrete strafe segments
+// counted by sampleStrafe. Same flush-and-zero delta model as the counters
+// above; the stats site sums them into lifetime totals.
+uint[] pendingDistance( maxClients );
+uint[] pendingStrafes( maxClients );
 
 void RACE_AttemptStarted( Player @player )
 {
@@ -88,6 +94,17 @@ void RACE_PrejumpFailed( Player @player )
     pendingPrejumpFails[ player.client.playerNum ]++;
 }
 
+void RACE_AddDistance( Player @player, int units )
+{
+    if ( units > 0 )
+        pendingDistance[ player.client.playerNum ] += uint( units );
+}
+
+void RACE_Strafe( Player @player )
+{
+    pendingStrafes[ player.client.playerNum ]++;
+}
+
 void RACE_Restarted( Client @client )
 {
     if ( @client == null )
@@ -103,6 +120,8 @@ void RACE_ClearMetrics( int playerNum )
     pendingDashes[ playerNum ] = 0;
     pendingPrejumpFails[ playerNum ] = 0;
     pendingRestarts[ playerNum ] = 0;
+    pendingDistance[ playerNum ] = 0;
+    pendingStrafes[ playerNum ] = 0;
 }
 
 // Flush one client's unreported starts without a finish report.
@@ -116,10 +135,12 @@ void RACE_FlushAttempts( Client @client )
     uint da = pendingDashes[ pn ];
     uint pj = pendingPrejumpFails[ pn ];
     uint rs = pendingRestarts[ pn ];
+    uint di = pendingDistance[ pn ];
+    uint st = pendingStrafes[ pn ];
     // Nothing to flush unless at least one counter is non-zero. Movement metrics
     // ride the same flush as attempts, but a lone /kill (no counted start) can
     // leave restarts pending with zero attempts — so gate on all of them.
-    if ( n == 0 && wj == 0 && da == 0 && pj == 0 && rs == 0 )
+    if ( n == 0 && wj == 0 && da == 0 && pj == 0 && rs == 0 && di == 0 && st == 0 )
         return;
     pendingAttempts[ pn ] = 0;
     RACE_ClearMetrics( pn );
@@ -133,7 +154,7 @@ void RACE_FlushAttempts( Client @client )
     String mapName = RACE_EffectiveMapName( player !is null && player.reversed );
     RS_ApiReportAttempts( rsApiUrl.string, rsApiToken.string, rsApiVersion.string,
             mapName, client.name, client.getMMLogin(), int( n ),
-            int( wj ), int( da ), int( pj ), int( rs ) );
+            int( wj ), int( da ), int( pj ), int( rs ), int( di ), int( st ) );
 }
 
 // Map is ending: flush everyone still holding uncounted starts (the script
@@ -144,7 +165,8 @@ void RACE_FlushAllAttempts()
     {
         if ( pendingAttempts[ i ] == 0 && pendingWallJumps[ i ] == 0
                 && pendingDashes[ i ] == 0 && pendingPrejumpFails[ i ] == 0
-                && pendingRestarts[ i ] == 0 )
+                && pendingRestarts[ i ] == 0 && pendingDistance[ i ] == 0
+                && pendingStrafes[ i ] == 0 )
             continue;
         Client@ client = G_GetClient( i );
         if ( @client == null || client.state() < CS_SPAWNED )
@@ -190,11 +212,16 @@ void RACE_LogFinish( Player @player )
     uint dashes = pendingDashes[ pn ];
     uint prejumpFails = pendingPrejumpFails[ pn ];
     uint restarts = pendingRestarts[ pn ];
+    uint distance = pendingDistance[ pn ];
+    uint strafes = pendingStrafes[ pn ];
     pendingAttempts[ pn ] = 0;
     RACE_ClearMetrics( pn );
 
     if ( rsApiUrl.string.length() > 0 )
     {
+        // maxSpeed/startSpeed are THIS run's snapshots (completeRace calls in
+        // here before it resets them); distance/strafes are flush-period deltas
+        // like the movement counters.
         RS_ApiReportRace( rsApiUrl.string, rsApiToken.string, rsApiVersion.string,
                 mapName,
                 player.current_recordTime.ident.playerName,
@@ -204,7 +231,10 @@ void RACE_LogFinish( Player @player )
                 cps,
                 int( wallJumps ), int( dashes ),
                 int( prejumpFails ), int( restarts ),
-                player.strafeQualityBasisPoints() );
+                player.strafeQualityBasisPoints(),
+                int( player.maxSpeed ),
+                player.raceStartSpeed,
+                int( distance ), int( strafes ) );
     }
 
     bool ok = G_AppendToFile( RACELOG_FILE, "R1\t" + mapName

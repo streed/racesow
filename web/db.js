@@ -34,6 +34,7 @@ import { fileURLToPath } from "node:url";
 import { runner as pgMigrateRunner } from "node-pg-migrate";
 import { tokenToCode } from "./weapons.js";
 import { buildMatcher, censorName, normalizeTerm } from "./censor.js";
+import { qualifyQuery, progressQuery, periodKey, targetOf, displayMeta } from "./achievements.js";
 
 // Async (thread-pool) compression for the request/ingest paths — the sync
 // variants block the event loop for the duration of an 8MB trajectory.
@@ -2020,7 +2021,8 @@ class RaceDB {
     // existed contribute 0.
     const mrow = await this.one(
       `SELECT COALESCE(SUM(wall_jumps),0) wj, COALESCE(SUM(dashes),0) da,
-              COALESCE(SUM(prejump_failures),0) pj, COALESCE(SUM(restarts),0) rs
+              COALESCE(SUM(prejump_failures),0) pj, COALESCE(SUM(restarts),0) rs,
+              COALESCE(SUM(distance),0) di, COALESCE(SUM(strafes),0) st
        FROM run_tally WHERE ${groupWhere}`,
       [canonId]
     );
@@ -2029,7 +2031,13 @@ class RaceDB {
       dashes: num(mrow.da),
       prejumpFailures: num(mrow.pj),
       restarts: num(mrow.rs),
+      distance: num(mrow.di),
+      strafes: num(mrow.st),
     };
+    // Fastest speed hit in any finished run (ups). NULL until a server with the
+    // speed-reporting native delivers a finish — never a misleading 0.
+    const spRow = await this.one(`SELECT MAX(max_speed) ms FROM finish WHERE ${groupWhere}`, [canonId]);
+    metrics.maxSpeed = spRow && spRow.ms != null ? num(spRow.ms) : null;
 
     // Air-strafe quality (accel efficiency, stored per finish as basis points
     // 0..10000). Lifetime average across every nick variant for the headline
@@ -2170,6 +2178,10 @@ class RaceDB {
       finishes,
       attempts,
       metrics,
+      // Earned awards ride the main profile payload so badges render without a
+      // second fetch; progress toward unearned ones is the lazy
+      // /players/:id/achievements endpoint (like the SR breakdown).
+      achievements: await this._earnedAchievements(canonId),
       recentFinishes: await this.recentFinishes({ limit: 5, playerId: canonId }),
       versions,
       records: { total, limit: lim, offset: off, rows: records },
@@ -3217,6 +3229,405 @@ class RaceDB {
   }
 
   // ------------------------------------------------------------------------
+  // Achievements
+  // ------------------------------------------------------------------------
+  // Definitions live in `achievement` (rule kinds + params from
+  // web/achievements.js — see the catalog there); awards in
+  // `player_achievement`, keyed by canonical player id with an idempotent PK
+  // insert, so evaluation can run repeatedly (both replicas, every ingest, the
+  // daily sweep) without double-awarding. Reads span the canonical group like
+  // sr_history reads do, in case the group representative ever flips.
+
+  // Normalise an achievement row (pg BIGINTs -> numbers; rule arrives as an
+  // object from jsonb).
+  _achRow(r) {
+    return {
+      id: num(r.id),
+      slug: r.slug,
+      title: r.title,
+      description: r.description,
+      tier: r.tier,
+      rule: r.rule,
+      time_window: r.time_window,
+      repeatable: r.repeatable,
+      hidden: r.hidden,
+      active: r.active,
+      created_at: num(r.created_at),
+      created_by: r.created_by,
+      updated_at: r.updated_at != null ? num(r.updated_at) : null,
+      updated_by: r.updated_by,
+      earners: r.earners != null ? num(r.earners) : undefined,
+    };
+  }
+
+  async listAchievements() {
+    return (
+      await this.all(
+        `SELECT a.*, COALESCE(c.n, 0) AS earners
+         FROM achievement a
+         LEFT JOIN (
+           SELECT pa.achievement_id, COUNT(DISTINCT COALESCE(p.canonical_id, p.id)) AS n
+           FROM player_achievement pa JOIN player p ON p.id = pa.player_id
+           GROUP BY 1
+         ) c ON c.achievement_id = a.id
+         ORDER BY a.active DESC, lower(a.title)`
+      )
+    ).map((r) => this._achRow(r));
+  }
+
+  async getAchievement(id) {
+    const r = await this.one("SELECT * FROM achievement WHERE id = $1", [id]);
+    return r ? this._achRow(r) : null;
+  }
+
+  // v is validateDefinition().value. Returns the new id, or null on a slug
+  // collision (the only UNIQUE besides the PK).
+  async createAchievement(v, by, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.one(
+      `INSERT INTO achievement (slug, title, description, tier, rule, time_window, repeatable, hidden, active, created_at, created_by)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, FALSE, $9, $10)
+       ON CONFLICT (slug) DO NOTHING RETURNING id`,
+      [v.slug, v.title, v.description, v.tier, JSON.stringify(v.rule), v.time_window, v.repeatable, v.hidden, now, by || null]
+    );
+    return r ? num(r.id) : null;
+  }
+
+  // Returns rows updated (0 = no such id); false on a slug collision.
+  async updateAchievement(id, v, by, now = Math.floor(Date.now() / 1000)) {
+    try {
+      const r = await this.pool.query(
+        `UPDATE achievement SET slug=$2, title=$3, description=$4, tier=$5, rule=$6::jsonb,
+                time_window=$7, repeatable=$8, hidden=$9, updated_at=$10, updated_by=$11
+         WHERE id = $1`,
+        [id, v.slug, v.title, v.description, v.tier, JSON.stringify(v.rule), v.time_window, v.repeatable, v.hidden, now, by || null]
+      );
+      return r.rowCount;
+    } catch (e) {
+      if (e.code === "23505") return false; // slug taken by another definition
+      throw e;
+    }
+  }
+
+  async setAchievementActive(id, active, by, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.pool.query(
+      "UPDATE achievement SET active = $2, updated_at = $3, updated_by = $4 WHERE id = $1",
+      [id, active, now, by || null]
+    );
+    return r.rowCount;
+  }
+
+  // Deleting is only allowed while nothing has been awarded — once earned, a
+  // definition is history (deactivate + hide instead).
+  async deleteAchievement(id) {
+    const r = await this.pool.query(
+      `DELETE FROM achievement a WHERE a.id = $1
+       AND NOT EXISTS (SELECT 1 FROM player_achievement pa WHERE pa.achievement_id = a.id)`,
+      [id]
+    );
+    return r.rowCount;
+  }
+
+  // Dry run for the admin form: who would this definition award RIGHT NOW,
+  // split into already-holding vs newly-qualifying, with a censored name
+  // sample. Read-only — nothing is inserted.
+  async previewAchievement(id, { sample = 20 } = {}) {
+    const def = await this.getAchievement(id);
+    if (!def) return null;
+    const q = qualifyQuery(def);
+    const rows = await this.all(q.sql, q.params);
+    const period = periodKey(def);
+    const holders = new Set(
+      (
+        await this.all(
+          `SELECT DISTINCT COALESCE(p.canonical_id, p.id) AS cid
+           FROM player_achievement pa JOIN player p ON p.id = pa.player_id
+           WHERE pa.achievement_id = $1 AND pa.period = $2`,
+          [def.id, period]
+        )
+      ).map((r) => num(r.cid))
+    );
+    const fresh = rows.filter((r) => !holders.has(num(r.player_id)));
+    const ids = fresh.slice(0, sample).map((r) => num(r.player_id));
+    const nameById = new Map();
+    if (ids.length) {
+      for (const n of await this.all("SELECT id, name, simplified FROM player WHERE id = ANY($1)", [ids])) {
+        nameById.set(num(n.id), this._censorNamed({ id: num(n.id), name: n.name, simplified: n.simplified }, num(n.id)));
+      }
+    }
+    return {
+      total: rows.length,
+      alreadyHolding: rows.length - fresh.length,
+      newlyQualifying: fresh.length,
+      sample: fresh.slice(0, sample).map((r) => ({
+        ...(nameById.get(num(r.player_id)) || { id: num(r.player_id), name: "?", simplified: "?" }),
+        value: r.value == null ? null : Number(r.value),
+      })),
+    };
+  }
+
+  // Evaluate every ACTIVE definition and award qualifiers. playerIds (raw or
+  // canonical ids — they're mapped to canonical here) restricts the pass to an
+  // ingest batch's players; null sweeps the whole field. Idempotent; returns
+  // the number of NEW awards. A single broken definition logs and skips rather
+  // than failing the pass.
+  async evaluateAchievements(playerIds = null, now = new Date()) {
+    let cids = null;
+    if (playerIds) {
+      if (!playerIds.length) return 0;
+      cids = (
+        await this.all("SELECT DISTINCT COALESCE(canonical_id, id) AS cid FROM player WHERE id = ANY($1)", [playerIds])
+      ).map((r) => num(r.cid));
+      if (!cids.length) return 0;
+    }
+    const defs = (await this.all("SELECT * FROM achievement WHERE active")).map((r) => this._achRow(r));
+    let awarded = 0;
+    for (const def of defs) {
+      let rows;
+      try {
+        const q = qualifyQuery(def, { playerIds: cids, now });
+        rows = await this.all(q.sql, q.params);
+      } catch (e) {
+        console.error(`achievement "${def.slug}" evaluation failed:`, e?.message ?? e);
+        continue;
+      }
+      if (rows.length) awarded += await this._insertAwards(def, periodKey(def, now), rows, Math.floor(now.getTime() / 1000));
+    }
+    return awarded;
+  }
+
+  async _insertAwards(def, period, rows, nowSec) {
+    const pids = rows.map((r) => num(r.player_id));
+    const fids = rows.map((r) => (r.finish_id == null ? null : num(r.finish_id)));
+    const vals = rows.map((r) => (r.value == null ? null : Math.round(Number(r.value))));
+    const r = await this.pool.query(
+      `INSERT INTO player_achievement (achievement_id, player_id, period, awarded_at, finish_id, detail)
+       SELECT $1, t.pid, $2, $3, t.fid, jsonb_build_object('value', t.val)
+       FROM unnest($4::bigint[], $5::bigint[], $6::bigint[]) AS t(pid, fid, val)
+       WHERE NOT EXISTS (
+         -- The same canonical GROUP already holds this award under another nick
+         -- id (representative flip after rebuild-canonical) — don't re-award.
+         SELECT 1 FROM player_achievement pa JOIN player p2 ON p2.id = pa.player_id
+         WHERE pa.achievement_id = $1 AND pa.period = $2 AND pa.player_id <> t.pid
+           AND COALESCE(p2.canonical_id, p2.id) =
+               (SELECT COALESCE(canonical_id, id) FROM player WHERE id = t.pid)
+       )
+       ON CONFLICT DO NOTHING`,
+      [def.id, period, nowSec, pids, fids, vals]
+    );
+    return r.rowCount;
+  }
+
+  // Full-field pass, claimed AT MOST once per UTC day across both web replicas
+  // (same shape as snapshotSrHistory: in-memory memo -> cheap config probe ->
+  // advisory lock + re-check). The claim is written BEFORE evaluating: awards
+  // are idempotent and the post-ingest incremental pass runs continuously, so
+  // a crash mid-sweep just means the field catches up tomorrow.
+  async achievementsDailySweep(now = new Date()) {
+    const day = now.toISOString().slice(0, 10);
+    if (this._achSweepDay === day) return 0;
+    if ((await this.getConfig("ach_sweep_day")) === day) {
+      this._achSweepDay = day;
+      return 0;
+    }
+    const client = await this.pool.connect();
+    let claimed = false;
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(727411003)"); // distinct from aggregate + sr locks
+      const cur = await client.query("SELECT value FROM config WHERE key = 'ach_sweep_day'");
+      if (!cur.rows.length || cur.rows[0].value !== day) {
+        await client.query(
+          `INSERT INTO config (key, value) VALUES ('ach_sweep_day', $1)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+          [day]
+        );
+        claimed = true;
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+    this._achSweepDay = day;
+    if (!claimed) return 0;
+    return this.evaluateAchievements(null, now);
+  }
+
+  // Earned awards for one canonical group, newest first. DISTINCT ON keeps the
+  // EARLIEST award per (achievement, period) if a representative flip ever
+  // left duplicates across nick ids.
+  async _earnedAchievements(canonId) {
+    return (
+      await this.all(
+        `SELECT * FROM (
+           SELECT DISTINCT ON (pa.achievement_id, pa.period)
+             a.id, a.slug, a.title, a.description, a.tier, pa.period, pa.awarded_at
+           FROM player_achievement pa JOIN achievement a ON a.id = pa.achievement_id
+           WHERE pa.player_id IN (SELECT id FROM player WHERE canonical_id = $1)
+           ORDER BY pa.achievement_id, pa.period, pa.awarded_at ASC
+         ) e ORDER BY e.awarded_at DESC`,
+        [canonId]
+      )
+    ).map((r) => ({
+      id: num(r.id),
+      slug: r.slug,
+      title: r.title,
+      description: r.description,
+      tier: r.tier,
+      period: r.period,
+      awarded_at: num(r.awarded_at),
+    }));
+  }
+
+  // The profile achievements panel: earned awards + progress toward every
+  // active, visible, not-yet-earned definition (hidden ones stay invisible
+  // until earned). Lazy endpoint — a handful of small per-definition queries.
+  async playerAchievements(id) {
+    let canonId = id;
+    const c = await this.one("SELECT canonical_id FROM player WHERE id = $1", [id]);
+    if (c && c.canonical_id != null) canonId = num(c.canonical_id);
+    if (!(await this.one("SELECT 1 FROM player WHERE id = $1", [canonId]))) return null;
+
+    const earned = await this._earnedAchievements(canonId);
+    const now = new Date();
+    const earnedKey = new Set(earned.map((e) => `${e.id}:${e.period}`));
+    const defs = (
+      await this.all("SELECT * FROM achievement WHERE active AND NOT hidden ORDER BY lower(title)")
+    ).map((r) => this._achRow(r));
+
+    const progress = [];
+    for (const def of defs) {
+      if (earnedKey.has(`${def.id}:${periodKey(def, now)}`)) continue;
+      let value = null;
+      try {
+        const q = progressQuery(def, canonId, now);
+        const row = await this.one(q.sql, q.params);
+        if (row && row.value != null) value = Number(row.value);
+      } catch (e) {
+        console.error(`achievement "${def.slug}" progress failed:`, e?.message ?? e);
+        continue;
+      }
+      const meta = displayMeta(def);
+      progress.push({
+        id: def.id,
+        slug: def.slug,
+        title: def.title,
+        description: def.description,
+        tier: def.tier,
+        window: def.time_window,
+        repeatable: def.repeatable,
+        value,
+        target: targetOf(def),
+        format: meta.format,
+        better: meta.better,
+      });
+    }
+    return { earned, progress };
+  }
+
+  // The public /achievements directory: every active definition with how many
+  // players hold it (rarity) and its most recent earners. Hidden achievements
+  // come back masked — tier + earner count only — until a player earns them.
+  async achievementsDirectory() {
+    const players = num((await this.one("SELECT COUNT(*) c FROM standings")).c);
+    const defs = (
+      await this.all(
+        `SELECT a.*, COALESCE(c.n, 0) AS earners
+         FROM achievement a
+         LEFT JOIN (
+           SELECT pa.achievement_id, COUNT(DISTINCT COALESCE(p.canonical_id, p.id)) AS n
+           FROM player_achievement pa JOIN player p ON p.id = pa.player_id
+           GROUP BY 1
+         ) c ON c.achievement_id = a.id
+         WHERE a.active
+         ORDER BY CASE a.tier WHEN 'legend' THEN 0 WHEN 'gold' THEN 1 WHEN 'silver' THEN 2 ELSE 3 END,
+                  lower(a.title)`
+      )
+    ).map((r) => this._achRow(r));
+
+    const recent = await this.all(
+      `SELECT pa.achievement_id, pa.player_id, pa.awarded_at, p.name, p.simplified
+       FROM player_achievement pa
+       JOIN player p ON p.id = pa.player_id
+       JOIN achievement a ON a.id = pa.achievement_id
+       WHERE a.active
+       ORDER BY pa.awarded_at DESC LIMIT 60`
+    );
+    const recentByAch = new Map();
+    for (const r of recent) {
+      const aid = num(r.achievement_id);
+      const list = recentByAch.get(aid) || [];
+      if (list.length < 3) {
+        list.push(
+          this._censorNamed(
+            { id: num(r.player_id), name: r.name, simplified: r.simplified, awarded_at: num(r.awarded_at) },
+            num(r.player_id)
+          )
+        );
+        recentByAch.set(aid, list);
+      }
+    }
+
+    return {
+      players,
+      achievements: defs.map((d) => {
+        const base = {
+          id: d.id,
+          tier: d.tier,
+          earners: d.earners || 0,
+          rarity: players ? (d.earners || 0) / players : 0,
+          hidden: d.hidden,
+        };
+        if (d.hidden) return base; // masked: no title/description/rule until earned
+        return {
+          ...base,
+          slug: d.slug,
+          title: d.title,
+          description: d.description,
+          window: d.time_window,
+          repeatable: d.repeatable,
+          recent: recentByAch.get(d.id) || [],
+        };
+      }),
+    };
+  }
+
+  // Recent earners of one achievement, for the admin edit page (with revoke).
+  async listAchievementAwards(achievementId, limit = 50) {
+    return (
+      await this.all(
+        `SELECT pa.player_id, pa.period, pa.awarded_at, pa.detail, p.name, p.simplified
+         FROM player_achievement pa JOIN player p ON p.id = pa.player_id
+         WHERE pa.achievement_id = $1
+         ORDER BY pa.awarded_at DESC LIMIT $2`,
+        [achievementId, limit]
+      )
+    ).map((r) =>
+      this._censorNamed(
+        {
+          player_id: num(r.player_id),
+          period: r.period,
+          awarded_at: num(r.awarded_at),
+          value: r.detail && r.detail.value != null ? Number(r.detail.value) : null,
+          name: r.name,
+          simplified: r.simplified,
+        },
+        num(r.player_id)
+      )
+    );
+  }
+
+  async revokeAward(achievementId, playerId, period = "") {
+    const r = await this.pool.query(
+      "DELETE FROM player_achievement WHERE achievement_id = $1 AND player_id = $2 AND period = $3",
+      [achievementId, playerId, period]
+    );
+    return r.rowCount;
+  }
+
+  // ------------------------------------------------------------------------
   // Ingest
   // ------------------------------------------------------------------------
   // Same contract as the SQLite layer (see git history for the long-form
@@ -3274,6 +3685,9 @@ class RaceDB {
       );
 
       const counts = { inserted: 0, improved: 0, unchanged: 0 };
+      // Every player row this request touched (raw ids) — the caller feeds
+      // them to the post-ingest achievements pass.
+      const touched = new Set();
 
       // Bump the per-(player,map,version) counters: race starts plus the
       // movement/behaviour metrics (wall jumps, dashes, prejump-rejected starts,
@@ -3282,30 +3696,35 @@ class RaceDB {
       const bumpTally = (playerId, count, m = {}) =>
         client.query(
           `INSERT INTO run_tally (player_id, map_id, version_id, finishes, attempts, last_attempt,
-                                  wall_jumps, dashes, prejump_failures, restarts)
-           VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9)
+                                  wall_jumps, dashes, prejump_failures, restarts, distance, strafes)
+           VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11)
            ON CONFLICT (player_id, map_id, version_id)
            DO UPDATE SET attempts = run_tally.attempts + EXCLUDED.attempts,
                          last_attempt = EXCLUDED.last_attempt,
                          wall_jumps = run_tally.wall_jumps + EXCLUDED.wall_jumps,
                          dashes = run_tally.dashes + EXCLUDED.dashes,
                          prejump_failures = run_tally.prejump_failures + EXCLUDED.prejump_failures,
-                         restarts = run_tally.restarts + EXCLUDED.restarts`,
+                         restarts = run_tally.restarts + EXCLUDED.restarts,
+                         distance = run_tally.distance + EXCLUDED.distance,
+                         strafes = run_tally.strafes + EXCLUDED.strafes`,
           [
             playerId, mapRow.id, versionRow.id, count, now,
             m.wall_jumps || 0, m.dashes || 0, m.prejump_failures || 0, m.restarts || 0,
+            m.distance || 0, m.strafes || 0,
           ]
         );
 
       if (tally) {
         for (const a of attempts) {
           const playerId = await this._resolvePlayer(client, a);
+          touched.add(playerId);
           await bumpTally(playerId, a.count, a);
         }
       }
 
       for (const rec of records) {
         const playerId = await this._resolvePlayer(client, rec);
+        touched.add(playerId);
 
         if (tally) {
           await client.query(
@@ -3322,9 +3741,13 @@ class RaceDB {
           // (source=racelog live finishes): a topscores re-sync resends the whole
           // top-50 each interval and would otherwise duplicate the log every run.
           const fin = await q1(
-            `INSERT INTO finish (player_id, map_id, version_id, time, server_id, created_at, strafe_quality)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-            [playerId, mapRow.id, versionRow.id, rec.time, serverId, now, rec.strafe_quality ?? null]
+            `INSERT INTO finish (player_id, map_id, version_id, time, server_id, created_at,
+                                 strafe_quality, max_speed, start_speed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+            [
+              playerId, mapRow.id, versionRow.id, rec.time, serverId, now,
+              rec.strafe_quality ?? null, rec.max_speed ?? null, rec.start_speed ?? null,
+            ]
           );
           const cps = Array.isArray(rec.checkpoints) ? rec.checkpoints : [];
           if (cps.length) {
@@ -3387,7 +3810,7 @@ class RaceDB {
         this._perfectRunCache.delete(num(mapRow.id));
       }
 
-      return counts;
+      return { ...counts, playerIds: [...touched] };
     }
   }
 

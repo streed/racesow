@@ -1152,14 +1152,18 @@ static void rsQueuePost( const char *url, const char *token, std::string &&body 
  * of race STARTS since this player's last flush, including the start that
  * produced this finish (pass a negative value to omit — the API then counts
  * the finish as a single attempt). strafeQuality is the run's average accel
- * efficiency in basis points (0..10000 = 0..100%; negative = omit). No-op when
- * url is empty.
+ * efficiency in basis points (0..10000 = 0..100%; negative = omit).
+ * maxSpeed/startSpeed are per-RUN snapshots in ups (negative = omit; stored
+ * per finish like strafe_quality, never summed). distance/strafes are counter
+ * DELTAS accumulated since the player's last flush (units travelled while
+ * racing / discrete strafe segments; negative = omit; the API adds them into
+ * the run tally like wall_jumps). No-op when url is empty.
  */
 void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	const char *mapname, const char *player, const char *login,
 	int timeMs, int attemptsSinceLast, const char *cpsCsv,
 	int wallJumps, int dashes, int prejumpFails, int restarts,
-	int strafeQuality )
+	int strafeQuality, int maxSpeed, int startSpeed, int distance, int strafes )
 {
 	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] || timeMs <= 0 )
 		return;
@@ -1210,6 +1214,13 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
 	// (negative = omit; the API stores it per finish, never summed like the
 	// counters above). Snapshot, not a monotonic tally.
 	if( strafeQuality >= 0 ) { body += ",\"strafe_quality\":"; body += std::to_string( strafeQuality ); }
+	// Per-run speed snapshots in ups (negative = omit; stored per finish).
+	if( maxSpeed >= 0 ) { body += ",\"max_speed\":"; body += std::to_string( maxSpeed ); }
+	if( startSpeed >= 0 ) { body += ",\"start_speed\":"; body += std::to_string( startSpeed ); }
+	// Counter deltas since the last flush (negative = omit; summed into the
+	// run tally like the movement counters above).
+	if( distance >= 0 ) { body += ",\"distance\":"; body += std::to_string( distance ); }
+	if( strafes >= 0 ) { body += ",\"strafes\":"; body += std::to_string( strafes ); }
 	body += "}]}";
 
 	rsQueuePost( url, token, std::move( body ) );
@@ -1225,13 +1236,15 @@ void RS_ApiReportRace( const char *url, const char *token, const char *version,
  */
 void RS_ApiReportAttempts( const char *url, const char *token, const char *version,
 	const char *mapname, const char *player, const char *login, int count,
-	int wallJumps, int dashes, int prejumpFails, int restarts )
+	int wallJumps, int dashes, int prejumpFails, int restarts,
+	int distance, int strafes )
 {
 	if( !url || !url[0] || !mapname || !mapname[0] || !player || !player[0] )
 		return;
 	// A flush is worth sending if there are starts to report OR any movement
 	// metric to carry (a lone /kill leaves restarts with no accompanying start).
-	if( count <= 0 && wallJumps <= 0 && dashes <= 0 && prejumpFails <= 0 && restarts <= 0 )
+	if( count <= 0 && wallJumps <= 0 && dashes <= 0 && prejumpFails <= 0 && restarts <= 0
+		&& distance <= 0 && strafes <= 0 )
 		return;
 
 	std::string body;
@@ -1250,6 +1263,8 @@ void RS_ApiReportAttempts( const char *url, const char *token, const char *versi
 	if( dashes >= 0 ) { body += ",\"dashes\":"; body += std::to_string( dashes ); }
 	if( prejumpFails >= 0 ) { body += ",\"prejump_failures\":"; body += std::to_string( prejumpFails ); }
 	if( restarts >= 0 ) { body += ",\"restarts\":"; body += std::to_string( restarts ); }
+	if( distance >= 0 ) { body += ",\"distance\":"; body += std::to_string( distance ); }
+	if( strafes >= 0 ) { body += ",\"strafes\":"; body += std::to_string( strafes ); }
 	body += "}]}";
 
 	rsQueuePost( url, token, std::move( body ) );

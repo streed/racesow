@@ -236,7 +236,16 @@ test("movement metrics ride finishes and standalone flushes into player totals",
   await new Promise((r) => setTimeout(r, 3600)); // aggregate debounce for /search
   const found = await get("/players?q=Strafer");
   const pd = await get(`/players/${found.rows[0].id}`);
-  assert.deepEqual(pd.metrics, { wallJumps: 10, dashes: 4, prejumpFailures: 1, restarts: 2 + 3, strafeQuality: null });
+  assert.deepEqual(pd.metrics, {
+    wallJumps: 10,
+    dashes: 4,
+    prejumpFailures: 1,
+    restarts: 2 + 3,
+    distance: 0,
+    strafes: 0,
+    maxSpeed: null,
+    strafeQuality: null,
+  });
 
   // A flush with neither starts nor any metric is nothing to record -> rejected.
   assert.equal(

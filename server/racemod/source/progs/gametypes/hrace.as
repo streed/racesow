@@ -783,6 +783,7 @@ void GT_ThinkRules()
         player.saveRunPosition();
         player.saveGhostFrame();
         player.sampleStrafe(); // accumulate air-strafe quality during a race
+        player.sampleDistance(); // accumulate distance raced during a race
         player.checkNoclipAction();
         player.checkRelease();
         player.updateMaxSpeed();

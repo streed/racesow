@@ -894,3 +894,27 @@ a.replay-badge { text-decoration: none; }
   .cmp-vs { text-align: center; }
   .cmp-table td.cmp-a, .cmp-table td.cmp-b { font-size: 18px; }
 }
+
+/* ---- Achievements (profile badges, progress, directory) ------------------ */
+.ach { display: inline-block; font-family: var(--cond); font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
+  font-size: 12px; padding: 3px 10px; border-radius: 14px; border: 1px solid var(--line); white-space: nowrap; }
+.ach.sm { font-size: 11px; padding: 2px 8px; }
+.ach.bronze { color: #e0a878; border-color: rgba(224,168,120,.45); background: rgba(224,168,120,.08); }
+.ach.silver { color: #cdd5df; border-color: rgba(205,213,223,.45); background: rgba(205,213,223,.08); }
+.ach.gold { color: var(--gold); border-color: rgba(255,210,74,.5); background: rgba(255,210,74,.08); }
+.ach.legend { color: #c792ff; border-color: rgba(199,146,255,.5); background: rgba(199,146,255,.1); }
+.achpanel { padding: 16px 18px 12px; margin-bottom: 24px; }
+.achlist { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+.achprog { padding: 10px 2px; border-bottom: 1px solid var(--line); }
+.achprog:last-child { border-bottom: 0; }
+.achprog-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.achprog-nums { font-family: var(--cond); font-weight: 700; font-variant-numeric: tabular-nums; }
+.achprog-desc { font-size: 13px; margin: 4px 0 2px; }
+.achbar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 6px; }
+.achbar-fill { height: 100%; background: var(--orange); border-radius: 3px; }
+.achdir-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; margin-bottom: 26px; }
+.achdir { padding: 14px 16px; }
+.achdir-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.achdir-desc { margin: 2px 0 6px; }
+.achdir-meta { font-size: 13px; }
+.achdir-recent { font-size: 13px; margin-top: 4px; }

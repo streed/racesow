@@ -1,7 +1,16 @@
 # Design: player achievements & rewards
 
-Status: **proposed** — codebase surveyed 2026-07-31 (web schema/API, game-side
-state/natives, admin-content patterns); no code written yet.
+Status: **Phase 1 BUILT** (2026-07-31, web-only — schema, rule catalog in
+web/achievements.js, evaluator, /admin/achievements, profile panel, public
+/achievements directory; db + smoke tested, not yet deployed).
+**Phase 3 PARTIALLY BUILT** (2026-07-31): distance raced + strafe count
+(run_tally counters, accumulated in player.as sampleDistance / the sampleStrafe
+segment counter) and max/starting speed (finish snapshots) now ride four new
+trailing ints on RS_ApiReportRace + two on RS_ApiReportAttempts; profile tiles,
+movement_total metrics and a max_speed_run achievement kind consume them;
+Warsow boot-test passed. Still open from the Phase 3 table: playtime, jumps,
+deaths, per-checkpoint speeds. Phase 2 (in-game announce) remains as designed
+below. Design survey was 2026-07-31.
 
 ## Goal
 
