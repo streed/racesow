@@ -669,6 +669,74 @@ async function viewMaps(params) {
   wireSort("#/maps", state);
 }
 
+// Demo directory index: maps that have recorded demos, newest activity first.
+// Click a map to reach its per-player download list (viewDemosMap).
+async function viewDemos(params) {
+  loading();
+  const state = { q: params.q || "", offset: parseInt(params.offset, 10) || 0 };
+  const data = await api("/demos" + buildQuery({ q: state.q, offset: state.offset || undefined }));
+  app.innerHTML = `
+    <div class="page-title"><span class="accent">DEMO</span> DIRECTORY</div>
+    <p class="page-sub">Every map with a downloadable run. Open a map to grab individual demo files — each is one player's personal best. To watch one, drop the file in your Warsow <span class="mono">racemod/demos</span> folder and run <span class="mono">demo &lt;file&gt;</span> in the console.</p>
+    <div class="toolbar">
+      <input class="filter" id="dfilter" placeholder="Filter maps by name…" value="${esc(state.q)}">
+      <span class="count">${fmtNum(data.total)} maps</span>
+    </div>
+    <div class="table-wrap"><div class="tscroll">
+      <table class="data">
+        <thead><tr>
+          <th>Map</th>
+          <th class="num">Demos</th>
+          <th class="num">Fastest</th>
+          <th class="num">Newest</th>
+        </tr></thead>
+        <tbody>
+          ${data.rows.map((m) => `
+            <tr class="clickable" data-nav="#/demos/${m.id}">
+              <td class="mapname">${mapNameHtml(m.name)}</td>
+              <td class="num">${fmtNum(m.demos)}</td>
+              <td class="num"><span class="time">${m.fastest != null ? fmtTime(m.fastest) : "—"}</span></td>
+              <td class="num"><span class="muted">${m.latest != null ? fmtAgo(m.latest) : "—"}</span></td>
+            </tr>`).join("") || `<tr><td colspan="4" class="empty">No demos ${state.q ? `match “${esc(state.q)}”` : "recorded yet"}.</td></tr>`}
+        </tbody>
+      </table>
+    </div>${pager(state, data, "#/demos")}</div>`;
+  wireFilter("dfilter", "#/demos", state);
+}
+
+// One map's demos: per-player PBs, fastest first, each with its own download
+// link. Mirrors the leaderboard's ⬇ demo affordance but as a focused list.
+async function viewDemosMap(id) {
+  loading();
+  const d = await api("/demos/" + id);
+  const anyDl = d.demos.some((x) => x.url);
+  app.innerHTML = `
+    <div class="crumbs"><a data-nav="#/demos">Demos</a> / ${esc(baseMapName(d.map.name))}${isReversedMap(d.map.name) ? " (reverse)" : ""}</div>
+    <div class="page-title" style="font-size:34px">${mapNameHtml(d.map.name)}</div>
+    <p class="page-sub">${fmtNum(d.demos.length)} demo${d.demos.length === 1 ? "" : "s"} — one per player, their personal best. <a data-nav="#/map/${d.map.id}">Open the full leaderboard ↗</a></p>
+    <div class="table-wrap"><div class="tscroll">
+      <table class="data">
+        <thead><tr>
+          <th>#</th><th>Player</th><th class="num">Time</th><th class="num">Size</th><th class="num">Recorded</th><th class="num">Demo</th>
+        </tr></thead>
+        <tbody>
+          ${d.demos.map((x, i) => `
+            <tr>
+              <td class="rankcell ${rankClass(i + 1)}">${i + 1}</td>
+              <td class="clickable" data-nav="#/player/${x.playerId}">${wname(x.name)}</td>
+              <td class="num"><span class="time">${fmtTime(x.time)}</span></td>
+              <td class="num"><span class="muted">${fmtBytes(x.bytes)}</span></td>
+              <td class="num"><span class="muted">${x.captured_at != null ? fmtAgo(x.captured_at) : "—"}</span></td>
+              <td class="num">${x.url ? `<a class="replay-badge demo" href="${esc(x.url)}" download rel="noopener" title="Download this demo">⬇ demo</a>` : `<span class="muted">—</span>`}</td>
+            </tr>`).join("") || `<tr><td colspan="6" class="empty">No demos for this map.</td></tr>`}
+        </tbody>
+      </table>
+    </div></div>
+    ${anyDl ? `<details class="demo-help"><summary>How to watch a demo in Warsow</summary>
+      <p>Download the file into your Warsow <span class="mono">racemod/demos</span> folder, then in the console run
+      <span class="mono">demo &lt;filename&gt;</span> — or launch <span class="mono">warsow +demo &lt;filename&gt;</span>. It plays the run start&#8209;to&#8209;finish.</p></details>` : ""}`;
+}
+
 async function viewPlayers(params) {
   loading();
   const state = {
@@ -2050,6 +2118,8 @@ async function router() {
   try {
     if (path === "/") await viewOverview();
     else if (path === "/maps") await viewMaps(params);
+    else if (path === "/demos") await viewDemos(params);
+    else if (path.startsWith("/demos/")) await viewDemosMap(parseInt(path.split("/")[2], 10));
     else if (path === "/players") await viewPlayers(params);
     else if (path === "/compare") await viewCompare(params);
     else if (path === "/live") await viewLive();

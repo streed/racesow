@@ -331,3 +331,45 @@ test("WR ghost: a lost fastest ghost falls through to the fastest recoverable on
   assert.equal(ghost.time, 9000);
   assert.equal(ghost.frames.length, slow.length);
 });
+
+test("demo directory: index lists maps with demos + a map lists its per-player download links", async () => {
+  const MAP = "demodir";
+  const demoA = "demodir/demodir_Alpha_00-08-000.wdz20";
+  const demoB = "demodir/demodir_Bravo_00-09-500.wdz20";
+  // Two distinct players each upload a PB demo for the same map (faster-only
+  // upsert keeps one row per player, so both land as separate rows).
+  for (const [name, time, demo, bytes] of [["Alpha", 8000, demoA, 4096], ["Bravo", 9500, demoB, 8192]]) {
+    const r = await ingest(JSON.stringify({
+      version: "wsw 2.1",
+      map: MAP,
+      source: "wr_demo",
+      wr_demo: { name, login: "", time, demo, bytes },
+    }));
+    assert.deepEqual(r.json, { ok: true });
+  }
+
+  // Index: the map appears with a demo count of 2 and the fastest time.
+  const idx = await getJson("/demos?q=demodir");
+  const row = idx.rows.find((m) => m.name === MAP);
+  assert.ok(row, "map appears in the demo directory index");
+  assert.equal(row.demos, 2);
+  assert.equal(row.fastest, 8000);
+  assert.ok(row.latest > 0, "latest captured_at surfaced");
+
+  // Per-map: both demos, fastest first, each with its own download URL + size.
+  const detail = await getJson(`/demos/${row.id}`);
+  assert.equal(detail.map.id, row.id);
+  assert.equal(detail.map.name, MAP);
+  assert.equal(detail.demos.length, 2);
+  assert.equal(detail.demos[0].name, "Alpha");
+  assert.equal(detail.demos[0].time, 8000);
+  assert.equal(detail.demos[0].url, `${DEMO_BASE}/demos/${demoA}`);
+  assert.equal(detail.demos[0].bytes, 4096);
+  assert.ok(detail.demos[0].captured_at > 0);
+  assert.equal(detail.demos[1].name, "Bravo");
+  assert.equal(detail.demos[1].time, 9500);
+  assert.equal(detail.demos[1].url, `${DEMO_BASE}/demos/${demoB}`);
+
+  // An unknown map id 404s rather than returning an empty list.
+  assert.equal((await fetch(`${base}/api/demos/99999999`)).status, 404);
+});

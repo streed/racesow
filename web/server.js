@@ -335,6 +335,18 @@ api.get("/maps/:id/ghost", wrap(async (req, res) => {
   res.send(buf);
 }));
 
+// Demo directory: browse the maps that have downloadable demos, then drill into
+// one map for its per-player demo files (each an individual download link).
+api.get("/demos", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.demoMaps(req.query))));
+
+api.get("/demos/:mapId", cache(60, { edge: true }), wrap(async (req, res) => {
+  const id = asInt(req.params.mapId);
+  if (id == null) return res.status(400).json({ error: "invalid map id" });
+  const detail = await race.demosForMap(id);
+  if (!detail) return res.status(404).json({ error: "map not found" });
+  res.json(detail);
+}));
+
 // Public "flag this map for review" (broken / offensive / wrong metadata / …).
 // Anonymous, tightly rate-limited, and deduped per reporter (db.flagMap): a
 // reporter is identified only by a salted hash of their IP, never stored raw.

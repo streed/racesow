@@ -1566,6 +1566,91 @@ class RaceDB {
     return { total, limit: lim, offset: off, rows };
   }
 
+  // Demo directory index: every map that has at least one recorded demo, with a
+  // count + the fastest recorded time + when its newest demo landed. Blocked
+  // maps are hidden (same as maps()); names are censored on the way out.
+  async demoMaps({ q = "", limit, offset } = {}) {
+    const lim = clampLimit(limit);
+    const off = toOffset(offset);
+    const conds = ["NOT EXISTS (SELECT 1 FROM map_block b WHERE b.map_id = d.map_id)"];
+    const args = [];
+    if (q) {
+      args.push(`%${likeEscape(q)}%`);
+      conds.push(`m.name ILIKE $${args.length}`);
+    }
+    const where = `WHERE ${conds.join(" AND ")}`;
+    const total = num(
+      (await this.one(
+        `SELECT COUNT(DISTINCT d.map_id) c FROM player_demo d JOIN map m ON m.id = d.map_id ${where}`,
+        args
+      )).c
+    );
+    const rows = (
+      await this.all(
+        `SELECT d.map_id AS id, m.name,
+                COUNT(*)           AS demos,
+                MIN(d.time)        AS fastest,
+                MAX(d.captured_at) AS latest
+         FROM player_demo d JOIN map m ON m.id = d.map_id
+         ${where}
+         GROUP BY d.map_id, m.name
+         ORDER BY latest DESC NULLS LAST, lower(m.name) ASC
+         LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
+        [...args, lim, off]
+      )
+    ).map((r) =>
+      this._censorMapped(
+        {
+          id: num(r.id),
+          name: r.name,
+          demos: num(r.demos),
+          fastest: r.fastest != null ? num(r.fastest) : null,
+          latest: r.latest != null ? num(r.latest) : null,
+        },
+        num(r.id),
+        "name"
+      )
+    );
+    return { total, limit: lim, offset: off, rows };
+  }
+
+  // One map's demos: every player's PB demo, fastest first, each carrying its
+  // own download URL (null when DEMO_BASE_URL is unset — the button is hidden).
+  // Returns null for an unknown map so the route can 404.
+  async demosForMap(id) {
+    const map = await this.one("SELECT id, name FROM map WHERE id = $1", [id]);
+    if (!map) return null;
+    const demos = (
+      await this.all(
+        `SELECT d.player_id, d.time, d.demo_path, d.bytes, d.captured_at, d.version_id,
+                p.name, p.simplified
+         FROM player_demo d JOIN player p ON p.id = d.player_id
+         WHERE d.map_id = $1
+         ORDER BY d.time ASC`,
+        [id]
+      )
+    ).map((r) =>
+      this._censorNamed(
+        {
+          playerId: num(r.player_id),
+          name: r.name,
+          simplified: r.simplified,
+          time: r.time,
+          bytes: r.bytes != null ? num(r.bytes) : null,
+          captured_at: r.captured_at != null ? num(r.captured_at) : null,
+          version: this.versions[num(r.version_id)] || null,
+          url: DEMO_BASE_URL ? `${DEMO_BASE_URL}/demos/${r.demo_path}` : null,
+          path: r.demo_path,
+        },
+        num(r.player_id)
+      )
+    );
+    return {
+      map: this._censorMapped({ id: num(map.id), name: map.name }, num(map.id), "name"),
+      demos,
+    };
+  }
+
   async mapDetail(id, { limit } = {}) {
     const map = await this.one("SELECT id, name FROM map WHERE id = $1", [id]);
     if (!map) return null;
