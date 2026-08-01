@@ -29,9 +29,13 @@
 #
 # Run on either box from the repo root; needs docker access (the deploy user is
 # in the docker group), no sudo:
-#   scripts/sync-demos.sh                 # mirror + alias (+ pull on the central box)
-#   scripts/sync-demos.sh --dry-run       # report only, change nothing
-#   scripts/sync-demos.sh --repair-stale  # also repoint superseded rows (writes to the DB)
+#   scripts/sync-demos.sh                  # mirror + alias (+ pull on the central box)
+#   scripts/sync-demos.sh --dry-run        # report only, change nothing
+#   scripts/sync-demos.sh --repair-stale   # also repoint superseded rows (writes to the DB)
+#   scripts/sync-demos.sh --prune-missing  # DELETE rows whose file is gone for good
+#
+# --repair-stale and --prune-missing write to the stats DB and are NEVER run by
+# the timer; --prune-missing is destructive, so pair it with --dry-run first.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -51,10 +55,12 @@ CURL_MAX_TIME="${DEMO_CURL_MAX_TIME:-60}"
 
 DRY_RUN=0
 REPAIR_STALE=0
+PRUNE_MISSING=0
 for arg in "$@"; do
   case "${arg}" in
-    --dry-run)      DRY_RUN=1 ;;
-    --repair-stale) REPAIR_STALE=1 ;;
+    --dry-run)       DRY_RUN=1 ;;
+    --repair-stale)  REPAIR_STALE=1 ;;
+    --prune-missing) PRUNE_MISSING=1 ;;
     --no-pull)      PEERS="" ;;
     -h|--help)      sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "unknown flag: ${arg}" >&2; exit 2 ;;
@@ -217,8 +223,38 @@ if [ "${REPAIR_STALE}" = 1 ] && [ -s "${tmp}/unrecoverable.txt" ]; then
         && say "repointed ${path} -> ${repl}"
     fi
     repaired=$(( repaired + 1 ))
+    printf '%s\n' "${path}" >> "${tmp}/repaired.txt"
   done < "${tmp}/unrecoverable.txt"
   say "stale rows repointed: ${repaired}"
+  # A repointed row is servable now — keep --prune-missing from deleting it.
+  if [ -s "${tmp}/repaired.txt" ] && [ "${DRY_RUN}" != 1 ]; then
+    grep -vxF -f "${tmp}/repaired.txt" "${tmp}/unrecoverable.txt" > "${tmp}/u2.txt" || true
+    mv "${tmp}/u2.txt" "${tmp}/unrecoverable.txt"
+  fi
+fi
+
+# --- 5. optional: prune rows whose demo is gone for good --------------------
+# NEVER run from the timer. A row that survives every step above points at a
+# file no box has: the run pre-dates demo persistence, or the capturing server
+# could not record one. It can only 404, so deleting the row is what stops the
+# site advertising a dead download — but it IS destructive and a peer being
+# briefly unreachable would look identical, so it stays a deliberate flag.
+if [ "${PRUNE_MISSING}" = 1 ] && [ -s "${tmp}/unrecoverable.txt" ]; then
+  pruned=0
+  while IFS= read -r path; do
+    [ -n "${path}" ] || continue
+    case "${path}" in *[!A-Za-z0-9./_-]*) continue ;; esac
+    if [ "${DRY_RUN}" = 1 ]; then
+      say "[dry-run] would DELETE row ${path}"
+    else
+      docker exec -i "${DB_CONTAINER}" psql -U racesow -d racesow -q -c \
+        "DELETE FROM player_demo WHERE demo_path = '${path}'" </dev/null \
+        && say "pruned ${path}"
+    fi
+    pruned=$(( pruned + 1 ))
+  done < "${tmp}/unrecoverable.txt"
+  say "rows pruned: ${pruned}"
+  exit 0
 fi
 
 if [ -s "${tmp}/unrecoverable.txt" ]; then
