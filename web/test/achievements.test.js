@@ -8,12 +8,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { openDatabase } from "../db.js";
-import { validateDefinition, periodKey, describeRule } from "../achievements.js";
+import { validateDefinition, periodKey, describeRule, qualifyQuery, progressQuery, targetOf, RULE_KINDS } from "../achievements.js";
 import { createTestDb } from "./pg-util.js";
 
-async function freshDb(t) {
+// The seed migration ships ~40 starter definitions into every fresh DB. The
+// logic tests below assert exact award/definition counts, so the default
+// helper purges the seeds (no awards exist yet, so the guard-less DELETE is
+// safe); the dedicated seed-validation test opts out to inspect them.
+async function freshDb(t, { keepSeeds = false } = {}) {
   const { url, drop } = await createTestDb();
   const race = await openDatabase(url);
+  if (!keepSeeds) await race.pool.query("DELETE FROM achievement WHERE created_by = 'seed'");
   t.after(async () => {
     await race.close();
     await drop();
@@ -40,6 +45,34 @@ async function makeAch(race, input, { activate = true } = {}) {
   if (activate) await race.setAchievementActive(id, true, "test-admin");
   return id;
 }
+
+test("every seeded achievement is a valid instance of the rule catalog", async (t) => {
+  const race = await freshDb(t, { keepSeeds: true });
+  const defs = (await race.all("SELECT * FROM achievement WHERE created_by = 'seed' ORDER BY id")).map((r) =>
+    race._achRow(r)
+  );
+  assert.ok(defs.length >= 30, `expected the full seed set, got ${defs.length}`);
+  const slugs = new Set();
+  for (const def of defs) {
+    assert.ok(!slugs.has(def.slug), `duplicate slug ${def.slug}`);
+    slugs.add(def.slug);
+    const kind = RULE_KINDS[def.rule.kind];
+    assert.ok(kind, `${def.slug}: unknown rule kind "${def.rule.kind}"`);
+    assert.ok(
+      kind.windows.includes(def.time_window),
+      `${def.slug}: window "${def.time_window}" unsupported by ${def.rule.kind}`
+    );
+    if (def.repeatable)
+      assert.ok(["month", "day"].includes(def.time_window), `${def.slug}: repeatable needs a month/day window`);
+    assert.ok(Number.isFinite(targetOf(def)), `${def.slug}: target not derivable`);
+    // Both statements must be executable SQL (empty DB -> zero rows, but any
+    // typo'd column/param mismatch throws here instead of in production).
+    const q = qualifyQuery(def);
+    await race.all(q.sql, q.params);
+    const p = progressQuery(def, 1);
+    await race.all(p.sql, p.params);
+  }
+});
 
 test("validateDefinition normalises good input and rejects junk", () => {
   // Good: slug derived, ints coerced, unsupported repeatable dropped.

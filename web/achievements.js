@@ -128,11 +128,11 @@ function standingsKind(col, maxBound, labels) {
 export const RULE_KINDS = {
   distinct_maps_finished: {
     label: "Distinct maps finished",
-    help: "Finished N different maps (optionally only maps the player had never finished before the window).",
+    help: "Finished N different maps. Lifetime counts the player's ALL-TIME map catalog (their PBs — predates the finish log); windowed variants count within the window, optionally only maps never finished before (“new maps”).",
     windows: ["lifetime", "month", "rolling30"],
     params: [
       { key: "count", label: "Map count", type: "int", min: 1, max: 100000 },
-      { key: "newOnly", label: "First-ever finishes only (“new maps”)", type: "bool" },
+      { key: "newOnly", label: "First-ever finishes only (“new maps”; windowed only)", type: "bool" },
     ],
     format: "count",
     better: "high",
@@ -140,10 +140,30 @@ export const RULE_KINDS = {
     describe: (rule) => `${rule.newOnly ? "new " : "distinct "}maps finished ≥ ${rule.count}`,
     sql(rule, win, p, o) {
       const since = windowSince(win, o.now);
-      if (rule.newOnly && since > 0) {
-        // A map counts when the player's FIRST-EVER finish of it falls inside
-        // the window — "played 100 new maps this month".
+      if (since === 0) {
+        // Lifetime: the finish log only reaches back to 2026-07-22, so count
+        // the player's PB catalog (best — one row per map ever finished, full
+        // history). best is already canonical-keyed.
+        const gate = o.progress ? "" : ` HAVING COUNT(*) >= ${p.add(rule.count)}`;
+        const who = o.progress
+          ? ` AND b.player_id = ${p.add(o.canonId)}`
+          : o.ids
+          ? ` AND b.player_id = ANY(${p.add(o.ids)})`
+          : "";
+        return `
+          SELECT b.player_id, COUNT(*)::int AS value, NULL::bigint AS finish_id
+          FROM best b WHERE TRUE${who}
+          GROUP BY 1${gate}`;
+      }
+      if (rule.newOnly) {
+        // A map counts when the player's first LOGGED finish of it falls
+        // inside the window AND they hold no pre-window PB on it — so a
+        // veteran replaying an old favourite (whose history predates the
+        // finish log) doesn't score it as "new". Known small leak: improving
+        // a pre-log PB replaces the race row with a fresh created_at, which
+        // this can't see; rare and harmless.
         const having = o.progress ? "" : ` HAVING COUNT(*) >= ${p.add(rule.count)}`;
+        const sinceP = p.add(since);
         return `
           SELECT player_id, COUNT(*)::int AS value, NULL::bigint AS finish_id FROM (
             SELECT ${CID} AS player_id, f.map_id, MIN(f.created_at) AS first_at
@@ -151,7 +171,13 @@ export const RULE_KINDS = {
             WHERE TRUE${cidFilter(p, o)}
             GROUP BY 1, 2
           ) firsts
-          WHERE first_at >= ${p.add(since)}
+          WHERE first_at >= ${sinceP}
+            AND NOT EXISTS (
+              SELECT 1 FROM race r JOIN player pl2 ON pl2.id = r.player_id
+              WHERE r.map_id = firsts.map_id
+                AND COALESCE(pl2.canonical_id, pl2.id) = firsts.player_id
+                AND (r.created_at IS NULL OR r.created_at < ${sinceP})
+            )
           GROUP BY player_id${having}`;
       }
       const having = o.progress ? "" : ` HAVING COUNT(DISTINCT f.map_id) >= ${p.add(rule.count)}`;
