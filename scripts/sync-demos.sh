@@ -96,30 +96,38 @@ done
 # --- 2. lowercase aliases for mixed-case demo paths --------------------------
 running "${PAK_CONTAINER}" || { warn "${PAK_CONTAINER} is not running — cannot alias or pull"; exit 4; }
 
-alias_script='
+# Reproduce EXACTLY what the old RACE_ReportWrDemo stored: it lowercased only
+# `mapname`, so the reported path is <lower(map)>/<lower(map)>_<player>_<time>
+# with the PLAYER fragment left in its original case. Lowercasing the whole path
+# would miss every demo by a player with a capital in their name.
+# $1 = "list" (print the aliases that are missing) or "create".
+alias_prog='
 cd '"${SERVED_DIR}"' 2>/dev/null || exit 0
 find . -type f -name "*.wdz20" | while IFS= read -r f; do
-  l=$(printf "%s" "$f" | tr "[:upper:]" "[:lower:]")
-  [ "$l" = "$f" ] && continue
-  [ -e "$l" ] && continue
-  echo "$l"
+  rel=${f#./}
+  case "${rel}" in */*) ;; *) continue ;; esac       # auto-recorded files sit at the root
+  d=${rel%%/*}; b=${rel##*/}
+  case "${b}" in "${d}_"*) ;; *) continue ;; esac    # only the canonical <map>_<player>_<time>
+  ld=$(printf "%s" "${d}" | tr "[:upper:]" "[:lower:]")
+  [ "${ld}" = "${d}" ] && continue                   # already lowercase: nothing to alias
+  l="${ld}/${ld}_${b#"${d}_"}"
+  [ -e "${l}" ] && continue
+  if [ "$1" = list ]; then
+    echo "${l}"
+  else
+    mkdir -p "${ld}" 2>/dev/null || continue
+    ln "${rel}" "${l}" 2>/dev/null || cp -p "${rel}" "${l}" 2>/dev/null || true
+  fi
 done'
-pending_aliases="$(docker exec "${PAK_CONTAINER}" sh -c "${alias_script}" | wc -l | tr -d ' ')"
+pending_aliases="$(docker exec "${PAK_CONTAINER}" sh -c "${alias_prog}" _ list | wc -l | tr -d ' ')"
 if [ "${DRY_RUN}" = 1 ]; then
-  say "[dry-run] ${pending_aliases} lowercase alias(es) would be created"
+  say "[dry-run] ${pending_aliases} map-case alias(es) would be created, e.g.:"
+  docker exec "${PAK_CONTAINER}" sh -c "${alias_prog}" _ list | head -3 | sed 's/^/     /'
 elif [ "${pending_aliases}" != "0" ]; then
   # Hardlink (same filesystem, no extra bytes); fall back to a copy if the FS
-  # refuses. Both spellings then resolve for nginx.
-  docker exec "${PAK_CONTAINER}" sh -c '
-    cd '"${SERVED_DIR}"' || exit 0
-    find . -type f -name "*.wdz20" | while IFS= read -r f; do
-      l=$(printf "%s" "$f" | tr "[:upper:]" "[:lower:]")
-      [ "$l" = "$f" ] && continue
-      [ -e "$l" ] && continue
-      mkdir -p "$(dirname "$l")" 2>/dev/null || continue
-      ln "$f" "$l" 2>/dev/null || cp -p "$f" "$l" 2>/dev/null || true
-    done' || warn "alias pass failed"
-  say "aliased ${pending_aliases} mixed-case demo path(s) to lowercase"
+  # refuses. Both spellings then resolve on case-sensitive nginx.
+  docker exec "${PAK_CONTAINER}" sh -c "${alias_prog}" _ create || warn "alias pass failed"
+  say "aliased ${pending_aliases} mixed-case demo path(s)"
 else
   say "aliases: nothing to do"
 fi
