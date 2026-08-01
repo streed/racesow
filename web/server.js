@@ -340,6 +340,12 @@ api.get("/maps/:id/ghost", wrap(async (req, res) => {
 // one map for its per-player demo files (each an individual download link).
 api.get("/demos", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.demoMaps(req.query))));
 
+// Everything in one feed: every map with its demos inline (who ran it, when it
+// was captured, the direct download link), paged by map via ?limit/&offset and
+// filterable by map name with ?q=. Registered BEFORE /demos/:mapId so "all" is
+// routed here instead of failing the numeric map-id parse below.
+api.get("/demos/all", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.allDemos(req.query))));
+
 api.get("/demos/:mapId", cache(60, { edge: true }), wrap(async (req, res) => {
   const id = asInt(req.params.mapId);
   if (id == null) return res.status(400).json({ error: "invalid map id" });

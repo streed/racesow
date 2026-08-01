@@ -373,3 +373,46 @@ test("demo directory: index lists maps with demos + a map lists its per-player d
   // An unknown map id 404s rather than returning an empty list.
   assert.equal((await fetch(`${base}/api/demos/99999999`)).status, 404);
 });
+
+test("demo feed: /demos/all inlines every map's demos with player, capture time + download link", async () => {
+  const MAP = "demofeed";
+  const demoA = "demofeed/demofeed_Carol_00-07-000.wdz20";
+  const demoB = "demofeed/demofeed_Dave_00-11-250.wdz20";
+  for (const [name, time, demo, bytes] of [["Carol", 7000, demoA, 2048], ["Dave", 11250, demoB, 3072]]) {
+    const r = await ingest(JSON.stringify({
+      version: "wsw 2.1",
+      map: MAP,
+      source: "wr_demo",
+      wr_demo: { name, login: "", time, demo, bytes },
+    }));
+    assert.deepEqual(r.json, { ok: true });
+  }
+
+  const feed = await getJson("/demos/all?q=demofeed");
+  assert.equal(feed.maps.length, 1, "?q= narrows the feed to the matching map");
+  const m = feed.maps[0];
+  assert.equal(m.name, MAP);
+  assert.equal(m.count, 2);
+  assert.equal(m.fastest, 7000);
+  assert.equal(m.demos.length, 2);
+  // Fastest first, each row carrying who ran it, when, and the direct link.
+  assert.equal(m.demos[0].name, "Carol");
+  assert.equal(m.demos[0].time, 7000);
+  assert.equal(m.demos[0].bytes, 2048);
+  assert.ok(m.demos[0].captured_at > 0);
+  assert.equal(m.demos[0].url, `${DEMO_BASE}/demos/${demoA}`);
+  assert.equal(m.demos[1].name, "Dave");
+  assert.equal(m.demos[1].url, `${DEMO_BASE}/demos/${demoB}`);
+
+  // Unfiltered, the feed is paged by map and every listed map carries its demos.
+  const all = await getJson("/demos/all");
+  assert.ok(all.total >= 2, "other demo maps from earlier tests are counted too");
+  assert.ok(all.maps.length >= 1);
+  for (const row of all.maps) {
+    assert.equal(row.demos.length, row.count, `${row.name}: inlined demos match the count`);
+    for (const d of row.demos) assert.ok(d.url && d.playerId > 0 && d.path);
+  }
+
+  // "all" must not be mistaken for a map id by the /demos/:mapId route.
+  assert.equal((await fetch(`${base}/api/demos/all`)).status, 200);
+});

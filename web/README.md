@@ -99,6 +99,9 @@ All responses are JSON. List endpoints accept `q`, `sort`, `order`
 | `GET /api/players/:id`   | Player detail: standing + every map record (with per-map attempts/finishes). Sort: `map`, `time`, `rank`, `attempts`. |
 | `GET /api/search?q=`     | Combined quick search across maps and players (typo-tolerant trigram). |
 | `GET /api/live`          | Who is playing now, per enrolled server with a query address.    |
+| `GET /api/demos`         | Demo directory index: every map that has a recorded demo, with the demo count, fastest time and newest capture. Filter with `q`. |
+| `GET /api/demos/all`     | The whole catalogue in one feed: each map with its demos inline — `{playerId, name, time, bytes, captured_at, version, url, path}` per demo, fastest first. Paged **by map** (`limit`/`offset` count maps, so one page can carry thousands of demos); filter with `q`. `url` is the direct download link (`null` when `DEMO_BASE_URL` is unset); `captured_at` is epoch seconds. |
+| `GET /api/demos/:mapId`  | One map's demos: each player's PB demo with its own download link. 404 for an unknown map. |
 | `GET /api/records`       | New records after `after_id` (the Discord announcer's feed).     |
 | `GET /api/game/topscores?map=` | A map's top-50 in the exact topscores file format the game reads. |
 | `GET /api/health`        | Liveness check.                                                  |

@@ -1662,6 +1662,26 @@ class RaceDB {
     return { total, limit: lim, offset: off, rows };
   }
 
+  // Shape one player_demo row (joined to player) for the public API: who ran it,
+  // when it was captured, and the direct download URL (null when DEMO_BASE_URL
+  // is unset — the UI hides the button). Names are censored on the way out.
+  _demoRow(r) {
+    return this._censorNamed(
+      {
+        playerId: num(r.player_id),
+        name: r.name,
+        simplified: r.simplified,
+        time: r.time,
+        bytes: r.bytes != null ? num(r.bytes) : null,
+        captured_at: r.captured_at != null ? num(r.captured_at) : null,
+        version: this.versions[num(r.version_id)] || null,
+        url: DEMO_BASE_URL ? `${DEMO_BASE_URL}/demos/${r.demo_path}` : null,
+        path: r.demo_path,
+      },
+      num(r.player_id)
+    );
+  }
+
   // One map's demos: every player's PB demo, fastest first, each carrying its
   // own download URL (null when DEMO_BASE_URL is unset — the button is hidden).
   // Returns null for an unknown map so the route can 404.
@@ -1677,25 +1697,47 @@ class RaceDB {
          ORDER BY d.time ASC`,
         [id]
       )
-    ).map((r) =>
-      this._censorNamed(
-        {
-          playerId: num(r.player_id),
-          name: r.name,
-          simplified: r.simplified,
-          time: r.time,
-          bytes: r.bytes != null ? num(r.bytes) : null,
-          captured_at: r.captured_at != null ? num(r.captured_at) : null,
-          version: this.versions[num(r.version_id)] || null,
-          url: DEMO_BASE_URL ? `${DEMO_BASE_URL}/demos/${r.demo_path}` : null,
-          path: r.demo_path,
-        },
-        num(r.player_id)
-      )
-    );
+    ).map((r) => this._demoRow(r));
     return {
       map: this._censorMapped({ id: num(map.id), name: map.name }, num(map.id), "name"),
       demos,
+    };
+  }
+
+  // The whole demo catalogue in one feed: the directory index (demoMaps) with
+  // each map's per-player demo list inlined, so a client can mirror/archive
+  // everything without an N+1 walk of /api/demos/:mapId. Paged by MAP —
+  // limit/offset count maps, and every map carries ALL of its demos, so a page
+  // of 200 maps can be a few thousand demo rows. Blocked maps stay hidden and
+  // names stay censored, exactly as the two endpoints it composes.
+  async allDemos({ q = "", limit, offset } = {}) {
+    const index = await this.demoMaps({ q, limit, offset });
+    const byMap = new Map(index.rows.map((m) => [m.id, []]));
+    if (index.rows.length) {
+      for (const r of await this.all(
+        `SELECT d.map_id, d.player_id, d.time, d.demo_path, d.bytes, d.captured_at, d.version_id,
+                p.name, p.simplified
+         FROM player_demo d JOIN player p ON p.id = d.player_id
+         WHERE d.map_id = ANY($1)
+         ORDER BY d.map_id ASC, d.time ASC`,
+        [index.rows.map((m) => m.id)]
+      )) {
+        const list = byMap.get(num(r.map_id));
+        if (list) list.push(this._demoRow(r));
+      }
+    }
+    return {
+      total: index.total,
+      limit: index.limit,
+      offset: index.offset,
+      maps: index.rows.map((m) => ({
+        id: m.id,
+        name: m.name,
+        count: m.demos, // demoMaps() reports the count here; `demos` is the list below
+        fastest: m.fastest,
+        latest: m.latest,
+        demos: byMap.get(m.id) || [],
+      })),
     };
   }
 
