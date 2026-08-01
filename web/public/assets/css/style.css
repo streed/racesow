@@ -709,6 +709,8 @@ a.replay-badge { text-decoration: none; }
 }
 .bmc-cta:hover { filter: brightness(1.05); color: #0d0e13; }
 .about-fineprint { font-size: 13px; margin-top: 14px !important; }
+/* About-page tutorial embed: 16:9, fills the panel's prose gutters. */
+.about-video { display: block; width: 100%; aspect-ratio: 16 / 9; border: 0; border-radius: 8px; background: #000; }
 /* Section headings between panels — pull the shared .page-title down a touch. */
 .about-h2 { margin-top: 14px; font-size: 24px; }
 

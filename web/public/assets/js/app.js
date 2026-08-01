@@ -1851,6 +1851,18 @@ async function viewAbout() {
       </div>
 
       <div class="panel">
+        <h3><span class="dot teal"></span> Learn the basics</h3>
+        <div class="about-body">
+          <p>New to race? Aelwi's tutorial walks through the mode's fundamentals — how a run works and how to build the speed the leaderboards are made of. Everything applies on both the Warsow and Warfork servers.</p>
+          <iframe class="about-video" src="https://www.youtube-nocookie.com/embed/bhkkDmhFL68"
+            title="Warfork Race Tutorial by Aelwi" loading="lazy"
+            allow="encrypted-media; fullscreen; picture-in-picture" allowfullscreen
+            referrerpolicy="strict-origin-when-cross-origin"></iframe>
+          <p class="muted about-fineprint">Player not loading? <a class="extlink" href="https://www.youtube.com/watch?v=bhkkDmhFL68" target="_blank" rel="noopener external">Watch it on YouTube ↗</a></p>
+        </div>
+      </div>
+
+      <div class="panel">
         <h3><span class="dot teal"></span> Join a server</h3>
         <div class="about-body">
           <p>Open the Warsow console with <b>~</b> and paste a connect line. Missing maps download from the server on join.</p>
