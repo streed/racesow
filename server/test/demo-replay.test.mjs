@@ -29,6 +29,7 @@ import {
   strafeQualityBasisPoints,
   idealGain,
   idealGainSingleStep,
+  ghostFramesFor,
   tokenize,
 } from "../../web/demo-replay.mjs";
 
@@ -167,6 +168,25 @@ test("strafeQuality: the key mask is read from the PREVIOUS snapshot", () => {
   // exactly the defect the phase fix removes.
   assert.equal(lag1.sampled, 3);
   assert.equal(lag0.sampled, 2);
+});
+
+test("ghostFramesFor: fixed-rate frames, and it refuses an irregular cadence", () => {
+  const mk = (times) => times.map((t, i) => ({
+    t, x: i, y: i * 2, z: i * 3, pitch: 1, yaw: 2, roll: 3,
+    vx: 10, vy: 20, vz: 30, keys: FWD | RIGHT,
+  }));
+  const even = ghostFramesFor(mk([0, 50, 100, 150, 200]), 50);
+  assert.equal(even.hz, 20);
+  assert.equal(even.frames.length, 5);
+  assert.equal(even.driftMs, 0);
+  // [x,y,z,pitch,yaw,roll,vx,vy,vz,keys] — the shape web/server.js sanitizeGhost accepts.
+  assert.deepEqual(even.frames[1], [1, 2, 3, 1, 2, 3, 10, 20, 30, FWD | RIGHT]);
+
+  // A little jitter is fine (the viewer derives time as i/hz).
+  assert.ok(ghostFramesFor(mk([0, 47, 100, 154, 200]), 50));
+  // A genuinely irregular cadence would replay out of sync, so refuse it rather
+  // than emit a trajectory that silently drifts.
+  assert.equal(ghostFramesFor(mk([0, 50, 100, 150, 400]), 50), null);
 });
 
 test("tokenize: quoted groups survive, as in Cmd_TokenizeString", () => {

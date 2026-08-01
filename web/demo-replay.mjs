@@ -451,8 +451,12 @@ function parseFrame(m, out, backup, baselines) {
     serverTime, snapNum,
     ps: frame.playerStates.map((s) => ({
       playerNum: s.playerNum, POVnum: s.POVnum,
+      // origin + all three view angles are carried for the browser replay
+      // viewer (a ghost frame is [x,y,z,pitch,yaw,roll,vx,vy,vz,keys]); the
+      // strafe sampler itself only needs velocity, yaw and keys.
+      x: s.origin[0], y: s.origin[1], z: s.origin[2],
+      pitch: s.viewangles[0], yaw: s.viewangles[1], roll: s.viewangles[2],
       vx: s.velocity[0], vy: s.velocity[1], vz: s.velocity[2],
-      yaw: s.viewangles[1],
       keys: s.plrkeys, pm_flags: s.pm_flags, pm_type: s.pm_type,
       maxspeed: s.pmstats[PM_STAT_MAXSPEED],
     })),
@@ -722,6 +726,41 @@ export function strafeQualityBasisPoints(acc) {
   return bp;
 }
 
+// --- browser replay viewer -------------------------------------------------
+// Turn a run's samples into the fixed-rate trajectory the in-browser viewer and
+// the in-game ghost racer consume: N frames of
+// [x, y, z, pitch, yaw, roll, vx, vy, vz, keys] at a constant `hz`
+// (web/server.js sanitizeGhost, web/public/assets/js/replay.js).
+//
+// The viewer indexes frames by position and derives time as i/hz, so this is
+// only sound because a demo's snapshots ARE a fixed cadence: snapFrameTime is
+// constant and the handful of jittered frames drift the run's total by a couple
+// of milliseconds over a minute. We assert that rather than assume it — a demo
+// whose cadence really is irregular gets rejected instead of silently replaying
+// out of sync.
+export function ghostFramesFor(samples, snapPeriodMs) {
+  if (!samples.length || !snapPeriodMs) return null;
+  const spanMs = samples[samples.length - 1].t - samples[0].t;
+  const nominal = (samples.length - 1) * snapPeriodMs;
+  // More than a frame's worth of accumulated drift means the cadence is not the
+  // fixed rate the viewer assumes.
+  if (Math.abs(spanMs - nominal) > snapPeriodMs) return null;
+  const r3 = (n) => Math.round(n * 1000) / 1000;
+  return {
+    hz: Math.round(1000 / snapPeriodMs),
+    driftMs: spanMs - nominal,
+    // `keys` is the raw per-snapshot mask (no sampler phase shift): this drives
+    // the viewer's key-press overlay, which should show what was held at the
+    // instant being drawn, not what gated the previous interval.
+    frames: samples.map((s) => [
+      r3(s.x), r3(s.y), r3(s.z),
+      r3(s.pitch), r3(s.yaw), r3(s.roll),
+      r3(s.vx), r3(s.vy), r3(s.vz),
+      s.keys & 255,
+    ]),
+  };
+}
+
 // The ground predicates we can actually evaluate. `onground` is the closest
 // stand-in for onStrafeGround(); the other two bracket the 8-unit trace halo we
 // cannot reproduce, so replayDemo can report how much it could possibly matter.
@@ -865,6 +904,7 @@ export function replayDemo(path) {
       if (!a) { a = []; series.set(s.playerNum, a); }
       a.push({
         t: f.serverTime, vx: s.vx, vy: s.vy, vz: s.vz, yaw: s.yaw,
+        x: s.x, y: s.y, z: s.z, pitch: s.pitch, roll: s.roll,
         keys: s.keys, pm_flags: s.pm_flags, pm_type: s.pm_type, maxspeed: s.maxspeed,
       });
     }
@@ -921,7 +961,9 @@ export function replayDemo(path) {
       const startSpeedSampled = Math.trunc(hspeed(win[0]));
 
       const p = players.get(clientNum);
+      const ghost = ghostFramesFor(win, snapPeriodMs);
       runs.push({
+        ghost,
         // `player` is what the DATABASE holds (the mod's reported form); the raw
         // configstring name is kept beside it for display/debugging.
         player: p ? p.reportedName : null,
@@ -1005,11 +1047,19 @@ if (isMain) {
   }
   try {
     const r = replayDemo(file);
+    // A ghost is thousands of frames; summarise it unless --ghost asked for the
+    // trajectory itself, or a --best/--all dump becomes unreadable.
+    const brief = (run) =>
+      run && run.ghost && !flags.has("--ghost")
+        ? { ...run, ghost: { hz: run.ghost.hz, frames: run.ghost.frames.length, driftMs: run.ghost.driftMs } }
+        : run;
     if (flags.has("--frames")) process.stdout.write(JSON.stringify(r.stats, null, 2) + "\n");
-    else if (flags.has("--best")) process.stdout.write(JSON.stringify(r.best, null, 2) + "\n");
+    else if (flags.has("--best")) process.stdout.write(JSON.stringify(brief(r.best), null, 2) + "\n");
     else {
       const { players, runs, best, ...head } = r;
-      process.stdout.write(JSON.stringify({ ...head, players, runs, best }, null, 2) + "\n");
+      process.stdout.write(
+        JSON.stringify({ ...head, players, runs: runs.map(brief), best: brief(best) }, null, 2) + "\n"
+      );
     }
   } catch (e) {
     console.error("demo-replay: " + (e && e.message ? e.message : e));

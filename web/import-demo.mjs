@@ -42,8 +42,12 @@
 //     rest up on its own.
 
 import fs from "node:fs";
+import zlib from "node:zlib";
+import { promisify } from "node:util";
 import pg from "pg";
 import { replayDemo } from "./demo-replay.mjs";
+
+const gzipAsync = promisify(zlib.gzip);
 
 // Mirrors web/server.js sanitizeRecord / sanitizeStrafeQuality bounds, so this
 // tool can never persist a value the HTTP ingest would have rejected.
@@ -107,6 +111,8 @@ function usage(code) {
                        demo's — e.g. legacy rows carry a trailing colour token
                        the in-game netname does not)
   --create-player      allow creating a player row when the nick is unknown
+  --ghost              also store the trajectory so the run is playable in the
+                       in-browser replay viewer (and drives the in-game ghost)
   --no-demo-pointer    skip the player_demo row (the site download link)
   --demo-path <p>      served relative path; default "<map>/<map>_<clean>_<MM-SS-mmm>.wdz20"
   --version <name>     leaderboard version label (default: guessed from the demo)
@@ -274,6 +280,40 @@ async function upsertRace(client, ids, run, at, serverId, strafeBp) {
   return { action: existing ? "improved" : "inserted", raceId, previousTime: existing ? Number(existing.time) : null };
 }
 
+
+// Store the run's trajectory as a player_ghost row, mirroring db.js
+// upsertPlayerGhost: same payload shape ({v,map,player,login,time,hz,cps,frames}
+// gzipped), same faster-only guard, same FOR UPDATE lock. We write only the DB
+// payload and not the GHOST_DIR file — ghostGzip() restores the file from the
+// payload on first read, so the row alone is enough and the CLI stays free of
+// any assumption about where that volume is mounted.
+async function upsertGhost(client, ids, run, at, serverId, mapName) {
+  if (!run.ghost) return "no usable trajectory (irregular snapshot cadence)";
+  const payload = {
+    v: 1, map: mapName, player: run.player, login: "",
+    time: run.timeMs, hz: run.ghost.hz, cps: [], frames: run.ghost.frames,
+  };
+  const gz = await gzipAsync(Buffer.from(JSON.stringify(payload)));
+
+  const existing = (await client.query(
+    "SELECT time FROM player_ghost WHERE map_id = $1 AND player_id = $2 FOR UPDATE",
+    [ids.mapId, ids.playerId]
+  )).rows[0];
+  if (existing && Number(existing.time) <= run.timeMs) return "kept (existing ghost is for a faster time)";
+
+  await client.query(
+    `INSERT INTO player_ghost (map_id, player_id, version_id, time, hz, frames, bytes, server_id, captured_at, payload)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (map_id, player_id) DO UPDATE SET
+       version_id = EXCLUDED.version_id, time = EXCLUDED.time, hz = EXCLUDED.hz,
+       frames = EXCLUDED.frames, bytes = EXCLUDED.bytes, server_id = EXCLUDED.server_id,
+       captured_at = EXCLUDED.captured_at, payload = EXCLUDED.payload`,
+    [ids.mapId, ids.playerId, ids.versionId, run.timeMs, run.ghost.hz,
+     run.ghost.frames.length, gz.length, serverId, at, gz]
+  );
+  return `stored (${run.ghost.frames.length} frames @ ${run.ghost.hz}Hz, ${(gz.length / 1024).toFixed(1)} KiB)`;
+}
+
 async function main() {
   const { flags, opts, file } = parseArgs(process.argv.slice(2));
   if (!file) usage(64);
@@ -307,7 +347,7 @@ async function main() {
       strafeQualityBp: strafeBp, maxSpeed: run.maxSpeed, startSpeed: run.startSpeed,
       // Every row this run writes is dated from the demo's own clock, not now.
       at: run.finishedAt, atISO: run.finishedAt ? new Date(run.finishedAt * 1000).toISOString() : null,
-      demoPath: relPath, awards: run.awards, provenance: run.provenance,
+      demoPath: relPath, awards: run.awards, provenance: run.provenance, ghost: run.ghost,
     });
   }
 
@@ -362,9 +402,12 @@ async function main() {
         );
         demo = r.rowCount ? "written" : "kept (existing demo is for a faster time)";
       }
+      let ghost = null;
+      if (flags.has("ghost")) ghost = await upsertGhost(client, ids, p, p.at, serverId, replay.map);
+
       results.push({
         player: p.player, timeMs: p.timeMs, playerId: ids.playerId,
-        resolvedName: ids.resolvedName ?? p.player, finish: fin, race, tally, demo,
+        resolvedName: ids.resolvedName ?? p.player, finish: fin, race, tally, demo, ghost,
       });
     }
     await client.query("COMMIT");
@@ -387,7 +430,8 @@ async function main() {
         `, finish ${r.finish.skipped ? `already present (#${r.finish.id})` : `#${r.finish.id}`}` +
         `, race ${r.race.action}${r.race.pbStrafe ? ` (PB strafe ${r.race.pbStrafe})` : ""}` +
         `${r.tally ? `, tally ${r.tally}` : ""}` +
-        `${r.demo ? `, demo pointer ${r.demo}` : ""}\n`
+        `${r.demo ? `, demo pointer ${r.demo}` : ""}` +
+        `${r.ghost ? `, ghost ${r.ghost}` : ""}\n`
       );
     }
     if (results.some((r) => r.race.action !== "unchanged"))
@@ -416,6 +460,8 @@ function printPlan(plan, flags) {
     w.write(`    speed         max ${r.maxSpeed} (${pv.speedSource ? pv.speedSource.max : "?"}),` +
             ` start ${r.startSpeed} (${pv.speedSource ? pv.speedSource.start : "?"})\n`);
     w.write(`    demo path     ${r.demoPath}\n`);
+    if (r.ghost)
+      w.write(`    ghost         ${r.ghost.frames.length} frames @ ${r.ghost.hz}Hz (drift ${r.ghost.driftMs}ms)\n`);
   }
 }
 
