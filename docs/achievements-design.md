@@ -1,16 +1,20 @@
 # Design: player achievements & rewards
 
-Status: **Phase 1 BUILT** (2026-07-31, web-only — schema, rule catalog in
+Status: **Phase 1 DEPLOYED** (2026-07-31, eb4bca2 — schema, rule catalog in
 web/achievements.js, evaluator, /admin/achievements, profile panel, public
-/achievements directory; db + smoke tested, not yet deployed).
+/achievements directory), plus a 66-definition seed set verified against
+production data (a71633e, 78dde2c, a7c8312) and retroactively awarded.
+**Phase 2 BUILT** (2026-08-01, e6c2cf1): per-player awards poll — see
+"Phase 2 as built" notes inline below (the endpoint grew a ?seed=1 variant and
+a row-id cursor; payload header is "//awards", not RSAWD, matching the other
+per-slot fetches).
 **Phase 3 PARTIALLY BUILT** (2026-07-31): distance raced + strafe count
 (run_tally counters, accumulated in player.as sampleDistance / the sampleStrafe
 segment counter) and max/starting speed (finish snapshots) now ride four new
 trailing ints on RS_ApiReportRace + two on RS_ApiReportAttempts; profile tiles,
 movement_total metrics and a max_speed_run achievement kind consume them;
 Warsow boot-test passed. Still open from the Phase 3 table: playtime, jumps,
-deaths, per-checkpoint speeds. Phase 2 (in-game announce) remains as designed
-below. Design survey was 2026-07-31.
+deaths, per-checkpoint speeds. Design survey was 2026-07-31.
 
 ## Goal
 
@@ -200,6 +204,19 @@ CSRF via `checkCsrf`, 303-redirect-with-`?ok=1`, nav link added to
 ---
 
 ## Phase 2 — in-game announce
+
+> **As built (e6c2cf1):** endpoint is `GET /api/game/awards?name=` with
+> `&seed=1` (join: newest row only, sets the mark silently) or `&after=<rowId>`
+> (rows above the mark, oldest first, capped at 20 — bursts page out across
+> polls). Header is `//awards` (not RSAWD) so the native's standard `//` gate
+> applies; lines are `<rowId>\t<tier>\t<title>\t<description>` (tabs because
+> titles carry spaces; the tier rides second so the free-text fields are last).
+> `player_achievement` gained an identity cursor column (awarded_at seconds
+> can't order a batch insert). Game side lives in hrace/awards.as: 75s per-slot
+> cadence, max 5 popups per poll + an "...and N more" summary, mesh kind "ach"
+> with the map field carrying "<tier> <title...>". A map change resets the
+> per-slot state and re-seeds, so an award landing exactly during the switch is
+> site-only — accepted (best-effort flair, not the record).
 
 Most awards will trigger from a finish that happened seconds earlier on that
 very server, but evaluation is web-side, so announcement is a poll with ~60s
