@@ -93,26 +93,29 @@ INSERT INTO achievement (slug, title, description, tier, rule, time_window, repe
 ('completionist', 'Completionist', 'Finish 500 different maps.',
  'legend', '{"kind":"distinct_maps_finished","count":500,"newOnly":false}', 'lifetime', FALSE, FALSE, TRUE, extract(epoch from now())::bigint, 'seed'),
 
--- ---- New-metric achievements: INACTIVE until data accrues ------------------
--- Strafe quality resamples from 2026-07-31 (600-ups gate); distance/strafes/
--- max speed only exist from the same date. Thresholds are provisional —
--- preview, tune, then activate from /admin/achievements.
-('half-perfect', 'Half Perfect', 'Finish a run with 50% strafe quality.',
- 'gold', '{"kind":"strafe_quality_run","minPct":50}', 'lifetime', FALSE, FALSE, FALSE, extract(epoch from now())::bigint, 'seed'),
-('smooth-operator', 'Smooth Operator', 'Average 40% strafe quality across 50 runs in 30 days.',
- 'gold', '{"kind":"strafe_quality_avg","minPct":40,"minRuns":50}', 'rolling30', FALSE, FALSE, FALSE, extract(epoch from now())::bigint, 'seed'),
+-- ---- New-metric achievements (activated 2026-08-01 after a day of data) -----
+-- Shipped INACTIVE on 2026-07-31, then previewed against live data and
+-- activated. The strafe pair was RETUNED first: the 600-ups recalibrated
+-- sampler only samples genuine high-speed strafing, so run quality averages
+-- ~78% on the new scale (~25% on the old) — the original 50%-run/40%-avg cuts
+-- would have been participation badges. 90% single-run had exactly 1 holder
+-- at activation; 80% avg sits above the field's median run.
+('near-perfect', 'Near Perfect', 'Finish a run at 90% strafe quality.',
+ 'gold', '{"kind":"strafe_quality_run","minPct":90}', 'lifetime', FALSE, FALSE, TRUE, extract(epoch from now())::bigint, 'seed'),
+('smooth-operator', 'Smooth Operator', 'Average 80% strafe quality across 50 runs in 30 days.',
+ 'gold', '{"kind":"strafe_quality_avg","minPct":80,"minRuns":50}', 'rolling30', FALSE, FALSE, TRUE, extract(epoch from now())::bigint, 'seed'),
 ('need-for-speed', 'Need for Speed', 'Hit 2,000 ups in a finished run.',
- 'silver', '{"kind":"max_speed_run","minUps":2000}', 'lifetime', FALSE, FALSE, FALSE, extract(epoch from now())::bigint, 'seed'),
+ 'silver', '{"kind":"max_speed_run","minUps":2000}', 'lifetime', FALSE, FALSE, TRUE, extract(epoch from now())::bigint, 'seed'),
 ('ludicrous-speed', 'Ludicrous Speed', 'Hit 3,000 ups in a finished run.',
- 'legend', '{"kind":"max_speed_run","minUps":3000}', 'lifetime', FALSE, FALSE, FALSE, extract(epoch from now())::bigint, 'seed'),
+ 'legend', '{"kind":"max_speed_run","minUps":3000}', 'lifetime', FALSE, FALSE, TRUE, extract(epoch from now())::bigint, 'seed'),
 ('road-trip', 'Road Trip', 'Travel 10 million units in races.',
- 'silver', '{"kind":"movement_total","metric":"distance","count":10000000}', 'lifetime', FALSE, FALSE, FALSE, extract(epoch from now())::bigint, 'seed'),
+ 'silver', '{"kind":"movement_total","metric":"distance","count":10000000}', 'lifetime', FALSE, FALSE, TRUE, extract(epoch from now())::bigint, 'seed'),
 ('the-long-haul', 'The Long Haul', 'Travel 100 million units in races.',
- 'gold', '{"kind":"movement_total","metric":"distance","count":100000000}', 'lifetime', FALSE, FALSE, FALSE, extract(epoch from now())::bigint, 'seed'),
+ 'gold', '{"kind":"movement_total","metric":"distance","count":100000000}', 'lifetime', FALSE, FALSE, TRUE, extract(epoch from now())::bigint, 'seed'),
 ('around-the-world', 'Around the World', 'Travel 1 billion units in races.',
- 'legend', '{"kind":"movement_total","metric":"distance","count":1000000000}', 'lifetime', FALSE, FALSE, FALSE, extract(epoch from now())::bigint, 'seed'),
+ 'legend', '{"kind":"movement_total","metric":"distance","count":1000000000}', 'lifetime', FALSE, FALSE, TRUE, extract(epoch from now())::bigint, 'seed'),
 ('strafe-machine', 'Strafe Machine', 'Rack up 10,000 counted strafes in races.',
- 'silver', '{"kind":"movement_total","metric":"strafes","count":10000}', 'lifetime', FALSE, FALSE, FALSE, extract(epoch from now())::bigint, 'seed'),
+ 'silver', '{"kind":"movement_total","metric":"strafes","count":10000}', 'lifetime', FALSE, FALSE, TRUE, extract(epoch from now())::bigint, 'seed'),
 
 -- ---- Hidden (active) — revealed only when earned ---------------------------
 ('jumping-the-gun', 'Jumping the Gun', 'Get caught prejumping 100 times. We see you.',
