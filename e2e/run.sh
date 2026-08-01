@@ -78,18 +78,21 @@ step "phase A: server up, 4 finishes reported through the native"
 start_server
 
 # 6th column: race starts since the player's last flush (Nova restarted a few
-# times before finishing; totals asserted in assert.mjs).
+# times before finishing; totals asserted in assert.mjs). Columns 7-10 are the
+# additive movement counters, 11-15 the metrics added since: per-run snapshots
+# stored on the finish row (strafe quality in basis points, max/start speed in
+# ups) and two more counter deltas (distance, strafes).
 "${TMP}/harness" "${BASE}/api/ingest" "${TOKEN}" "${VERSION}" <<'EOF'
-testrace	^1No^7va		52000	11000,30000	2	5	3	1	0
-testrace	^1No^7va		48000	10000,28000	1	4	2	0	1
-testrace	^1No^7va		50000	10500,29000	3	6	4	0	2
-testrace	^4Wa^5ve		49000	9800,27500	2	7	1	2	0
+testrace	^1No^7va		52000	11000,30000	2	5	3	1	0	7000	1100	700	12000	40
+testrace	^1No^7va		48000	10000,28000	1	4	2	0	1	8000	1300	800	11000	35
+testrace	^1No^7va		50000	10500,29000	3	6	4	0	2	7500	1200	750	11500	38
+testrace	^4Wa^5ve		49000	9800,27500	2	7	1	2	0	6000	1000	600	10000	30
 EOF
 
 step "phase A: standalone attempt flush (starts with no finish, e.g. disconnect)"
 curl -fsS -X POST "${BASE}/api/ingest" \
     -H "Authorization: Bearer ${TOKEN}" -H "Content-Type: application/json" \
-    -d '{"version":"wsw 2.1","map":"testrace","source":"racelog","attempts":[{"name":"^4Wa^5ve","login":"","count":4,"wall_jumps":1,"dashes":0,"prejump_failures":0,"restarts":3}]}' \
+    -d '{"version":"wsw 2.1","map":"testrace","source":"racelog","attempts":[{"name":"^4Wa^5ve","login":"","count":4,"wall_jumps":1,"dashes":0,"prejump_failures":0,"restarts":3,"distance":5000,"strafes":12}]}' \
     > /dev/null
 
 step "phase A: asserting attempts, PRs, leaderboard, WR splits, perfect run"

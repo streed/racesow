@@ -331,9 +331,15 @@ long doGet( const ApiRequest &req, std::string &out )
 	curl_easy_setopt( curl, CURLOPT_MAXREDIRS, 3L );
 	// http(s) only on redirects: never follow into file:// etc., and keep the
 	// Authorization header from wandering to arbitrary protocols. NB: the
-	// non-_STR option is deprecated in modern curl but is the ONLY spelling
-	// libcurl 7.58 (the Ubuntu 18.04 build target) has — do not "modernize".
+	// non-_STR option is the ONLY spelling libcurl 7.58 (the Ubuntu 18.04 build
+	// target) has, so it must stay for the engine image — do not delete this
+	// branch. curl 7.85+ deprecates it and warns, which is what CI builds the
+	// e2e harness against; both spellings mean exactly the same thing.
+#if defined( LIBCURL_VERSION_NUM ) && LIBCURL_VERSION_NUM >= 0x075500 /* 7.85.0 */
+	curl_easy_setopt( curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https" );
+#else
 	curl_easy_setopt( curl, CURLOPT_REDIR_PROTOCOLS, (long)( CURLPROTO_HTTP | CURLPROTO_HTTPS ) );
+#endif
 	curl_easy_setopt( curl, CURLOPT_WRITEFUNCTION, collectBody );
 	curl_easy_setopt( curl, CURLOPT_WRITEDATA, &out );
 
