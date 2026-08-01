@@ -1,0 +1,15 @@
+# Reconcile demo availability every 10 minutes (see scripts/sync-demos.sh).
+# 10 min is the worst-case delay between a player setting a PB and their demo
+# being downloadable; the run itself is a no-op copy pass when nothing changed.
+# The US box must mirror its own demos into its pak share BEFORE the EU box can
+# pull them, so both boxes run the same timer and EU converges a tick later.
+[Unit]
+Description=Racesow demo availability sync poll
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

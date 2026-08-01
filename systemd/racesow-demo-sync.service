@@ -1,0 +1,24 @@
+# One-shot: make every recorded demo downloadable from the public site (see
+# scripts/sync-demos.sh) — mirrors the game container's live demos into the
+# served pak tree, adds lowercase aliases for mixed-case paths, and (on the
+# central box) pulls anything the stats DB advertises but this box lacks from a
+# peer's pak mirror. Driven by racesow-demo-sync.timer, or on demand:
+# `systemctl start racesow-demo-sync`. Templates are substituted by
+# systemd/install.sh. Safe on BOTH boxes: the pull step no-ops without a local DB.
+#
+# Runs as __RACESOW_USER__ (in the docker group) — it only talks to Docker, and
+# never touches host paths or the SFTP jail, so it needs no root.
+[Unit]
+Description=Racesow demo availability sync (mirror + alias + peer pull)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__RACESOW_USER__
+WorkingDirectory=__RACESOW_DIR__
+EnvironmentFile=-__RACESOW_DIR__/.env
+ExecStart=__RACESOW_DIR__/scripts/sync-demos.sh
+TimeoutStartSec=900
+Nice=10
+IOSchedulingClass=idle

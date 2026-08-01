@@ -22,6 +22,36 @@ Status: **implemented** (layers 1–4 complete + tested; layer 5 partial — see
 - Tests: web suite 40/40 (incl. per-player cases). Game-module + frontend need a
   live game-server rebuild + manual verification on deploy.
 
+## Demo AVAILABILITY (2026-08-01)
+
+Storing a correct pointer is only half the job — the FILE has to reach the pak
+mirror the site links to. An audit of all 253 `player_demo` rows found only 130
+(51%) actually downloadable, from four independent causes:
+
+| Cause | Rows | Fix |
+|---|---:|---|
+| Fine | 130 | — |
+| **Case mismatch** — `RACE_ReportWrDemo` lowercased `mapname` while the engine writes the BSP's real case (`Daemond-marky/…`); nginx is case-sensitive | 14 | racemod: don't lowercase (this commit) + `sync-demos.sh` hardlinks a lowercase alias so already-stored rows resolve |
+| **US demos never reach EU** — every link points at `DEMO_BASE_URL` (EU) but the file is written on us.east | 46 | `sync-demos.sh` pulls them from the US pak mirror into EU's served tree |
+| **Superseded pointer** — the engine keeps ONE demo per (player, map) and renames it on improvement; a dropped report leaves the row on the old time | 4 | `sync-demos.sh --repair-stale` repoints the row at the surviving faster file |
+| **No file was ever written** — 43 US runs pre-dating the `demos` volume (container overlay, lost on recreate) + 16 Warfork | 63 | unrecoverable; rows pruned |
+
+**Warfork records no demos at all.** Its `Client` type has no
+`demoStart/demoStop/demoCancel`, so `warfork/scriptpatches/patch-scripts-as2024.py`
+stubs the capture calls out — but the racemod still *reported* a pointer, so every
+Warfork PB minted a permanent 404. `warfork/entrypoint.sh` now sets
+`rs_record_demos 0`, which gates both the capture calls and `RACE_ReportWrDemo`.
+Flip it back to 1 when the three Client demo natives get registered in the
+Warfork game module (that remains the real fix — see Open risks).
+
+**Ongoing:** `scripts/sync-demos.sh` (systemd `racesow-demo-sync.timer`, every
+10 min on BOTH boxes) mirrors each box's freshly recorded demos into its pak
+share — `export_pakshare` otherwise only runs at container launch, so a new PB
+404s until the next restart — adds the lowercase aliases, and on the central box
+pulls anything the DB advertises that EU lacks. It only ever adds files; pruning
+dead rows stays a deliberate manual step so a transient peer outage can't delete
+history.
+
 ---
 
 Original proposal below.

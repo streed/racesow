@@ -121,6 +121,16 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     [ -n "${RCON_PASSWORD}" ]      && echo "set rcon_password \"${RCON_PASSWORD}\""
     [ -n "${SV_UPLOADS_BASEURL}" ] && echo "set sv_uploads_baseurl \"${SV_UPLOADS_BASEURL}\""
     echo "set sv_demodir \"\""
+    # Per-client demo capture does not exist on Warfork: its Client type has no
+    # demoStart/demoStop/demoCancel, so warfork/scriptpatches/patch-scripts-as2024.py
+    # stubs those 6 call sites out. With capture stubbed, reporting a demo
+    # POINTER would register a download link for a file that is never written —
+    # every Warfork PB used to mint a permanent 404 on the site. rs_record_demos
+    # gates BOTH the capture calls and RACE_ReportWrDemo (hrace/player.as), so
+    # turning it off here is exactly "no demos on Warfork". Ghost replays are
+    # independent (RS_Ghost* natives) and stay on. Flip this back to 1 when the
+    # 3 Client demo natives get registered in the Warfork game module.
+    echo "set rs_record_demos \"0\""
     if [ -n "${INGEST_URL}" ]; then
         base="${INGEST_URL%/api/ingest}"
         echo "set rs_api_url \"${INGEST_URL}\""

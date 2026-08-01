@@ -48,13 +48,17 @@ fi
 # so the heartbeat service+timer install on full and agent alike (they no-op
 # until XPIRY_PING_* land in .env — see scripts/xpiry-provision.sh).
 XPIRY="racesow-xpiry-heartbeat.service racesow-xpiry-heartbeat.timer"
+# Both tiers also reconcile demo availability: each box mirrors its OWN freshly
+# recorded demos into its pak share, and the central box additionally pulls the
+# agent box's demos so racesow.org can serve them (scripts/sync-demos.sh).
+DEMOSYNC="racesow-demo-sync.service racesow-demo-sync.timer"
 if [ "${MODE}" = "full" ]; then
-    UNITS="racesow-web.service racesow-server.service racesow-db-backup.service racesow-db-backup.timer racesow-pakscan.service racesow-pakscan.timer racesow-restart.service racesow-restart.timer ${XPIRY}"
-    ENABLE="racesow-web.service racesow-server.service racesow-db-backup.timer racesow-pakscan.timer racesow-restart.timer racesow-xpiry-heartbeat.timer"
+    UNITS="racesow-web.service racesow-server.service racesow-db-backup.service racesow-db-backup.timer racesow-pakscan.service racesow-pakscan.timer racesow-restart.service racesow-restart.timer ${XPIRY} ${DEMOSYNC}"
+    ENABLE="racesow-web.service racesow-server.service racesow-db-backup.timer racesow-pakscan.timer racesow-restart.timer racesow-xpiry-heartbeat.timer racesow-demo-sync.timer"
     RESTART_TZ="${RESTART_TZ:-Europe/Berlin}"
 else
-    UNITS="racesow-agent.service racesow-pakscan.service racesow-pakscan.timer racesow-restart.service racesow-restart.timer ${XPIRY}"
-    ENABLE="racesow-agent.service racesow-pakscan.timer racesow-restart.timer racesow-xpiry-heartbeat.timer"
+    UNITS="racesow-agent.service racesow-pakscan.service racesow-pakscan.timer racesow-restart.service racesow-restart.timer ${XPIRY} ${DEMOSYNC}"
+    ENABLE="racesow-agent.service racesow-pakscan.timer racesow-restart.timer racesow-xpiry-heartbeat.timer racesow-demo-sync.timer"
     RESTART_TZ="${RESTART_TZ:-America/New_York}"
 fi
 

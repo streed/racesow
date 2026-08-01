@@ -101,8 +101,14 @@ void RACE_ReportWrDemo( Player@ player, uint finishTime )
     // "<map>-reversed" level on the site. The on-disk demo path still uses the
     // physical BSP name (the engine writes demos/server/<bsp>/...), so build the
     // relative path from the real map name but report the effective one.
+    //
+    // Do NOT lowercase diskMap: the engine writes the map dir + filename with
+    // the BSP's OWN case ("Daemond-marky/Daemond-marky_..."), and the download
+    // is served by case-sensitive nginx, so a lowercased pointer 404s on every
+    // map whose name isn't already lowercase. (scripts/sync-demos.sh hardlinks
+    // a lowercase alias so the rows reported before this fix still resolve.)
     Cvar mapNameVar( "mapname", "", 0 );
-    String diskMap = mapNameVar.string.tolower();
+    String diskMap = mapNameVar.string;
     String map = RACE_EffectiveMapName( player.reversed );
     String relPath = RACE_DemoRelPath( diskMap, player.client, finishTime );
     RS_ApiReportWrDemo( rsApiUrl.string, rsApiToken.string, rsApiVersion.string,
