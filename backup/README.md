@@ -30,9 +30,13 @@ It is a **full public mirror** of the gameplay data, not just current records.
 **Included** — every personal-best record (`race`) **and** the complete
 finish-log history (`finish`), all their checkpoint splits (`checkpoint`,
 `finish_checkpoint`), `run_tally`, `player`, `map`, `version`, `canonical`,
-per-player replay metadata (`player_demo`, `player_ghost`), daily Skill-Rating
-history (`sr_history`), the per-map weapon index (`map_weapon`), the message of
-the day (`site_setting`) and game-server **names** (`server`), plus the `config`
+per-player replay metadata (`player_demo`, `player_ghost`), saved practice
+starts (`player_saved_start`), daily Skill-Rating history (`sr_history`), the
+per-map weapon index (`map_weapon`), achievement definitions (`achievement`) and
+every award earned (`player_achievement`), tournaments with their map pools,
+final standings and trophies (`tournament`, `tournament_map`,
+`tournament_standing`, `tournament_trophy`), the message of the day
+(`site_setting`) and game-server **names** (`server`), plus the `config`
 counter and `pgmigrations` bookkeeping (so a restore boots without re-running
 migrations).
 
@@ -43,18 +47,36 @@ migrations).
 | `admin_user`, `admin_session` | moderator logins + sessions |
 | `map_flag` | abuse reports + salted reporter-IP hashes |
 | `map_block` | moderation block decisions (admin usernames) |
+| `server_log` | rcon / ops audit trail |
+| `censor_term`, `player_censor`, `map_censor` | moderation word list + per-player/per-map overrides |
+| `tournament_entrant` | **live entry codes** that redeem a tournament slot in-game |
 | `server.token_hash` | ingest API tokens |
 | `server.address` | game-server IP addresses |
 | `site_setting.updated_by` | admin username on the MOTD |
+| `achievement.created_by/updated_by`, `tournament.created_by/updated_by` | admin usernames on admin-authored definitions |
 | `config.maintenance_*` | maintenance-mode state + the admin who toggled it |
 | mesh keys, `INGEST_TOKEN` | live in env/config, never stored in the DB |
 
-`config`, `server` and `site_setting` have their **data** dumped through a
-sanitized `SELECT` (config: every key except `maintenance_*`, so the
-`next_race_id` bootstrap counter survives; server: id, name, status, timestamps,
-record count; site_setting: key, value, timestamp) — `token_hash`, `address`,
-`updated_by` and the `maintenance_*` keys are never written out. Everything else
-on the exclude list is simply never selected by `pg_dump`.
+`config`, `server`, `site_setting`, `achievement` and `tournament` have their
+**data** dumped through a sanitized `SELECT` (config: every key except
+`maintenance_*`, so the `next_race_id` bootstrap counter survives; server: id,
+name, status, timestamps, record count; site_setting: key, value, timestamp;
+achievement + tournament: every column except the `created_by`/`updated_by`
+admin usernames) — `token_hash`, `address`, `updated_by` and the
+`maintenance_*` keys are never written out. Everything else on the exclude list
+is simply never selected by `pg_dump`.
+
+Also absent by design: `best`, `standings` and `map_index`. Those are derived
+leaderboard rollups that `openDatabase()` rebuilds from the race data on every
+boot (`db.js` `refreshAggregates`), so a restored instance regenerates them.
+
+> **Adding a table?** `TABLES` in `backup.sh` is an allow-list, so a new table is
+> excluded until you name it — a new moderation or secret table can never
+> silently leak. When you add a race-record table, add it there too; if it
+> carries an admin username or any other operator-only column, give it a
+> sanitized `\copy` in step 3 rather than dumping its data wholesale. The
+> sanitized parent rows are emitted between pg_dump's `data` and `post-data`
+> sections so foreign keys still validate on restore.
 
 ## Restore
 

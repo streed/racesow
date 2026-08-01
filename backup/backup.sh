@@ -12,12 +12,27 @@
 #   * admin_user / admin_session -> never selected (moderator logins + sessions)
 #   * map_flag                   -> never selected (abuse reports, IP hashes)
 #   * map_block                  -> never selected (moderation block decisions)
+#   * server_log                 -> never selected (rcon/ops audit trail)
+#   * censor_term / player_censor / map_censor
+#                                -> never selected (moderation word list + the
+#                                   per-player and per-map name overrides)
+#   * tournament_entrant         -> never selected: `code` is a LIVE ENTRY CODE
+#                                   that redeems a tournament slot in-game, so
+#                                   the whole table stays out. Nothing else
+#                                   references it; the public result of a
+#                                   tournament is tournament_standing/_trophy.
 #   * server.token_hash          -> ingest API tokens, stripped
 #   * server.address             -> game-server IP addresses, stripped
 #   * site_setting.updated_by    -> admin username on the MOTD, stripped
+#   * achievement.created_by/updated_by, tournament.created_by/updated_by
+#                                -> admin usernames on admin-authored defs, stripped
 #   * config.maintenance_*        -> maintenance-mode state incl. the admin
 #                                   username that toggled it, stripped
 #   * mesh keys / INGEST_TOKEN    -> live in env/config, never in the DB at all
+#
+# best / standings / map_index are deliberately absent: they are derived rollups
+# that openDatabase() rebuilds from race/finish/player/map on every boot
+# (db.js refreshAggregates), so a restored instance regenerates them itself.
 #
 # The dump is plain SQL (schema + data + sequences, via pg_dump) that restores
 # into an empty PostgreSQL 16 database with psql. See README.txt in the archive.
@@ -47,15 +62,18 @@ SQL="$WORK/$SQL_NAME"
 # The tables that make up the public race database. This is an ALLOW-LIST: any
 # table not named here is excluded from the dump entirely, so a future
 # moderation/secret table can never silently leak. The intentionally-excluded
-# tables today are admin_user, admin_session, map_flag, and map_block
-# (moderator accounts/sessions + abuse reports + block decisions). config,
-# server and site_setting are listed here for their SCHEMA but have their DATA
-# excluded below and re-added sanitized in step 3 (config: bootstrap counters
-# without the maintenance_* keys; server: names only; site_setting: MOTD without
-# the admin username). pgmigrations is included so a restored DB boots without
-# re-running the schema migrations.
-# NOTE: when a NEW race-record table is added to the schema, add it here too.
-TABLES="public.config public.version public.map public.player public.canonical public.race public.checkpoint public.finish public.finish_checkpoint public.run_tally public.player_demo public.player_ghost public.sr_history public.map_weapon public.site_setting public.server public.pgmigrations"
+# tables today are admin_user, admin_session, map_flag, map_block, server_log,
+# censor_term, player_censor, map_censor and tournament_entrant (see the header).
+# config, server, site_setting, achievement and tournament are listed here for
+# their SCHEMA but have their DATA excluded below and re-added sanitized in step
+# 3 (config: bootstrap counters without the maintenance_* keys; server: names
+# only; site_setting: MOTD without the admin username; achievement + tournament:
+# every column except the created_by/updated_by admin usernames). pgmigrations is
+# included so a restored DB boots without re-running the schema migrations.
+# NOTE: when a NEW race-record table is added to the schema, add it here too —
+# and if it carries an admin username or any other operator-only column, give it
+# a sanitized \copy in step 3 instead of dumping its data wholesale.
+TABLES="public.config public.version public.map public.player public.canonical public.race public.checkpoint public.finish public.finish_checkpoint public.run_tally public.player_demo public.player_ghost public.player_saved_start public.sr_history public.map_weapon public.achievement public.player_achievement public.tournament public.tournament_map public.tournament_standing public.tournament_trophy public.site_setting public.server public.pgmigrations"
 
 echo "[backup] $NOW_ISO building $SQL_NAME"
 
@@ -68,13 +86,18 @@ cat > "$SQL" <<EOF
 --
 -- Included : records (race) + the full finish-log history (finish), all their
 --            checkpoint splits, run tallies, players, maps, versions, per-player
---            replay metadata (demo + ghost), daily Skill-Rating history, the
---            per-map weapon index, the message of the day, and game-server names.
+--            replay metadata (demo + ghost), saved practice starts, daily
+--            Skill-Rating history, the per-map weapon index, achievement
+--            definitions + every award earned, tournaments with their map pools,
+--            final standings and trophies, the message of the day, and
+--            game-server names.
 -- EXCLUDED : admin accounts & sessions, ingest API tokens, game-server IP
 --            addresses, moderation reports/blocks (map_flag, map_block), the
---            MOTD's admin username, and maintenance-mode state (which records
---            the admin who toggled it). Mesh keys and INGEST_TOKEN never live in
---            the database, so they cannot appear here.
+--            rcon/ops audit log, the name-censoring word list and overrides,
+--            tournament entry codes (tournament_entrant), the admin usernames
+--            on the MOTD / achievement / tournament rows, and maintenance-mode
+--            state (which records the admin who toggled it). Mesh keys and
+--            INGEST_TOKEN never live in the database, so they cannot appear here.
 --
 -- Restore into an EMPTY PostgreSQL 16 database:
 --   createdb racesow
@@ -85,18 +108,37 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 EOF
 
-# 2) Schema + data for the public tables. server and site_setting DATA are
-#    excluded here and re-added sanitized in step 3, but their CREATE TABLE is
-#    still emitted so the restored column layout matches a real instance.
+# 2) The dump is emitted in pg_dump's own three sections so the sanitized rows of
+#    step 3 land INSIDE the data section, before post-data adds the foreign keys.
+#    That ordering is load-bearing: player_achievement references achievement(id)
+#    and tournament_map/_standing/_trophy reference tournament(id), so if the
+#    sanitized parent rows were simply appended after a whole-dump pg_dump, the
+#    children would already be loaded and the FK constraint would fail to
+#    validate against an empty parent. (server, site_setting and config have no
+#    dependents, which is why appending worked while they were the only ones.)
+#
+# 2a) pre-data: CREATE TABLE for every public table. server, site_setting,
+#     config, achievement and tournament get their schema here too; only their
+#     DATA is withheld, so the restored column layout matches a real instance.
 TBL_ARGS=""
 for t in $TABLES; do TBL_ARGS="$TBL_ARGS -t $t"; done
 # shellcheck disable=SC2086
 pg_dump "$DATABASE_URL" \
-  --no-owner --no-privileges --no-comments \
+  --no-owner --no-privileges --no-comments --section=pre-data \
+  $TBL_ARGS \
+  >> "$SQL"
+
+# 2b) data: every table whose rows are published verbatim. The five sanitized
+#     tables are withheld here and re-added, column-filtered, in step 3.
+# shellcheck disable=SC2086
+pg_dump "$DATABASE_URL" \
+  --no-owner --no-privileges --no-comments --section=data \
   $TBL_ARGS \
   --exclude-table-data=public.config \
   --exclude-table-data=public.server \
   --exclude-table-data=public.site_setting \
+  --exclude-table-data=public.achievement \
+  --exclude-table-data=public.tournament \
   >> "$SQL"
 
 # 3) Sanitized game-server rows: id + name + status + counts only. token_hash
@@ -140,6 +182,43 @@ pg_dump "$DATABASE_URL" \
   printf '\\.\n'
 } >> "$SQL"
 
+# 3d) Sanitized achievement definitions: everything the site shows publicly
+#     (slug, title, description, tier, rule, window, flags) MINUS created_by /
+#     updated_by, which are the admin usernames that authored or last edited the
+#     definition. The setval keeps the identity sequence consistent so a restored
+#     instance can define new achievements without a primary-key collision.
+{
+  printf '\n-- Sanitized achievement definitions (author/editor admin usernames stripped).\n'
+  printf 'COPY public.achievement (id, slug, title, description, tier, rule, time_window, repeatable, hidden, active, created_at, updated_at) FROM stdin;\n'
+  psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+    -c "\\copy (SELECT id, slug, title, description, tier, rule, time_window, repeatable, hidden, active, created_at, updated_at FROM public.achievement ORDER BY id) TO STDOUT"
+  printf '\\.\n'
+  printf "SELECT pg_catalog.setval(pg_get_serial_sequence('public.achievement','id'), (SELECT COALESCE(MAX(id), 1) FROM public.achievement), (SELECT COUNT(*) > 0 FROM public.achievement));\n"
+} >> "$SQL"
+
+# 3e) Sanitized tournaments: the full public definition of each competition
+#     (name, window, scoring, status, recurrence, edition) MINUS the created_by /
+#     updated_by admin usernames. The entrant table is never dumped at all — it
+#     holds live entry codes — so a restored instance keeps the tournaments and
+#     their frozen standings/trophies, but not the in-flight join codes.
+{
+  printf '\n-- Sanitized tournaments (creator/editor admin usernames stripped).\n'
+  printf 'COPY public.tournament (id, slug, name, description, starts_at, ends_at, status, scoring, join_open, repeat_every_days, repeat_gap_days, series_key, edition, finalized_at, created_at, updated_at) FROM stdin;\n'
+  psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+    -c "\\copy (SELECT id, slug, name, description, starts_at, ends_at, status, scoring, join_open, repeat_every_days, repeat_gap_days, series_key, edition, finalized_at, created_at, updated_at FROM public.tournament ORDER BY id) TO STDOUT"
+  printf '\\.\n'
+  printf "SELECT pg_catalog.setval(pg_get_serial_sequence('public.tournament','id'), (SELECT COALESCE(MAX(id), 1) FROM public.tournament), (SELECT COUNT(*) > 0 FROM public.tournament));\n"
+} >> "$SQL"
+
+# 2c) post-data: primary keys, indexes and foreign keys, emitted last so every
+#     COPY above (pg_dump's own and the sanitized ones) is already loaded when
+#     the constraints are validated.
+# shellcheck disable=SC2086
+pg_dump "$DATABASE_URL" \
+  --no-owner --no-privileges --no-comments --section=post-data \
+  $TBL_ARGS \
+  >> "$SQL"
+
 SQL_BYTES=$(wc -c < "$SQL" | tr -d ' ')
 
 # Best-effort row counts for the public manifest.
@@ -156,14 +235,19 @@ File:      $SQL_NAME  (plain PostgreSQL SQL: schema + data + sequences)
 This archive is a FULL public mirror of the racesow.org race database so anyone
 can run their own instance or analyse the data. It contains every record and
 finish, all their checkpoint splits, players, maps, versions, run tallies,
-per-player replay metadata (demo + ghost), daily Skill-Rating history, the
-per-map weapon index, the message of the day, and game-server names. It
-deliberately EXCLUDES:
+per-player replay metadata (demo + ghost), saved practice starts, daily
+Skill-Rating history, the per-map weapon index, achievement definitions and
+every award earned, tournaments with their map pools, final standings and
+trophies, the message of the day, and game-server names. It deliberately
+EXCLUDES:
   * admin/moderator accounts and login sessions
   * ingest API tokens (server.token_hash) and mesh keys
   * game-server IP addresses (server.address)
   * moderation flag reports and block decisions (map_flag, map_block)
-  * the MOTD's admin username (site_setting.updated_by)
+  * the rcon / ops audit log (server_log)
+  * the name-censoring word list and per-player/per-map overrides
+  * tournament entry codes (tournament_entrant) — these redeem a slot in-game
+  * admin usernames on the MOTD, achievement and tournament rows
   * maintenance-mode state incl. the toggling admin (config.maintenance_*)
 
 Restore into an EMPTY PostgreSQL 16 database:
@@ -173,6 +257,14 @@ Restore into an EMPTY PostgreSQL 16 database:
 The dump includes node-pg-migrate's pgmigrations bookkeeping, so a racesow web
 instance pointed at the restored database boots without re-running (or
 conflicting with) the schema migrations.
+
+The leaderboard rollups (best, standings, map_index) are NOT in this dump on
+purpose: a racesow instance rebuilds them from the race data at startup.
+
+NOTE: because the excluded tables above are omitted while pgmigrations says
+their migrations already ran, they are absent after a restore. A stock racesow
+web instance expects some of them (e.g. map_block, censor_term) to exist, so
+create them from web/migrations before pointing a full site at this database.
 EOF
 
 cat > "$WORK/manifest.json" <<EOF
@@ -183,8 +275,8 @@ cat > "$WORK/manifest.json" <<EOF
   "sql_file": "$SQL_NAME",
   "sql_bytes": $SQL_BYTES,
   "row_counts": { "race": ${RACES:-0}, "finish": ${FINISHES:-0}, "player": ${PLAYERS:-0}, "map": ${MAPS:-0} },
-  "included": ["races","finishes","checkpoints","run_tally","players","maps","versions","player_demo","player_ghost","sr_history","map_weapon","motd","server names"],
-  "excluded": ["admin_user","admin_session","ingest API tokens","server IP addresses","map_flag","map_block","MOTD admin username","maintenance-mode admin","mesh keys"]
+  "included": ["races","finishes","checkpoints","run_tally","players","maps","versions","player_demo","player_ghost","player_saved_start","sr_history","map_weapon","achievement","player_achievement","tournament","tournament_map","tournament_standing","tournament_trophy","motd","server names"],
+  "excluded": ["admin_user","admin_session","ingest API tokens","server IP addresses","map_flag","map_block","server_log","censor_term","player_censor","map_censor","tournament_entrant (entry codes)","MOTD admin username","achievement/tournament admin usernames","maintenance-mode admin","mesh keys"]
 }
 EOF
 
@@ -221,8 +313,8 @@ cat > "$OUT_DIR/.${BASENAME}-latest.json.tmp" <<EOF
   "sha256": "$SHA",
   "download_url": "/backup/${BASENAME}-latest.zip",
   "row_counts": { "race": ${RACES:-0}, "finish": ${FINISHES:-0}, "player": ${PLAYERS:-0}, "map": ${MAPS:-0} },
-  "included": ["races","finishes","checkpoints","run_tally","players","maps","versions","player_demo","player_ghost","sr_history","map_weapon","motd","server names"],
-  "excluded": ["admin accounts & sessions","ingest API tokens","game-server IP addresses","moderation flags & blocks (map_flag, map_block)","MOTD admin username","maintenance-mode admin","mesh keys"]
+  "included": ["races","finishes","checkpoints","run_tally","players","maps","versions","player_demo","player_ghost","player_saved_start","sr_history","map_weapon","achievement","player_achievement","tournament","tournament_map","tournament_standing","tournament_trophy","motd","server names"],
+  "excluded": ["admin accounts & sessions","ingest API tokens","game-server IP addresses","moderation flags & blocks (map_flag, map_block)","rcon/ops audit log","name-censor list & overrides","tournament entry codes","MOTD admin username","achievement & tournament admin usernames","maintenance-mode admin","mesh keys"]
 }
 EOF
 mv "$OUT_DIR/.${BASENAME}-latest.json.tmp" "$OUT_DIR/${BASENAME}-latest.json"

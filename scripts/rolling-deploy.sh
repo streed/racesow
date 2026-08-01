@@ -131,4 +131,23 @@ if docker compose config --services 2>/dev/null | grep -qx heatmaps; then
     docker compose up -d --no-deps --force-recreate heatmaps
 fi
 
+# The db-backup sidecar (weekly public database snapshot) runs its OWN image,
+# built from ./backup. Unlike heatmaps it is not part of any other service's
+# lifecycle, so nothing here would ever create it: it sat unstarted for two
+# weeks after being added to compose because deploys only ever touch services
+# by name and a bare `docker compose up -d` is deliberately never run (it would
+# force-kill web). Hence this ensure-step.
+#
+# `--build` is what makes an edit to backup.sh actually ship, since the script
+# is COPYed into the image. In practice the rebuild yields a fresh image id even
+# when fully cached, so this recreates the container on every deploy. That is
+# harmless: the loop schedules off the AGE OF THE PUBLISHED FILE, not uptime, so
+# a restart re-checks at once and skips while the snapshot is fresh (it does not
+# republish, and never touches the existing zip). It also means a deploy repairs
+# a crashed or removed sidecar for free.
+if docker compose config --services 2>/dev/null | grep -qx db-backup; then
+    say "ensuring the db-backup sidecar is built and running"
+    docker compose up -d --no-deps --build db-backup
+fi
+
 say "rolling deploy complete — both replicas on the new image, no downtime"

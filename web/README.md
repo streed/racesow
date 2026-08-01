@@ -255,9 +255,11 @@ It is produced by the `db-backup` sidecar (`../backup/`, wired in the top-level
 `docker-compose.yml`) — a self-scheduling container that dumps into
 `./data/backups`, which this server serves via `BACKUP_DIR` (default
 `/data/backups`). The dump includes races, checkpoints, run tallies, players,
-maps, versions, replay metadata, and game-server **names**, but **excludes**
-admin accounts/sessions, ingest API tokens (`server.token_hash`), game-server
-IPs (`server.address`), and moderation data (`map_flag`, `map_block`). Mesh keys
+maps, versions, replay metadata, achievements and their awards, tournaments with
+their standings and trophies, and game-server **names**, but **excludes** admin
+accounts/sessions, ingest API tokens (`server.token_hash`), game-server IPs
+(`server.address`), moderation data (`map_flag`, `map_block`, `server_log`, the
+name-censor tables) and tournament entry codes (`tournament_entrant`). Mesh keys
 and `INGEST_TOKEN` live in env/config and are never in the database. See
 [`../backup/README.md`](../backup/README.md) for restore steps.
 

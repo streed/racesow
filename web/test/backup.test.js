@@ -47,6 +47,13 @@ const SECRETS = {
   session: "SESSIONHASH_0badc0de0badc0de",
   csrf: "CSRFSENTINEL_feedface",
   reporter: "REPORTERHASH_8badf00d8badf00d",
+  // A tournament entry code redeems a competition slot in-game, so the whole
+  // entrant table stays out of the dump.
+  entryCode: "ENTRYCODE_c0ffee15gooD",
+  // Admin usernames that authored an achievement / tournament definition. The
+  // rows themselves are public; these two columns are not.
+  achievementAuthor: "admin_ach_author_sentinel",
+  tournamentAuthor: "admin_trn_author_sentinel",
 };
 const PUBLIC = {
   map: "backuptest_map",
@@ -54,6 +61,8 @@ const PUBLIC = {
   login: "backuptestlogin",
   server: "BackupTest EU Node",
   time: 123456,
+  achievement: "BackupTest First Blood",
+  tournament: "BackupTest Winter Cup",
 };
 
 async function seed(pool) {
@@ -94,6 +103,37 @@ async function seed(pool) {
     `INSERT INTO map_flag (map_id, reason, reporter_hash, created_at) VALUES (1, 'broken', $1, $2)`,
     [SECRETS.reporter, now]
   );
+
+  // Achievements + tournaments: the rows are public, but each carries the admin
+  // username that authored it, and an entrant row carries a live entry code.
+  await pool.query(
+    `INSERT INTO achievement (slug, title, description, tier, rule, created_at, created_by)
+     VALUES ('backuptest-first', $1, 'first finish', 'bronze', '{"kind":"finishes","min":1}'::jsonb, $2, $3)`,
+    [PUBLIC.achievement, now, SECRETS.achievementAuthor]
+  );
+  await pool.query(
+    `INSERT INTO player_achievement (achievement_id, player_id, awarded_at)
+     VALUES ((SELECT id FROM achievement WHERE slug = 'backuptest-first'), 1, $1)`,
+    [now]
+  );
+  await pool.query(
+    `INSERT INTO tournament (slug, name, starts_at, ends_at, created_at, created_by)
+     VALUES ('backuptest-cup', $1, $2, $3, $2, $4)`,
+    [PUBLIC.tournament, now, now + 86400, SECRETS.tournamentAuthor]
+  );
+  const trn = `(SELECT id FROM tournament WHERE slug = 'backuptest-cup')`;
+  await pool.query(`INSERT INTO tournament_map (tournament_id, map_id) VALUES (${trn}, 1)`);
+  await pool.query(
+    `INSERT INTO tournament_entrant (tournament_id, code, created_at) VALUES (${trn}, $1, $2)`,
+    [SECRETS.entryCode, now]
+  );
+  await pool.query(
+    `INSERT INTO tournament_standing (tournament_id, player_id, place, points) VALUES (${trn}, 1, 1, 25)`
+  );
+  await pool.query(
+    `INSERT INTO tournament_trophy (tournament_id, player_id, place, awarded_at) VALUES (${trn}, 1, 1, $1)`,
+    [now]
+  );
 }
 
 // Run backup.sh against `dbUrl`, unzip into `dir`, return { sql, files, meta }.
@@ -130,15 +170,29 @@ test("backup keeps race records and drops every secret", { skip: !TOOLS && "pg_d
   assert.ok(sql.includes(PUBLIC.login), "player login present (public identity)");
   assert.ok(sql.includes(String(PUBLIC.time)), "race time present");
   assert.ok(sql.includes(PUBLIC.server), "server name present");
-  // Server data is re-added through the sanitized column list.
+  assert.ok(sql.includes(PUBLIC.achievement), "achievement definition present");
+  assert.ok(sql.includes(PUBLIC.tournament), "tournament present");
+  // Server/achievement/tournament data is re-added through sanitized column lists.
   assert.match(sql, /COPY public\.server \(id, name, status, created_at, last_seen_at, records\)/);
+  assert.match(sql, /COPY public\.achievement \(id, slug, title, description, tier, rule, time_window/);
+  assert.match(sql, /COPY public\.tournament \(id, slug, name, description, starts_at, ends_at/);
 
   // --- Every secret is gone -------------------------------------------------
   for (const [label, value] of Object.entries(SECRETS)) {
     assert.ok(!sql.includes(value), `secret ${label} must not appear in the backup`);
   }
   // The private / moderation tables are not even defined in the dump.
-  for (const tbl of ["admin_user", "admin_session", "map_flag", "map_block"]) {
+  for (const tbl of [
+    "admin_user",
+    "admin_session",
+    "map_flag",
+    "map_block",
+    "server_log",
+    "censor_term",
+    "player_censor",
+    "map_censor",
+    "tournament_entrant",
+  ]) {
     assert.ok(!sql.includes(`CREATE TABLE public.${tbl}`), `${tbl} must not be dumped`);
   }
 
@@ -180,8 +234,57 @@ test("backup restores into an empty database with secrets absent", { skip: !TOOL
   assert.equal(await n("SELECT count(*) n FROM checkpoint"), 1, "checkpoints restored");
   assert.equal(await n("SELECT count(*) n FROM run_tally"), 1, "tallies restored");
 
+  // Achievements + tournaments survive the round-trip. These are the tables
+  // whose sanitized parent rows must load BEFORE the foreign keys are validated
+  // — if the ordering regressed, the restore above would already have failed.
+  // Compared against the SOURCE rather than a literal: the migrations seed a
+  // few dozen achievement definitions, and that count moves as seeds are added.
+  const srcN = async (sql) => Number((await race.pool.query(sql)).rows[0].n);
+  for (const tbl of [
+    "achievement",
+    "player_achievement",
+    "tournament",
+    "tournament_map",
+    "tournament_standing",
+    "tournament_trophy",
+  ]) {
+    const before = await srcN(`SELECT count(*) n FROM ${tbl}`);
+    assert.ok(before > 0, `fixture seeded ${tbl}`);
+    assert.equal(await n(`SELECT count(*) n FROM ${tbl}`), before, `${tbl} restored in full`);
+  }
+
+  // The admin usernames on those public rows are gone.
+  const ach = (
+    await client.query("SELECT title, created_by, updated_by FROM achievement WHERE slug = 'backuptest-first'")
+  ).rows[0];
+  assert.equal(ach.title, PUBLIC.achievement);
+  assert.equal(ach.created_by, null, "achievement author stripped");
+  const trn = (await client.query("SELECT name, created_by FROM tournament WHERE slug = 'backuptest-cup'")).rows[0];
+  assert.equal(trn.name, PUBLIC.tournament);
+  assert.equal(trn.created_by, null, "tournament author stripped");
+
+  // A restored instance can still define new achievements/tournaments — the
+  // identity sequences were advanced past the restored rows.
+  await assert.doesNotReject(
+    client.query(
+      `INSERT INTO achievement (slug, title, rule, created_at)
+       VALUES ('post-restore', 'Post Restore', '{}'::jsonb, 1) RETURNING id`
+    ),
+    "achievement identity sequence set"
+  );
+
   // Excluded tables never came back.
-  for (const tbl of ["admin_user", "admin_session", "map_flag", "map_block"]) {
+  for (const tbl of [
+    "admin_user",
+    "admin_session",
+    "map_flag",
+    "map_block",
+    "server_log",
+    "censor_term",
+    "player_censor",
+    "map_censor",
+    "tournament_entrant",
+  ]) {
     const reg = (await client.query("SELECT to_regclass($1) AS r", [`public.${tbl}`])).rows[0].r;
     assert.equal(reg, null, `${tbl} must not exist after restore`);
   }
