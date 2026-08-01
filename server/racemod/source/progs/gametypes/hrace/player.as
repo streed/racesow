@@ -120,6 +120,15 @@ class Player
     // try again.
     bool pendingTourneyJoin;
     uint tourneyJoinDeadline;
+    // The unprompted "a tournament is on, come and join" notice (tournament.as
+    // RACE_TourneyGreetThink): tourneyNoticeAt is the levelTime it may print at
+    // (0 = not scheduled yet), tourneyNoticeSent latches once this player has
+    // been told BY ANY ROUTE — the personal notice, a broadcast they were
+    // present for, /tournament, or their own sign-up — so nobody hears the same
+    // pitch twice in a minute. Cleared by clear() on enterGame, so a rejoin or
+    // a map change earns one fresh notice.
+    uint tourneyNoticeAt;
+    bool tourneyNoticeSent;
     Position savedRaceStart;
     bool savedRaceStartValid;
     Position savedReverseStart;
@@ -354,6 +363,8 @@ class Player
         this.nextAwardsPoll = 0;
         this.pendingTourneyJoin = false;
         this.tourneyJoinDeadline = 0;
+        this.tourneyNoticeAt = 0;
+        this.tourneyNoticeSent = false;
         this.savedRaceStartValid = false;
         this.savedReverseStartValid = false;
         this.noclipSpawn = false;

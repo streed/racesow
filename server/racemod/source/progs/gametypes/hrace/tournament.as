@@ -28,21 +28,35 @@
 //      from the pool and reuses the proven randmap change path (set
 //      randmap_passed, launch POSTMATCH — see commands.as).
 //
+//   4. Telling people it is on. A tournament nobody hears about is a tournament
+//      nobody enters, and the website is the only other place it is advertised.
+//      So while one is LIVE the box says so: once to each player shortly after
+//      they join, once to everyone the moment a tournament starts mid-session,
+//      and then on a slow rs_tourney_announce_interval rotation. All three are
+//      the same pitch (RACE_TourneyPitch) and all three are silent unless a
+//      tournament is actually running with a real player on the box.
+//
 // Fail-open throughout: empty rs_api_tourney_url = the feature is off and every
 // command says so; a failed fetch just retries next interval.
 //
 // Payload contract (web/tournaments.js gameTourneyText):
 //   RSTOURNEY
 //   T<TAB><id><TAB><slug><TAB><startsAt><TAB><endsAt><TAB><name>
+//   S<TAB><live|soon><TAB><secondsLeft><TAB><entrants>
 //   M<TAB><mapname>
 //   ...
 // At most one T line — the tournament running NOW, or the next one due if none
-// is — followed by its pool. A bare header is the real "nothing scheduled"
-// state. Line-walked with RACE_LocateFrom because getToken would split the
-// multi-word name; tabs delimit so a name with spaces survives intact.
+// is — followed by its state and its pool. A bare header is the real "nothing
+// scheduled" state. Line-walked with RACE_LocateFrom because getToken would
+// split the multi-word name; tabs delimit so a name with spaces survives intact.
 
 Cvar rsApiTourneyUrl( "rs_api_tourney_url", "", 0 );
 Cvar rsApiTourneyJoinUrl( "rs_api_tourney_join_url", "", 0 );
+// Seconds between "a tournament is on" broadcasts; 0 mutes the rotation (the
+// per-player notice on join and the it-just-started announce still fire — those
+// are news, not a rotation). Archived and defaulted to the same cadence as
+// rs_announce_interval so the two nudges sit at the same, tunable volume.
+Cvar rs_tourney_announce_interval( "rs_tourney_announce_interval", "600", CVAR_ARCHIVE );
 
 const uint API_TOURNEY_REFRESH_MS = 60 * 1000;
 // How long a sign-up may stay in flight before the player is told to retry. The
@@ -55,6 +69,13 @@ const uint TOURNEY_JOIN_TIMEOUT_MS = 20000;
 // anything else in this mod emits at once (Cmd_Maplist pages at 30). The tail
 // is summarised instead; the full pool is always on the website.
 const uint TOURNEY_MAPS_SHOWN = 30;
+// How long after a player is first seen spawned before their personal "there is
+// a tournament on" notice prints. Joining already dumps the MOTD, their PB for
+// this map and any achievement popups into the console; landing on top of that
+// is landing in a scroll nobody reads.
+const uint TOURNEY_GREET_DELAY_MS = 12000;
+// Floor on rs_tourney_announce_interval; below it the rotation is off entirely.
+const int TOURNEY_ANNOUNCE_MIN_S = 60;
 
 // 0 = no fetch yet this map, so the first think frame fires one immediately;
 // then one per refresh interval (same levelTime idiom as apiLastMapsLastFetch).
@@ -68,11 +89,29 @@ int raceTourneyStartsAt = 0;       // epoch seconds
 int raceTourneyEndsAt = 0;
 String[] raceTourneyMaps;          // lowercased pool map names, pool order
 
-// Note there is deliberately no "is it live?" flag here. AngelScript has no
-// wall clock, so the game cannot compare the window against now — and it does
-// not need to: the web sends the tournament that is RUNNING when one is, and
-// the next one otherwise. Everything below therefore states the window as
-// absolute dates rather than a countdown that a stale cache could get wrong.
+// Whether that tournament is running RIGHT NOW, and how long until it ends (or
+// starts, when it hasn't). AngelScript has no wall clock, so neither is derived
+// here — both are resolved web-side at fetch time and carried on the S line.
+// The feed refreshes every API_TOURNEY_REFRESH_MS, which is why the countdown
+// is only ever printed coarsely (RACE_TourneyFmtSpan): at day/hour/minute
+// granularity a payload up to a minute old reads exactly the same as a fresh
+// one, and nothing has to tick between fetches.
+bool raceTourneyLive = false;
+int raceTourneySecsLeft = 0;
+int raceTourneyEntrants = 0;
+
+// Announce bookkeeping. raceTourneyStateSeen exists so the FIRST payload parsed
+// on a map only records the state: the game module persists the last payload
+// across map changes (RS_TourneyText), so without it every map load would look
+// like a tournament that had just started and re-announce it.
+bool raceTourneyStateSeen = false;
+bool raceTourneyWasLive = false;
+String raceTourneyLastSlug = "";
+bool raceTourneyAnnounceNow = false;  // a tournament went live since the last parse
+// Wall-clock deadline (realTime, ms) for the next rotation broadcast. realTime
+// rather than levelTime keeps the cadence steady across map changes and match
+// states, matching announcement.as.
+uint raceTourneyAnnounceNext = 0;
 
 // Format an epoch-seconds timestamp as "YYYY-MM-DD HH:MM UTC" without any date
 // library: AngelScript here has no time formatting, so this is plain integer
@@ -117,6 +156,36 @@ String RACE_TourneyFmtTime( int epoch )
     return "" + y + "-" + mm + "-" + dd + " " + hh + ":" + mi + " UTC";
 }
 
+// A rough "2d 3h" / "45m" for a countdown. Coarse on purpose — see the note on
+// raceTourneySecsLeft: the number is only as fresh as the last fetch, and an
+// exact second would advertise a precision the feed does not have.
+String RACE_TourneyFmtSpan( int secs )
+{
+    if ( secs <= 0 )
+        return "any moment";
+    int days = secs / 86400;
+    int hours = ( secs % 86400 ) / 3600;
+    int mins = ( secs % 3600 ) / 60;
+    if ( days > 0 )
+    {
+        // Build-then-append rather than a String ternary (Warsow-AS strictness).
+        String s = "" + days + "d";
+        if ( hours > 0 )
+            s += " " + hours + "h";
+        return s;
+    }
+    if ( hours > 0 )
+    {
+        String s = "" + hours + "h";
+        if ( mins > 0 )
+            s += " " + mins + "m";
+        return s;
+    }
+    if ( mins > 0 )
+        return "" + mins + "m";
+    return "under a minute";
+}
+
 // Rebuild the cached tournament from a fetched payload. Tolerant by design: a
 // malformed line is skipped rather than failing the whole parse, because this
 // only drives display and a vote pool — the scoring is web-side and cannot be
@@ -128,6 +197,9 @@ void RACE_ParseTourney( const String &in text )
     raceTourneySlug = "";
     raceTourneyStartsAt = 0;
     raceTourneyEndsAt = 0;
+    raceTourneyLive = false;
+    raceTourneySecsLeft = 0;
+    raceTourneyEntrants = 0;
     raceTourneyMaps.resize( 0 );
 
     uint total = text.length();
@@ -150,6 +222,23 @@ void RACE_ParseTourney( const String &in text )
             String name = line.substr( 2 );
             if ( name.length() > 0 )
                 raceTourneyMaps.insertLast( name.removeColorTokens().tolower() );
+            continue;
+        }
+        if ( kind == "S" )
+        {
+            // S \t live|soon \t secondsLeft \t entrants
+            uint u1 = RACE_LocateFrom( line, "\t", 0 );
+            if ( u1 >= line.length() )
+                continue;
+            uint u2 = RACE_LocateFrom( line, "\t", u1 + 1 );
+            if ( u2 >= line.length() )
+                continue;
+            uint u3 = RACE_LocateFrom( line, "\t", u2 + 1 );
+            if ( u3 >= line.length() )
+                continue;
+            raceTourneyLive = ( line.substr( u1 + 1, u2 - u1 - 1 ) == "live" );
+            raceTourneySecsLeft = line.substr( u2 + 1, u3 - u2 - 1 ).toInt();
+            raceTourneyEntrants = line.substr( u3 + 1 ).toInt();
             continue;
         }
         if ( kind != "T" )
@@ -181,6 +270,17 @@ void RACE_ParseTourney( const String &in text )
         raceTourneyKnown = true;
     }
 
+    // Did a tournament START between this payload and the last one? That is
+    // news worth interrupting for, so flag it for the announce tick instead of
+    // making everyone wait out the rotation. A different slug counts too: one
+    // edition ending as the next begins is, to everyone on the box, a new
+    // tournament starting.
+    bool live = raceTourneyKnown && raceTourneyLive;
+    if ( raceTourneyStateSeen && live && ( !raceTourneyWasLive || raceTourneySlug != raceTourneyLastSlug ) )
+        raceTourneyAnnounceNow = true;
+    raceTourneyStateSeen = true;
+    raceTourneyWasLive = live;
+    raceTourneyLastSlug = raceTourneySlug;
 }
 
 // Poll for a freshly-fetched payload and pace the periodic refresh. Called from
@@ -216,6 +316,178 @@ void RACE_ApiTourneyThink()
         apiTourneyLastFetch = levelTime == 0 ? 1 : levelTime;
         // empty token: the feed is public (same as blocked-maps / last-maps).
         RS_ApiFetchTourney( rsApiTourneyUrl.string, "" );
+    }
+
+    RACE_TourneyAnnounceTick();
+    RACE_TourneyGreetThink();
+}
+
+// Print one line to one client, or to everyone when `client` is null. The two
+// halves of every announcement path differ only here.
+void RACE_TourneyPrintLine( Client@ client, const String &in line )
+{
+    if ( @client == null )
+        G_PrintMsg( null, line );
+    else
+        client.printMessage( line );
+}
+
+// The pitch: what is on, how long it has left, and the one command that gets
+// you into it. Sent per line (each print is its own reliable command — see the
+// 1024-char command buffer note in the engine docs) and deliberately short: it
+// interrupts whatever the player was doing, so it earns four lines at most.
+void RACE_TourneyPitch( Client@ client )
+{
+    if ( !raceTourneyKnown )
+        return;
+
+    // Assign-then-branch instead of a String ternary (Warsow-AS strictness).
+    String head = S_COLOR_ORANGE + ">> TOURNAMENT: " + S_COLOR_WHITE + raceTourneyName;
+    if ( raceTourneyLive )
+        head = S_COLOR_ORANGE + ">> TOURNAMENT LIVE: " + S_COLOR_WHITE + raceTourneyName;
+    RACE_TourneyPrintLine( client, head + "\n" );
+
+    String facts = S_COLOR_WHITE + "" + raceTourneyMaps.length() + " map";
+    if ( raceTourneyMaps.length() != 1 )
+        facts += "s";
+    if ( raceTourneySecsLeft > 0 )
+    {
+        String when = " until it starts";
+        if ( raceTourneyLive )
+            when = " left";
+        facts += S_COLOR_ORANGE + " | " + S_COLOR_WHITE + RACE_TourneyFmtSpan( raceTourneySecsLeft ) + when;
+    }
+    if ( raceTourneyEntrants > 0 )
+        facts += S_COLOR_ORANGE + " | " + S_COLOR_WHITE + raceTourneyEntrants + " entered";
+    RACE_TourneyPrintLine( client, facts + "\n" );
+
+    RACE_TourneyPrintLine( client, S_COLOR_WHITE + "Enter free right here with " + S_COLOR_ORANGE
+        + "/tournament join" + S_COLOR_WHITE + " - every run on a pool map then counts.\n" );
+
+    // Assign-then-branch again: which nudge follows depends on where they are.
+    String tail = S_COLOR_WHITE + "Pool: " + S_COLOR_ORANGE + "/tmaps" + S_COLOR_WHITE + " - switch to one with "
+        + S_COLOR_ORANGE + "callvote tourneymap" + S_COLOR_WHITE + ".\n";
+    if ( RACE_TourneyOnPoolMap() )
+        tail = S_COLOR_GREEN + "This map is in the pool" + S_COLOR_WHITE + " - your next run scores.\n";
+    RACE_TourneyPrintLine( client, tail );
+}
+
+// Pitch to the whole box, and count everyone present as told: a player who just
+// heard the broadcast must not get their personal copy 12 seconds later.
+void RACE_TourneyPitchAll()
+{
+    RACE_TourneyPitch( null );
+    for ( int i = 0; i < maxClients; i++ )
+    {
+        Client@ client = G_GetClient( i );
+        if ( @client == null || client.state() < CS_SPAWNED )
+            continue;
+        Player@ player = RACE_GetPlayer( client );
+        if ( player is null )
+            continue;
+        player.tourneyNoticeSent = true;
+    }
+}
+
+// The rotation gap in milliseconds, or 0 when the rotation is off. Anything
+// under TOURNEY_ANNOUNCE_MIN_S is treated as off rather than obeyed: this print
+// interrupts everyone on the box, and a mis-typed "5" would be a spam loop
+// nobody could mute except by finding this cvar again.
+uint RACE_TourneyRotationMs()
+{
+    int interval = rs_tourney_announce_interval.integer;
+    if ( interval < TOURNEY_ANNOUNCE_MIN_S )
+        return 0;
+    return uint( interval ) * 1000;
+}
+
+// Broadcast when a tournament starts, then on the slow rotation. Silent unless
+// something is actually LIVE and a real player is on the box — an empty server
+// announcing a tournament to nobody just fills its own console log (the same
+// reasoning, and the same RACE_RealPlayerCount guard, as announcement.as).
+void RACE_TourneyAnnounceTick()
+{
+    if ( !raceTourneyKnown || !raceTourneyLive )
+    {
+        // Nothing on: re-arm so whatever starts next gets a full interval
+        // before its first rotation broadcast rather than an immediate one.
+        raceTourneyAnnounceNext = 0;
+        raceTourneyAnnounceNow = false;
+        return;
+    }
+
+    uint gap = RACE_TourneyRotationMs();
+
+    if ( raceTourneyAnnounceNow )
+    {
+        // Consume it either way: if the box is empty, the news is stale by the
+        // time anyone arrives, and they get the personal notice on join.
+        raceTourneyAnnounceNow = false;
+        if ( RACE_RealPlayerCount() > 0 )
+        {
+            RACE_TourneyPitchAll();
+            raceTourneyAnnounceNext = realTime + gap;
+            return;
+        }
+    }
+
+    if ( gap == 0 )
+        return; // rotation off
+
+    // First eligible frame: arm the timer instead of firing, so the rotation
+    // lands an interval in rather than the moment a map loads.
+    if ( raceTourneyAnnounceNext == 0 )
+    {
+        raceTourneyAnnounceNext = realTime + gap;
+        return;
+    }
+    if ( realTime < raceTourneyAnnounceNext )
+        return;
+    // Re-arm even when the print below is skipped, so an idle stretch doesn't
+    // fire the instant someone joins mid-interval.
+    raceTourneyAnnounceNext = realTime + gap;
+    if ( RACE_RealPlayerCount() <= 0 )
+        return;
+    RACE_TourneyPitchAll();
+}
+
+// One personal notice per player per map while a tournament is live, a few
+// seconds after they are properly in. Walks every slot (not just TEAM_PLAYERS)
+// so a spectator hears about it too — they can enter and start racing.
+void RACE_TourneyGreetThink()
+{
+    if ( !raceTourneyKnown || !raceTourneyLive )
+        return;
+
+    for ( int i = 0; i < maxClients; i++ )
+    {
+        Client@ client = G_GetClient( i );
+        // Same liveness guard the ghostbot sweep uses — the ONLY client-slot
+        // idiom proven at boot in this codebase.
+        if ( @client == null || client.state() < CS_SPAWNED )
+            continue;
+        // Mirror bots stand in for players on OTHER servers and the TV client
+        // is a camera; neither can type /tournament join.
+        if ( RACE_MirrorIsFakeClient( client ) || RACE_IsTvClient( client ) )
+            continue;
+        Player@ player = RACE_GetPlayer( client );
+        if ( player is null || player.tourneyNoticeSent )
+            continue;
+
+        if ( player.tourneyNoticeAt == 0 )
+        {
+            // levelTime can be 0 on the very first frame, so 1 is the "armed"
+            // sentinel (0 means "not scheduled"), as in RACE_TriggerTourneyJoin.
+            player.tourneyNoticeAt = levelTime + TOURNEY_GREET_DELAY_MS;
+            if ( player.tourneyNoticeAt == 0 )
+                player.tourneyNoticeAt = 1;
+            continue;
+        }
+        if ( levelTime < player.tourneyNoticeAt )
+            continue;
+
+        player.tourneyNoticeSent = true;
+        RACE_TourneyPitch( client );
     }
 }
 
@@ -275,6 +547,9 @@ void RACE_ApiTourneyJoinThink()
         }
         player.pendingTourneyJoin = false;
         player.tourneyJoinDeadline = 0;
+        // Whatever the answer, they have just been talking to the tournament —
+        // the unprompted "there is one on" notice would be noise now.
+        player.tourneyNoticeSent = true;
         if ( result != 1 )
         {
             client.printMessage( S_COLOR_RED + "Could not reach the tournament server - try again in a moment.\n" );
@@ -342,6 +617,12 @@ void RACE_TriggerTourneyJoin( Client@ client, const String &in code )
 // Print the current tournament and its pool to one player.
 void RACE_PrintTourney( Client@ client )
 {
+    // They asked, so they know: don't also push the unprompted notice at them
+    // moments later.
+    Player@ reader = RACE_GetPlayer( client );
+    if ( reader !is null )
+        reader.tourneyNoticeSent = true;
+
     if ( !raceTourneyKnown )
     {
         client.printMessage( S_COLOR_YELLOW + "No tournament is scheduled right now.\n" );
@@ -349,6 +630,16 @@ void RACE_PrintTourney( Client@ client )
     }
 
     client.printMessage( S_COLOR_ORANGE + "== " + S_COLOR_WHITE + raceTourneyName + S_COLOR_ORANGE + " ==\n" );
+    // Lead with the state: "is this on right now, and how long have I got" is
+    // the first thing anyone wants, and the absolute window below answers it
+    // only after some mental arithmetic in a timezone that isn't theirs.
+    String state = S_COLOR_YELLOW + "Starts in " + RACE_TourneyFmtSpan( raceTourneySecsLeft );
+    if ( raceTourneyLive )
+        state = S_COLOR_GREEN + "LIVE NOW" + S_COLOR_WHITE + " - " + S_COLOR_YELLOW
+            + RACE_TourneyFmtSpan( raceTourneySecsLeft ) + " left";
+    if ( raceTourneyEntrants > 0 )
+        state += S_COLOR_WHITE + " - " + raceTourneyEntrants + " entered";
+    client.printMessage( state + S_COLOR_WHITE + "\n" );
     client.printMessage( S_COLOR_WHITE + "Runs " + S_COLOR_YELLOW + RACE_TourneyFmtTime( raceTourneyStartsAt )
         + S_COLOR_WHITE + " to " + S_COLOR_YELLOW + RACE_TourneyFmtTime( raceTourneyEndsAt ) + S_COLOR_WHITE + "\n" );
 

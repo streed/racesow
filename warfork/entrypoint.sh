@@ -153,6 +153,8 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # Tournaments (hrace/tournament.as): the shared calendar feed the
         # gametype polls, and the server-token-authed POST a player's
         # "/tournament <code>" redeems through. Empty = feature off in-game.
+        # A LIVE tournament is announced in-game on join, on start, and every
+        # rs_tourney_announce_interval seconds (default 600, archived).
         echo "set rs_api_tourney_url \"${base}/api/game/tournament\""
         echo "set rs_api_tourney_join_url \"${base}/api/game/tournament/join\""
     fi

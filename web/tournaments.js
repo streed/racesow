@@ -327,19 +327,33 @@ export function overlaps(aStart, aEnd, bStart, bEnd) {
 //
 //   RSTOURNEY
 //   T\t<id>\t<slug>\t<startsAt>\t<endsAt>\t<name>
+//   S\t<live|soon>\t<secondsLeft>\t<entrants>
 //   M\t<mapname>
 //   M\t<mapname>
 //
 // Exactly one T line (the tournament that is live NOW, or the next one starting
-// if none is) followed by its pool, or just the header when there is nothing
-// scheduled — an empty body after the header is a real state, not an error.
-// Tabs and control characters are stripped from the free-text name so an
+// if none is) followed by its state and its pool, or just the header when there
+// is nothing scheduled — an empty body after the header is a real state, not an
+// error. Tabs and control characters are stripped from the free-text name so an
 // admin-entered title can't break the line shape.
-export function gameTourneyText(t, mapNames) {
+//
+// The S line exists because AngelScript has no wall clock: the game cannot
+// compare the window it was sent against "now", so without it a server can only
+// state the window as absolute dates and can never say "this is on RIGHT NOW,
+// come and join". `secondsLeft` counts to the END when live and to the START
+// when not, and is resolved HERE, at fetch time — the feed refreshes every ~60s,
+// so the game prints it coarsely (days/hours) and the staleness never shows.
+// Unknown line kinds are skipped by the game parser, so this is additive: an
+// older server ignores it and behaves exactly as before.
+export function gameTourneyText(t, mapNames, { nowSec = Math.floor(Date.now() / 1000), entrants = 0 } = {}) {
   const strip = (s) => String(s || "").replace(/[\x00-\x1f\x7f]+/g, " ").trim();
   let body = "RSTOURNEY\n";
   if (!t) return body;
   body += `T\t${t.id}\t${strip(t.slug)}\t${Number(t.starts_at)}\t${Number(t.ends_at)}\t${strip(t.name)}\n`;
+  const live = phaseOf(t, nowSec) === "live";
+  const target = live ? Number(t.ends_at) : Number(t.starts_at);
+  const left = Math.max(0, target - Number(nowSec));
+  body += `S\t${live ? "live" : "soon"}\t${left}\t${Math.max(0, Math.trunc(Number(entrants) || 0))}\n`;
   for (const m of mapNames || []) body += `M\t${strip(m).toLowerCase()}\n`;
   return body;
 }

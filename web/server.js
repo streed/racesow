@@ -2785,11 +2785,16 @@ admin.post("/achievements/:id/revoke", requireAuth, wrap(async (req, res) => {
 }));
 
 // --- Tournaments ------------------------------------------------------------
-// CRUD over the calendar. Two rules the form enforces that the schema cannot:
-// the window must not overlap another tournament (the admin can override with
-// an explicit checkbox — sometimes you really do want two at once), and maps
-// must already exist in the database (a tournament on a map nobody has ever
-// finished would score nothing and quietly look broken).
+// CRUD over the calendar. ONE tournament runs at a time: the window must not
+// overlap any other non-cancelled tournament, with no override, because
+// everything the players see — the game feed, "/tournament join", the in-game
+// announcement — can only carry one. The schema enforces it too (migration
+// 20260801140000000); the check here exists to say WHICH tournament clashes
+// instead of showing a constraint error.
+//
+// The other rule the form adds is that pool maps must already exist in the
+// database — a tournament on a map nobody has ever finished would score nothing
+// and quietly look broken, so the admin gets a warning naming them.
 
 function tournamentPhaseBadge(t) {
   const phase = phaseOf(t);
@@ -2826,7 +2831,8 @@ function tournamentFormHtml(session, t, maps, action, { defaultStart = null } = 
       <input name="repeatEveryDays" type="number" min="0" max="365" value="${v(t ? t.repeat_every_days : 0)}"></label>
     <label>Gap before the next edition starts (days)
       <input name="repeatGapDays" type="number" min="0" max="365" value="${v(t ? t.repeat_gap_days : 1)}"></label>
-    <label><input type="checkbox" name="allowOverlap" style="width:auto"> Allow this to overlap another tournament</label>
+    <p class="meta">One tournament runs at a time — this window has to be clear of every other
+      tournament that isn't cancelled.</p>
     <div class="actions"><button class="primary" type="submit">Save</button></div>
   </form>`;
 }
@@ -2887,22 +2893,30 @@ admin.get("/tournaments/new", requireAuth, wrap(async (req, res) => {
     ${err}${tournamentFormHtml(req.session, null, "", "/admin/tournaments/new", { defaultStart: free })}`, req.session);
 }));
 
-// Shared overlap gate for create + edit. Returns an error string, or null.
-async function tournamentOverlapError(v, body, excludeId) {
-  if (body.allowOverlap) return null;
-  const clash = await race.overlappingTournaments(v.starts_at, v.ends_at, excludeId);
+// Shared overlap gate for create + edit + un-cancel. Returns an error string,
+// or null. Not an override in sight: one tournament at a time is a rule, and
+// the database holds it whatever this says.
+async function tournamentOverlapError(startsAt, endsAt, excludeId) {
+  const clash = await race.overlappingTournaments(startsAt, endsAt, excludeId);
   if (!clash.length) return null;
   const names = clash.slice(0, 3).map((c) => `${c.name} (${fmtWhen(c.starts_at)} → ${fmtWhen(c.ends_at)})`).join("; ");
-  return `That window overlaps: ${names}. Move it, or tick “Allow this to overlap”.`;
+  return `Only one tournament runs at a time, and that window overlaps: ${names}. Move it, or cancel the other one.`;
 }
+
+// What create/edit/status say when the database itself refused the window —
+// two admins saving at once, which the check above cannot see.
+const TOURNAMENT_OVERLAP_RACE =
+  "That window was taken while you were saving — only one tournament runs at a time. Reload and pick another slot.";
 
 admin.post("/tournaments/new", requireAuth, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   const v = validateTournament(tournamentInput(req.body));
   if (v.error) return res.redirect(303, `/admin/tournaments/new?error=${encodeURIComponent(v.error)}`);
-  const clash = await tournamentOverlapError(v.value, req.body, null);
+  const clash = await tournamentOverlapError(v.value.starts_at, v.value.ends_at, null);
   if (clash) return res.redirect(303, `/admin/tournaments/new?error=${encodeURIComponent(clash)}`);
   const created = await race.createTournament(v.value, req.session.username);
+  if (created && created.conflict)
+    return res.redirect(303, `/admin/tournaments/new?error=${encodeURIComponent(TOURNAMENT_OVERLAP_RACE)}`);
   if (!created) return res.redirect(303, `/admin/tournaments/new?error=${encodeURIComponent("That slug is already taken.")}`);
   const note = created.unraced.length
     ? `Created. Heads up — nobody has ever finished these pool maps, so check for a typo: ${created.unraced.join(", ")}`
@@ -2988,9 +3002,11 @@ admin.post("/tournaments/:id", requireAuth, wrap(async (req, res) => {
   if (id == null) return res.status(400).type("text/plain").send("Bad tournament id.");
   const v = validateTournament(tournamentInput(req.body));
   if (v.error) return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent(v.error)}`);
-  const clash = await tournamentOverlapError(v.value, req.body, id);
+  const clash = await tournamentOverlapError(v.value.starts_at, v.value.ends_at, id);
   if (clash) return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent(clash)}`);
   const r = await race.updateTournament(id, v.value, req.session.username);
+  if (r && r.conflict)
+    return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent(TOURNAMENT_OVERLAP_RACE)}`);
   if (r === null) return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent("That slug is already taken.")}`);
   if (!r.rows)
     return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent("Not saved — a finalized tournament can't be edited.")}`);
@@ -3006,7 +3022,16 @@ admin.post("/tournaments/:id/status", requireAuth, wrap(async (req, res) => {
   const status = String(req.body.status || "");
   if (id == null || !["draft", "published", "cancelled"].includes(status))
     return res.status(400).type("text/plain").send("Bad status change.");
+  // Bringing a cancelled tournament back re-takes a slot somebody else may
+  // have moved into meanwhile — the one status change that can clash.
+  const before = await race.tournamentById(id);
+  if (before && before.status === "cancelled" && status !== "cancelled") {
+    const clash = await tournamentOverlapError(before.starts_at, before.ends_at, id);
+    if (clash) return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent(clash)}`);
+  }
   const n = await race.setTournamentStatus(id, status, req.session.username);
+  if (n && n.conflict)
+    return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent(TOURNAMENT_OVERLAP_RACE)}`);
   // Only log the change that actually applied — the UPDATE is a no-op on a
   // finalized tournament, and an audit log that records changes which never
   // happened is worse than no audit log.

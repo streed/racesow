@@ -79,30 +79,43 @@ Trophies ride the profile payload (`playerDetail.trophies`) rather than a lazy
 endpoint: they are rare and usually an empty array, so a second fetch would cost
 a round trip to render nothing.
 
-## Scheduling and non-overlap
+## One at a time
 
-Tournaments are meant not to overlap, and that is enforced in three layers of
-increasing firmness:
+**Exactly one tournament may occupy any given moment.** Not a convention — a
+rule, enforced in four layers of increasing firmness:
 
 1. **The default is right.** `/admin/tournaments/new` pre-fills the start at
    `nextFreeTournamentSlot()` — the latest end among scheduled tournaments — so
    the obvious action produces a non-overlapping tournament with no thought.
 2. **The form blocks it.** Saving a window that intersects another
-   non-cancelled tournament is refused, naming the clash, unless the admin
-   explicitly ticks *"Allow this to overlap"*.
+   non-cancelled tournament is refused, naming the clash. There is no override.
+   The same check guards *un-cancelling*, which is the one status change that
+   re-takes a slot somebody else may have moved into.
 3. **Series never overlap themselves.** A recurring tournament
    (`repeat_every_days > 0`) schedules its next edition `repeat_gap_days` after
    the previous one ends, so a series is structurally incapable of colliding
-   with itself.
+   with itself; `scheduleNextEdition` additionally skips a slot somebody else
+   has taken.
+4. **The schema refuses it.** `tournament_no_overlap` (migration
+   `20260801140000000`) is an `EXCLUDE USING gist` over
+   `int8range(starts_at, ends_at)` `WHERE status <> 'cancelled'`. The calendar
+   has three writers — the form, the status flip and the background series
+   scheduler — so a check living in any one of them is a check the other two
+   can walk around. Create/update/status map the resulting `23P01` to a plain
+   "that window was taken while you were saving" instead of a 500.
 
-There is deliberately **no database exclusion constraint**, because the override
-in (2) is a real requirement — sometimes you do want two at once. The residual
-race (two admins saving overlapping windows in the same second) is visible
-immediately on the calendar and fixable by editing a row. Note the consequence
-if it happens: `liveTournament()` picks one (`ORDER BY starts_at DESC, id DESC`),
-so the other is invisible to the game servers until the calendar is untangled.
+The reason is not tidiness: **the in-game side can only advertise one.** The
+game feed carries a single `T` line, `/tournament join` enters you into
+"whatever is on", and the servers announce the live tournament to the whole box.
+With two running at once, each of those silently picks one and hides the other —
+players would be told to join a tournament that is not the one their runs are
+scoring for.
 
-Cancelled tournaments free their slot; drafts never occupy one.
+Half-open windows, so back-to-back editions may share a boundary second.
+Cancelled tournaments free their slot (that is what cancelling is *for*);
+finalized ones keep theirs, so a new tournament can never be backdated over a
+finished one and re-score runs that already paid out trophies. Drafts *do*
+occupy a slot — a draft is a plan for that window.
 
 ## The finalizer
 

@@ -190,16 +190,30 @@ test("the admin form rejects the mistakes the schema cannot catch", () => {
 test("the game feed carries a multi-word name intact and survives an empty calendar", () => {
   assert.equal(gameTourneyText(null, []), "RSTOURNEY\n");
   const body = gameTourneyText(
-    { id: 7, slug: "summer-sprint", starts_at: 100, ends_at: 200, name: "Summer\tSprint #3" },
-    ["Hrace_Line", "pornstar"]
+    { id: 7, slug: "summer-sprint", starts_at: 100, ends_at: 200, status: "published", name: "Summer\tSprint #3" },
+    ["Hrace_Line", "pornstar"],
+    { nowSec: 150, entrants: 12 }
   );
   const lines = body.split("\n");
   assert.equal(lines[0], "RSTOURNEY");
   // Tabs inside the free-text name are scrubbed — they are the field delimiter.
   assert.equal(lines[1], "T\t7\tsummer-sprint\t100\t200\tSummer Sprint #3");
   assert.equal(lines[1].split("\t").length, 6);
-  assert.equal(lines[2], "M\thrace_line"); // lowercased for the game
-  assert.equal(lines[3], "M\tpornstar");
+  assert.equal(lines[2], "S\tlive\t50\t12"); // in the window: 50s to the END
+  assert.equal(lines[3], "M\thrace_line"); // lowercased for the game
+  assert.equal(lines[4], "M\tpornstar");
+});
+
+test("the game feed resolves the countdown the game cannot compute itself", () => {
+  const t = { id: 7, slug: "s", starts_at: 100, ends_at: 200, status: "published", name: "S" };
+  // Before the window the countdown runs to the START, and nothing is live —
+  // the game announces only what is actually on.
+  assert.match(gameTourneyText(t, [], { nowSec: 40 }), /^S\tsoon\t60\t0$/m);
+  // The boundary second belongs to whatever comes next (half-open window).
+  assert.match(gameTourneyText(t, [], { nowSec: 200 }), /^S\tsoon\t0\t0$/m);
+  assert.match(gameTourneyText(t, [], { nowSec: 199 }), /^S\tlive\t1\t0$/m);
+  // A draft never reaches the feed, but if one did it must not read as live.
+  assert.match(gameTourneyText({ ...t, status: "draft" }, [], { nowSec: 150 }), /^S\tsoon\t/m);
 });
 
 /* --------------------------------- database ------------------------------- */
@@ -558,6 +572,54 @@ test("overlap detection ignores cancelled tournaments and the row being edited",
   // A cancelled tournament frees its slot.
   await race.setTournamentStatus(a.id, "cancelled", "test-admin");
   assert.equal((await race.overlappingTournaments(now + HOUR, now + 2 * HOUR)).length, 0);
+});
+
+test("the calendar is exclusive — a second tournament cannot share the window", async (t) => {
+  const race = await freshDb(t);
+  const now = 1_800_000_000;
+  await makeTournament(race, { slug: "a", name: "A", start: now, end: now + DAY, maps: ["m1"] });
+
+  // Straight at db.createTournament, bypassing the admin form's check: the form
+  // is not the only writer (the series scheduler and the status flip are too),
+  // so the schema has to be the thing that holds.
+  const clashing = validateTournament({
+    name: "B", slug: "b", description: "", startsAt: toAdminTime(now + HOUR),
+    endsAt: toAdminTime(now + 2 * DAY), scoring: "points", status: "published",
+    joinOpen: true, maps: "m1", repeatEveryDays: 0, repeatGapDays: 1,
+  });
+  assert.deepEqual(
+    await race.createTournament(clashing.value, "test-admin"),
+    { conflict: "overlap" },
+    "two tournaments were allowed to run at once"
+  );
+
+  // Back-to-back stays legal — the window is half-open.
+  const next = validateTournament({
+    name: "C", slug: "c", description: "", startsAt: toAdminTime(now + DAY),
+    endsAt: toAdminTime(now + 2 * DAY), scoring: "points", status: "published",
+    joinOpen: true, maps: "m1", repeatEveryDays: 0, repeatGapDays: 1,
+  });
+  const created = await race.createTournament(next.value, "test-admin");
+  assert.ok(created && created.id, "a back-to-back edition was refused");
+});
+
+test("cancelling frees a slot, and bringing the cancelled one back cannot double-book it", async (t) => {
+  const race = await freshDb(t);
+  const now = 1_800_000_000;
+  const a = await makeTournament(race, { slug: "a", name: "A", start: now, end: now + DAY, maps: ["m1"] });
+  assert.equal(await race.setTournamentStatus(a.id, "cancelled", "test-admin"), 1);
+
+  // The freed window is fair game — this is what cancelling is FOR.
+  const b = await makeTournament(race, { slug: "b", name: "B", start: now, end: now + DAY, maps: ["m1"] });
+
+  assert.deepEqual(
+    await race.setTournamentStatus(a.id, "published", "test-admin"),
+    { conflict: "overlap" },
+    "un-cancelling put two tournaments in the same window"
+  );
+  // ...and it works again once the window is genuinely free.
+  assert.equal(await race.setTournamentStatus(b.id, "cancelled", "test-admin"), 1);
+  assert.equal(await race.setTournamentStatus(a.id, "published", "test-admin"), 1);
 });
 
 test("a recurring series schedules its next edition, and the sweep heals a missed one", async (t) => {

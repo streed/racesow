@@ -4011,10 +4011,12 @@ class RaceDB {
     };
   }
 
-  // The tournament that is running RIGHT NOW, if any. Ties (which the overlap
-  // guard tries to prevent but does not make impossible — an admin can force
-  // one) resolve to the one that started most recently, so the newest thing an
-  // admin scheduled is what the servers pick up.
+  // The tournament that is running RIGHT NOW, if any. There can only be one:
+  // the calendar is exclusive (the tournament_no_overlap constraint added by
+  // migration 20260801140000000, plus the admin-form gate in front of it). The
+  // LIMIT 1 and its tie-break stay anyway — a read that silently returns two
+  // rows to a caller expecting one is a worse failure than a deterministic
+  // pick, and this is the query every game server's feed is built from.
   async liveTournament(nowSec = Math.floor(Date.now() / 1000)) {
     return this._tournamentRow(
       await this.one(
@@ -4044,18 +4046,25 @@ class RaceDB {
 
   // Plain-text feed for the game servers (hrace/tournament.as). Uses the RAW
   // map names — the server has to `map <name>` them, and a censored display
-  // name would not load.
+  // name would not load. The entrant count rides along for the in-game pitch
+  // ("12 racers entered"); claimed entries only, so an unredeemed code minted
+  // on the website never inflates it.
   async gameTourneyText(nowSec = Math.floor(Date.now() / 1000)) {
     const t = await this.currentOrNextTournament(nowSec);
     if (!t) return gameTourneyText(null, []);
-    const names = (
-      await this.all(
+    const [names, entrants] = await Promise.all([
+      this.all(
         `SELECT m.name FROM tournament_map tm JOIN map m ON m.id = tm.map_id
          WHERE tm.tournament_id = $1 ORDER BY tm.position, m.name`,
         [t.id]
-      )
-    ).map((r) => r.name);
-    return gameTourneyText(t, names);
+      ),
+      this.one(
+        `SELECT COUNT(*) c FROM tournament_entrant
+         WHERE tournament_id = $1 AND player_id IS NOT NULL`,
+        [t.id]
+      ),
+    ]);
+    return gameTourneyText(t, names.map((r) => r.name), { nowSec, entrants: num(entrants.c) });
   }
 
   // Tournaments whose window intersects [startsAt, endsAt). Cancelled ones are
@@ -4146,8 +4155,13 @@ class RaceDB {
     return { added: wanted.length, unraced: wanted.filter((m) => !raced.has(m)) };
   }
 
-  // Create a tournament + its pool. Returns {id, unraced} or null on a slug
-  // collision (the caller re-renders the form with the message).
+  // Create a tournament + its pool. Returns {id, unraced}, null on a slug
+  // collision, or {conflict:"overlap"} when the exclusive-calendar constraint
+  // rejects the window (the caller re-renders the form with the message).
+  //
+  // The route checks for an overlap before calling this, so reaching the
+  // constraint means two admins saved at once — rare, but the only alternative
+  // is a 500 on a form the admin can plainly see is fine.
   async createTournament(v, by, now = Math.floor(Date.now() / 1000)) {
     let row;
     try {
@@ -4165,6 +4179,7 @@ class RaceDB {
       );
     } catch (e) {
       if (e.code === "23505") return null; // slug taken
+      if (e.code === "23P01") return { conflict: "overlap" }; // calendar already booked
       throw e;
     }
     const id = num(row.id);
@@ -4172,7 +4187,8 @@ class RaceDB {
     return { id, unraced: maps.unraced };
   }
 
-  // Returns {rows, missing} — rows 0 means no such id; null on a slug collision.
+  // Returns {rows, missing} — rows 0 means no such id; null on a slug
+  // collision; {conflict:"overlap"} when the window is already booked.
   async updateTournament(id, v, by, now = Math.floor(Date.now() / 1000)) {
     let r;
     try {
@@ -4188,6 +4204,7 @@ class RaceDB {
       );
     } catch (e) {
       if (e.code === "23505") return null;
+      if (e.code === "23P01") return { conflict: "overlap" };
       throw e;
     }
     if (!r.rowCount) return { rows: 0, unraced: [] };
@@ -4195,12 +4212,21 @@ class RaceDB {
     return { rows: r.rowCount, unraced: maps.unraced };
   }
 
+  // Rows changed, or {conflict:"overlap"}. Only one status change can hit the
+  // exclusive-calendar constraint: un-cancelling. A cancelled tournament frees
+  // its slot (that is the whole point of cancelling), so by the time somebody
+  // brings it back another tournament may be sitting in its window.
   async setTournamentStatus(id, status, by, now = Math.floor(Date.now() / 1000)) {
-    const r = await this.pool.query(
-      "UPDATE tournament SET status = $2, updated_at = $3, updated_by = $4 WHERE id = $1 AND status <> 'finalized'",
-      [id, status, now, by || null]
-    );
-    return r.rowCount;
+    try {
+      const r = await this.pool.query(
+        "UPDATE tournament SET status = $2, updated_at = $3, updated_by = $4 WHERE id = $1 AND status <> 'finalized'",
+        [id, status, now, by || null]
+      );
+      return r.rowCount;
+    } catch (e) {
+      if (e.code === "23P01") return { conflict: "overlap" };
+      throw e;
+    }
   }
 
   // Deleting is only allowed while nobody has ENTERED. Once a player has
@@ -4561,6 +4587,10 @@ class RaceDB {
     } catch (e) {
       try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
       if (e.code === "23505") return null; // this edition already exists
+      // Someone booked the slot between the overlap check above and this
+      // insert. Skipping is right: the sweep is a reconciliation and will try
+      // again on its next pass, by which time the roll-forward has moved on.
+      if (e.code === "23P01") return null;
       throw e;
     } finally {
       client.release();
