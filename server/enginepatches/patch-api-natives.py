@@ -701,6 +701,82 @@ AWARDS_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, AWARDS_ENTRY, "asGlobFuncs awards entry")
 
+# --- 1o. tournaments: the current/next tournament feed + the in-game join -----
+# Adds RS_ApiFetchTourney / RS_ApiPollTourney / RS_TourneyText (SHARED, the
+# lastmaps shape: one deduped payload per server, re-fetched every ~60s) and
+# RS_ApiTourneyJoin / RS_ApiPollTourneyJoin / RS_TourneyJoinText (PER PLAYER,
+# playerNum-keyed like the awards trio). The join is the only POST in this file
+# whose REPLY is read: the player has to be told whether their entry code
+# worked, so the response body is captured into their slot and printed. Anchors
+# re-emitted so they stay unique. The Dockerfile asserts on
+# "asFunc_RS_ApiFetchTourney" and "asFunc_RS_ApiTourneyJoin".
+TOURNEY_WRAPPER = (
+    "// racesow-docker: tournaments - GETs the central /api/game/tournament text\n"
+    "// (an \"RSTOURNEY\" header, then one \"T\\t...\" line and one \"M\\t<map>\" line\n"
+    "// per pool map) into memory; the gametype polls RS_ApiPollTourney and reads\n"
+    "// RS_TourneyText. RS_ApiTourneyJoin POSTs an entry redeem for ONE player and\n"
+    "// captures the reply in that player\'s slot (RS_ApiPollTourneyJoin /\n"
+    "// RS_TourneyJoinText), because the reply is what gets printed to them.\n"
+    "void RS_ApiFetchTourney( const char *url, const char *token );\n"
+    "int RS_ApiPollTourney( void );\n"
+    "const char *RS_TourneyText( void );\n"
+    "void RS_ApiTourneyJoin( const char *url, const char *token, const char *code,\n"
+    "\tconst char *player, const char *login, int playerNum );\n"
+    "int RS_ApiPollTourneyJoin( int playerNum );\n"
+    "const char *RS_TourneyJoinText( int playerNum );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchTourney( asstring_t *url, asstring_t *token )\n"
+    "{\n"
+    "\tif( !url || !url->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchTourney( url->buffer, token && token->buffer ? token->buffer : \"\" );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollTourney( void ) { return RS_ApiPollTourney(); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_TourneyText( void )\n"
+    "{\n"
+    "\tconst char *s = RS_TourneyText();\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+    "static void asFunc_RS_ApiTourneyJoin( asstring_t *url, asstring_t *token, asstring_t *code,\n"
+    "\tasstring_t *player, asstring_t *login, int playerNum )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !player || !player->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiTourneyJoin( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tcode && code->buffer ? code->buffer : \"\",\n"
+    "\t\tplayer->buffer,\n"
+    "\t\tlogin && login->buffer ? login->buffer : \"\",\n"
+    "\t\tplayerNum );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollTourneyJoin( int playerNum ) { return RS_ApiPollTourneyJoin( playerNum ); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_TourneyJoinText( int playerNum )\n"
+    "{\n"
+    "\tconst char *s = RS_TourneyJoinText( playerNum );\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, TOURNEY_WRAPPER, "asFunc tourney wrappers")
+
+TOURNEY_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchTourney( const String &in url, const String &in token )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchTourney), NULL },\n"
+    "\t{ \"int RS_ApiPollTourney()\", asFUNCTION(asFunc_RS_ApiPollTourney), NULL },\n"
+    "\t{ \"const String @RS_TourneyText()\", asFUNCTION(asFunc_RS_TourneyText), NULL },\n"
+    "\t{ \"void RS_ApiTourneyJoin( const String &in url, const String &in token, "
+    "const String &in code, const String &in player, const String &in login, int playerNum )\", "
+    "asFUNCTION(asFunc_RS_ApiTourneyJoin), NULL },\n"
+    "\t{ \"int RS_ApiPollTourneyJoin( int playerNum )\", asFUNCTION(asFunc_RS_ApiPollTourneyJoin), NULL },\n"
+    "\t{ \"const String @RS_TourneyJoinText( int playerNum )\", asFUNCTION(asFunc_RS_TourneyJoinText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, TOURNEY_ENTRY, "asGlobFuncs tourney entries")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

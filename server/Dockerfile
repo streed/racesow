@@ -79,6 +79,8 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "asFunc_RS_ApiFetchSavedStart" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiSaveStart" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchAwards" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchTourney" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiTourneyJoin" game/g_ascript.cpp \
     && grep -q "curl pthread" game/CMakeLists.txt
 
 # 7. Cross-server player mirroring: the RS_Mirror* natives (UDP mesh on a
@@ -172,6 +174,11 @@ RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=ON -DCMAKE_BUILD_TYPE=Releas
     && strings /libgame_x86_64.so | grep -q "RS_ApiFetchSavedStart" \
     && strings /libgame_x86_64.so | grep -q "rs_api: saved-start fetch failed" \
     && strings /libgame_x86_64.so | grep -q "RS_ApiSaveStart" \
+    # tournaments: the shared calendar feed + the per-player entry-code redeem.
+    && strings /libgame_x86_64.so | grep -q "RS_ApiFetchTourney" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: tournament fetch failed" \
+    && strings /libgame_x86_64.so | grep -q "RS_ApiTourneyJoin" \
+    && strings /libgame_x86_64.so | grep -q "rs_api: tournament join failed" \
     && strings /libgame_x86_64.so | grep -q "racerecord" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: configured" \
     && strings /libgame_x86_64.so | grep -q "rs_mirror: bot slot" \

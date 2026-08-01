@@ -35,6 +35,14 @@ import { runner as pgMigrateRunner } from "node-pg-migrate";
 import { tokenToCode } from "./weapons.js";
 import { buildMatcher, censorName, normalizeTerm } from "./censor.js";
 import { qualifyQuery, progressQuery, periodKey, targetOf, displayMeta } from "./achievements.js";
+import {
+  standingsQuery,
+  mapBoardsQuery,
+  phaseOf,
+  joinOpen,
+  generateCode,
+  gameTourneyText,
+} from "./tournaments.js";
 
 // Async (thread-pool) compression for the request/ingest paths — the sync
 // variants block the event loop for the duration of an 8MB trajectory.
@@ -181,6 +189,11 @@ export function sha256(s) {
 // Valid map-flag reasons. Single source of truth: the HTTP endpoint, the admin
 // CLI and the server-rendered admin page all validate against this list.
 export const FLAG_REASONS = ["broken", "offensive", "wrong_name", "duplicate", "other"];
+
+// Longest nick stored alongside a tournament entry (matches the HTTP layer's
+// MAX_NAME_LEN — these are display/diagnostic copies of a name, never the
+// identity, which is always the resolved canonical player id).
+const MAX_ENTRY_NAME = 64;
 
 // Password hashing for admin accounts — scrypt from node:crypto, so there is no
 // bcrypt/argon dependency (this codebase stays dep-light). Stored format is
@@ -1352,7 +1365,10 @@ class RaceDB {
            version_id = EXCLUDED.version_id, time = EXCLUDED.time, demo_path = EXCLUDED.demo_path,
            bytes = EXCLUDED.bytes, server_id = EXCLUDED.server_id, captured_at = EXCLUDED.captured_at
          WHERE EXCLUDED.time <= player_demo.time`,
-        [ids.mapId, ids.playerId, ids.versionId, time, demoPath, bytes, serverId, Math.floor(Date.now() / 1000)]
+        [
+          ids.mapId, ids.playerId, ids.versionId, time, demoPath, bytes, serverId,
+          Math.floor(Date.now() / 1000),
+        ]
       );
       return true;
     });
@@ -1798,6 +1814,29 @@ class RaceDB {
           };
         const g = ghostByPid.get(row.playerId);
         if (g) row.ghost = { url: `/api/maps/${id}/ghost?player=${row.playerId}`, hz: g.hz, frames: g.frames, time: g.time };
+      }
+
+      // Per-PB run facts: how well the record run was strafed and how many
+      // attempts it took (see migration 20260801130000000). `best` is built per
+      // CANONICAL player and carries no race id, so re-pick the same PB row here
+      // with the identical tie-break buildAggregates uses (fastest time, then
+      // lowest race id) — that guarantees this is the very run on the row above.
+      const pbByPid = new Map();
+      for (const r of await this.all(
+        `SELECT DISTINCT ON (pl.canonical_id)
+                pl.canonical_id AS player_id, r.strafe_quality, r.attempts
+           FROM race r JOIN player pl ON pl.id = r.player_id
+          WHERE r.map_id = $1 AND pl.canonical_id = ANY($2)
+          ORDER BY pl.canonical_id, r.time ASC, r.id ASC`,
+        [id, pids]
+      )) pbByPid.set(num(r.player_id), r);
+      for (const row of leaderboard) {
+        const pb = pbByPid.get(row.playerId);
+        // Basis points -> percent, mirroring the profile's strafe readouts.
+        // null (not 0) when the run predates the measurement or the server
+        // never reported it, so the UI can say "no data" rather than "0%".
+        row.strafeQuality = pb && pb.strafe_quality != null ? num(pb.strafe_quality) / 100 : null;
+        row.attempts = pb && pb.attempts != null ? num(pb.attempts) : null;
       }
     }
 
@@ -2271,6 +2310,10 @@ class RaceDB {
       // second fetch; progress toward unearned ones is the lazy
       // /players/:id/achievements endpoint (like the SR breakdown).
       achievements: await this._earnedAchievements(canonId),
+      // Tournament trophies ride the payload for the same reason: they are the
+      // rarest thing on a profile and almost always an empty array, so a lazy
+      // endpoint would cost a round trip to render nothing.
+      trophies: await this.playerTrophies(canonId),
       recentFinishes: await this.recentFinishes({ limit: 5, playerId: canonId }),
       versions,
       records: { total, limit: lim, offset: off, rows: records },
@@ -3717,6 +3760,861 @@ class RaceDB {
   }
 
   // ------------------------------------------------------------------------
+  // Tournaments
+  // ------------------------------------------------------------------------
+  // Time-boxed, map-limited competitions layered over the normal leaderboard.
+  // See migration 20260801120000000_tournaments.sql for the model and
+  // web/tournaments.js for the scoring SQL: a tournament owns no runs, it is a
+  // filter over the finish log, frozen into tournament_standing at the end.
+
+  _tournamentRow(r) {
+    if (!r) return null;
+    return {
+      id: num(r.id),
+      slug: r.slug,
+      name: r.name,
+      description: r.description || "",
+      starts_at: num(r.starts_at),
+      ends_at: num(r.ends_at),
+      status: r.status,
+      scoring: r.scoring,
+      join_open: Boolean(r.join_open),
+      repeat_every_days: num(r.repeat_every_days) || 0,
+      repeat_gap_days: num(r.repeat_gap_days) || 0,
+      series_key: r.series_key || null,
+      edition: num(r.edition) || 1,
+      finalized_at: r.finalized_at == null ? null : num(r.finalized_at),
+      created_at: num(r.created_at),
+      created_by: r.created_by || null,
+      updated_at: r.updated_at == null ? null : num(r.updated_at),
+      updated_by: r.updated_by || null,
+      phase: phaseOf(r),
+      // Counts come from the list/detail queries when they join them in.
+      maps: r.map_count == null ? undefined : num(r.map_count),
+      entrants: r.entrant_count == null ? undefined : num(r.entrant_count),
+    };
+  }
+
+  // Tournament list. `includeDrafts` is the admin view; the public site only
+  // ever sees published/finalized/cancelled rows.
+  async tournaments({ includeDrafts = false, limit = 200, offset = 0 } = {}) {
+    const gate = includeDrafts ? "" : "WHERE t.status <> 'draft'";
+    const lim = clampLimit(limit, 200, 500);
+    const off = toOffset(offset);
+    const total = num((await this.one(`SELECT COUNT(*) c FROM tournament t ${gate}`)).c);
+    const rows = await this.all(
+      `SELECT t.*,
+              (SELECT COUNT(*) FROM tournament_map tm WHERE tm.tournament_id = t.id)      AS map_count,
+              (SELECT COUNT(*) FROM tournament_entrant te
+                WHERE te.tournament_id = t.id AND te.player_id IS NOT NULL)               AS entrant_count
+       FROM tournament t ${gate}
+       ORDER BY t.starts_at DESC, t.id DESC
+       LIMIT $1 OFFSET $2`,
+      [lim, off]
+    );
+    return { total, limit: lim, offset: off, rows: rows.map((r) => this._tournamentRow(r)) };
+  }
+
+  async tournamentById(id, { includeDrafts = true } = {}) {
+    const gate = includeDrafts ? "" : " AND t.status <> 'draft'";
+    return this._tournamentRow(await this.one(`SELECT t.* FROM tournament t WHERE t.id = $1${gate}`, [id]));
+  }
+
+  async tournamentBySlug(slug, { includeDrafts = false } = {}) {
+    const gate = includeDrafts ? "" : " AND t.status <> 'draft'";
+    return this._tournamentRow(
+      await this.one(`SELECT t.* FROM tournament t WHERE t.slug = $1${gate}`, [String(slug || "").toLowerCase()])
+    );
+  }
+
+  // The tournament's map pool, in pool order. Names are censored for display
+  // like everywhere else; `rawName` keeps the real name for the game feed and
+  // for building rotation commands (which must use what the server has installed).
+  async tournamentMaps(tournamentId) {
+    return (
+      await this.all(
+        `SELECT m.id, m.name, tm.position
+         FROM tournament_map tm JOIN map m ON m.id = tm.map_id
+         WHERE tm.tournament_id = $1
+         ORDER BY tm.position, m.name`,
+        [tournamentId]
+      )
+    ).map((r) =>
+      this._censorMapped({ id: num(r.id), name: r.name, rawName: r.name, position: num(r.position) }, num(r.id), "name")
+    );
+  }
+
+  // Tie-aware places over an ORDERED standings result.
+  //
+  // The query's last tiebreak is player_id, which is arbitrary: on a dead tie
+  // (common — an exact millisecond tie on a short map gives both players rank 1
+  // and identical points) the lower id would otherwise silently take the place
+  // above. Rows whose whole scoring tuple matches share a place, standard-
+  // competition style (1, 2, 2, 4). Shared by the live board and the freeze so
+  // the two can never disagree about a tie.
+  _tournamentPlaces(rows, scoring) {
+    const key = (r) =>
+      scoring === "time_sum"
+        ? `${r.complete ? 1 : 0}:${r.total_time}:${r.maps_played}`
+        : `${r.points}:${r.map_wins}:${r.maps_played}:${r.total_time}`;
+    const places = [];
+    for (let i = 0; i < rows.length; i++) {
+      places.push(i > 0 && key(rows[i]) === key(rows[i - 1]) ? places[i - 1] : i + 1);
+    }
+    return places;
+  }
+
+  // Live standings, computed from the finish log. Used by the public page while
+  // a tournament runs AND as the input to the freeze at the end, so what
+  // players watched is exactly what gets awarded.
+  async _computeTournamentStandings(t, { limit = 500 } = {}) {
+    const q = standingsQuery(t, { limit });
+    const rows = await this.all(q.sql, q.params);
+    if (!rows.length) return [];
+    const ids = rows.map((r) => num(r.player_id));
+    const nameById = new Map();
+    for (const n of await this.all("SELECT id, name, simplified FROM player WHERE id = ANY($1)", [ids])) {
+      nameById.set(num(n.id), { name: n.name, simplified: n.simplified });
+    }
+    const places = this._tournamentPlaces(rows, t.scoring);
+    return rows.map((r, i) => {
+      const pid = num(r.player_id);
+      const nm = nameById.get(pid) || { name: "?", simplified: "?" };
+      return this._censorNamed(
+        {
+          place: places[i],
+          id: pid,
+          name: nm.name,
+          simplified: nm.simplified,
+          points: num(r.points) || 0,
+          mapsPlayed: num(r.maps_played) || 0,
+          mapWins: num(r.map_wins) || 0,
+          totalTime: r.total_time == null ? null : num(r.total_time),
+          complete: Boolean(r.complete),
+          detail: (r.detail || []).map((d) =>
+            this._censorMapped({ ...d, mapId: num(d.mapId) }, num(d.mapId), "map")
+          ),
+        },
+        pid
+      );
+    });
+  }
+
+  // Frozen standings for a finalized tournament, read back in place order.
+  async _frozenTournamentStandings(tournamentId) {
+    return (
+      await this.all(
+        `SELECT s.*, p.name, p.simplified
+         FROM tournament_standing s JOIN player p ON p.id = s.player_id
+         WHERE s.tournament_id = $1
+         ORDER BY s.place`,
+        [tournamentId]
+      )
+    ).map((r) =>
+      this._censorNamed(
+        {
+          place: num(r.place),
+          id: num(r.player_id),
+          name: r.name,
+          simplified: r.simplified,
+          points: num(r.points) || 0,
+          mapsPlayed: num(r.maps_played) || 0,
+          mapWins: num(r.map_wins) || 0,
+          totalTime: r.total_time == null ? null : num(r.total_time),
+          complete: r.complete == null ? null : Boolean(r.complete),
+          detail: (r.detail || []).map((d) =>
+            this._censorMapped({ ...d, mapId: num(d.mapId) }, num(d.mapId), "map")
+          ),
+        },
+        num(r.player_id)
+      )
+    );
+  }
+
+  // A finalized tournament reads its frozen snapshot; anything else is computed
+  // live. That split is the whole durability story: a historical result never
+  // moves when the finish log, the map pool or the alias grouping does.
+  async tournamentStandings(t, { limit = 500 } = {}) {
+    if (!t) return [];
+    if (t.status === "finalized") return this._frozenTournamentStandings(t.id);
+    if (t.status === "cancelled" || t.status === "draft") return [];
+    return this._computeTournamentStandings(t, { limit });
+  }
+
+  // Per-map boards for the detail page: the fastest entrants on each pool map
+  // inside the window. Live only — a finalized tournament's per-map detail
+  // lives in each standing row's `detail`.
+  async tournamentMapBoards(t, { perMap = 25 } = {}) {
+    if (!t || t.status === "draft" || t.status === "cancelled") return {};
+    const q = mapBoardsQuery(t, { perMap });
+    const out = {};
+    for (const r of await this.all(q.sql, q.params)) {
+      const mid = num(r.map_id);
+      (out[mid] ||= []).push(
+        this._censorNamed(
+          {
+            id: num(r.player_id),
+            name: r.name,
+            simplified: r.simplified,
+            time: num(r.time),
+            rank: num(r.rank),
+            points: num(r.points) || 0,
+          },
+          num(r.player_id)
+        )
+      );
+    }
+    return out;
+  }
+
+  // Registered entrants (never the unredeemed codes — those are private to
+  // whoever minted them).
+  async tournamentEntrants(tournamentId, { limit = 500 } = {}) {
+    return (
+      await this.all(
+        `SELECT te.player_id, te.registered_at, te.registered_name, p.name, p.simplified
+         FROM tournament_entrant te JOIN player p ON p.id = te.player_id
+         WHERE te.tournament_id = $1 AND te.player_id IS NOT NULL
+         ORDER BY te.registered_at ASC NULLS LAST, te.id ASC
+         LIMIT $2`,
+        [tournamentId, clampLimit(limit, 500, 2000)]
+      )
+    ).map((r) =>
+      this._censorNamed(
+        {
+          id: num(r.player_id),
+          name: r.name,
+          simplified: r.simplified,
+          registered_at: r.registered_at == null ? null : num(r.registered_at),
+        },
+        num(r.player_id)
+      )
+    );
+  }
+
+  // Everything the public tournament page needs in one round trip.
+  async tournamentDetail(slug, { includeDrafts = false, perMap = 10 } = {}) {
+    const t = await this.tournamentBySlug(slug, { includeDrafts });
+    if (!t) return null;
+    const [maps, standings, boards, entrants] = await Promise.all([
+      this.tournamentMaps(t.id),
+      this.tournamentStandings(t),
+      this.tournamentMapBoards(t, { perMap }),
+      this.tournamentEntrants(t.id),
+    ]);
+    return {
+      tournament: { ...t, maps: maps.length, entrants: entrants.length, joinOpen: joinOpen(t) },
+      maps: maps.map(({ rawName, ...m }) => m), // rawName is server-side only
+      standings,
+      boards,
+      entrants,
+    };
+  }
+
+  // The tournament that is running RIGHT NOW, if any. Ties (which the overlap
+  // guard tries to prevent but does not make impossible — an admin can force
+  // one) resolve to the one that started most recently, so the newest thing an
+  // admin scheduled is what the servers pick up.
+  async liveTournament(nowSec = Math.floor(Date.now() / 1000)) {
+    return this._tournamentRow(
+      await this.one(
+        `SELECT * FROM tournament
+         WHERE status = 'published' AND starts_at <= $1 AND ends_at > $1
+         ORDER BY starts_at DESC, id DESC LIMIT 1`,
+        [nowSec]
+      )
+    );
+  }
+
+  // What the game servers should be pointed at: the live tournament, or the
+  // next one due to start if nothing is running. The servers advertise the
+  // upcoming one so players can see what is coming without a website visit.
+  async currentOrNextTournament(nowSec = Math.floor(Date.now() / 1000)) {
+    const live = await this.liveTournament(nowSec);
+    if (live) return live;
+    return this._tournamentRow(
+      await this.one(
+        `SELECT * FROM tournament
+         WHERE status = 'published' AND starts_at > $1
+         ORDER BY starts_at ASC, id ASC LIMIT 1`,
+        [nowSec]
+      )
+    );
+  }
+
+  // Plain-text feed for the game servers (hrace/tournament.as). Uses the RAW
+  // map names — the server has to `map <name>` them, and a censored display
+  // name would not load.
+  async gameTourneyText(nowSec = Math.floor(Date.now() / 1000)) {
+    const t = await this.currentOrNextTournament(nowSec);
+    if (!t) return gameTourneyText(null, []);
+    const names = (
+      await this.all(
+        `SELECT m.name FROM tournament_map tm JOIN map m ON m.id = tm.map_id
+         WHERE tm.tournament_id = $1 ORDER BY tm.position, m.name`,
+        [t.id]
+      )
+    ).map((r) => r.name);
+    return gameTourneyText(t, names);
+  }
+
+  // Tournaments whose window intersects [startsAt, endsAt). Cancelled ones are
+  // ignored — a called-off tournament should not block the calendar slot it
+  // was going to occupy. Half-open, so back-to-back editions never collide.
+  async overlappingTournaments(startsAt, endsAt, excludeId = null) {
+    return (
+      await this.all(
+        `SELECT * FROM tournament
+         WHERE status <> 'cancelled'
+           AND starts_at < $2 AND ends_at > $1
+           AND ($3::bigint IS NULL OR id <> $3)
+         ORDER BY starts_at`,
+        [startsAt, endsAt, excludeId]
+      )
+    ).map((r) => this._tournamentRow(r));
+  }
+
+  // When the calendar is next free: the latest end among scheduled tournaments,
+  // or now. Used to pre-fill the admin form so the default is non-overlapping.
+  async nextFreeTournamentSlot(nowSec = Math.floor(Date.now() / 1000)) {
+    const r = await this.one(
+      "SELECT MAX(ends_at) e FROM tournament WHERE status <> 'cancelled' AND ends_at > $1",
+      [nowSec]
+    );
+    return r && r.e != null ? num(r.e) : nowSec;
+  }
+
+  // Replace a tournament's map pool.
+  //
+  // Map rows are CREATED ON DEMAND (the same get-or-create upsert the ingest
+  // and saved-start paths use) rather than required to exist. `map` only holds
+  // maps somebody has already raced, so requiring a pre-existing row would make
+  // the most natural tournament of all — "here are three brand-new maps, go" —
+  // impossible to set up. A pool entry for a never-raced map simply scores
+  // nothing until the first finish lands, which is exactly right.
+  //
+  // `unraced` comes back so the admin form can warn about a likely typo: a name
+  // nobody has ever finished is far more often a misspelling than a new map.
+  //
+  // NOTE for pool authors: a REVERSE run is stored under its own map row named
+  // "<map>-reversed" (RACE_EffectiveMapName in hrace/racelog.as), so a pool
+  // containing "coldrun" scores forward runs only. Add "coldrun-reversed" as a
+  // separate entry to score the reverse direction.
+  async setTournamentMaps(tournamentId, mapNames) {
+    const wanted = mapNames.map((m) => String(m).toLowerCase());
+    // "Raced" means somebody has actually finished it, NOT that a map row
+    // exists: this very method creates rows on demand, so a row-existence test
+    // would report a brand-new pool map as known the second time it is saved
+    // and the typo warning would quietly stop working.
+    const raced = new Set(
+      wanted.length
+        ? (
+            await this.all(
+              `SELECT m.name FROM map m
+               WHERE m.name = ANY($1) AND EXISTS (SELECT 1 FROM race r WHERE r.map_id = m.id)`,
+              [wanted]
+            )
+          ).map((r) => String(r.name).toLowerCase())
+        : []
+    );
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("DELETE FROM tournament_map WHERE tournament_id = $1", [tournamentId]);
+      let pos = 0;
+      for (const m of wanted) {
+        const row = (
+          await client.query(
+            `INSERT INTO map (name) VALUES ($1)
+             ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+            [m]
+          )
+        ).rows[0];
+        await client.query(
+          `INSERT INTO tournament_map (tournament_id, map_id, position) VALUES ($1, $2, $3)
+           ON CONFLICT (tournament_id, map_id) DO UPDATE SET position = EXCLUDED.position`,
+          [tournamentId, num(row.id), pos++]
+        );
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+    return { added: wanted.length, unraced: wanted.filter((m) => !raced.has(m)) };
+  }
+
+  // Create a tournament + its pool. Returns {id, unraced} or null on a slug
+  // collision (the caller re-renders the form with the message).
+  async createTournament(v, by, now = Math.floor(Date.now() / 1000)) {
+    let row;
+    try {
+      row = await this.one(
+        `INSERT INTO tournament
+           (slug, name, description, starts_at, ends_at, status, scoring, join_open,
+            repeat_every_days, repeat_gap_days, series_key, edition, created_at, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
+        [
+          v.slug, v.name, v.description, v.starts_at, v.ends_at, v.status, v.scoring, v.join_open,
+          v.repeat_every_days, v.repeat_gap_days,
+          v.repeat_every_days > 0 ? v.series_key || v.slug : null,
+          v.edition || 1, now, by || null,
+        ]
+      );
+    } catch (e) {
+      if (e.code === "23505") return null; // slug taken
+      throw e;
+    }
+    const id = num(row.id);
+    const maps = await this.setTournamentMaps(id, v.mapNames || []);
+    return { id, unraced: maps.unraced };
+  }
+
+  // Returns {rows, missing} — rows 0 means no such id; null on a slug collision.
+  async updateTournament(id, v, by, now = Math.floor(Date.now() / 1000)) {
+    let r;
+    try {
+      r = await this.pool.query(
+        `UPDATE tournament SET slug=$2, name=$3, description=$4, starts_at=$5, ends_at=$6,
+                status=$7, scoring=$8, join_open=$9, repeat_every_days=$10, repeat_gap_days=$11,
+                updated_at=$12, updated_by=$13
+         WHERE id = $1 AND status <> 'finalized'`,
+        [
+          id, v.slug, v.name, v.description, v.starts_at, v.ends_at, v.status, v.scoring, v.join_open,
+          v.repeat_every_days, v.repeat_gap_days, now, by || null,
+        ]
+      );
+    } catch (e) {
+      if (e.code === "23505") return null;
+      throw e;
+    }
+    if (!r.rowCount) return { rows: 0, unraced: [] };
+    const maps = await this.setTournamentMaps(id, v.mapNames || []);
+    return { rows: r.rowCount, unraced: maps.unraced };
+  }
+
+  async setTournamentStatus(id, status, by, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.pool.query(
+      "UPDATE tournament SET status = $2, updated_at = $3, updated_by = $4 WHERE id = $1 AND status <> 'finalized'",
+      [id, status, now, by || null]
+    );
+    return r.rowCount;
+  }
+
+  // Deleting is only allowed while nobody has ENTERED. Once a player has
+  // redeemed a code the tournament is somebody's plan for their week: the
+  // cascade would take their entry, their frozen standing and their trophy
+  // with it, and every code minted for it would go permanently dead. Cancel it
+  // instead — that keeps the row, the history and the calendar slot's story.
+  // (The achievements precedent refuses deletion once EARNED; the tournament
+  // equivalent has to be "once anyone signed up", because the damage lands on
+  // entrants long before any trophy exists.)
+  async deleteTournament(id) {
+    const r = await this.pool.query(
+      `DELETE FROM tournament t WHERE t.id = $1
+       AND NOT EXISTS (SELECT 1 FROM tournament_trophy tt WHERE tt.tournament_id = t.id)
+       AND NOT EXISTS (
+         SELECT 1 FROM tournament_entrant te
+         WHERE te.tournament_id = t.id AND te.player_id IS NOT NULL
+       )`,
+      [id]
+    );
+    return r.rowCount;
+  }
+
+  // Mint an UNCLAIMED entry code. The website hands this to a player, who binds
+  // it to their in-game identity with "/tournament <code>". Retries on the
+  // (astronomically unlikely) code collision rather than trusting the RNG.
+  async createEntryCode(tournamentId, claimedName = "", now = Math.floor(Date.now() / 1000)) {
+    const name = String(claimedName || "").trim().slice(0, MAX_ENTRY_NAME) || null;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const code = generateCode((n) => crypto.randomBytes(n));
+      try {
+        const row = await this.one(
+          `INSERT INTO tournament_entrant (tournament_id, code, claimed_name, created_at)
+           VALUES ($1, $2, $3, $4) RETURNING id`,
+          [tournamentId, code, name, now]
+        );
+        return { id: num(row.id), code };
+      } catch (e) {
+        if (e.code === "23505") continue; // code collision — draw again
+        if (e.code === "23503") return null; // no such tournament
+        throw e;
+      }
+    }
+    throw new Error("could not mint a unique tournament entry code");
+  }
+
+  // Redeem a code in-game: bind the entry to the canonical player behind
+  // (name, login). Returns a small result object the game turns into a printed
+  // line; `reason` is a stable machine key, never player-facing text.
+  async redeemEntryCode({ code, name, login = "", serverId = null }, now = Math.floor(Date.now() / 1000)) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Lock the entry row first: two servers redeeming the same code at once
+      // must serialize here, or both would see it unclaimed.
+      const te = (
+        await client.query("SELECT * FROM tournament_entrant WHERE code = $1 FOR UPDATE", [code])
+      ).rows[0];
+      if (!te) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "unknown_code" };
+      }
+      const t = this._tournamentRow(
+        (await client.query("SELECT * FROM tournament WHERE id = $1", [te.tournament_id])).rows[0]
+      );
+      if (!t || !joinOpen(t, now)) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "closed", tournament: t };
+      }
+
+      const rawId = await this._resolvePlayer(client, { name, login });
+      const cRow = (await client.query("SELECT canonical_id FROM player WHERE id = $1", [rawId])).rows[0];
+      const canonId = cRow && cRow.canonical_id != null ? num(cRow.canonical_id) : rawId;
+
+      // Already registered for this tournament (possibly under a different
+      // code, or under an alias that has since merged into this group)? Say so
+      // and succeed — a second redeem is a no-op, not an error.
+      const existing = (
+        await client.query(
+          `SELECT te2.id FROM tournament_entrant te2
+           JOIN player pl ON pl.id = te2.player_id
+           WHERE te2.tournament_id = $1 AND COALESCE(pl.canonical_id, pl.id) = $2`,
+          [te.tournament_id, canonId]
+        )
+      ).rows[0];
+      if (existing) {
+        await client.query("COMMIT");
+        return { ok: true, already: true, tournament: t };
+      }
+      if (te.player_id != null) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "code_used", tournament: t };
+      }
+
+      await client.query(
+        `UPDATE tournament_entrant
+         SET player_id = $2, registered_name = $3, registered_at = $4, server_id = $5
+         WHERE id = $1`,
+        [num(te.id), canonId, String(name).slice(0, MAX_ENTRY_NAME), now, serverId]
+      );
+      await client.query("COMMIT");
+      return { ok: true, already: false, tournament: t };
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      if (e.code === "23505") return { ok: false, reason: "already_entered" }; // lost the race
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // In-game "/tournament join": enrol the nick the player is playing under,
+  // right now, with no website round trip. The code is still minted (and shown
+  // to them) so the entry looks identical to a website signup and they have
+  // something to quote if they ever need support.
+  async joinTournamentInGame({ tournamentId, name, login = "", serverId = null }, now = Math.floor(Date.now() / 1000)) {
+    const t = await this.tournamentById(tournamentId);
+    if (!t || !joinOpen(t, now)) return { ok: false, reason: "closed", tournament: t };
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const rawId = await this._resolvePlayer(client, { name, login });
+      const cRow = (await client.query("SELECT canonical_id FROM player WHERE id = $1", [rawId])).rows[0];
+      const canonId = cRow && cRow.canonical_id != null ? num(cRow.canonical_id) : rawId;
+      const existing = (
+        await client.query(
+          `SELECT te.code FROM tournament_entrant te
+           JOIN player pl ON pl.id = te.player_id
+           WHERE te.tournament_id = $1 AND COALESCE(pl.canonical_id, pl.id) = $2`,
+          [tournamentId, canonId]
+        )
+      ).rows[0];
+      if (existing) {
+        await client.query("COMMIT");
+        return { ok: true, already: true, tournament: t, code: existing.code };
+      }
+      let code = null;
+      for (let attempt = 0; attempt < 6 && code == null; attempt++) {
+        const draw = generateCode((n) => crypto.randomBytes(n));
+        try {
+          await client.query("SAVEPOINT mint");
+          await client.query(
+            `INSERT INTO tournament_entrant
+               (tournament_id, code, claimed_name, player_id, registered_name, registered_at, server_id, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$6)`,
+            [tournamentId, draw, null, canonId, String(name).slice(0, MAX_ENTRY_NAME), now, serverId]
+          );
+          code = draw;
+        } catch (e) {
+          await client.query("ROLLBACK TO SAVEPOINT mint");
+          if (e.code === "23505" && String(e.constraint || "").includes("uq_tentrant_player")) {
+            // Someone else enrolled this player between the SELECT and here.
+            await client.query("COMMIT");
+            return { ok: true, already: true, tournament: t, code: null };
+          }
+          if (e.code === "23505") continue; // code collision — draw again
+          throw e;
+        }
+      }
+      if (code == null) throw new Error("could not mint a unique tournament entry code");
+      await client.query("COMMIT");
+      return { ok: true, already: false, tournament: t, code };
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Is this nick registered for `tournamentId`, and where do they stand? Nick
+  // lookup spans the whole canonical group, like the awards/saved-start feeds.
+  async playerTournamentEntry(tournamentId, playerName) {
+    const clean = simplifyName(playerName).toLowerCase();
+    if (!clean) return null;
+    // Match through the alias group in BOTH directions. tournament_entrant
+    // stores the representative id AT REDEEM TIME, so after a canonical rebuild
+    // picks a new representative the stored id is no longer what the nick
+    // resolves to — comparing only forwards would tell a registered player they
+    // are not registered while the standings still (correctly) score them.
+    // Mapping the stored id through canonical_id, the way playerTrophies does,
+    // survives the flip.
+    const row = await this.one(
+      `SELECT te.code, te.registered_at, te.player_id
+       FROM tournament_entrant te
+       JOIN player ep ON ep.id = te.player_id
+       WHERE te.tournament_id = $1
+         AND COALESCE(ep.canonical_id, ep.id) IN (
+           SELECT DISTINCT COALESCE(pl.canonical_id, pl.id) FROM player pl
+           WHERE lower(regexp_replace(pl.name, '\\^[0-9]', '', 'g')) = $2
+         )
+       LIMIT 1`,
+      [tournamentId, clean]
+    );
+    if (!row) return null;
+    return {
+      code: row.code,
+      registered_at: row.registered_at == null ? null : num(row.registered_at),
+      playerId: num(row.player_id),
+    };
+  }
+
+  // Every trophy a player holds, newest first — the profile card. Reads span
+  // the canonical group so a trophy survives the representative flipping.
+  async playerTrophies(id) {
+    let canonId = id;
+    const c = await this.one("SELECT canonical_id FROM player WHERE id = $1", [id]);
+    if (c && c.canonical_id != null) canonId = num(c.canonical_id);
+    return (
+      await this.all(
+        `SELECT tt.place, tt.points, tt.awarded_at,
+                t.id AS tournament_id, t.slug, t.name, t.starts_at, t.ends_at,
+                (SELECT COUNT(*) FROM tournament_standing s WHERE s.tournament_id = t.id) AS field
+         FROM tournament_trophy tt
+         JOIN tournament t ON t.id = tt.tournament_id
+         WHERE tt.player_id IN (SELECT id FROM player WHERE canonical_id = $1)
+         ORDER BY tt.awarded_at DESC, t.ends_at DESC`,
+        [canonId]
+      )
+    ).map((r) => ({
+      tournamentId: num(r.tournament_id),
+      slug: r.slug,
+      name: r.name,
+      place: num(r.place),
+      points: num(r.points) || 0,
+      field: num(r.field) || 0,
+      startsAt: num(r.starts_at),
+      endsAt: num(r.ends_at),
+      awardedAt: num(r.awarded_at),
+    }));
+  }
+
+  // Freeze one tournament: snapshot its standings and mint trophies.
+  //
+  // Idempotent and replica-safe by construction. The whole pass runs in one
+  // transaction that begins by locking the tournament row and re-checking that
+  // it is still an un-finalized, published, ENDED tournament — so two replicas
+  // (or a sweep racing an admin's "finalize now") can only ever have one of
+  // them do the work; the loser sees status='finalized' and no-ops. The insert
+  // shapes are ON CONFLICT DO NOTHING on top of that, so even a torn retry
+  // cannot double-award.
+  //
+  // Trophies: place 1/2/3 for the podium, place 0 for everyone else who scored
+  // at least one map. A tournament nobody entered is still finalized (with an
+  // empty snapshot) so it stops being re-swept every night.
+  async finalizeTournament(tournamentId, now = Math.floor(Date.now() / 1000)) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const t = this._tournamentRow(
+        (await client.query("SELECT * FROM tournament WHERE id = $1 FOR UPDATE", [tournamentId])).rows[0]
+      );
+      if (!t || t.status !== "published" || t.ends_at > now) {
+        await client.query("ROLLBACK");
+        return { finalized: false, standings: 0, trophies: 0 };
+      }
+
+      const q = standingsQuery(t, { limit: 10000 });
+      const rows = (await client.query(q.sql, q.params)).rows;
+      let trophies = 0;
+      const places = this._tournamentPlaces(rows, t.scoring);
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        const place = places[i];
+        const complete = r.complete !== false;
+        await client.query(
+          `INSERT INTO tournament_standing
+             (tournament_id, player_id, place, points, maps_played, map_wins, total_time, complete, detail)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+           ON CONFLICT (tournament_id, player_id) DO NOTHING`,
+          [
+            t.id, num(r.player_id), place, num(r.points) || 0, num(r.maps_played) || 0,
+            num(r.map_wins) || 0, r.total_time == null ? null : num(r.total_time),
+            complete, JSON.stringify(r.detail || []),
+          ]
+        );
+        // A podium trophy requires a podium place AND, under time_sum, a
+        // COMPLETE entry: that format explicitly does not rank anyone who
+        // skipped a pool map, so handing one of them a bronze because only two
+        // players finished everything would contradict the board they are
+        // standing on. They still get the participation trophy.
+        const podium = place <= 3 && (t.scoring !== "time_sum" || complete);
+        const res = await client.query(
+          `INSERT INTO tournament_trophy (tournament_id, player_id, place, points, awarded_at)
+           VALUES ($1,$2,$3,$4,$5) ON CONFLICT (tournament_id, player_id) DO NOTHING`,
+          [t.id, num(r.player_id), podium ? place : 0, num(r.points) || 0, now]
+        );
+        trophies += res.rowCount;
+      }
+      await client.query(
+        "UPDATE tournament SET status = 'finalized', finalized_at = $2, updated_at = $2 WHERE id = $1",
+        [t.id, now]
+      );
+      await client.query("COMMIT");
+      return { finalized: true, standings: rows.length, trophies, tournament: t };
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Schedule the next edition of a recurring tournament, starting
+  // repeat_gap_days after `prev` ended and running for the same duration. The
+  // gap is what guarantees a series never overlaps itself; an explicit overlap
+  // with some OTHER tournament is skipped (logged by the caller) rather than
+  // silently double-booking the calendar. Idempotent: the slug carries the
+  // edition number, so a repeat run collides on the unique slug and no-ops.
+  async scheduleNextEdition(prev, now = Math.floor(Date.now() / 1000)) {
+    if (!prev || prev.repeat_every_days <= 0) return null;
+    const duration = prev.ends_at - prev.starts_at;
+    const seriesKey = prev.series_key || prev.slug;
+    const edition = (prev.edition || 1) + 1;
+    // Roll forward until the start is in the future: a series that lay dormant
+    // while the site was down should resume NEXT, not replay every missed week.
+    let startsAt = prev.ends_at + prev.repeat_gap_days * 86400;
+    const step = prev.repeat_every_days * 86400;
+    let guard = 0;
+    while (startsAt + duration <= now && guard++ < 520) startsAt += step;
+
+    // The slug is built from the SERIES key, which never changes across
+    // editions, so there is nothing to strip: edition 2 of "weekly" is
+    // "weekly-2", edition 3 is "weekly-3". (Stripping a trailing "-<digits>"
+    // would have mangled a series whose own name ends in a number — "sprint-2026"
+    // would have produced "sprint-2".)
+    const slug = `${seriesKey}-${edition}`;
+    const name = prev.name.replace(/\s*#\d+\s*$/, "") + ` #${edition}`;
+    if ((await this.overlappingTournaments(startsAt, startsAt + duration)).length) return null;
+
+    // Row and pool in ONE transaction: an edition that committed with an empty
+    // map pool would be a published tournament nobody can score on, and the
+    // reconciliation pass would consider the series healed and never retry.
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const row = (
+        await client.query(
+          `INSERT INTO tournament
+             (slug, name, description, starts_at, ends_at, status, scoring, join_open,
+              repeat_every_days, repeat_gap_days, series_key, edition, created_at, created_by)
+           VALUES ($1,$2,$3,$4,$5,'published',$6,TRUE,$7,$8,$9,$10,$11,'auto') RETURNING id`,
+          [
+            slug, name, prev.description, startsAt, startsAt + duration, prev.scoring,
+            prev.repeat_every_days, prev.repeat_gap_days, seriesKey, edition, now,
+          ]
+        )
+      ).rows[0];
+      const id = num(row.id);
+      await client.query(
+        `INSERT INTO tournament_map (tournament_id, map_id, position)
+         SELECT $1, map_id, position FROM tournament_map WHERE tournament_id = $2
+         ON CONFLICT DO NOTHING`,
+        [id, prev.id]
+      );
+      await client.query("COMMIT");
+      return { id, slug, startsAt, endsAt: startsAt + duration };
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      if (e.code === "23505") return null; // this edition already exists
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // The sweep: finalize every published tournament whose window has closed, and
+  // make sure every recurring series has its next edition on the calendar.
+  // Safe to run on both replicas and as often as you like (see
+  // finalizeTournament's locking).
+  //
+  // The series roll-forward is a RECONCILIATION, not a follow-on step, and that
+  // is deliberate. Scheduling cannot join the finalize transaction (it needs
+  // the finalized row committed to know the window it follows), so a container
+  // recreate — which every deploy does — landing between the two would leave a
+  // weekly series permanently stuck with no next edition and nothing to notice.
+  // Instead this asks the standing question "does any finalized recurring
+  // tournament lack a successor?" every pass, so the series heals itself on the
+  // next sweep no matter where it was interrupted.
+  async finalizeDueTournaments(now = Math.floor(Date.now() / 1000)) {
+    const due = await this.all(
+      "SELECT id FROM tournament WHERE status = 'published' AND ends_at <= $1 ORDER BY ends_at",
+      [now]
+    );
+    const out = { finalized: 0, trophies: 0, scheduled: [] };
+    for (const d of due) {
+      const r = await this.finalizeTournament(num(d.id), now);
+      if (!r.finalized) continue;
+      out.finalized++;
+      out.trophies += r.trophies;
+    }
+
+    // Reconcile: the latest finalized edition of every recurring series that
+    // has no later edition scheduled. scheduleNextEdition is itself idempotent
+    // (the edition-numbered slug collides), so a duplicate pass is a no-op.
+    const orphans = await this.all(
+      `SELECT t.* FROM tournament t
+       WHERE t.status = 'finalized' AND t.repeat_every_days > 0
+         AND NOT EXISTS (
+           SELECT 1 FROM tournament n
+           WHERE COALESCE(n.series_key, n.slug) = COALESCE(t.series_key, t.slug)
+             AND n.edition > t.edition
+             AND n.status <> 'cancelled'
+         )
+       ORDER BY t.ends_at`
+    );
+    for (const o of orphans) {
+      const next = await this.scheduleNextEdition(this._tournamentRow(o), now);
+      if (next) out.scheduled.push(next);
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------------
   // Ingest
   // ------------------------------------------------------------------------
   // Same contract as the SQLite layer (see git history for the long-form
@@ -3863,11 +4761,38 @@ class RaceDB {
           await client.query("DELETE FROM checkpoint WHERE race_id = $1", [existing.id]);
           await client.query("DELETE FROM race WHERE id = $1", [existing.id]);
         }
+        // Snapshot how many tries this PB took. run_tally.attempts is a running
+        // counter with no history, so it can only be captured HERE, while it
+        // still reads as of this run. The tally bump above already counted the
+        // attempt that produced this finish, so the sum is inclusive. Summed
+        // over the whole canonical identity group and every game version on the
+        // map, matching how the leaderboard row itself is grouped. Only for
+        // racelog ingests: a topscores re-sync bumps no tally, so its counter is
+        // unrelated to the run being recorded — NULL ("unknown") instead.
+        let attemptsAtPb = null;
+        if (tally) {
+          const a = await q1(
+            `SELECT SUM(rt.attempts) a
+               FROM run_tally rt JOIN player pl ON pl.id = rt.player_id
+              WHERE rt.map_id = $1
+                AND pl.canonical_id = (SELECT canonical_id FROM player WHERE id = $2)`,
+            [mapRow.id, playerId]
+          );
+          // 0 means "counted nothing", which is not a real attempt count.
+          attemptsAtPb = a && a.a != null && num(a.a) > 0 ? num(a.a) : null;
+        }
         const raceId = await this._nextRaceId(client);
         await client.query(
-          `INSERT INTO race (id, version_id, player_id, map_id, time, server_id, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [raceId, versionRow.id, playerId, mapRow.id, rec.time, serverId, now]
+          `INSERT INTO race (id, version_id, player_id, map_id, time, server_id, created_at,
+                             strafe_quality, attempts)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            raceId, versionRow.id, playerId, mapRow.id, rec.time, serverId, now,
+            // The PB's OWN strafe quality — the same measurement written to its
+            // finish row above, denormalised so the leaderboard needn't guess
+            // which finish produced the record.
+            rec.strafe_quality ?? null, attemptsAtPb,
+          ]
         );
         if (rec.checkpoints.length) {
           await client.query(

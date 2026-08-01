@@ -206,6 +206,14 @@ table.data tbody tr.clickable { cursor: pointer; }
 table.data tbody tr:last-child td { border-bottom: none; }
 table.data td.num, table.data thead th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .time { font-family: var(--mono); font-weight: 500; font-variant-numeric: tabular-nums; }
+/* Per-PB run facts on the map leaderboard: air-strafe quality (banded to the
+   same cuts the strafe achievements use) and the attempt count it took. */
+.sq { font-family: var(--mono); font-weight: 500; font-variant-numeric: tabular-nums; }
+.sq.elite { color: var(--green); }
+.sq.good  { color: var(--cyan); }
+.sq.ok    { color: var(--text); }
+.sq.low   { color: var(--muted); }
+.tries { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); }
 .rankcell { font-family: var(--cond); font-weight: 800; font-style: italic; font-size: 16px; width: 46px; }
 .rank-1 { color: var(--gold); }
 .rank-2 { color: var(--silver); }
@@ -920,3 +928,154 @@ a.replay-badge { text-decoration: none; }
 .achdir-desc { margin: 2px 0 6px; }
 .achdir-meta { font-size: 13px; }
 .achdir-recent { font-size: 13px; margin-top: 4px; }
+
+/* ==========================================================================
+   Tournaments — calendar cards, standings, join form, profile trophy shelf.
+   Reuses the existing panel/statrow/data-table vocabulary; only the badge,
+   the trophy shelf and the code readout are new shapes.
+   ========================================================================== */
+
+/* Schedule timeline. Bars are absolutely positioned by percentage of the whole
+   span, so two overlapping tournaments visibly share horizontal space instead
+   of quietly stacking. */
+.ttimeline {
+  position: relative;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  padding: 30px 16px 14px; margin-bottom: 26px; overflow: hidden;
+}
+.ttl-axis { position: absolute; inset: 0 16px auto 16px; height: 100%; pointer-events: none; }
+.ttl-tick { position: absolute; top: 0; bottom: 0; transform: translateX(-50%); }
+.ttl-tick i { position: absolute; top: 24px; bottom: 0; left: 50%; width: 1px; background: var(--line); }
+.ttl-tick b {
+  position: absolute; top: 4px; left: 50%; transform: translateX(-50%);
+  font-family: var(--cond); text-transform: uppercase; letter-spacing: .8px;
+  font-size: 10px; font-weight: 600; color: var(--faint); white-space: nowrap;
+}
+.ttl-row { position: relative; height: 30px; margin-top: 4px; }
+.ttl-bar {
+  position: absolute; top: 0; height: 26px; min-width: 8px;
+  display: flex; align-items: center; border-radius: 6px;
+  padding: 0 9px; text-decoration: none; overflow: hidden;
+  background: var(--panel-2); border: 1px solid var(--line-2); color: var(--text);
+  transition: filter .15s;
+}
+.ttl-bar:hover { filter: brightness(1.25); }
+.ttl-bar span {
+  font-family: var(--cond); font-weight: 600; font-size: 12.5px;
+  letter-spacing: .3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ttl-bar.live { background: var(--orange-dim); border-color: var(--orange); }
+.ttl-bar.upcoming { background: rgba(34,211,238,.16); border-color: rgba(34,211,238,.45); }
+/* "Now" is the left edge of the axis by construction (the span starts at now). */
+.ttl-now { position: absolute; left: 16px; top: 24px; bottom: 8px; width: 2px; background: var(--orange); opacity: .7; }
+
+/* Calendar. auto-fill (not auto-fit) so a single live tournament stays a card
+   the width of the others instead of stretching across the whole page. */
+.tgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 14px;
+  margin-bottom: 26px;
+}
+.tcard { display: block; padding: 16px 18px; color: inherit; text-decoration: none; transition: border-color .15s, transform .15s; }
+.tcard:hover { border-color: var(--line-2); transform: translateY(-2px); }
+.tcard-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.tcard .tname { font-family: var(--cond); font-weight: 700; font-size: 19px; letter-spacing: .3px; }
+.tcard-when { font-size: 13px; }
+.tcard-meta { font-size: 12px; margin-top: 8px; font-variant-numeric: tabular-nums; }
+/* A live tournament gets the orange edge — it is the one thing on the page
+   that is happening right now and worth the page's loudest colour. */
+.tcard.tphase-live { border-color: rgba(255,106,26,.45); }
+
+.tbadge {
+  font-family: var(--cond); text-transform: uppercase; letter-spacing: 1.2px;
+  font-size: 11px; font-weight: 700; white-space: nowrap;
+  padding: 3px 9px; border-radius: 20px;
+  border: 1px solid var(--line-2); color: var(--muted); background: var(--bg-2);
+  vertical-align: middle;
+}
+.tbadge.live { color: #12100e; background: var(--orange); border-color: var(--orange); }
+.tbadge.upcoming { color: var(--cyan); border-color: rgba(34,211,238,.4); }
+.tbadge.finalized { color: var(--gold); border-color: rgba(255,210,74,.4); }
+.tbadge.ended { color: var(--muted); }
+.tbadge.cancelled { color: #ff6b6b; border-color: rgba(255,107,107,.4); }
+.tbadge.draft { color: var(--faint); }
+
+.tdesc { padding: 16px 18px; margin-bottom: 22px; line-height: 1.65; }
+.tdesc p { margin: 0 0 10px; }
+.tdesc p:last-child { margin-bottom: 0; }
+/* The admin-entered description is escaped prose, not markup, so its newlines
+   have to be honoured by CSS or every paragraph break the admin typed
+   disappears into one run-on block. */
+.tdesc-raw { white-space: pre-wrap; word-break: break-word; }
+.tdesc code, .tjoin code {
+  font-family: var(--mono); font-size: .92em; color: var(--orange-2);
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px;
+}
+.tnote { font-size: 12px; margin: 8px 2px 22px; }
+/* time_sum: an entrant who hasn't finished every map isn't ranked, so the row
+   is present but visibly out of contention rather than silently missing. */
+tr.tincomplete td { opacity: .5; }
+
+/* Join form. */
+.tjoin { padding: 16px 18px; margin-bottom: 26px; }
+.tjoin.closed { padding: 14px 18px; font-size: 14px; }
+.tjoin-head { font-family: var(--cond); text-transform: uppercase; letter-spacing: 1.5px; font-weight: 700; margin-bottom: 6px; }
+.tjoin p { margin: 0 0 12px; font-size: 14px; line-height: 1.6; }
+.tjoin-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.tjoin-row input {
+  flex: 1 1 220px; min-width: 0;
+  background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 8px;
+  color: var(--text); font: inherit; padding: 9px 12px;
+}
+.tjoin-row input:focus { outline: none; border-color: var(--orange-dim); }
+.tjoin-row .btn { flex: 0 0 auto; cursor: pointer; }
+.tjoin-row .btn.primary { background: var(--orange); border-color: var(--orange); color: #12100e; font-weight: 700; }
+.tjoin-row .btn[disabled] { opacity: .55; cursor: default; }
+.tjoin-out { margin-top: 12px; font-size: 14px; }
+.tjoin-err { color: #ff6b6b; }
+.tcode-wrap { display: flex; flex-direction: column; gap: 8px; }
+.tcode {
+  font-family: var(--mono); font-weight: 700; font-size: 30px; letter-spacing: 3px;
+  color: var(--gold); background: var(--bg-2);
+  border: 1px dashed var(--line-2); border-radius: 10px;
+  padding: 12px 16px; text-align: center; user-select: all;
+}
+
+/* Per-map boards on the detail page — same disclosure shape as the SR
+   breakdown so the caret/behaviour is already familiar. */
+.tmapboard { margin-bottom: 10px; }
+.tmapboard > summary {
+  cursor: pointer; list-style: none; padding: 12px 18px;
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  font-size: 14px; color: var(--text);
+}
+.tmapboard > summary::-webkit-details-marker { display: none; }
+.tmapboard > summary .srbd-caret { color: var(--orange); display: inline-block; transition: transform .15s; }
+.tmapboard[open] > summary .srbd-caret { transform: rotate(90deg); }
+.tmapboard > summary .muted { margin-left: auto; font-size: 12px; font-variant-numeric: tabular-nums; }
+.tmapboard .data { border-top: 1px solid var(--line); }
+
+/* Profile trophy shelf. */
+.trophycase { padding: 14px 16px; display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 24px; }
+.trophy-item {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 12px;
+  padding: 9px 14px 9px 11px; text-decoration: none; color: inherit;
+  transition: border-color .15s, transform .15s;
+}
+.trophy-item:hover { border-color: var(--line-2); transform: translateY(-1px); }
+.trophy-item .trophy-medal { font-size: 22px; line-height: 1; }
+.trophy-item .trophy-body { display: flex; flex-direction: column; }
+.trophy-item .trophy-name { font-family: var(--cond); font-weight: 700; font-size: 15px; letter-spacing: .3px; }
+.trophy-item .trophy-sub { font-size: 11.5px; }
+.trophy-item.p1 { border-color: rgba(255,210,74,.5); }
+.trophy-item.p2 { border-color: rgba(207,214,230,.4); }
+.trophy-item.p3 { border-color: rgba(214,139,82,.45); }
+/* Podium medal inside a standings table cell. */
+.data .trophy { font-size: 14px; }
+
+@media (max-width: 700px) {
+  .tgrid { grid-template-columns: 1fr; }
+  .tcode { font-size: 24px; letter-spacing: 2px; }
+}

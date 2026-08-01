@@ -678,6 +678,74 @@ test("map detail lists a PR for EVERY player, with WR splits and rank order", as
   assert.deepEqual(detail.wr.splits, [9000, 25000]);
 });
 
+test("leaderboard rows carry the PB run's strafe quality and the attempts it took", async (t) => {
+  const race = await freshDb(t);
+  const run = (time, attempts, sq) => ({
+    name: "Nova", login: "", time, checkpoints: [], attempts, strafe_quality: sq,
+  });
+  const board = async () => {
+    await race.refreshAggregates();
+    const mapId = N((await race.one("SELECT id FROM map WHERE name = $1", [MAP])).id);
+    return (await race.mapDetail(mapId)).leaderboard[0];
+  };
+
+  // First PB: 4 attempts to get there, strafed at 72.50% (7250 basis points).
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [run(52000, 4, 7250)] });
+  let row = await board();
+  assert.equal(row.strafeQuality, 72.5); // basis points -> percent
+  assert.equal(row.attempts, 4);
+
+  // Improving the PB re-snapshots BOTH facts for the new run: its own strafe
+  // quality, and the cumulative attempt count (4 + 6), not just the last flush.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [run(48000, 6, 8880)] });
+  row = await board();
+  assert.equal(row.strafeQuality, 88.8);
+  assert.equal(row.attempts, 10);
+
+  // A later, SLOWER finish leaves the PB row alone even if it was strafed
+  // better — the columns describe the record run, not the most recent one.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [run(50000, 3, 9900)] });
+  row = await board();
+  assert.equal(row.time, 48000);
+  assert.equal(row.strafeQuality, 88.8);
+  assert.equal(row.attempts, 10);
+});
+
+test("PB strafe quality and attempts are null (not 0) when unreported", async (t) => {
+  const race = await freshDb(t);
+  // A racelog finish from an older server: no strafe_quality field at all.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("Nova", 52000)] });
+  // A topscores re-sync bumps no tally, so its attempt counter says nothing
+  // about the run being recorded.
+  await race.ingest({ version: VER, map: MAP, source: "topscores", records: [finish("Ghost", 51000)] });
+  await race.refreshAggregates();
+
+  const mapId = N((await race.one("SELECT id FROM map WHERE name = $1", [MAP])).id);
+  const byName = Object.fromEntries(
+    (await race.mapDetail(mapId)).leaderboard.map((r) => [r.name, r])
+  );
+  assert.equal(byName.Nova.strafeQuality, null);
+  assert.equal(byName.Nova.attempts, 1); // the finish itself counts as one attempt
+  assert.equal(byName.Ghost.strafeQuality, null);
+  assert.equal(byName.Ghost.attempts, null); // topscores: unknown, NOT zero
+});
+
+test("attempts-to-PB span every nick variant of one canonical player", async (t) => {
+  const race = await freshDb(t);
+  const run = (name, time, attempts) => ({ name, login: "", time, checkpoints: [], attempts });
+  // Same person, two nick spellings that collapse into one canonical identity
+  // (and therefore into ONE leaderboard row) — their attempts must add up.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [run("^8EL^9chupa^7", 52000, 5)] });
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [run("ELchupa(1)", 48000, 2)] });
+  await race.refreshAggregates();
+
+  const mapId = N((await race.one("SELECT id FROM map WHERE name = $1", [MAP])).id);
+  const lb = (await race.mapDetail(mapId)).leaderboard;
+  assert.equal(lb.length, 1);
+  assert.equal(lb[0].time, 48000);
+  assert.equal(lb[0].attempts, 7);
+});
+
 test("perfect run is the sum of best segments across different players", async (t) => {
   const race = await freshDb(t);
   await race.ingest({

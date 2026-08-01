@@ -189,6 +189,14 @@ Beyond raw leaderboards it computes:
 - **Attempts vs records** — every race START is counted (an *attempt*) and
   every finished run (a *finish*), both separate from the number of ranked
   best-times (*records*).
+- **Tournaments** — time-boxed competitions on a fixed map pool. Admins
+  schedule them at `/admin/tournaments` (with overlap avoidance and optional
+  recurrence); players take an entry code on the site and redeem it in-game with
+  `/tournament <code>`, after which their runs on pool maps score for the
+  tournament board *and* the normal leaderboard. A tournament owns no runs — it
+  is a filter over the finish log, frozen into a snapshot when it ends, so it
+  can never corrupt the real records. Top three take a profile trophy.
+  See [`docs/tournaments-design.md`](docs/tournaments-design.md).
 - **Canonical players** — variants of one person collapse to a single profile,
   displayed as the **last nick we've seen them use**, so leaderboards aren't
   fragmented across `^1Foo`/`^2Foo`/`Foo(1)`. Grouping is exact after stripping

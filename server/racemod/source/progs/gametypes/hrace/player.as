@@ -110,6 +110,16 @@ class Player
     bool awardsSeeded;
     int awardsHighWater;
     uint nextAwardsPoll;
+    // Tournament entry redeem (hrace/tournament.as): "/tournament <code>" fires
+    // one per-slot POST whose REPLY is printed back to the player, so exactly
+    // one may be in flight at a time — pendingTourneyJoin gates both the poll
+    // and a second command while the first is still travelling.
+    // tourneyJoinDeadline (levelTime ms) is the backstop: a request that is
+    // never answered — dropped at shutdown, evicted from a full queue, or
+    // no-opped by the native — must not leave the player permanently unable to
+    // try again.
+    bool pendingTourneyJoin;
+    uint tourneyJoinDeadline;
     Position savedRaceStart;
     bool savedRaceStartValid;
     Position savedReverseStart;
@@ -342,6 +352,8 @@ class Player
         this.awardsSeeded = false;
         this.awardsHighWater = 0;
         this.nextAwardsPoll = 0;
+        this.pendingTourneyJoin = false;
+        this.tourneyJoinDeadline = 0;
         this.savedRaceStartValid = false;
         this.savedReverseStartValid = false;
         this.noclipSpawn = false;

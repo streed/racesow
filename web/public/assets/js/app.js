@@ -50,7 +50,17 @@ async function apiPost(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // Prefer the API's own {error: "..."} message over "409 Conflict": these are
+  // shown verbatim to players ("this tournament is not taking entries"), and an
+  // HTTP status name explains nothing.
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      const b = await res.json();
+      if (b && typeof b.error === "string" && b.error) msg = b.error;
+    } catch (err) { /* not JSON — keep the status line */ }
+    throw new Error(msg);
+  }
   return res.json();
 }
 
@@ -888,6 +898,21 @@ async function viewPlayers(params) {
   wireSort("#/players", state);
 }
 
+// Leaderboard cells for the two per-PB run facts. Both are null for runs set
+// before the measurement existed (or by a server that never reported it), and
+// null renders as an em dash — NOT 0%, which would read as a real, terrible
+// number. Banding mirrors the achievement cuts (90% near-perfect, 80% smooth
+// operator) so the colours agree with the badges players already know.
+function strafeCell(q) {
+  if (q == null) return `<span class="muted" title="No strafe measurement for this run">—</span>`;
+  const tier = q >= 90 ? "elite" : q >= 80 ? "good" : q >= 65 ? "ok" : "low";
+  return `<span class="sq ${tier}" title="Air-strafe quality of this record run">${(Math.round(q * 10) / 10).toFixed(1)}%</span>`;
+}
+function triesCell(n) {
+  if (n == null) return `<span class="muted" title="Attempt count not recorded for this run">—</span>`;
+  return `<span class="tries" title="${fmtNum(n)} attempt${n === 1 ? "" : "s"} on this map up to the run that set this record">${fmtNum(n)}</span>`;
+}
+
 async function viewMap(id) {
   loading();
   // limit=10000 = "everyone": the leaderboard lists every player's PR on the
@@ -965,7 +990,7 @@ async function viewMap(id) {
       <div class="map-hero-main">
         <div class="table-wrap"><div class="tscroll">
           <table class="data">
-            <thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">Behind</th><th class="num">Gap</th><th>Version</th></tr></thead>
+            <thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">Behind</th><th class="num">Gap</th><th class="num" title="Air-strafe quality of this record run — how close the acceleration stayed to the ideal strafe angle">Strafe</th><th class="num" title="Attempts on this map up to and including the run that set this record">Tries</th><th>Version</th></tr></thead>
             <tbody>
               ${d.leaderboard.map((r, i) => `
                 <tr class="clickable" data-nav="#/player/${r.playerId}">
@@ -974,8 +999,10 @@ async function viewMap(id) {
                   <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
                   <td class="num"><span class="time">${r.pos === 1 ? "—" : "+" + fmtTime(r.time - d.leaderboard[0].time)}</span></td>
                   <td class="num"><span class="time muted">${i === 0 ? "—" : "+" + fmtTime(r.time - d.leaderboard[i - 1].time)}</span></td>
+                  <td class="num">${strafeCell(r.strafeQuality)}</td>
+                  <td class="num">${triesCell(r.attempts)}</td>
                   <td><span class="pill ${r.version === 1 ? "v1" : ""}">${esc(r.versionName || "")}</span></td>
-                </tr>`).join("") || `<tr><td colspan="6" class="empty">No runs recorded.</td></tr>`}
+                </tr>`).join("") || `<tr><td colspan="8" class="empty">No runs recorded.</td></tr>`}
             </tbody>
           </table>
         </div></div>
@@ -1182,6 +1209,8 @@ async function viewPlayer(id, params) {
       <div>${srHistoryCard(d.srHistory, d.id)}</div>
       <div>${strafeQualityCard(d.strafeHistory)}</div>
     </div>
+
+    ${trophiesCard(d.trophies)}
 
     ${achievementsCard(d.achievements)}
 
@@ -2265,6 +2294,356 @@ async function viewAchievements() {
       : `<div class="empty">No achievements have been defined yet — check back soon.</div>`}`;
 }
 
+/* ============================== tournaments ============================== */
+/* A tournament is a time window plus a map pool; a registered entrant's
+ * finishes on those maps inside that window score for its board as well as the
+ * normal leaderboard. Everything below derives the PHASE from the `now` the
+ * server stamped into the payload rather than the browser's clock: the response
+ * is edge-cached for up to ~60s, and a client clock that disagreed would show
+ * "starts in 3 minutes" for a tournament that started an hour ago (or worse,
+ * hide the Join button on a live one). */
+
+const TPHASE_LABEL = {
+  upcoming: "Upcoming",
+  live: "Live now",
+  ended: "Finished",
+  finalized: "Final",
+  cancelled: "Cancelled",
+  draft: "Draft",
+};
+
+function tPhase(t, now) {
+  if (!t) return null;
+  if (t.status === "cancelled") return "cancelled";
+  if (t.status === "finalized") return "finalized";
+  if (t.status === "draft") return "draft";
+  if (now < t.starts_at) return "upcoming";
+  if (now < t.ends_at) return "live";
+  return "ended";
+}
+
+/* Epoch seconds -> "5 Aug 2026, 18:00 UTC". Always UTC and always absolute:
+ * tournament windows are set in UTC by admins and read by players in a dozen
+ * zones, so a local-time rendering would have two people disagree about when
+ * the thing they are both racing actually ends. */
+const TMONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function fmtUtc(ts, { time = true } = {}) {
+  if (ts == null) return "—";
+  const d = new Date(Number(ts) * 1000);
+  const date = `${d.getUTCDate()} ${TMONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+  if (!time) return date;
+  return `${date}, ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")} UTC`;
+}
+
+/* Signed span in seconds -> "3d 4h" / "12m". Coarse on purpose: this is used for
+ * "starts in" / "ends in", where a ticking second counter would just be a
+ * promise the 30s cache cannot keep. */
+function fmtSpan(secs) {
+  const s = Math.max(0, Math.floor(secs));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m`;
+  return "moments";
+}
+
+/* One line of human context under a tournament's title. */
+function tWhen(t, now) {
+  const phase = tPhase(t, now);
+  if (phase === "live") return `Ends in ${fmtSpan(t.ends_at - now)} · ${fmtUtc(t.ends_at)}`;
+  if (phase === "upcoming") return `Starts in ${fmtSpan(t.starts_at - now)} · ${fmtUtc(t.starts_at)}`;
+  return `${fmtUtc(t.starts_at, { time: false })} – ${fmtUtc(t.ends_at, { time: false })}`;
+}
+
+function tCard(t, now) {
+  const phase = tPhase(t, now);
+  return `<a class="panel tcard tphase-${phase}" data-nav="#/tournaments/${esc(t.slug)}" href="/tournaments/${esc(t.slug)}">
+    <div class="tcard-head">
+      <span class="tname">${esc(t.name)}</span>
+      <span class="tbadge ${phase}">${TPHASE_LABEL[phase]}</span>
+    </div>
+    <div class="tcard-when muted">${esc(tWhen(t, now))}</div>
+    <div class="tcard-meta muted">${fmtNum(t.maps || 0)} map${t.maps === 1 ? "" : "s"}
+      <span class="sep">·</span> ${fmtNum(t.entrants || 0)} entrant${t.entrants === 1 ? "" : "s"}
+      ${t.scoring === "time_sum" ? '<span class="sep">·</span> total time' : ""}</div>
+  </a>`;
+}
+
+/* The schedule strip: a proportional timeline of everything running or due,
+ * from now to the last scheduled end.
+ *
+ * A timeline rather than a month grid on purpose — these tournaments run for
+ * days to weeks, so a grid would be a wall of identical full-week rows that
+ * answers "what's on, and when does it end?" worse than a single axis does.
+ * Bars are positioned by percentage of the whole span, so overlapping
+ * tournaments (which the admin form discourages but permits) are immediately
+ * visible as bars sharing horizontal space. */
+function tTimeline(list, now) {
+  if (!list.length) return "";
+  const from = now;
+  const to = Math.max(...list.map((t) => t.ends_at));
+  const span = Math.max(1, to - from);
+  // Tick every week, or every day when the whole span is short.
+  const step = span > 21 * 86400 ? 7 * 86400 : span > 3 * 86400 ? 86400 : 3600 * 6;
+  // Axis labels are built from the parts rather than regex-stripped out of
+  // fmtUtc, so a sub-day step keeps its clock and a multi-day one doesn't
+  // repeat the year across every tick.
+  const tickLabel = (ts) => {
+    const dt = new Date(ts * 1000);
+    const day = `${dt.getUTCDate()} ${TMONTHS[dt.getUTCMonth()]}`;
+    return step < 86400 ? `${String(dt.getUTCHours()).padStart(2, "0")}:00` : day;
+  };
+  const ticks = [];
+  for (let ts = Math.ceil(from / step) * step; ts <= to && ticks.length < 14; ts += step) {
+    ticks.push({ pct: ((ts - from) / span) * 100, label: tickLabel(ts) });
+  }
+  return `
+    <div class="ttimeline">
+      <div class="ttl-axis">
+        ${ticks.map((t) => `<span class="ttl-tick" style="left:${t.pct.toFixed(2)}%"><i></i><b>${esc(t.label)}</b></span>`).join("")}
+      </div>
+      ${list
+        .map((t) => {
+          const phase = tPhase(t, now);
+          // A tournament already under way starts at the left edge — the past
+          // part of its window is not what anyone is looking for here.
+          const l = (Math.max(0, t.starts_at - from) / span) * 100;
+          const w = Math.max(1.5, ((Math.min(t.ends_at, to) - Math.max(t.starts_at, from)) / span) * 100);
+          return `<div class="ttl-row">
+            <a class="ttl-bar ${phase}" style="left:${l.toFixed(2)}%;width:${w.toFixed(2)}%"
+               data-nav="#/tournaments/${esc(t.slug)}" href="/tournaments/${esc(t.slug)}"
+               title="${esc(`${t.name} · ${fmtUtc(t.starts_at)} → ${fmtUtc(t.ends_at)}`)}"><span>${esc(t.name)}</span></a>
+          </div>`;
+        })
+        .join("")}
+      <div class="ttl-now" title="now"></div>
+    </div>`;
+}
+
+/* The calendar page: the schedule strip, then live / upcoming / finished. */
+async function viewTournaments() {
+  loading();
+  const d = await api("/tournaments");
+  const now = d.now || Math.floor(Date.now() / 1000);
+  const rows = (d.rows || []).filter((t) => t.status !== "draft");
+  const group = (p) => rows.filter((t) => tPhase(t, now) === p);
+  const live = group("live");
+  const upcoming = group("upcoming").sort((a, b) => a.starts_at - b.starts_at);
+  const past = rows.filter((t) => ["ended", "finalized", "cancelled"].includes(tPhase(t, now)));
+  const scheduled = live.concat(upcoming);
+
+  const section = (title, list, empty) =>
+    `<div class="page-title" style="font-size:20px">${title}${list.length ? ` <span class="accent">·</span> ${fmtNum(list.length)}` : ""}</div>
+     ${list.length ? `<div class="tgrid">${list.map((t) => tCard(t, now)).join("")}</div>` : `<div class="empty">${empty}</div>`}`;
+
+  app.innerHTML = `
+    <div class="page-title">TOURNAMENTS</div>
+    <p class="page-sub">Time-boxed competitions on a fixed pool of maps. Enter once, then just race —
+      every run you set on a pool map while it's open counts for the tournament board
+      <em>and</em> the normal leaderboard. Top three take a trophy for their profile.</p>
+    ${scheduled.length ? `<div class="page-title" style="font-size:20px">SCHEDULE</div>${tTimeline(scheduled, now)}` : ""}
+    ${section("LIVE NOW", live, "Nothing running right now — check what's coming up below.")}
+    ${section("COMING UP", upcoming, "Nothing scheduled yet.")}
+    ${past.length ? section("FINISHED", past, "") : ""}`;
+}
+
+/* The per-map boards on a detail page, one collapsible panel per pool map. */
+function tMapBoards(d, maps) {
+  const boards = d.boards || {};
+  return maps
+    .map((m) => {
+      const rowsFor = boards[m.id] || [];
+      return `<details class="panel tmapboard">
+        <summary><span class="srbd-caret">▸</span> <span class="mapname">${esc(m.name)}</span>
+          <span class="muted">${rowsFor.length ? `${fmtNum(rowsFor.length)} entrant${rowsFor.length === 1 ? "" : "s"} · best ${fmtTime(rowsFor[0].time)}` : "no times yet"}</span></summary>
+        ${rowsFor.length
+          ? `<div class="tscroll"><table class="data"><thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">Points</th></tr></thead><tbody>${rowsFor
+              .map(
+                (r) => `<tr class="clickable" data-nav="#/player/${r.id}">
+                  <td class="num ${rankClass(r.rank)}">${r.rank}</td>
+                  <td>${wname(r.name)}</td>
+                  <td class="num"><span class="time">${fmtTime(r.time)}</span></td>
+                  <td class="num muted">${fmtNum(r.points)}</td></tr>`
+              )
+              .join("")}</tbody></table></div>`
+          : `<div class="srbd-note">Nobody registered has finished this map inside the window yet.</div>`}
+      </details>`;
+    })
+    .join("");
+}
+
+async function viewTournament(slug) {
+  loading();
+  let d;
+  try {
+    d = await api(`/tournaments/${encodeURIComponent(slug)}`);
+  } catch (e) {
+    // Only a genuine "no such tournament" gets the friendly dead-end; anything
+    // else (a 500, a network drop) must surface as an error, not be disguised
+    // as a missing page.
+    const missing = /^(404|400)\b/.test(e.message || "");
+    app.innerHTML = missing
+      ? `<div class="empty">No such tournament.<br><small><a data-nav="#/tournaments" href="/tournaments">Back to the calendar</a></small></div>`
+      : `<div class="empty">Couldn't load that tournament<br><small>${esc(e.message || e)}</small></div>`;
+    return;
+  }
+  const t = d.tournament;
+  const now = d.now || Math.floor(Date.now() / 1000);
+  const phase = tPhase(t, now);
+  const timeSum = t.scoring === "time_sum";
+  track("View tournament", { tournament: t.slug });
+
+  const standings = d.standings || [];
+  const board = standings.length
+    ? `<div class="table-wrap"><div class="tscroll"><table class="data">
+        <thead><tr>
+          <th class="num">#</th><th>Player</th>
+          ${timeSum ? '<th class="num">Total time</th>' : '<th class="num">Points</th>'}
+          <th class="num">Maps</th><th class="num">Map wins</th>
+          ${timeSum ? "" : '<th class="num">Total time</th>'}
+        </tr></thead>
+        <tbody>${standings
+          .map(
+            (s) => `<tr class="clickable ${timeSum && s.complete === false ? "tincomplete" : ""}" data-nav="#/player/${s.id}" title="${
+              timeSum && s.complete === false ? "Hasn't finished every pool map, so not ranked" : ""
+            }">
+              <td class="num ${rankClass(s.place)}">${s.place <= 3 ? `<span class="trophy p${s.place}">${["🥇", "🥈", "🥉"][s.place - 1]}</span> ` : ""}${s.place}</td>
+              <td>${wname(s.name)}</td>
+              ${timeSum ? `<td class="num"><span class="time">${fmtTime(s.totalTime)}</span></td>` : `<td class="num"><b>${fmtNum(s.points)}</b></td>`}
+              <td class="num">${fmtNum(s.mapsPlayed)}<span class="muted">/${fmtNum(d.maps.length)}</span></td>
+              <td class="num">${fmtNum(s.mapWins)}</td>
+              ${timeSum ? "" : `<td class="num muted"><span class="time">${fmtTime(s.totalTime)}</span></td>`}
+            </tr>`
+          )
+          .join("")}</tbody></table></div></div>
+        ${timeSum ? `<div class="muted tnote">Greyed-out rows haven't finished every map yet, so they aren't ranked.</div>` : ""}`
+    : `<div class="empty">${
+        phase === "upcoming"
+          ? "Hasn't started yet — the board fills in as people race."
+          : "Nobody registered has set a time yet. Be first."
+      }</div>`;
+
+  const joinPanel = t.joinOpen
+    ? `<div class="panel tjoin" id="tjoin">
+        <div class="tjoin-head">Enter this tournament</div>
+        <p class="muted">Take a code here, then type <code>/tournament &lt;code&gt;</code> on any Racesow server to
+          link it to the name you play under. Already in-game? <code>/tournament join</code> does both at once.</p>
+        <div class="tjoin-row">
+          <input id="tjoin-name" type="text" maxlength="64" placeholder="Your in-game name (optional)" autocomplete="off">
+          <button class="btn primary" id="tjoin-go" type="button">Get my code</button>
+        </div>
+        <div class="tjoin-out" id="tjoin-out"></div>
+      </div>`
+    : `<div class="panel tjoin closed muted">${
+        phase === "upcoming" || phase === "live"
+          ? "Entries are closed for this tournament."
+          : "This tournament is over — entries are closed."
+      }</div>`;
+
+  app.innerHTML = `
+    <div class="crumbs"><a data-nav="#/tournaments" href="/tournaments">Tournaments</a> / ${esc(t.name)}</div>
+    <div class="page-title" style="font-size:34px">${esc(t.name)} <span class="tbadge ${phase}">${TPHASE_LABEL[phase]}</span></div>
+    <p class="page-sub">${esc(tWhen(t, now))} <span class="sep">·</span>
+      ${fmtUtc(t.starts_at)} → ${fmtUtc(t.ends_at)}</p>
+    ${t.description ? `<div class="panel tdesc tdesc-raw">${esc(t.description)}</div>` : ""}
+
+    <div class="statrow">
+      <div class="s hl"><div class="n">${fmtNum(d.maps.length)}</div><div class="l">Maps</div></div>
+      <div class="s hl"><div class="n">${fmtNum(d.entrants.length)}</div><div class="l">Entrants</div></div>
+      <div class="s"><div class="n">${fmtNum(standings.length)}</div><div class="l">On the board</div></div>
+      <div class="s"><div class="n">${timeSum ? "Total time" : "Points"}</div><div class="l">Scoring</div></div>
+    </div>
+
+    ${joinPanel}
+
+    <div class="page-title" style="font-size:20px">STANDINGS${
+      phase === "finalized" ? ' <span class="accent">·</span> final' : phase === "live" ? ' <span class="accent">·</span> live' : ""
+    }</div>
+    ${board}
+
+    <div class="page-title" style="font-size:20px">MAP POOL <span class="accent">·</span> ${fmtNum(d.maps.length)}</div>
+    ${d.maps.length ? tMapBoards(d, d.maps) : `<div class="empty">No maps in the pool yet.</div>`}
+
+    <div class="page-title" style="font-size:20px">HOW IT WORKS</div>
+    <div class="panel tdesc">
+      <p>Enter any time before it ends — <b>every run you set inside the window counts</b>, including runs you
+        set before you entered. Your times also go to the normal leaderboard exactly as they always do;
+        a tournament never changes how a run is recorded.</p>
+      <p>${
+        timeSum
+          ? "Scoring is <b>total time</b>: your best time on each pool map, added up. Only players who finish <em>every</em> map are ranked."
+          : "Scoring is <b>placement points</b>: on each pool map your best time is ranked against the other entrants, and the top 15 score 100 / 85 / 75 / … points. Your total is the sum across the pool."
+      }</p>
+      <p>In-game: <code>/tournament</code> shows what's on, <code>/tmaps</code> lists the pool, and
+        <code>callvote tourneymap</code> moves the server onto a pool map.</p>
+    </div>`;
+
+  wireTournamentJoin(t.slug);
+}
+
+/* The join form: POSTs for a code and shows it. Deliberately does not reload
+ * the page — the code is the whole result and a re-render would throw it away
+ * before the player could copy it. */
+function wireTournamentJoin(slug) {
+  const btn = document.getElementById("tjoin-go");
+  if (!btn) return;
+  const out = document.getElementById("tjoin-out");
+  const nameEl = document.getElementById("tjoin-name");
+  const submit = async () => {
+    btn.disabled = true;
+    out.innerHTML = `<span class="muted">Taking your entry…</span>`;
+    try {
+      const r = await apiPost(`/tournaments/${encodeURIComponent(slug)}/join`, { name: nameEl.value.trim() });
+      track("Tournament join", { tournament: slug });
+      out.innerHTML = `<div class="tcode-wrap">
+        <div class="tcode">${esc(r.formatted)}</div>
+        <div class="muted">Now type <code>/tournament ${esc(r.formatted)}</code> on any Racesow server.
+          Case and the dash don't matter. Keep this code — it's your entry.</div>
+      </div>`;
+      // Deliberately leave the button disabled: a second click would mint a
+      // second unclaimed code and push the first one off screen.
+      btn.textContent = "Code issued";
+    } catch (e) {
+      btn.disabled = false;
+      out.innerHTML = `<span class="tjoin-err">${esc(e.message || "Could not take your entry.")}</span>`;
+    }
+  };
+  btn.addEventListener("click", submit);
+  nameEl.addEventListener("keydown", (e) => {
+    // Same lock as the button: Enter must not mint a second code and push the
+    // first one off screen before the player has copied it.
+    if (e.key === "Enter" && !btn.disabled) submit();
+  });
+}
+
+/* Profile trophy shelf. Rides the main profile payload (trophies are rare and
+ * usually an empty array, so a lazy endpoint would cost a round trip to render
+ * nothing) and renders nothing at all when there are none. */
+function trophiesCard(list) {
+  const t = list || [];
+  if (!t.length) return "";
+  const medal = (p) => (p === 1 ? "🥇" : p === 2 ? "🥈" : p === 3 ? "🥉" : "🎖");
+  const place = (p) => (p === 1 ? "Winner" : p === 2 ? "2nd place" : p === 3 ? "3rd place" : "Took part");
+  return `
+    <div class="page-title" style="font-size:20px">TROPHIES <span class="accent">·</span> ${fmtNum(t.length)}</div>
+    <div class="panel trophycase">
+      ${t
+        .map(
+          (x) => `<a class="trophy-item p${x.place}" data-nav="#/tournaments/${esc(x.slug)}" href="/tournaments/${esc(x.slug)}"
+            title="${esc(`${place(x.place)} in ${x.name} · ${fmtUtc(x.startsAt, { time: false })} – ${fmtUtc(x.endsAt, { time: false })}${x.field ? ` · field of ${x.field}` : ""}`)}">
+            <span class="trophy-medal">${medal(x.place)}</span>
+            <span class="trophy-body">
+              <span class="trophy-name">${esc(x.name)}</span>
+              <span class="trophy-sub muted">${esc(place(x.place))}${x.field ? ` of ${fmtNum(x.field)}` : ""} · ${esc(fmtUtc(x.endsAt, { time: false }))}</span>
+            </span>
+          </a>`
+        )
+        .join("")}
+    </div>`;
+}
+
 async function router() {
   stopLiveRefresh();
   stopReplay();
@@ -2285,6 +2664,11 @@ async function router() {
     else if (path === "/players") await viewPlayers(params);
     else if (path === "/compare") await viewCompare(params);
     else if (path === "/achievements") await viewAchievements();
+    // Exact match first: "/tournaments" is the calendar, "/tournaments/<slug>"
+    // one tournament. Both share a stem so setActiveNav's startsWith highlights
+    // the header link on either.
+    else if (path === "/tournaments") await viewTournaments();
+    else if (path.startsWith("/tournaments/")) await viewTournament(decodeURIComponent(path.slice(13)));
     else if (path === "/live") await viewLive();
     else if (path === "/about") await viewAbout();
     else if (path === "/colors") viewColors();

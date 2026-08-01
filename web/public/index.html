@@ -49,8 +49,7 @@
         <a data-nav="#/" href="/">Overview</a>
         <a data-nav="#/maps" href="/maps">Maps</a>
         <a data-nav="#/players" href="/players">Players</a>
-        <a data-nav="#/demo" href="/demo">Demos</a>
-        <a data-nav="#/achievements" href="/achievements">Awards</a>
+        <a data-nav="#/tournaments" href="/tournaments">Tournaments</a>
         <a data-nav="#/live" href="/live">Live<span class="livedot" aria-hidden="true"></span></a>
         <a data-nav="#/about" href="/about">About</a>
       </nav>
@@ -69,7 +68,12 @@
 
   <footer class="site">
     <div class="fi">
-      <div>Seeded from the livesow database · growing live from Warsow race servers. · <a data-nav="#/about">Download the full database</a> · <a data-nav="#/colors" href="/colors">Name colors</a> · <a href="https://status.racesow.org/" target="_blank" rel="noopener">Server status</a></div>
+      <!-- Demos and Awards moved down here from the header nav to keep the top
+           bar to the six things people actually navigate by. Both attributes
+           are required on every in-app link: data-nav alone breaks middle-click
+           and open-in-new-tab, href alone falls out of the SPA router into a
+           full page reload (see the delegated click handler in app.js). -->
+      <div>Seeded from the livesow database · growing live from Warsow race servers. · <a data-nav="#/demo" href="/demo">Demos</a> · <a data-nav="#/achievements" href="/achievements">Awards</a> · <a data-nav="#/about" href="/about">Download the full database</a> · <a data-nav="#/colors" href="/colors">Name colors</a> · <a href="https://status.racesow.org/" target="_blank" rel="noopener">Server status</a></div>
       <div class="foot-right">
         <!-- Buy Me a Coffee widget button — injects an <a> (inline SVG cup + Poppins).
              Needs script-src cdnjs.buymeacoffee.com in the nginx CSP. SRI pins the

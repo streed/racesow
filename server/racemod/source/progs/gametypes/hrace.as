@@ -251,6 +251,10 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_CopyStart( client, cmdString, argsString, argc );
     else if ( cmdString == "servers" || cmdString == "hop" )
         return Cmd_Servers( client, cmdString, argsString, argc );
+    else if ( cmdString == "tournament" || cmdString == "tourney" )
+        return Cmd_Tournament( client, cmdString, argsString, argc );
+    else if ( cmdString == "tmaps" )
+        return Cmd_TourneyMaps( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -675,6 +679,16 @@ void GT_ThinkRules()
     // empty): seeds a high-water mark on join, then polls the central award
     // log and pops "Achievement unlocked" for fresh rows (awards.as)
     RACE_ApiAwardsThink();
+
+    // the current/next tournament and its map pool (no-op when
+    // rs_api_tourney_url is empty): caches the calendar so /tournament, /tmaps
+    // and `callvote tourneymap` answer instantly (tournament.as)
+    RACE_ApiTourneyThink();
+
+    // replies to per-player tournament sign-ups (no-op when
+    // rs_api_tourney_join_url is empty): prints the web's answer to whoever
+    // typed "/tournament <code>" (tournament.as)
+    RACE_ApiTourneyJoinThink();
 
     // in-game WR ghost racer (no-op unless rs_wr_ghost + its URL are set); also
     // before the early-return so the ghost keeps looping while the scoreboard
@@ -1398,12 +1412,16 @@ void GT_InitGametype()
     G_RegisterCommand( "copystart" );
     G_RegisterCommand( "servers" );
     G_RegisterCommand( "hop" );
+    G_RegisterCommand( "tournament" );
+    G_RegisterCommand( "tourney" );
+    G_RegisterCommand( "tmaps" );
 
     RACE_MirrorInit(); // registers "who" and "watch"
     RACE_GhostInit();
 
     // add votes
     G_RegisterCallvote( "randmap", "<* | pattern>", "string", "Changes to a random map" );
+    G_RegisterCallvote( "tourneymap", "<map>", "string", "Changes to a map from the current tournament pool" );
 
     // msc: practicemode message
     practiceModeMsg = G_RegisterHelpMessage(S_COLOR_CYAN + "Practicing");

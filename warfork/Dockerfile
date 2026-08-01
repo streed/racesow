@@ -92,6 +92,8 @@ RUN cd source \
     && grep -q 'asFunc_RS_ApiFetchSavedStart' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiSaveStart' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchAwards' game/g_ascript.cpp \
+    && grep -q 'asFunc_RS_ApiFetchTourney' game/g_ascript.cpp \
+    && grep -q 'asFunc_RS_ApiTourneyJoin' game/g_ascript.cpp \
     && grep -q 'RS_MirrorLocalChat'       game/g_cmds.cpp \
     && grep -q 'rs_isWrGhost'             game/g_public.h \
     && grep -q 'rs_isWrGhost'             qcommon/snap_write.c \
@@ -112,6 +114,8 @@ RUN export CC=clang CXX=clang++ \
     && strings "$SO" | grep -q 'RS_ApiFetchAnnounce' \
     && strings "$SO" | grep -q 'RS_ApiFetchSavedStart' \
     && strings "$SO" | grep -q 'RS_ApiSaveStart' \
+    && strings "$SO" | grep -q 'RS_ApiFetchTourney' \
+    && strings "$SO" | grep -q 'RS_ApiTourneyJoin' \
     && strings "$SO" | grep -q 'rs_api: spooled undeliverable report' \
     && strings "$SO" | grep -q 'rs_mirror: configured' \
     && strings "$SO" | grep -q 'RS_SetHideWrGhost' \

@@ -366,6 +366,13 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # web evaluates awards after ingests, so the popup lags the earning
         # finish by up to ~poll interval + debounce). Empty url = site-only awards.
         echo "set rs_api_awards_url \"${INGEST_URL%/api/ingest}/api/game/awards\""
+        # Tournaments (hrace/tournament.as). Two urls: the shared feed the
+        # gametype polls ~60s for the current/next tournament and its map pool
+        # (drives /tournament, /tmaps and `callvote tourneymap`), and the
+        # server-token-authed POST a player's "/tournament <code>" redeems
+        # through. Empty urls = the commands report the feature as unavailable.
+        echo "set rs_api_tourney_url \"${INGEST_URL%/api/ingest}/api/game/tournament\""
+        echo "set rs_api_tourney_join_url \"${INGEST_URL%/api/ingest}/api/game/tournament/join\""
     fi
     # Cross-server player mirroring: the gametype reads these and drives the
     # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.

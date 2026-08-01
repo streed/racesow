@@ -18,7 +18,11 @@ RUN apt-get update \
 
 # instrument.mjs is the Sentry bootstrap loaded via `--import` in the CMD below
 # (must run before server.js under ESM) — keep it first in this explicit list.
-COPY instrument.mjs server.js db.js achievements.js censor.js live.js streams.js og-image.js cache.js admin.js rcon.js seed-topscores.js heatmap.js bsp.js mapindex.js weapons.js scan-map-weapons.js migrate-sqlite-to-pg.js ./
+COPY instrument.mjs server.js db.js achievements.js tournaments.js censor.js live.js streams.js og-image.js cache.js admin.js rcon.js seed-topscores.js heatmap.js bsp.js mapindex.js weapons.js scan-map-weapons.js migrate-sqlite-to-pg.js ./
+# One-off demo import (web/import-demo.mjs + its replayer). Baked in rather than
+# bind-mounted like demo-meta.mjs because it needs `pg` from this image's
+# node_modules: `docker compose run --rm web node import-demo.mjs <file>`.
+COPY demo-replay.mjs import-demo.mjs ./
 COPY migrations ./migrations
 COPY og-assets ./og-assets
 COPY public ./public

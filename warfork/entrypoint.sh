@@ -150,6 +150,11 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         echo "set rs_api_savedstart_post_url \"${base}/api/ingest/saved-start\""
         echo "set rs_api_lastmaps_url \"${base}/api/game/last-maps\""
         echo "set rs_api_awards_url \"${base}/api/game/awards\""
+        # Tournaments (hrace/tournament.as): the shared calendar feed the
+        # gametype polls, and the server-token-authed POST a player's
+        # "/tournament <code>" redeems through. Empty = feature off in-game.
+        echo "set rs_api_tourney_url \"${base}/api/game/tournament\""
+        echo "set rs_api_tourney_join_url \"${base}/api/game/tournament/join\""
     fi
     # Cross-server (cross-GAME) player mesh. Empty peers/tag = off. Uses the same
     # RS_Mirror* natives + wire protocol as the Warsow servers, so a Warfork node

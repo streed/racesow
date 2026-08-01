@@ -17,6 +17,17 @@ import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js"
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
 import { cache, invalidate } from "./cache.js";
 import { RULE_KINDS, WINDOWS, TIERS, validateDefinition, describeRule } from "./achievements.js";
+import {
+  SCORINGS,
+  STATUSES as TOURNAMENT_STATUSES,
+  normalizeCode,
+  formatCode,
+  validateTournament,
+  toAdminTime,
+  phaseOf,
+  PHASE_LABEL,
+  joinOpen,
+} from "./tournaments.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -194,6 +205,12 @@ const ingestLimiter = rateLimiter({
 // Public map-flag submissions: per IP, well under the read budget so a script
 // can't spam the review queue (dedupe in the DB is the second line of defence).
 const flagLimiter = rateLimiter({ windowMs: 60_000, max: 8, key: (req) => "flag:" + (req.ip || "?") });
+// Tournament sign-up gets its OWN bucket, not the flag one: minting a join code
+// and reporting a broken map are unrelated actions, and sharing a bucket meant
+// a player who flagged eight maps could not then enter a tournament. This is
+// only an anti-spam ceiling on row creation — what actually protects a code is
+// its 30^8 keyspace, not this.
+const joinLimiter = rateLimiter({ windowMs: 60_000, max: 10, key: (req) => "tjoin:" + (req.ip || "?") });
 // Admin login POST: tight per-IP brute-force backstop (nginx also fronts this).
 const loginLimiter = rateLimiter({ windowMs: 60_000, max: 10, key: (req) => "login:" + (req.ip || "?") });
 // Public backup download: a multi-MB file, so cap per-IP pulls (nginx also
@@ -415,6 +432,76 @@ api.get("/players/:id/achievements", cache(60, { edge: true }), wrap(async (req,
   const out = await race.playerAchievements(id);
   if (!out) return res.status(404).json({ error: "player not found" });
   res.json(out);
+}));
+
+// A player's tournament trophies, newest first. Lazy like /achievements, so a
+// profile with no trophies pays nothing for the panel.
+api.get("/players/:id/trophies", cache(60, { edge: true }), wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).json({ error: "invalid player id" });
+  res.json({ trophies: await race.playerTrophies(id) });
+}));
+
+// ===================== Tournaments (public) =================================
+// The whole calendar in one shot. Deliberately NOT paginated: a free-form
+// ?limit/?offset would mint a distinct cache key per value (cache.js defaultKey
+// is path + sorted query) and hand anyone a cache-busting lever on the page —
+// the same hazard /maps/:id solves with MAP_DETAIL_LIMIT_BUCKETS. The list is
+// bounded by how many tournaments have ever been run, so the client just gets
+// all of them and groups by phase.
+//
+// Short TTL: the phase (upcoming -> live -> ended) is derived from the clock,
+// so a long cache would say "starts in 3 minutes" well after it started. The
+// response carries `now` so the client derives phases from the SERVER's clock
+// at generation time rather than trusting a possibly-stale body.
+api.get("/tournaments", cache(30, { edge: true }), wrap(async (_req, res) => {
+  const list = await race.tournaments({ limit: 200 });
+  res.json({ ...list, now: Math.floor(Date.now() / 1000) });
+}));
+
+// One tournament: pool, standings, per-map boards and entrants.
+//
+// Goes through cache() like every other read (NOT a hand-set Cache-Control):
+// tournamentDetail fans out to four queries, two of which window-scan `finish`
+// across the whole pool — exactly the shape that must not run once per visitor
+// when a link lands in a Discord announcement. cache() adds the Redis layer,
+// in-process single-flight and stale-while-revalidate that a bare header does
+// not. 15s flat, including for finalized tournaments: their body is immutable
+// so a longer TTL would only save a frozen-table read, and one TTL keeps the
+// cache key free of any dependence on the row we haven't fetched yet.
+// The cache key is built from the NORMALISED slug, not the raw path: cache.js's
+// default key is path + sorted query, while the handler lowercases the slug and
+// ignores every query param — so /Summer-Cup, /summer-cup and /summer-cup?x=1
+// would otherwise mint three Redis + edge entries for one byte-identical body,
+// which is a free cache-busting lever on the most expensive read on the site.
+// (Same defence /api/maps/:id uses with MAP_DETAIL_LIMIT_BUCKETS.)
+const tournamentCacheKey = (req) => `/tournaments/${String(req.params.slug || "").toLowerCase().slice(0, 64)}`;
+api.get("/tournaments/:slug", cache(15, { edge: true, key: tournamentCacheKey }), wrap(async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) return res.status(400).json({ error: "invalid tournament" });
+  const d = await race.tournamentDetail(slug);
+  if (!d) return res.status(404).json({ error: "tournament not found" });
+  res.json({ ...d, now: Math.floor(Date.now() / 1000) });
+}));
+
+// Take an entry: mint an unclaimed code the player redeems in-game with
+// "/tournament <code>". Deliberately anonymous — the site has no player
+// accounts, and the redeem is what binds the entry to a real identity, so
+// handing out a code proves nothing and costs nothing. Rate-limited per IP the
+// same way /flag is, so nobody can mint a million rows for fun.
+api.post("/tournaments/:slug/join", joinLimiter, express.json({ limit: "8kb" }), wrap(async (req, res) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) return res.status(400).json({ error: "invalid tournament" });
+  const t = await race.tournamentBySlug(slug);
+  if (!t) return res.status(404).json({ error: "tournament not found" });
+  if (!joinOpen(t)) return res.status(409).json({ error: "this tournament is not taking entries" });
+  const name = typeof req.body?.name === "string" ? req.body.name.trim().slice(0, MAX_NAME_LEN) : "";
+  const entry = await race.createEntryCode(t.id, name);
+  if (!entry) return res.status(404).json({ error: "tournament not found" });
+  // Nothing cached changes here: an unredeemed code is invisible to every
+  // public read (entrant counts only see claimed rows), so there is no cache
+  // to bust — the entry becomes visible when it is redeemed in-game.
+  res.json({ code: entry.code, formatted: formatCode(entry.code), tournament: { slug: t.slug, name: t.name } });
 }));
 
 // Head-to-head comparison of two players (a vs b): overall standings plus the
@@ -663,6 +750,94 @@ api.get("/game/last-maps", cache(60), wrap(async (_req, res) => {
   res.type("text/plain").send(body ? body + "\n" : "");
 }));
 
+// The current (or next) tournament for the game servers: the gametype polls
+// this (~60s, hrace/tournament.as via RS_ApiFetchTourney) so "/tournament",
+// "/tmaps" and the `callvote tourneymap` pool track the calendar without a
+// restart. Plain text; "RSTOURNEY" first line lets the game-side native reject
+// captive-portal / proxy error bodies that answer 200 (same idea as RSMOTD).
+// An empty body after the header is a real state — "nothing scheduled".
+// Cached 60s: the payload only changes when an admin edits the calendar or a
+// tournament rolls over, and a minute of lag on either is invisible in-game.
+api.get("/game/tournament", cache(60), wrap(async (_req, res) => {
+  res.type("text/plain").send(await race.gameTourneyText());
+}));
+
+// In-game "/tournament <code>" and "/tournament join": a game server redeems an
+// entry code (or enrols the nick outright) on behalf of a player. Server-token
+// authed like /ingest — this WRITES, so it is a POST and never a game GET.
+//
+// The response is plain text the gametype prints almost verbatim, because
+// AngelScript has no JSON parser: an "RSTJOIN" sentinel, then "ok" or "err",
+// then one line per message. Auth runs BEFORE body parsing (DoS guard), the
+// same ordering /ingest/saved-start uses.
+api.post(
+  "/game/tournament/join",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  express.json({ limit: "8kb" }),
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const name = typeof body.name === "string" ? body.name.slice(0, MAX_NAME_LEN) : "";
+    const login = typeof body.login === "string" ? body.login.slice(0, MAX_NAME_LEN) : "";
+    // Every line of an RSTJOIN reply is printed to the player verbatim, so the
+    // payload is line-delimited and control characters are structural. The
+    // tournament NAME is admin-entered free text that lands in these lines, so
+    // scrub it here the same way gameTourneyText scrubs it for the sibling feed
+    // — otherwise a name containing a newline turns one message into several.
+    const clean = (s) => String(s == null ? "" : s).replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+    const reply = (ok, ...lines) =>
+      res
+        .type("text/plain")
+        .send(`RSTJOIN\n${ok ? "ok" : "err"}\n${lines.map(clean).filter(Boolean).join("\n")}\n`);
+    if (!name) return reply(false, "Your name could not be read.");
+
+    const rawCode = typeof body.code === "string" ? body.code : "";
+    let result;
+    if (rawCode) {
+      const code = normalizeCode(rawCode);
+      if (!code) return reply(false, "That is not a valid entry code (8 characters, e.g. RS9K-4MTB).");
+      result = await race.redeemEntryCode({ code, name, login, serverId: req.ingest.serverId });
+    } else {
+      // No code: enrol in whatever is running (or starting next) right now.
+      const t = await race.currentOrNextTournament();
+      if (!t) return reply(false, "No tournament is scheduled right now.");
+      if (!joinOpen(t)) return reply(false, `${t.name} is not taking entries.`);
+      result = await race.joinTournamentInGame({
+        tournamentId: t.id, name, login, serverId: req.ingest.serverId,
+      });
+    }
+
+    if (!result.ok) {
+      const why = {
+        unknown_code: "No tournament entry matches that code.",
+        code_used: "That entry code has already been claimed by someone else.",
+        closed: "That tournament is not taking entries.",
+        already_entered: "You are already registered for that tournament.",
+      };
+      return reply(false, why[result.reason] || "Could not register you for that tournament.");
+    }
+    const t = result.tournament;
+    recordEvent(
+      req.ingest.serverId,
+      `/tournament ${rawCode ? "redeem" : "join"} ${t ? t.slug : "?"} by ${simplifyName(name)}` +
+        `${result.already ? " [already registered]" : ""}`
+    );
+    if (result.already) return reply(true, `You are already registered for ${t.name}.`);
+    return reply(
+      true,
+      `Registered for ${t.name}!`,
+      result.code ? `Your entry code is ${formatCode(result.code)} - keep it safe.` : "",
+      "Every run you set on a tournament map before it ends counts."
+    );
+  })
+);
+
 // Message of the day for the game servers: the gametype polls this (~60s,
 // hrace/motd.as) and sets the engine's sv_MOTDString cvar, so an admin edit
 // reaches newly connecting players without a restart. The "RSMOTD" first line
@@ -799,6 +974,42 @@ function scheduleAchievementEval() {
 // One pass shortly after boot so the daily sweep runs even on a day with no
 // ingest traffic to this replica (e.g. right after a deploy).
 setTimeout(scheduleAchievementEval, 15_000).unref();
+
+// ===================== Tournament finalizer =================================
+// Freeze the standings of every tournament whose window has closed, mint its
+// trophies, and roll a recurring series forward. Runs on a plain interval on
+// BOTH replicas rather than behind a day-claim like the achievements sweep:
+// db.finalizeTournament locks the tournament row and re-checks the window
+// inside the transaction, so a double run is a no-op, and a tournament that
+// ended two minutes ago should not have to wait for tomorrow's sweep to award
+// its podium. The query is one indexed range scan that returns nothing
+// 99.99% of the time.
+const TOURNAMENT_SWEEP_MS = Math.max(60_000, parseInt(process.env.TOURNAMENT_SWEEP_MS || "300000", 10));
+let tournamentSweepRunning = false;
+async function sweepTournaments() {
+  if (shuttingDown || tournamentSweepRunning) return;
+  tournamentSweepRunning = true;
+  try {
+    const r = await race.finalizeDueTournaments();
+    if (r.finalized) {
+      recordEvent(
+        null,
+        `tournaments: finalized ${r.finalized} (${r.trophies} troph${r.trophies === 1 ? "y" : "ies"} awarded)`,
+        "system"
+      );
+    }
+    for (const s of r.scheduled) {
+      recordEvent(null, `tournaments: scheduled next edition ${s.slug} (starts ${new Date(s.startsAt * 1000).toISOString()})`, "system");
+    }
+  } catch (e) {
+    console.error("tournament finalizer failed (will retry):", e?.message ?? e);
+  } finally {
+    tournamentSweepRunning = false;
+  }
+}
+let tournamentSweepTimer = setInterval(sweepTournaments, TOURNAMENT_SWEEP_MS);
+tournamentSweepTimer.unref();
+setTimeout(sweepTournaments, 20_000).unref();
 
 // ===================== Operator log stream + maintenance ====================
 // The admin "servers" page (server-rendered, no client JS) is an operator
@@ -1819,7 +2030,7 @@ admin.get("/flags", requireAuth, wrap(async (req, res) => {
   sendAdmin(res, "Flag queue", `
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
-      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a>` : ""} · <a href="/admin/account">account</a></p>
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a> · <a href="/admin/tournaments">tournaments</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a>` : ""} · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
 }));
 
@@ -2573,6 +2784,267 @@ admin.post("/achievements/:id/revoke", requireAuth, wrap(async (req, res) => {
   )}`);
 }));
 
+// --- Tournaments ------------------------------------------------------------
+// CRUD over the calendar. Two rules the form enforces that the schema cannot:
+// the window must not overlap another tournament (the admin can override with
+// an explicit checkbox — sometimes you really do want two at once), and maps
+// must already exist in the database (a tournament on a map nobody has ever
+// finished would score nothing and quietly look broken).
+
+function tournamentPhaseBadge(t) {
+  const phase = phaseOf(t);
+  const cls =
+    phase === "live" ? "st-open" : phase === "finalized" ? "st-resolved" : phase === "cancelled" ? "st-dismissed" : "";
+  return `<span class="${cls}">${escHtml(PHASE_LABEL[phase] || phase)}</span>`;
+}
+
+// The create/edit form. `t` null = new; `maps` is the pool as a newline list.
+function tournamentFormHtml(session, t, maps, action, { defaultStart = null } = {}) {
+  const v = (x) => escHtml(x == null ? "" : String(x));
+  const start = t ? toAdminTime(t.starts_at) : toAdminTime(defaultStart);
+  const end = t ? toAdminTime(t.ends_at) : toAdminTime((defaultStart || 0) + 7 * 86400);
+  const scoringOpts = Object.entries(SCORINGS)
+    .map(([k, label]) => `<option value="${v(k)}"${t && t.scoring === k ? " selected" : ""}>${escHtml(label)}</option>`)
+    .join("");
+  const statusOpts = TOURNAMENT_STATUSES.filter((s) => s !== "finalized")
+    .map((s) => `<option value="${v(s)}"${t && t.status === s ? " selected" : ""}>${escHtml(s)}</option>`)
+    .join("");
+  return `<form class="card" method="post" action="${v(action)}">
+    <input type="hidden" name="_csrf" value="${escHtml(session.csrf)}">
+    <label>Name<input name="name" required maxlength="120" value="${v(t && t.name)}" placeholder="Summer Sprint"></label>
+    <label>URL slug (blank = from the name)<input name="slug" maxlength="64" value="${v(t && t.slug)}" placeholder="summer-sprint"></label>
+    <label>Description<textarea name="description" rows="4" maxlength="2000" placeholder="What this tournament is, any rules, prizes…">${v(t && t.description)}</textarea></label>
+    <label>Starts — <b>UTC</b>, not your local time<input name="startsAt" type="datetime-local" step="1" required value="${v(start)}"></label>
+    <label>Ends — <b>UTC</b>, not your local time<input name="endsAt" type="datetime-local" step="1" required value="${v(end)}"></label>
+    <label>Scoring<select name="scoring">${scoringOpts}</select></label>
+    <label>Status<select name="status">${statusOpts}</select>
+      <span class="meta">draft = invisible on the site · published = live on the calendar</span></label>
+    <label>Map pool — one map name per line (they must already exist on the site)
+      <textarea name="maps" rows="8" required placeholder="hrace_line&#10;pornstar&#10;…">${v(maps)}</textarea></label>
+    <label><input type="checkbox" name="joinOpen" style="width:auto" ${!t || t.join_open ? "checked" : ""}> Accepting entries</label>
+    <label>Repeat every N days after it ends (0 = one-off)
+      <input name="repeatEveryDays" type="number" min="0" max="365" value="${v(t ? t.repeat_every_days : 0)}"></label>
+    <label>Gap before the next edition starts (days)
+      <input name="repeatGapDays" type="number" min="0" max="365" value="${v(t ? t.repeat_gap_days : 1)}"></label>
+    <label><input type="checkbox" name="allowOverlap" style="width:auto"> Allow this to overlap another tournament</label>
+    <div class="actions"><button class="primary" type="submit">Save</button></div>
+  </form>`;
+}
+
+function tournamentInput(body) {
+  return {
+    name: String(body.name || ""),
+    slug: String(body.slug || ""),
+    description: String(body.description || ""),
+    startsAt: String(body.startsAt || ""),
+    endsAt: String(body.endsAt || ""),
+    scoring: String(body.scoring || ""),
+    status: String(body.status || ""),
+    joinOpen: Boolean(body.joinOpen),
+    maps: String(body.maps || ""),
+    repeatEveryDays: body.repeatEveryDays,
+    repeatGapDays: body.repeatGapDays,
+  };
+}
+
+admin.get("/tournaments", requireAuth, wrap(async (req, res) => {
+  const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
+  const err = req.query.error ? `<div class="msg err">${escHtml(String(req.query.error))}</div>` : "";
+  const { rows } = await race.tournaments({ includeDrafts: true, limit: 200 });
+  const body = rows.length
+    ? `<table><thead><tr><th>Tournament</th><th>Window (UTC)</th><th>Phase</th><th>Maps</th><th>Entrants</th><th>Scoring</th></tr></thead><tbody>${rows
+        .map(
+          (t) => `<tr>
+            <td><a href="/admin/tournaments/${t.id}">${escHtml(t.name)}</a>
+                ${t.repeat_every_days ? ` <span class="tag">repeats</span>` : ""}</td>
+            <td class="meta">${fmtWhen(t.starts_at)} → ${fmtWhen(t.ends_at)}</td>
+            <td>${tournamentPhaseBadge(t)}</td>
+            <td class="meta">${fmtNumAdmin(t.maps || 0)}</td>
+            <td class="meta">${fmtNumAdmin(t.entrants || 0)}</td>
+            <td class="meta">${escHtml(t.scoring)}</td>
+          </tr>`
+        )
+        .join("")}</tbody></table>`
+    : `<div class="empty">No tournaments yet.</div>`;
+  sendAdmin(res, "Tournaments", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Tournaments</h1>
+    <p class="sub">Time-boxed competitions on a fixed map pool · players join for a code and redeem it in-game with
+      <code>/tournament &lt;code&gt;</code> · public calendar at
+      <a href="/tournaments" target="_blank" rel="noopener">/tournaments ↗</a>.</p>
+    ${done}${err}
+    <div class="actions" style="margin-bottom:14px"><a class="btn" href="/admin/tournaments/new">+ New tournament</a></div>
+    ${body}`, req.session);
+}));
+
+admin.get("/tournaments/new", requireAuth, wrap(async (req, res) => {
+  const err = req.query.error ? `<div class="msg err">${escHtml(String(req.query.error))}</div>` : "";
+  // Default the start to the moment the calendar is next free, so the obvious
+  // action produces a non-overlapping tournament without any thought.
+  const free = await race.nextFreeTournamentSlot();
+  sendAdmin(res, "New tournament", `<div class="crumbs"><a href="/admin/tournaments">← tournaments</a></div>
+    <h1>New tournament</h1>
+    <p class="sub">Starts pre-filled at the next free slot (${fmtWhen(free)}), so the default never overlaps.</p>
+    ${err}${tournamentFormHtml(req.session, null, "", "/admin/tournaments/new", { defaultStart: free })}`, req.session);
+}));
+
+// Shared overlap gate for create + edit. Returns an error string, or null.
+async function tournamentOverlapError(v, body, excludeId) {
+  if (body.allowOverlap) return null;
+  const clash = await race.overlappingTournaments(v.starts_at, v.ends_at, excludeId);
+  if (!clash.length) return null;
+  const names = clash.slice(0, 3).map((c) => `${c.name} (${fmtWhen(c.starts_at)} → ${fmtWhen(c.ends_at)})`).join("; ");
+  return `That window overlaps: ${names}. Move it, or tick “Allow this to overlap”.`;
+}
+
+admin.post("/tournaments/new", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const v = validateTournament(tournamentInput(req.body));
+  if (v.error) return res.redirect(303, `/admin/tournaments/new?error=${encodeURIComponent(v.error)}`);
+  const clash = await tournamentOverlapError(v.value, req.body, null);
+  if (clash) return res.redirect(303, `/admin/tournaments/new?error=${encodeURIComponent(clash)}`);
+  const created = await race.createTournament(v.value, req.session.username);
+  if (!created) return res.redirect(303, `/admin/tournaments/new?error=${encodeURIComponent("That slug is already taken.")}`);
+  const note = created.unraced.length
+    ? `Created. Heads up — nobody has ever finished these pool maps, so check for a typo: ${created.unraced.join(", ")}`
+    : "Created.";
+  recordEvent(null, `tournament created: ${v.value.slug} by ${req.session.username}`, "system");
+  res.redirect(303, `/admin/tournaments/${created.id}?done=${encodeURIComponent(note)}`);
+}));
+
+admin.get("/tournaments/:id", requireAuth, wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  const t = id != null ? await race.tournamentById(id) : null;
+  if (!t) return res.status(404).type("text/plain").send("No such tournament.");
+  const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
+  const err = req.query.error ? `<div class="msg err">${escHtml(String(req.query.error))}</div>` : "";
+  const csrf = escHtml(req.session.csrf);
+  const maps = await race.tournamentMaps(t.id);
+  const entrants = await race.tournamentEntrants(t.id, { limit: 200 });
+  const standings = await race.tournamentStandings(t, { limit: 50 });
+
+  const standingRows = standings
+    .map(
+      (s) => `<tr><td>${s.place}</td>
+        <td><a href="/player/${s.id}" target="_blank" rel="noopener">${escHtml(s.simplified || s.name)}</a></td>
+        <td class="meta">${fmtNumAdmin(s.points)}</td>
+        <td class="meta">${fmtNumAdmin(s.mapsPlayed)}</td>
+        <td class="meta">${fmtNumAdmin(s.mapWins)}</td></tr>`
+    )
+    .join("");
+
+  const finalizable = t.status === "published" && t.ends_at <= Math.floor(Date.now() / 1000);
+  const controls = `<div class="actions">
+    ${t.status === "draft"
+      ? `<form class="inline" method="post" action="/admin/tournaments/${t.id}/status">
+           <input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="status" value="published">
+           <button class="ok" type="submit">Publish</button></form>`
+      : ""}
+    ${t.status === "published"
+      ? `<form class="inline" method="post" action="/admin/tournaments/${t.id}/status">
+           <input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="status" value="cancelled">
+           <button class="warn" type="submit">Cancel</button></form>`
+      : ""}
+    ${finalizable
+      ? `<form class="inline" method="post" action="/admin/tournaments/${t.id}/finalize">
+           <input type="hidden" name="_csrf" value="${csrf}">
+           <button class="primary" type="submit">Finalize now</button></form>`
+      : ""}
+    ${entrants.length === 0
+      ? `<form class="inline" method="post" action="/admin/tournaments/${t.id}/delete">
+           <input type="hidden" name="_csrf" value="${csrf}">
+           <button class="danger" type="submit">Delete</button></form>`
+      : ""}
+  </div>`;
+
+  sendAdmin(res, `Tournament · ${t.name}`, `<div class="crumbs"><a href="/admin/tournaments">← tournaments</a></div>
+    <h1>${escHtml(t.name)}</h1>
+    <p class="sub">${tournamentPhaseBadge(t)} · ${fmtWhen(t.starts_at)} → ${fmtWhen(t.ends_at)} ·
+      ${maps.length} map${maps.length === 1 ? "" : "s"} · ${entrants.length} entrant${entrants.length === 1 ? "" : "s"} ·
+      <a href="/tournaments/${escHtml(t.slug)}" target="_blank" rel="noopener">public page ↗</a>
+      ${t.finalized_at ? ` · finalized ${fmtWhen(t.finalized_at)}` : ""}</p>
+    ${done}${err}
+    ${controls}
+    ${t.status === "finalized"
+      ? `<div class="msg ok">This tournament is final — its standings and trophies are frozen and can no longer be edited.</div>`
+      : tournamentFormHtml(req.session, t, maps.map((m) => m.rawName).join("\n"), `/admin/tournaments/${t.id}`)}
+    <h2>Standings ${t.status === "finalized" ? "(final)" : "(live)"}</h2>
+    ${standings.length
+      ? `<table><thead><tr><th>#</th><th>Player</th><th>Points</th><th>Maps</th><th>Wins</th></tr></thead><tbody>${standingRows}</tbody></table>`
+      : `<div class="empty">Nobody has scored yet.</div>`}
+    <h2>Entrants</h2>
+    ${entrants.length
+      ? `<table><thead><tr><th>Player</th><th>Registered</th></tr></thead><tbody>${entrants
+          .map(
+            (e) => `<tr><td><a href="/player/${e.id}" target="_blank" rel="noopener">${escHtml(e.simplified || e.name)}</a></td>
+              <td class="meta">${fmtWhen(e.registered_at)}</td></tr>`
+          )
+          .join("")}</tbody></table>`
+      : `<div class="empty">Nobody has redeemed a code yet.</div>`}`, req.session);
+}));
+
+admin.post("/tournaments/:id", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("Bad tournament id.");
+  const v = validateTournament(tournamentInput(req.body));
+  if (v.error) return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent(v.error)}`);
+  const clash = await tournamentOverlapError(v.value, req.body, id);
+  if (clash) return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent(clash)}`);
+  const r = await race.updateTournament(id, v.value, req.session.username);
+  if (r === null) return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent("That slug is already taken.")}`);
+  if (!r.rows)
+    return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent("Not saved — a finalized tournament can't be edited.")}`);
+  const note = r.unraced.length
+    ? `Saved. Heads up — nobody has ever finished these pool maps, so check for a typo: ${r.unraced.join(", ")}`
+    : "Saved.";
+  res.redirect(303, `/admin/tournaments/${id}?done=${encodeURIComponent(note)}`);
+}));
+
+admin.post("/tournaments/:id/status", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  const status = String(req.body.status || "");
+  if (id == null || !["draft", "published", "cancelled"].includes(status))
+    return res.status(400).type("text/plain").send("Bad status change.");
+  const n = await race.setTournamentStatus(id, status, req.session.username);
+  // Only log the change that actually applied — the UPDATE is a no-op on a
+  // finalized tournament, and an audit log that records changes which never
+  // happened is worse than no audit log.
+  if (n) recordEvent(null, `tournament ${id} -> ${status} by ${req.session.username}`, "system");
+  res.redirect(303, `/admin/tournaments/${id}?done=${encodeURIComponent(n ? `Now ${status}.` : "A finalized tournament can't change status.")}`);
+}));
+
+// Finalize early/by hand. The db call re-checks that the window has closed, so
+// this can never freeze a tournament that is still running.
+admin.post("/tournaments/:id/finalize", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("Bad tournament id.");
+  const r = await race.finalizeTournament(id);
+  if (!r.finalized)
+    return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent("Not finalized — it is still running, or already final.")}`);
+  recordEvent(null, `tournament ${id} finalized by ${req.session.username}: ${r.trophies} trophies`, "system");
+  // A recurring series' next edition is scheduled by the sweep's reconciliation
+  // pass (db.finalizeDueTournaments), not here — doing it inline would be a
+  // second, unprotected step that a crash could skip forever.
+  const repeats = r.tournament && r.tournament.repeat_every_days > 0;
+  res.redirect(303, `/admin/tournaments/${id}?done=${encodeURIComponent(
+    `Final. ${r.standings} placed, ${r.trophies} trophies awarded.` +
+      (repeats ? " The next edition is scheduled automatically within a few minutes." : "")
+  )}`);
+}));
+
+admin.post("/tournaments/:id/delete", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("Bad tournament id.");
+  const n = await race.deleteTournament(id);
+  if (!n)
+    return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent("Not deleted — players have entered. Cancel it instead, so their entries and any trophies survive.")}`);
+  recordEvent(null, `tournament ${id} deleted by ${req.session.username}`, "system");
+  res.redirect(303, "/admin/tournaments?done=Deleted.");
+}));
+
 // --- Account (self-service password change) ---
 admin.get("/account", requireAuth, (req, res) => {
   const msg = req.query.ok
@@ -3160,6 +3632,42 @@ app.get("/server/:id", renderLimiter, wrap(async (req, res, next) => {
   );
 }));
 
+// Shareable /tournaments/:slug page: SPA shell with tournament-specific OG tags,
+// so a link dropped in a Discord announcement previews as the tournament rather
+// than as the generic site card. No custom og:image — the calendar has nothing
+// worth rendering to a PNG that the text summary doesn't already say.
+app.get("/tournaments/:slug", renderLimiter, wrap(async (req, res, next) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(slug)) return next(); // -> plain SPA shell
+  const t = await race.tournamentBySlug(slug);
+  if (!t) return next();
+  const origin = siteOrigin(req);
+  const phase = phaseOf(t);
+  const when =
+    phase === "live"
+      ? `Running now until ${new Date(t.ends_at * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC`
+      : phase === "upcoming"
+      ? `Starts ${new Date(t.starts_at * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC`
+      : `${new Date(t.starts_at * 1000).toISOString().slice(0, 10)} — ${new Date(t.ends_at * 1000).toISOString().slice(0, 10)}`;
+  const desc = `${when} · ${t.maps == null ? "" : `${t.maps} maps · `}${simplifyName(t.description).slice(0, 140) || "Race the pool, climb the board."}`;
+  const image = `${origin}/assets/img/warsow-logo.png`;
+  sendShell(
+    res,
+    withOgTags([
+      ["og:site_name", "Racesow"],
+      ["og:type", "website"],
+      ["og:title", `${simplifyName(t.name)} — Racesow tournament`],
+      ["og:description", desc],
+      ["og:url", `${origin}/tournaments/${t.slug}`],
+      ["og:image", image],
+      ["twitter:card", "summary"],
+      ["twitter:title", `${simplifyName(t.name)} — Racesow tournament`],
+      ["twitter:description", desc],
+      ["twitter:image", image],
+    ])
+  );
+}));
+
 // The per-server status card behind og:image.
 app.get("/og/server/:id.png", renderLimiter, wrap(async (req, res) => {
   const id = parseInt(req.params.id, 10);
@@ -3310,6 +3818,7 @@ async function shutdown(signal) {
   live.stop();
   stopMaintTimer();
   clearInterval(maintRefreshTimer);
+  clearInterval(tournamentSweepTimer);
   clearTimeout(refreshTimer);
   await new Promise((resolve) => {
     server.close(resolve); // stop accepting; resolves once all sockets close

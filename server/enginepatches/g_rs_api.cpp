@@ -51,7 +51,9 @@ enum RequestType {
 	REQ_GET_LASTMAPS,   // recently-played maps -> stored in memory (RS_ApiPollLastMaps)
 	REQ_GET_PLAYERREC,  // one player's PB on the current map -> stored per-slot (RS_ApiPollPlayerRecord)
 	REQ_GET_SAVEDSTART, // one player's saved start(s) on the current map -> per-slot (RS_ApiPollSavedStart)
-	REQ_GET_AWARDS      // one player's fresh "achievement unlocked" rows -> per-slot (RS_ApiPollAwards)
+	REQ_GET_AWARDS,     // one player's fresh "achievement unlocked" rows -> per-slot (RS_ApiPollAwards)
+	REQ_GET_TOURNEY,    // current/next tournament + its map pool -> in memory (RS_ApiPollTourney)
+	REQ_POST_TJOIN      // tournament entry redeem -> per-slot REPLY body (RS_ApiPollTourneyJoin)
 };
 
 // note: no default member initializers — the game module builds as C++11,
@@ -209,6 +211,28 @@ struct ApiState {
 	std::mutex awardsMutex;
 	std::string awardsText[RS_PLAYERREC_MAX];
 
+	// Tournament feed handshake (shared, one payload per server — same shape as
+	// the lastmaps/mapweapons fetches). tourneyText holds the raw "RSTOURNEY"
+	// payload INCLUDING its header line: empty means "never fetched", a bare
+	// header means "fetched, nothing scheduled". Deduped on change so the
+	// gametype only re-parses when the calendar actually moved.
+	std::atomic<unsigned> fetchTourneyGen;
+	std::atomic<int> fetchTourneyResult;
+	std::mutex tourneyMutex;
+	std::string tourneyText;
+
+	// Tournament-join handshake. This is the only PER-SLOT POST: the reply body
+	// is the whole point (the player has to be told whether their code worked),
+	// so unlike every other POST it is not fire-and-forget and its response is
+	// captured per player slot exactly like the awards/saved-start GETs.
+	// Never retried and never spooled: a stale "you are registered" printed
+	// minutes later to whoever now occupies the slot would be worse than
+	// nothing, and the player can simply type the command again.
+	std::atomic<unsigned> fetchTJoinGen[RS_PLAYERREC_MAX];
+	std::atomic<int> fetchTJoinResult[RS_PLAYERREC_MAX];
+	std::mutex tjoinMutex;
+	std::string tjoinText[RS_PLAYERREC_MAX];
+
 	ApiState()
 		: stop( false ), fetchGen( 0 ), fetchResult( 0 ), fetchGhostGen( 0 ), fetchGhostResult( 0 ),
 		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ),
@@ -216,7 +240,8 @@ struct ApiState {
 		  fetchAnnounceGen( 0 ), fetchAnnounceResult( 0 ),
 		  fetchRanksGen( 0 ), fetchRanksResult( 0 ),
 		  fetchMapWeaponsGen( 0 ), fetchMapWeaponsResult( 0 ),
-		  fetchLastMapsGen( 0 ), fetchLastMapsResult( 0 )
+		  fetchLastMapsGen( 0 ), fetchLastMapsResult( 0 ),
+		  fetchTourneyGen( 0 ), fetchTourneyResult( 0 )
 	{
 		// Atomics can't be aggregate-initialized in the member-init list loop-free,
 		// so zero the per-slot arrays here in the ctor body.
@@ -227,6 +252,8 @@ struct ApiState {
 			fetchSavedStartResult[i].store( 0 );
 			fetchAwardsGen[i].store( 0 );
 			fetchAwardsResult[i].store( 0 );
+			fetchTJoinGen[i].store( 0 );
+			fetchTJoinResult[i].store( 0 );
 		}
 	}
 };
@@ -386,8 +413,18 @@ std::string spoolPath()
 // Append one undeliverable report (worker or script thread; O_APPEND keeps
 // concurrent line appends whole at these sizes). Fetches pass through here
 // from the shared eviction paths — their empty body makes this a no-op.
+//
+// The TYPE check is not redundant with the empty-body check: REQ_POST_TJOIN is
+// the first non-report POST that carries a body, and spooling it would replay a
+// tournament sign-up on the NEXT BOOT as if it were a race report (re-queued as
+// a REQ_POST_REPORT to the join URL, with no player slot to answer to). A join
+// is a live, repeatable player action; the right answer to a dropped one is for
+// the player to type the command again, never for the server to remember it
+// across a restart.
 void spoolReport( const ApiRequest &req )
 {
+	if( req.type != REQ_POST_REPORT )
+		return;
 	if( req.url.empty() || req.body.empty() )
 		return;
 	if( req.url.size() + req.body.size() + 2 > SPOOL_LINE_MAX ) {
@@ -443,7 +480,12 @@ std::vector<ApiRequest> loadSpool()
 }
 
 // -1 = transport error (retryable), otherwise the HTTP status.
-long doPost( const ApiRequest &req )
+//
+// `out` is normally null: a report POST throws its reply away. The tournament
+// join is the one POST whose BODY is the payload (it answers with the lines to
+// print to the player), so it passes a buffer and gets the response collected
+// into it — same collectBody writer doGet uses.
+long doPost( const ApiRequest &req, std::string *out = nullptr )
 {
 	CURL *curl = curl_easy_init();
 	if( !curl )
@@ -465,7 +507,12 @@ long doPost( const ApiRequest &req )
 	curl_easy_setopt( curl, CURLOPT_NOSIGNAL, 1L ); // threads + SIGALRM don't mix
 	curl_easy_setopt( curl, CURLOPT_FOLLOWLOCATION, 1L );
 	curl_easy_setopt( curl, CURLOPT_MAXREDIRS, 3L );
-	curl_easy_setopt( curl, CURLOPT_WRITEFUNCTION, discardBody );
+	if( out ) {
+		curl_easy_setopt( curl, CURLOPT_WRITEFUNCTION, collectBody );
+		curl_easy_setopt( curl, CURLOPT_WRITEDATA, out );
+	} else {
+		curl_easy_setopt( curl, CURLOPT_WRITEFUNCTION, discardBody );
+	}
 
 	CURLcode rc = curl_easy_perform( curl );
 	long status = -1;
@@ -888,6 +935,76 @@ void workerMain( ApiState *s )
 				continue;
 			}
 			// transient: fall through to the requeue below
+		} else if( req.type == REQ_GET_TOURNEY ) {
+			// A fetch queued once shutdown is under way is worthless: nobody
+			// will ever poll the result.
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchTourneyGen.load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded while in flight - drop silently
+				// The web always leads with an "RSTOURNEY" header; a bare header
+				// is the real "nothing scheduled" state. Anything else is a
+				// captive portal / proxy error page answering 200 and must never
+				// replace the good payload.
+				if( payload.compare( 0, 9, "RSTOURNEY" ) != 0 ) {
+					fprintf( stderr, "rs_api: rejecting non-tournament payload from %s\n",
+						req.url.c_str() );
+					s->fetchTourneyResult.store( -1 );
+					continue;
+				}
+				{
+					std::lock_guard<std::mutex> lock( s->tourneyMutex );
+					// Unchanged since the last swap: skip the signal so the
+					// gametype doesn't re-parse an identical payload every
+					// interval (same idea as the motd/ranks/lastmaps compare).
+					if( payload == s->tourneyText )
+						continue;
+					s->tourneyText.swap( payload );
+				}
+				s->fetchTourneyResult.store( 1 );
+				continue;
+			}
+			if( !current )
+				continue; // superseded - do not burn retries on a stale fetch
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				if( status != 404 )
+					fprintf( stderr, "rs_api: tournament fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchTourneyResult.store( -1 );
+				continue;
+			}
+			// transient: fall through to the requeue below
+		} else if( req.type == REQ_POST_TJOIN ) {
+			// The one POST whose REPLY matters: keyed by req.slot like the
+			// per-player GETs, and NEVER retried or spooled — see the ApiState
+			// comment. A failure just tells the player to try again.
+			if( req.slot < 0 || req.slot >= ApiState::RS_PLAYERREC_MAX )
+				continue;
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doPost( req, &payload );
+			if( req.gen != s->fetchTJoinGen[req.slot].load() )
+				continue; // superseded (the slot's occupant re-issued or left)
+			if( status >= 200 && status < 300 && payload.compare( 0, 7, "RSTJOIN" ) == 0 ) {
+				{
+					std::lock_guard<std::mutex> lock( s->tjoinMutex );
+					s->tjoinText[req.slot].swap( payload );
+				}
+				s->fetchTJoinResult[req.slot].store( 1 );
+				continue;
+			}
+			if( status != 200 )
+				fprintf( stderr, "rs_api: tournament join failed, status %ld: %s\n",
+					status, req.url.c_str() );
+			s->fetchTJoinResult[req.slot].store( -1 );
+			continue;
 		} else if( req.type == REQ_GET_LASTMAPS ) {
 			// A fetch queued once shutdown is under way is worthless: nobody
 			// will ever poll the result.
@@ -1171,6 +1288,13 @@ __attribute__(( destructor )) void rsApiShutdown()
 // the queue is full, evict a fetch first — fetches are fully reproducible on
 // the next refresh interval — and only then the oldest report, which goes to
 // the on-disk spool instead of being silently dropped.
+//
+// REQ_POST_TJOIN is deliberately NOT evictable here. It looks like a fetch to a
+// "anything that isn't a report" test, but it is neither reproducible nor
+// spoolable: a player is sitting at their console waiting for its reply, and
+// dropping it silently would leave their slot pending with nothing ever to
+// answer it. (The gametype times a pending join out as a backstop, but it
+// should not have to.)
 static void rsQueuePost( const char *url, const char *token, std::string &&body )
 {
 	ApiState *s = ensureStarted();
@@ -1179,7 +1303,7 @@ static void rsQueuePost( const char *url, const char *token, std::string &&body 
 		if( s->queue.size() >= QUEUE_MAX ) {
 			bool evicted = false;
 			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type != REQ_POST_REPORT ) {
+				if( it->type != REQ_POST_REPORT && it->type != REQ_POST_TJOIN ) {
 					s->queue.erase( it );
 					evicted = true;
 					break;
@@ -2445,4 +2569,166 @@ void RS_ApiSaveStart( const char *url, const char *token, const char *mapname,
 	body += "\"}";
 
 	rsQueuePost( url, token, std::move( body ) );
+}
+
+
+/*
+ * RS_ApiFetchTourney / RS_ApiPollTourney / RS_TourneyText
+ *
+ * Fetch the current (or next) tournament and its map pool from <url> (the
+ * public /api/game/tournament endpoint) into memory. RS_ApiPollTourney()
+ * returns 1 when a CHANGED payload has landed (read it with RS_TourneyText),
+ * -1 when the last fetch failed for good, 0 otherwise. Same shared, deduped,
+ * once-per-interval shape as RS_ApiFetchLastMaps: the payload only moves when
+ * an admin edits the calendar or a tournament rolls over.
+ */
+void RS_ApiFetchTourney( const char *url, const char *token )
+{
+	if( !url || !url[0] )
+		return;
+
+	ApiState *s = ensureStarted();
+	unsigned gen = s->fetchTourneyGen.fetch_add( 1 ) + 1;
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			// evict another fetch (fully reproducible next interval) before a
+			// one-shot race report
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_TOURNEY || it->type == REQ_GET_LASTMAPS ||
+					it->type == REQ_GET_MAPWEAPONS ||
+					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
+					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
+					it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				// No fetch to evict: the whole queue is reports. Spool the
+				// oldest instead of silently losing a finish.
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
+			REQ_GET_TOURNEY, "", gen, 0 } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollTourney( void )
+{
+	ApiState *s = g_state;
+	if( !s )
+		return 0;
+	return s->fetchTourneyResult.exchange( 0 );
+}
+
+// Copy out the last-fetched tournament payload (header line included). Called
+// from the script thread after a poll of 1; the AngelScript wrapper copies the
+// static buffer immediately (no reentrancy on the single script thread).
+const char *RS_TourneyText( void )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->tourneyMutex );
+	buf = s->tourneyText;
+	return buf.c_str();
+}
+
+/*
+ * RS_ApiTourneyJoin / RS_ApiPollTourneyJoin / RS_TourneyJoinText
+ *
+ * Redeem a tournament entry code (or, with an empty code, enrol outright) for
+ * one player. POSTs {code, name, login} to <url> (/api/game/tournament/join,
+ * server-token authed) and captures the REPLY per player slot — the reply is
+ * the point, because the player has to be told whether it worked.
+ *
+ * RS_ApiPollTourneyJoin(playerNum) returns 1 when a reply landed (read it with
+ * RS_TourneyJoinText(playerNum)), -1 on failure, 0 while still in flight. The
+ * reply is the "RSTJOIN" payload: header line, then "ok" or "err", then the
+ * lines to print. Never retried: this is a deliberate, repeatable player
+ * action, and a reply arriving minutes later would print to whoever now holds
+ * the slot.
+ */
+void RS_ApiTourneyJoin( const char *url, const char *token, const char *code,
+	const char *player, const char *login, int playerNum )
+{
+	if( !url || !url[0] || !player || !player[0] )
+		return;
+	if( playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return;
+
+	std::string body;
+	body.reserve( 192 );
+	body += "{\"code\":\"";
+	jsonEscapeInto( body, code ? code : "" );
+	body += "\",\"name\":\"";
+	jsonEscapeInto( body, player );
+	body += "\",\"login\":\"";
+	jsonEscapeInto( body, login ? login : "" );
+	body += "\"}";
+
+	ApiState *s = ensureStarted();
+	// gen first, result second (see RS_ApiFetchPlayerRecord): slots are reused
+	// across players, so clear any stale result the previous occupant left behind.
+	unsigned gen = s->fetchTJoinGen[playerNum].fetch_add( 1 ) + 1;
+	s->fetchTJoinResult[playerNum].store( 0 );
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			bool evicted = false;
+			// Evict only REPRODUCIBLE fetches — never another player's join,
+			// which has somebody waiting on its reply, and never a race report.
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_TOURNEY ||
+					it->type == REQ_GET_AWARDS || it->type == REQ_GET_SAVEDSTART ||
+					it->type == REQ_GET_PLAYERREC ||
+					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
+					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
+					it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
+			REQ_POST_TJOIN, "", gen, playerNum } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollTourneyJoin( int playerNum )
+{
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return 0;
+	return s->fetchTJoinResult[playerNum].exchange( 0 );
+}
+
+const char *RS_TourneyJoinText( int playerNum )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->tjoinMutex );
+	buf = s->tjoinText[playerNum];
+	return buf.c_str();
 }

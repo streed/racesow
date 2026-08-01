@@ -32,6 +32,11 @@ String randmap;
 String randmap_passed = "";
 uint randmap_time = 0;
 uint randmap_matches;
+// Separate from randmap_time so a `tourneymap` vote and a `randmap` vote never
+// suppress each other's fresh pick (see Cmd_CallvoteValidate). Both still write
+// the shared `randmap` slot, which is what makes them mutually exclusive — only
+// one map change can be in flight at a time.
+uint tourneymap_time = 0;
 const uint RANDMAP_DELAY_MIN = 80;
 const uint RANDMAP_DELAY_MAX = 1100;
 
@@ -77,6 +82,38 @@ bool Cmd_CallvoteValidate( Client@ client, const String &cmdString, const String
 
         randmap_time = levelTime;
     }
+    else if ( votename == "tourneymap" )
+    {
+        // Reuses randmap's chosen-map slot and its change path (see
+        // Cmd_CallvotePassed) — the only difference is where the map comes
+        // from. It ALSO has to reuse randmap's delay dance, and for the same
+        // reason: the engine calls callvotevalidate more than once for a single
+        // vote, so re-rolling a random pool map on every call would announce one
+        // map and load another. Its own timer (not randmap_time) so the two vote
+        // types can't hand each other a stale choice.
+        if ( levelTime - tourneymap_time > RANDMAP_DELAY_MAX )
+        {
+            String why = "";
+            String picked = RACE_PickTourneyMap( argsString.getToken( 1 ), why );
+            if ( picked.length() == 0 )
+            {
+                client.printMessage( S_COLOR_RED + why + "\n" );
+                return false;
+            }
+            randmap = picked;
+        }
+
+        if ( levelTime - tourneymap_time < RANDMAP_DELAY_MIN )
+        {
+            // A re-validation of the vote already in flight: re-announce the
+            // SAME map rather than drawing again.
+            G_PrintMsg( null, S_COLOR_YELLOW + "Tournament map: " + S_COLOR_WHITE + randmap + "\n" );
+            return true;
+        }
+
+        tourneymap_time = levelTime;
+        G_PrintMsg( null, S_COLOR_YELLOW + "Tournament map: " + S_COLOR_WHITE + randmap + "\n" );
+    }
     else
     {
         client.printMessage( "Unknown callvote " + votename + "\n" );
@@ -90,7 +127,9 @@ bool Cmd_CallvotePassed( Client@ client, const String &cmdString, const String &
 {
     String votename = argsString.getToken( 0 );
 
-    if ( votename == "randmap" )
+    // tourneymap resolves to the same chosen-map slot as randmap, so both take
+    // the one proven map-change path (GT_MatchStateFinished runs `map <name>`).
+    if ( votename == "randmap" || votename == "tourneymap" )
     {
         randmap_passed = randmap;
         match.launchState( MATCH_STATE_POSTMATCH );
@@ -683,6 +722,15 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/copystart <player>" );
         cmdlist.addCell( "Start where another player on the server starts (this session only)." );
 
+        cmdlist.addCell( "/tournament [code]" );
+        cmdlist.addCell( "Show the tournament that's on - or enter it with the code from the website." );
+
+        cmdlist.addCell( "/tmaps" );
+        cmdlist.addCell( "List the current tournament's map pool." );
+
+        cmdlist.addCell( "/callvote tourneymap" );
+        cmdlist.addCell( "Calls a vote to move the server onto a tournament map." );
+
         for ( uint i = 0; i < cmdlist.numRows(); i++ )
             client.printMessage( cmdlist.getRow(i) + "\n" );
 
@@ -697,6 +745,18 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
     {
         client.printMessage( S_COLOR_YELLOW + "/kill /racerestart" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Respawns you. I mean srsly.. that's it." + "\n" );
+    }
+    else if ( command == "tournament" || command == "tourney" || command == "tmaps" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/tournament" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Shows the tournament that is running (or next up), its map pool and how to enter." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/tournament <code>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Enters you using the code you got on racesow.org. Dashes and case don't matter." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/tournament join" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Enters you right now under the name you are playing as, no website needed." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/tmaps" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Just the map pool." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Every run you set on a pool map before the tournament ends counts, whenever you entered." + "\n" );
     }
     else if ( command == "practicemode" )
     {
