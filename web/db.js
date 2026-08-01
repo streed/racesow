@@ -1184,6 +1184,53 @@ class RaceDB {
     return body;
   }
 
+  // In-game "achievement unlocked" poll (hrace/awards.as via the
+  // RS_ApiFetchAwards native, one fetch per player slot). Stateless by design:
+  // the GAME keeps the high-water award row id per slot and asks for rows above
+  // it — nothing is marked "notified" here, because a public game GET must stay
+  // side-effect-free (cacheable, spoofable). Two modes:
+  //   seed=true   the join-time fetch: just the NEWEST row (or nothing), so the
+  //               gametype can set its high-water mark without replaying the
+  //               player's award history as popups.
+  //   after=N     rows with id > N, OLDEST first, capped — the poll announces in
+  //               earn order and ends holding the newest id; a burst larger than
+  //               the cap pages itself out over successive polls.
+  // Header "//awards" (the native rejects non-"//" bodies as captive-portal
+  // noise), then one "<rowId>\t<tier>\t<title>\t<description>" line per award —
+  // tab-delimited because titles carry spaces; tabs/control chars are stripped
+  // from the text fields so the line shape survives any admin-entered text.
+  // Awards are stored under the canonical rep id, so match the name's whole
+  // canonical group like savedStartText does. null = unusable name (route 404s).
+  async gameAwardsText(playerName, { after = 0, seed = false } = {}) {
+    const clean = simplifyName(playerName).toLowerCase();
+    if (!clean) return null;
+    const aft = Math.max(0, Math.floor(Number(after) || 0));
+    const strip = (s) =>
+      String(s || "")
+        .replace(/[\x00-\x1f\x7f]+/g, " ")
+        .trim();
+    const groupSql = `SELECT DISTINCT COALESCE(pl.canonical_id, pl.id) FROM player pl
+         WHERE lower(regexp_replace(pl.name, '\\^[0-9]', '', 'g')) = $1`;
+    const rows = seed
+      ? await this.all(
+          `SELECT pa.id, a.tier, a.title, a.description
+           FROM player_achievement pa JOIN achievement a ON a.id = pa.achievement_id
+           WHERE pa.player_id IN (${groupSql})
+           ORDER BY pa.id DESC LIMIT 1`,
+          [clean]
+        )
+      : await this.all(
+          `SELECT pa.id, a.tier, a.title, a.description
+           FROM player_achievement pa JOIN achievement a ON a.id = pa.achievement_id
+           WHERE pa.player_id IN (${groupSql}) AND pa.id > $2
+           ORDER BY pa.id ASC LIMIT 20`,
+          [clean, aft]
+        );
+    let body = "//awards\n";
+    for (const r of rows) body += `${num(r.id)}\t${strip(r.tier)}\t${strip(r.title)}\t${strip(r.description)}\n`;
+    return body;
+  }
+
   // Store (or replace) a player's saved start for a map+direction. Resolves the
   // raw (name, login) to its CANONICAL player id — like the replay upserts — so
   // aliases share one row and a returning player matches by nick. `origin` and

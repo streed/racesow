@@ -671,6 +671,11 @@ void GT_ThinkRules()
     // first prerace spawn so they begin where they left off (savedstarts.as)
     RACE_ApiSavedStartThink();
 
+    // per-player achievement announcements (no-op when rs_api_awards_url is
+    // empty): seeds a high-water mark on join, then polls the central award
+    // log and pops "Achievement unlocked" for fresh rows (awards.as)
+    RACE_ApiAwardsThink();
+
     // in-game WR ghost racer (no-op unless rs_wr_ghost + its URL are set); also
     // before the early-return so the ghost keeps looping while the scoreboard
     // is up

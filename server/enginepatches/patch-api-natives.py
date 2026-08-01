@@ -652,6 +652,55 @@ SAVESTART_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, SAVESTART_ENTRY, "asGlobFuncs savestart entry")
 
+# --- 1n. per-player achievement announcements: poll fresh award rows ----------
+# Adds RS_ApiFetchAwards / RS_ApiPollAwards / RS_AwardsText (impl in
+# g_rs_api.cpp). PER PLAYER (playerNum-keyed per-slot result), the same shape as
+# the player-record/saved-start trios: the gametype (hrace/awards.as) seeds a
+# high-water award row id on join (after < 0 = the ?seed=1 variant) and then
+# polls for rows above it, popping "Achievement unlocked" for each. Anchors
+# re-emitted so they stay unique. The Dockerfile asserts on
+# "asFunc_RS_ApiFetchAwards".
+AWARDS_WRAPPER = (
+    "// racesow-docker: per-player achievement announcements - GETs the central\n"
+    "// /api/game/awards text (a \"//awards\" header, then one\n"
+    "// \"<rowId>\\t<tier>\\t<title>\\t<description>\" line per fresh award) into a\n"
+    "// per-player slot; the gametype polls RS_ApiPollAwards(playerNum), reads\n"
+    "// RS_AwardsText(playerNum) and announces the new rows.\n"
+    "void RS_ApiFetchAwards( const char *url, const char *token, const char *cleanName,\n"
+    "\tint after, int playerNum );\n"
+    "int RS_ApiPollAwards( int playerNum );\n"
+    "const char *RS_AwardsText( int playerNum );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchAwards( asstring_t *url, asstring_t *token,\n"
+    "\tasstring_t *name, int after, int playerNum )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !name || !name->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchAwards( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tname->buffer, after, playerNum );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollAwards( int playerNum ) { return RS_ApiPollAwards( playerNum ); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_AwardsText( int playerNum )\n"
+    "{\n"
+    "\tconst char *s = RS_AwardsText( playerNum );\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, AWARDS_WRAPPER, "asFunc awards wrapper")
+
+AWARDS_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchAwards( const String &in url, const String &in token, "
+    "const String &in name, int after, int playerNum )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchAwards), NULL },\n"
+    "\t{ \"int RS_ApiPollAwards( int playerNum )\", asFUNCTION(asFunc_RS_ApiPollAwards), NULL },\n"
+    "\t{ \"const String @RS_AwardsText( int playerNum )\", asFUNCTION(asFunc_RS_AwardsText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, AWARDS_ENTRY, "asGlobFuncs awards entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

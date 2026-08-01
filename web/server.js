@@ -593,6 +593,28 @@ api.get("/game/saved-start", wrap(async (req, res) => {
   res.type("text/plain").send(body);
 }));
 
+// In-game "achievement unlocked" announcements (hrace/awards.as polls this per
+// player slot ~75s via the RS_ApiFetchAwards native). Payload contract lives in
+// db.gameAwardsText: "//awards" header, then "<rowId>\t<tier>\t<title>\t<desc>"
+// lines; ?seed=1 answers with just the newest row so a joining player's slot
+// can set its high-water mark without replaying history, ?after=<id> returns
+// the newer rows oldest-first. Public and side-effect-free like every game GET
+// — the game tracks what it has announced, the web marks nothing. Short cache:
+// a poll repeats its exact (name, after) until an award moves the mark, and a
+// 15s-stale answer only delays the popup, never the award itself.
+const awardsCacheKey = (req) =>
+  `/api/game/awards?name=${String(req.query.name || "").slice(0, 64)}` +
+  `&after=${String(req.query.after || 0).slice(0, 16)}&seed=${req.query.seed ? 1 : 0}`;
+api.get("/game/awards", cache(15, { key: awardsCacheKey }), wrap(async (req, res) => {
+  const { name, after, seed } = req.query;
+  if (typeof name !== "string" || name.length === 0 || name.length > 64 || /[\x00-\x1f\x7f]/.test(name))
+    return res.status(404).type("text/plain").send("// bad name\n");
+  const aft = typeof after === "string" && /^[0-9]{1,15}$/.test(after) ? Number(after) : 0;
+  const body = await race.gameAwardsText(name, { after: aft, seed: Boolean(seed) });
+  if (body == null) return res.status(404).type("text/plain").send("// bad name\n");
+  res.type("text/plain").send(body);
+}));
+
 // Flat-text WR ghost for game servers: the hrace gametype's RS_ApiFetchGhost
 // native GETs this on map load and drives an in-game "ghost racer" along it.
 // Text (not the gzipped JSON) because AngelScript can't decompress/parse JSON.

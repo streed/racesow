@@ -91,6 +91,7 @@ RUN cd source \
     && grep -q 'asFunc_RS_ApiFetchPlayerRecord' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchSavedStart' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiSaveStart' game/g_ascript.cpp \
+    && grep -q 'asFunc_RS_ApiFetchAwards' game/g_ascript.cpp \
     && grep -q 'RS_MirrorLocalChat'       game/g_cmds.cpp \
     && grep -q 'rs_isWrGhost'             game/g_public.h \
     && grep -q 'rs_isWrGhost'             qcommon/snap_write.c \

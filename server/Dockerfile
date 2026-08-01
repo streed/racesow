@@ -78,6 +78,7 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "asFunc_RS_ApiFetchPlayerRecord" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchSavedStart" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiSaveStart" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchAwards" game/g_ascript.cpp \
     && grep -q "curl pthread" game/CMakeLists.txt
 
 # 7. Cross-server player mirroring: the RS_Mirror* natives (UDP mesh on a

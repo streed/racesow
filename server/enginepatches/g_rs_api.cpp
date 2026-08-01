@@ -50,7 +50,8 @@ enum RequestType {
 	REQ_GET_MAPWEAPONS, // per-map weapon inventory -> stored in memory (RS_ApiPollMapWeapons)
 	REQ_GET_LASTMAPS,   // recently-played maps -> stored in memory (RS_ApiPollLastMaps)
 	REQ_GET_PLAYERREC,  // one player's PB on the current map -> stored per-slot (RS_ApiPollPlayerRecord)
-	REQ_GET_SAVEDSTART  // one player's saved start(s) on the current map -> per-slot (RS_ApiPollSavedStart)
+	REQ_GET_SAVEDSTART, // one player's saved start(s) on the current map -> per-slot (RS_ApiPollSavedStart)
+	REQ_GET_AWARDS      // one player's fresh "achievement unlocked" rows -> per-slot (RS_ApiPollAwards)
 };
 
 // note: no default member initializers — the game module builds as C++11,
@@ -199,6 +200,15 @@ struct ApiState {
 	std::mutex savedStartMutex;
 	std::string savedStartText[RS_PLAYERREC_MAX];
 
+	// Per-player "achievement unlocked" fetch handshake — identical PER-PLAYER
+	// shape again (keyed by playerNum, payload per slot behind awardsMutex, a
+	// per-slot gen to supersede an in-flight re-join fetch, per-slot result
+	// read-and-cleared by RS_ApiPollAwards(i)). Shares the RS_PLAYERREC_MAX cap.
+	std::atomic<unsigned> fetchAwardsGen[RS_PLAYERREC_MAX];
+	std::atomic<int> fetchAwardsResult[RS_PLAYERREC_MAX];
+	std::mutex awardsMutex;
+	std::string awardsText[RS_PLAYERREC_MAX];
+
 	ApiState()
 		: stop( false ), fetchGen( 0 ), fetchResult( 0 ), fetchGhostGen( 0 ), fetchGhostResult( 0 ),
 		  ghostFrameCount( 0 ), ghostHz( 0 ), ghostTime( 0 ),
@@ -215,6 +225,8 @@ struct ApiState {
 			fetchPlayerRecResult[i].store( 0 );
 			fetchSavedStartGen[i].store( 0 );
 			fetchSavedStartResult[i].store( 0 );
+			fetchAwardsGen[i].store( 0 );
+			fetchAwardsResult[i].store( 0 );
 		}
 	}
 };
@@ -1007,6 +1019,48 @@ void workerMain( ApiState *s )
 						fprintf( stderr, "rs_api: saved-start fetch failed for good, status %ld: %s\n",
 							status, req.url.c_str() );
 					s->fetchSavedStartResult[req.slot].store( -1 );
+					continue;
+				}
+				// transient: fall through to the requeue below
+			} else if( req.type == REQ_GET_AWARDS ) {
+				// Per-player "achievement unlocked" fetch, keyed by req.slot - same
+				// per-slot handshake as REQ_GET_SAVEDSTART above.
+				if( req.slot < 0 || req.slot >= ApiState::RS_PLAYERREC_MAX )
+					continue;
+				if( s->stop.load() )
+					continue;
+				std::string payload;
+				status = doGet( req, payload );
+				bool current = req.gen == s->fetchAwardsGen[req.slot].load();
+				if( status >= 200 && status < 300 ) {
+					if( !current )
+						continue; // superseded (re-join on this slot) - drop
+					// The web always leads with a "//awards" header (a bare header =
+					// nothing new). Anything not "//..." is a captive portal / proxy
+					// error page -> fail-open -1 (the gametype just polls again later).
+					if( payload.empty() || payload.compare( 0, 2, "//" ) != 0 ) {
+						s->fetchAwardsResult[req.slot].store( -1 );
+						continue;
+					}
+					{
+						std::lock_guard<std::mutex> lock( s->awardsMutex );
+						s->awardsText[req.slot].swap( payload );
+					}
+					// One-shot fetch: always signal 1 on a good body (the script clears
+					// its pendingAwardsFetch only on a non-zero poll).
+					s->fetchAwardsResult[req.slot].store( 1 );
+					continue;
+				}
+				if( !current )
+					continue; // superseded - do not burn retries on a stale fetch
+				bool permanent = status >= 400 && status < 500;
+				req.attempts++;
+				if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+					// 404 is the expected "name the web can't use".
+					if( status != 404 )
+						fprintf( stderr, "rs_api: awards fetch failed for good, status %ld: %s\n",
+							status, req.url.c_str() );
+					s->fetchAwardsResult[req.slot].store( -1 );
 					continue;
 				}
 				// transient: fall through to the requeue below
@@ -2281,6 +2335,86 @@ const char *RS_SavedStartText( int playerNum )
 	}
 	std::lock_guard<std::mutex> lock( s->savedStartMutex );
 	buf = s->savedStartText[playerNum];
+	return buf.c_str();
+}
+
+/*
+ * RS_ApiFetchAwards / RS_ApiPollAwards / RS_AwardsText
+ *
+ * Per-player fetch of fresh "achievement unlocked" rows from <url> (the
+ * central /api/game/awards endpoint), keyed by playerNum into a per-slot
+ * buffer - the exact shape of the saved-start trio above. `after` is the
+ * game-side high-water award row id (?name=<urlencoded>&after=<id> is
+ * appended); a NEGATIVE after asks the seed variant (?seed=1), which answers
+ * with just the newest row so the gametype can set its mark on join without
+ * replaying the player's award history. The gametype (hrace/awards.as) parses
+ * the "//awards" payload and pops the announcements. RS_ApiPollAwards
+ * (playerNum) returns 1 when a fresh payload landed, -1 on a hard failure
+ * (fail-open - poll again next interval), else 0.
+ */
+void RS_ApiFetchAwards( const char *url, const char *token, const char *cleanName,
+	int after, int playerNum )
+{
+	if( !url || !url[0] || !cleanName || !cleanName[0] )
+		return;
+	if( playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return;
+
+	std::string full = std::string( url ) + "?name=" + urlEncode( cleanName );
+	if( after < 0 )
+		full += "&seed=1";
+	else
+		full += "&after=" + std::to_string( after );
+	ApiState *s = ensureStarted();
+	// gen first, result second (see RS_ApiFetchPlayerRecord): slots are reused
+	// across players, so clear any stale result the previous occupant left behind.
+	unsigned gen = s->fetchAwardsGen[playerNum].fetch_add( 1 ) + 1;
+	s->fetchAwardsResult[playerNum].store( 0 );
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		if( s->queue.size() >= QUEUE_MAX ) {
+			bool evicted = false;
+			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+				if( it->type == REQ_GET_AWARDS || it->type == REQ_GET_SAVEDSTART ||
+					it->type == REQ_GET_PLAYERREC ||
+					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
+					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
+					it->type == REQ_GET_TOPSCORES ) {
+					s->queue.erase( it );
+					evicted = true;
+					break;
+				}
+			}
+			if( !evicted ) {
+				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+				spoolReport( s->queue.front() );
+				s->queue.pop_front();
+			}
+		}
+		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
+			REQ_GET_AWARDS, "", gen, playerNum } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollAwards( int playerNum )
+{
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return 0;
+	return s->fetchAwardsResult[playerNum].exchange( 0 );
+}
+
+const char *RS_AwardsText( int playerNum )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->awardsMutex );
+	buf = s->awardsText[playerNum];
 	return buf.c_str();
 }
 

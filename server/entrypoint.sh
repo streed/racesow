@@ -361,6 +361,11 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # so the in-game /lastmaps command shows the last maps played across the
         # network from a cached list. Empty url = command reports unavailable.
         echo "set rs_api_lastmaps_url \"${INGEST_URL%/api/ingest}/api/game/last-maps\""
+        # Achievement announcements (hrace/awards.as): each player slot polls the
+        # central award log and pops "Achievement unlocked" for fresh rows (the
+        # web evaluates awards after ingests, so the popup lags the earning
+        # finish by up to ~poll interval + debounce). Empty url = site-only awards.
+        echo "set rs_api_awards_url \"${INGEST_URL%/api/ingest}/api/game/awards\""
     fi
     # Cross-server player mirroring: the gametype reads these and drives the
     # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.

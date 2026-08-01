@@ -101,6 +101,15 @@ class Player
     // or overrides a hand save); savedReverseStart is what /reverse restores.
     bool pendingSavedStartFetch;
     bool savedStartApplied;
+    // Achievement announcements (hrace/awards.as): pendingAwardsFetch gates the
+    // per-slot poll; awardsSeeded flips once the join-time seed fetch has set
+    // awardsHighWater (the newest central award row id already accounted for),
+    // so a player's award HISTORY is never replayed as popups; nextAwardsPoll
+    // paces the periodic re-poll.
+    bool pendingAwardsFetch;
+    bool awardsSeeded;
+    int awardsHighWater;
+    uint nextAwardsPoll;
     Position savedRaceStart;
     bool savedRaceStartValid;
     Position savedReverseStart;
@@ -329,6 +338,10 @@ class Player
         this.recordFetchName = "";
         this.pendingSavedStartFetch = false;
         this.savedStartApplied = false;
+        this.pendingAwardsFetch = false;
+        this.awardsSeeded = false;
+        this.awardsHighWater = 0;
+        this.nextAwardsPoll = 0;
         this.savedRaceStartValid = false;
         this.savedReverseStartValid = false;
         this.noclipSpawn = false;

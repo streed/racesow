@@ -145,6 +145,7 @@ bool RACE_MirrorEnabled()
 /// sentinel to RACE_MirrorRenderActivity instead of printing it as chat. Payload
 /// (the event's tab-delimited text field, so intra-field spaces are safe):
 ///   ~RSACT~ <rec|fin> <rev:0|1> <rank> <timeMs> <mapname>
+///   ~RSACT~ ach 0 0 0 <tier> <title words...>   (achievement unlocked flair)
 ///*****************************************************************
 
 const String MESH_ACT_SENTINEL = "~RSACT~";
@@ -154,8 +155,10 @@ uint mirrorNextPresence = 0;
 // Broadcast a notable local finish to the mesh. `actor` = the finishing player's
 // name (its own event field, so spaces/colours are fine); no-op when mirroring
 // is off. Records use kind "rec" (rank ignored); top finishes use "fin" with the
-// 1-based rank. A server never hears its OWN events, so this is peer-facing only
-// — the local server shows its own finishes through the normal race announces.
+// 1-based rank; achievement unlocks use "ach" (awards.as) with rev/rank/time
+// zeroed and the map field carrying "<tier> <title...>". A server never hears
+// its OWN events, so this is peer-facing only — the local server shows its own
+// finishes through the normal race announces.
 void RACE_MirrorBroadcastActivity( const String &in actor, const String &in kind, bool reversed, int rank, uint timeMs, const String &in map )
 {
     if ( !RACE_MirrorEnabled() )
@@ -177,9 +180,9 @@ bool RACE_MirrorLooksLikeActivity( const String &in body )
     if ( body.getToken( 0 ) != MESH_ACT_SENTINEL )
         return false;
     String kind = body.getToken( 1 );
-    if ( kind != "rec" && kind != "fin" )
+    if ( kind != "rec" && kind != "fin" && kind != "ach" )
         return false;
-    return body.getToken( 5 ).length() > 0; // map field present
+    return body.getToken( 5 ).length() > 0; // map field (ach: tier) present
 }
 
 // Render a received activity payload as a one-line network-feed entry. Called
@@ -195,7 +198,28 @@ void RACE_MirrorRenderActivity( const String &in tag, const String &in actor, co
     if ( reversed )
         revNote = " (reverse)";
     String head = S_COLOR_ORANGE + ">> " + S_COLOR_WHITE + "[" + tag + S_COLOR_WHITE + "] " + actor;
-    if ( kind == "rec" )
+    if ( kind == "ach" )
+    {
+        // Token 5 is the tier; the title is every following token (it is the
+        // only multi-word field, so a space-joined rebuild is faithful enough).
+        String tier = map;
+        String title = "";
+        for ( int t = 6; ; t++ )
+        {
+            String tok = payload.getToken( t );
+            if ( tok.length() == 0 )
+                break;
+            if ( title.length() > 0 )
+                title += " ";
+            title += tok;
+        }
+        if ( title.length() == 0 )
+            title = tier; // degenerate payload: show something rather than nothing
+        String color = RACE_AwardTierColor( tier );
+        G_PrintMsg( null, head + " " + color + "unlocked " + S_COLOR_WHITE + "["
+                + color + title + S_COLOR_WHITE + "]\n" );
+    }
+    else if ( kind == "rec" )
         G_PrintMsg( null, head + S_COLOR_YELLOW + " * NEW RECORD " + S_COLOR_WHITE + "on "
                 + S_COLOR_GREEN + map + revNote + S_COLOR_WHITE + "  " + S_COLOR_GREEN + RACE_TimeToString( timeMs ) + "\n" );
     else

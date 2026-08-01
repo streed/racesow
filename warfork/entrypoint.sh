@@ -139,6 +139,7 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         echo "set rs_api_savedstart_get_url \"${base}/api/game/saved-start\""
         echo "set rs_api_savedstart_post_url \"${base}/api/ingest/saved-start\""
         echo "set rs_api_lastmaps_url \"${base}/api/game/last-maps\""
+        echo "set rs_api_awards_url \"${base}/api/game/awards\""
     fi
     # Cross-server (cross-GAME) player mesh. Empty peers/tag = off. Uses the same
     # RS_Mirror* natives + wire protocol as the Warsow servers, so a Warfork node

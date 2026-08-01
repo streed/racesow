@@ -39,6 +39,7 @@ hrace/motd.as;
 hrace/ranks.as;
 hrace/playerrecord.as;
 hrace/savedstarts.as;
+hrace/awards.as;
 hrace/demos.as;
 hrace/ghostbot.as;
 hrace/mirror.as;

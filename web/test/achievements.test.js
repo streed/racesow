@@ -343,3 +343,42 @@ test("deleting is blocked once earned; deactivation stops new awards but keeps o
   assert.equal(await race.evaluateAchievements(null), 0); // inactive: no new awards
   assert.equal((await race.all("SELECT 1 FROM player_achievement")).length, 1); // old award kept
 });
+
+test("game awards poll: seed returns just the newest mark; after pages oldest-first", async (t) => {
+  const race = await freshDb(t);
+  await ingest(race, "awmap", [finish("^1An^7na", 9000)]);
+  // Two lifetime achievements earned in one pass — same awarded_at second, so
+  // only the row id can order them (what the migration's cursor is for).
+  await makeAch(race, { title: "First Blood", kind: "finishes", params: { count: "1" }, window: "lifetime" });
+  await makeAch(race, { title: "Tab\tTitle", kind: "finishes", params: { count: "1" }, window: "lifetime" });
+  assert.equal(await race.evaluateAchievements(null), 2);
+  const ids = (await race.all("SELECT id FROM player_achievement ORDER BY id")).map((r) => Number(r.id));
+  assert.equal(ids.length, 2);
+  assert.ok(ids[0] > 0 && ids[1] > ids[0], "identity cursor must be monotonic");
+
+  // Colored in-game name resolves via its clean form, like saved starts do.
+  const seed = await race.gameAwardsText("anna", { seed: true });
+  const seedLines = seed.trim().split("\n");
+  assert.equal(seedLines[0], "//awards");
+  assert.equal(seedLines.length, 2, "seed answers with the newest row only");
+  assert.equal(Number(seedLines[1].split("\t")[0]), ids[1]);
+
+  // after=0 pages everything oldest-first; each line keeps 4 tab fields even
+  // when an admin title carried a tab (stripped web-side).
+  const all = (await race.gameAwardsText("anna", { after: 0 })).trim().split("\n");
+  assert.equal(all.length, 3);
+  const first = all[1].split("\t");
+  assert.equal(Number(first[0]), ids[0]);
+  assert.equal(first.length, 4);
+  assert.equal(all[2].split("\t")[2], "Tab Title");
+
+  // after=<mid> returns only the newer row; after=<newest> a bare header.
+  const tail = (await race.gameAwardsText("anna", { after: ids[0] })).trim().split("\n");
+  assert.equal(tail.length, 2);
+  assert.equal(Number(tail[1].split("\t")[0]), ids[1]);
+  assert.equal(await race.gameAwardsText("anna", { after: ids[1] }), "//awards\n");
+
+  // Unknown player: a bare header (nothing to announce); unusable name: null.
+  assert.equal(await race.gameAwardsText("nobody-here", { after: 0 }), "//awards\n");
+  assert.equal(await race.gameAwardsText("", { after: 0 }), null);
+});
