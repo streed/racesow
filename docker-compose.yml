@@ -229,6 +229,28 @@ services:
       - ./data:/data
       - ./server/maps:/maps:ro
     command: ["node", "heatmap.js", "--loop"]
+    # This service reuses racesow-web, whose image HEALTHCHECK fetches
+    # /api/health — an endpoint this batch loop never serves. Inheriting it left
+    # the container permanently "unhealthy" (a 617-long failing streak) while it
+    # was in fact working, which meant a REAL stall would have looked identical.
+    # Check the loop's own heartbeat instead: heatmap.js touches it after every
+    # cycle, so staleness means the cycle hung — the one failure its internal
+    # try/catch cannot detect. Bound = two check intervals plus slack for a long
+    # full pass.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - |
+          const p = (process.env.HEATMAP_DIR || "/data/heatmaps") + "/.heartbeat";
+          const max = parseInt(process.env.HEATMAP_CHECK_SECONDS || "3600", 10) * 2 + 1800;
+          try { process.exit((Date.now() - require("fs").statSync(p).mtimeMs) / 1000 < max ? 0 : 1); }
+          catch { process.exit(1); }
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 600s
 
   discord:
     build: ./discord

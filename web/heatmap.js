@@ -543,6 +543,23 @@ async function runOnce({ all = false, only = null } = {}) {
 // Self-scheduling daemon: generate on boot (bootstrapping any missing images),
 // then refresh maps that saw a finish in the past ACTIVE_WINDOW every CHECK
 // seconds, guaranteeing at least one full nightly pass per INTERVAL.
+// Liveness marker for the container healthcheck. This sidecar reuses the web
+// image, whose HEALTHCHECK probes /api/health — an endpoint a batch loop never
+// serves — so without a check of its own the container sits "unhealthy" forever
+// and a genuine stall is indistinguishable from the false alarm (it ran up a
+// 617-cycle failing streak that way). Touched after EVERY cycle, including one
+// that threw: the loop caught it and will retry, which is still alive. A stale
+// marker therefore means the cycle HUNG — precisely the failure the try/catch
+// around runOnce cannot see.
+function touchHeartbeat() {
+  try {
+    fs.mkdirSync(HEATMAP_DIR, { recursive: true });
+    fs.writeFileSync(path.join(HEATMAP_DIR, ".heartbeat"), `${Math.floor(Date.now() / 1000)}\n`);
+  } catch (e) {
+    log(`heartbeat write failed (not fatal): ${e.message}`);
+  }
+}
+
 async function runLoop() {
   log(`loop start (interval=${INTERVAL_SECONDS}s, check=${CHECK_SECONDS}s, window=${ACTIVE_WINDOW_SECONDS}s, size=${SIZE}, out=${HEATMAP_DIR})`);
   let stop = false;
@@ -568,6 +585,7 @@ async function runLoop() {
     } catch (e) {
       log(`cycle FAILED (will retry): ${e.stack || e.message}`);
     }
+    touchHeartbeat();
     if (stop) break;
     await nap(CHECK_SECONDS);
   }
