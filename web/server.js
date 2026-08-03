@@ -644,8 +644,14 @@ api.post(
 // VERIFY a pending "new server record" announcement, so a board left stale for
 // the full TTL could confirm a record another node had already beaten — a false
 // announce, not just a late one.
+//
+// The TTL is NOT what bounds record freshness — the eviction is, so it stays
+// several times the game's 10s poll and goes on absorbing the fan-in from four
+// nodes rather than handing each poll a rebuild. What it does bound is the rare
+// change that moves this board WITHOUT an ingest: an admin deleting a record, a
+// censor-list edit, a player merge. 30s for those, not two minutes.
 const topscoresCacheKey = (map) => `/api/game/topscores?map=${String(map || "").toLowerCase()}`;
-api.get("/game/topscores", cache(120, { key: (req) => topscoresCacheKey(req.query.map) }), wrap(async (req, res) => {
+api.get("/game/topscores", cache(30, { key: (req) => topscoresCacheKey(req.query.map) }), wrap(async (req, res) => {
   const body = await race.gameTopscoresText(req.query.map);
   if (body == null) return res.status(404).type("text/plain").send("// unknown map\n");
   res.type("text/plain").send(body);

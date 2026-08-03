@@ -20,7 +20,20 @@
 
 Cvar rsApiTopUrl( "rs_api_top_url", "", 0 );
 
-const uint API_TOP_REFRESH_MS = 60 * 1000;
+// How often a node re-pulls the central top-50. This is what decides how long a
+// record set on ANOTHER node stays invisible here — in `top`, in the HUD record
+// lines and in the scoreboard's "Diff" column. It used to be a minute, and twice
+// that per board because the base/reverse variants alternated.
+//
+// 10s is affordable because of what the fetch actually costs. The payload is
+// Redis-cached with a TTL several times this interval, so most polls are answered
+// without touching Postgres, and the cache is evicted the moment a record lands —
+// which is why freshness comes from the eviction, not from the TTL, and why
+// polling faster does not mean rebuilding faster. The native then suppresses an
+// unchanged payload before the gametype re-parses anything, so a quiet map costs
+// nothing beyond the request itself. What it buys is convergence: a record set on
+// EU now shows on US within ~10s instead of up to two minutes.
+const uint API_TOP_REFRESH_MS = 10 * 1000;
 // 0 = no fetch yet this map (scripts reload per map), so the first think
 // frame fires one immediately; then one per refresh interval. Same levelTime
 // idiom as lastRecordSent in hrace.as.
