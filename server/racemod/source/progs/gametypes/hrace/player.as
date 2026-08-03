@@ -83,6 +83,11 @@ class Player
     // Preferred over `pos` in the scoreboard because it covers players ranked
     // past the local top-50 board.
     int globalRank;
+    // levelTime of the last time completeRace() stamped globalRank straight from
+    // this player's fresh top-50 board position (RACE_StampFinishRank), or 0 for
+    // never. Until FINISH_RANK_HOLD_MS after it, a ranks blob that predates the
+    // finish is not allowed to push the rank back DOWN — see ranks.as.
+    uint rankStampedAt;
     // Global Skill Rating from the central DB (hrace/playerrecord.as carries it
     // in the per-player record fetch), or -1 when unknown: the API is off or
     // unreachable, the player is unrated, or nobody ever fetched for this slot.
@@ -352,6 +357,7 @@ class Player
         this.raceStartSpeed = -1;
         this.pos = -1;
         this.globalRank = -1;
+        this.rankStampedAt = 0;
         this.skillRating = -1;
         this.pendingRecordFetch = false;
         this.recordFetchName = "";
@@ -1172,6 +1178,16 @@ class Player
         }
         this.updateScore();
         this.updatePos();
+        // The scoreboard's global "Pos" is mode-dependent too, and nothing else
+        // re-derives it on a /reverse toggle: the respawn that follows comes back
+        // with old_team == new_team, so hrace.as's join-time re-stamp is skipped.
+        // Left alone, `/reverse on` kept displaying the standard-board rank for a
+        // run it does not describe, and `/reverse off` kept the blank the reversed
+        // player was given — both until the next ranks poll, up to a minute later,
+        // even though the answer was already parsed and sitting in g_rankValues.
+        // Any post-finish stamp belongs to the mode being left, so drop it first.
+        RACE_ClearFinishRankStamp( this );
+        RACE_ApplyGlobalRankTo( this );
     }
 
     PositionStore@ positionStore()
@@ -2466,6 +2482,11 @@ class Player
             if ( !this.reversed )
                 RACE_UpdateHUDTopScores();
             RACE_UpdatePosValues();
+            // The board just moved, so the scoreboard's global "Pos" column is
+            // stale for this player (better now) and for everyone they passed.
+            // Take this player's new rank straight off the board and ask the API
+            // for the rest off-schedule, instead of waiting out its interval.
+            RACE_StampFinishRank( this );
 
             // set up for respawning the player with a delay
             Entity@ respawner = G_SpawnEntity( "race_respawner" );

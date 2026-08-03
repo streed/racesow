@@ -28,6 +28,121 @@ const uint API_RANKS_REFRESH_MS = 60 * 1000;
 // then one per refresh interval (same levelTime idiom as apiBlockedLastFetch).
 uint apiRanksLastFetch = 0;
 
+// --- Post-finish refresh ------------------------------------------------------
+// A finish reorders the whole map's board: the finisher's own rank improves and
+// everyone they passed drops one. Waiting out API_RANKS_REFRESH_MS for that meant
+// the scoreboard showed a just-improved player their OLD rank for up to a minute —
+// the "Pos" column visibly trailing the run it had already announced. So a finish
+// asks for an off-schedule pull instead, and stamps what it can read locally in the
+// same frame.
+//
+// levelTime at which a requested pull is due; 0 = nothing pending. Trailing
+// debounce (a second finish pushes it back so the pull covers that one too),
+// bounded by apiRanksRefetchFirst + POST_FINISH_REFETCH_MAX_MS so a busy map can
+// never starve it.
+//
+// The delay is short because it is NOT waiting for the finish to reach the
+// database — the transport already guarantees that ordering. RACE_LogFinish
+// queues the report at the top of completeRace(), this pull is queued at the
+// bottom of the same frame, and the native drains one FIFO deque on a single
+// worker (g_rs_api.cpp): the GET cannot be dequeued until the POST has finished,
+// and the ingest handler evicts the cached ranks blob before it answers that POST.
+// So the answer to this pull is computed from a database that already has the run.
+// The few hundred ms is only a coalescing window, so a pack of players crossing
+// the line together costs one fetch instead of one each.
+uint apiRanksRefetchAt = 0;
+uint apiRanksRefetchFirst = 0;
+const uint POST_FINISH_REFETCH_MS = 300;
+const uint POST_FINISH_REFETCH_MAX_MS = 2000;
+
+// Whether a landed blob may be applied over a locally stamped rank.
+//
+// The native coalesces by generation: a response whose gen is not the newest is
+// dropped as superseded (g_rs_api.cpp), so whatever RS_ApiPollRanks reports is
+// always the answer to the LAST fetch we issued. That makes the test exact rather
+// than a guess about timing — every blob from before the post-finish fetch went out
+// predates the finish and must not overwrite the stamp, and the first one after it
+// is guaranteed to postdate it. Set false when a finish stamps, true again the
+// instant the post-finish fetch is issued.
+bool apiRanksTrusted = true;
+// Belt-and-braces bound in case that fetch never lands (API down, map ending): a
+// stamp is never held longer than this, after which the central DB is
+// authoritative again and a rank that legitimately dropped settles.
+const uint FINISH_RANK_HOLD_MS = 15 * 1000;
+
+// Ask for an off-schedule ranks pull. Called once per finish; see the coalescing
+// note on POST_FINISH_REFETCH_MS above for why the small delay is not a race
+// guard.
+void RACE_RequestRanksRefresh()
+{
+    if ( rsApiRanksUrl.string.length() == 0 )
+        return;
+
+    uint now = levelTime == 0 ? 1 : levelTime;
+    if ( apiRanksRefetchAt == 0 )
+        apiRanksRefetchFirst = now;
+
+    uint due = now + POST_FINISH_REFETCH_MS;
+    uint cap = apiRanksRefetchFirst + POST_FINISH_REFETCH_MAX_MS;
+    apiRanksRefetchAt = due > cap ? cap : due;
+}
+
+// Called from completeRace() once the local board has been updated. Gives the
+// FINISHER a correct "Pos" with no round trip at all: the local top-50 board is not
+// a local artefact, it IS the network-wide top 50 (the API serves it in topscores
+// format and apitop.as merges it in), so their position on it is their global rank.
+//
+// Only the finisher is stamped, deliberately. Their rank provably improved (or held)
+// — that is what finishing means — so reading it off the board can only move the
+// column in the direction the run justifies. Nobody else's rank is safe to infer
+// this way: a bystander's rank changes only by being passed, at most by one, and a
+// local board that happened to be behind the central one would stamp them a number
+// the run does not justify. They are corrected by the pull requested above instead,
+// seconds later, which is invisible for a one-place shift.
+//
+// Reversed players are skipped: ranks.as only ever loads the STANDARD board, so a
+// reverse run says nothing about the rank this column shows (same posture as
+// RACE_ApplyGlobalRankTo).
+void RACE_StampFinishRank( Player@ player )
+{
+    RACE_RequestRanksRefresh();
+
+    if ( player is null || player.client is null || player.reversed )
+        return;
+    if ( player.pos <= 0 )
+        return; // not on the top-50 board - only the API knows this rank
+
+    // Refuse to stamp from a board that is missing people. On a map this node has
+    // never hosted there is no persisted topscores file, so levelRecords is empty
+    // until the first apitop fetch lands and updatePos() will happily call a
+    // mediocre time "1". The ranks blob header carries the real finisher count, so
+    // compare against it: a board holding fewer than it should is behind the
+    // central one and its indices mean nothing globally.
+    //
+    // Skipping is free rather than a compromise — with no blob parsed there is no
+    // globalRank either, and scoreboardEntry() already falls back to the very same
+    // this.pos. The stamp only ever CHANGES what is displayed in the case this
+    // check confirms, which is the case worth having.
+    if ( raceTotalFinishers == 0 )
+        return;
+
+    uint expected = raceTotalFinishers < uint( MAX_RECORDS ) ? raceTotalFinishers : uint( MAX_RECORDS );
+    RecordTime[]@ board = RACE_Records( false );
+    uint loaded = 0;
+    for ( uint i = 0; i < MAX_RECORDS; i++ )
+    {
+        if ( !board[ i ].isFinished() )
+            break;
+        loaded++;
+    }
+    if ( loaded < expected )
+        return;
+
+    player.globalRank = player.pos;
+    player.rankStampedAt = levelTime == 0 ? 1 : levelTime;
+    apiRanksTrusted = false;
+}
+
 // Parsed ranks blob: parallel arrays (cleaned name -> rank), rebuilt whenever a
 // changed payload lands. raceTotalFinishers is the "N" a scoreboard could show
 // as the denominator (currently unused by the display, kept for completeness).
@@ -112,7 +227,30 @@ void RACE_ApplyGlobalRankTo( Player@ player )
         player.globalRank = -1;
         return;
     }
+
+    // Hold a freshly stamped rank until a blob we know postdates the finish lands
+    // (apiRanksTrusted). Without this, a blob already in flight when the player
+    // finished describes the board BEFORE their run, and applying it would bounce
+    // the Pos column straight back to the old number for another refresh cycle —
+    // the very flicker this module's post-finish pull exists to remove.
+    if ( player.rankStampedAt != 0 )
+    {
+        if ( !apiRanksTrusted && levelTime - player.rankStampedAt < FINISH_RANK_HOLD_MS )
+            return;
+        player.rankStampedAt = 0;
+    }
+
     player.globalRank = RACE_LookupGlobalRank( player.client.name.removeColorTokens().tolower() );
+}
+
+// Drop a player's post-finish stamp so the next lookup is authoritative again.
+// Called when their identity changes under them (a rename): the stamped rank was
+// read off the board for the OLD nick, so holding it against the new one would
+// show a rank that is not theirs.
+void RACE_ClearFinishRankStamp( Player@ player )
+{
+    if ( player !is null )
+        player.rankStampedAt = 0;
 }
 
 // Re-stamp every in-game player (called when a fresh board lands).
@@ -149,8 +287,24 @@ void RACE_ApiRanksThink()
         RACE_ApplyGlobalRanks();
     }
 
-    if ( apiRanksLastFetch == 0 || levelTime - apiRanksLastFetch >= API_RANKS_REFRESH_MS )
+    // A finish asked for an off-schedule pull and its grace delay has elapsed.
+    bool refetchDue = apiRanksRefetchAt != 0 && levelTime >= apiRanksRefetchAt;
+    if ( refetchDue )
     {
+        apiRanksRefetchAt = 0;
+        apiRanksRefetchFirst = 0;
+        // From here on, whatever the native hands back answers THIS fetch (older
+        // ones are dropped as superseded), so it postdates the finish that asked
+        // for it and may overwrite the stamped ranks.
+        apiRanksTrusted = true;
+    }
+
+    if ( refetchDue || apiRanksLastFetch == 0 || levelTime - apiRanksLastFetch >= API_RANKS_REFRESH_MS )
+    {
+        // Restarting the periodic clock here is deliberate: a post-finish pull is
+        // as good as the interval one, so a busy map does not fetch twice in a
+        // row. The native supersedes an in-flight fetch of the same type, so an
+        // overlapping request is coalesced rather than doubled.
         apiRanksLastFetch = levelTime == 0 ? 1 : levelTime;
         Cvar mapNameVar( "mapname", "", 0 );
         // Standard board only (see file header); public endpoint, no token.

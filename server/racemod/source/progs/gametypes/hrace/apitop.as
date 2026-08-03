@@ -33,6 +33,25 @@ uint apiTopLastFetch = 0;
 // topscores fetch when it completes.
 bool apiTopFetchReversed = false;
 
+// ...but only alternate when the reverse board is actually being looked at.
+// Unconditional alternation cost the STANDARD board half its refresh rate — one
+// fetch every other cycle, so 120 s, not the 60 s the constant above reads like —
+// and that board is what `top`, the HUD record lines and the scoreboard's "Diff"
+// column are drawn from for practically every player. Reverse is a per-player
+// niche: with nobody racing it, RACE_Records( true ) is never read, so spending
+// every other cycle on it is pure latency for no reader.
+bool RACE_AnyoneReversed()
+{
+    Team@ team = G_GetTeam( TEAM_PLAYERS );
+    for ( int i = 0; @team.ent( i ) != null; i++ )
+    {
+        Player@ player = RACE_GetPlayer( team.ent( i ).client );
+        if ( player !is null && player.reversed )
+            return true;
+    }
+    return false;
+}
+
 // --- Verified record announcements ------------------------------------------
 // A finish that ranks #1 in the LOCAL top scores is only a genuine server/world
 // record if it also beats the CURRENT central records — the local list can be a
@@ -46,7 +65,17 @@ uint raceAnnounceTime = 0;
 String raceAnnounceName = "";
 uint raceAnnounceDeadline = 0;
 bool raceAnnounceReversed = false; // which board the pending finish belongs to
-const uint ANNOUNCE_VERIFY_TIMEOUT = 6000; // ms to wait for the API before falling back
+// ms to wait for the API before announcing on the local check alone. Two round
+// trips through the native's single worker (the finish POST, then this GET) run
+// in well under a second, and the timeout is now the NORMAL path rather than the
+// exception: /api/ingest evicts the cached topscores board as the finish lands,
+// so the verify GET comes back containing the record just set — which can be
+// byte-identical to the file the same frame just wrote, and the native suppresses
+// an unchanged payload rather than signalling a fresh one. Waiting 6 s to say
+// "new record" in that case was the announcement visibly trailing the run. The
+// fallback is also safer than it used to be: the board it falls back on is the
+// freshly evicted one, not a board up to two minutes old.
+const uint ANNOUNCE_VERIFY_TIMEOUT = 3000;
 
 void RACE_DoRecordAnnounce( const String &in playerName, uint finishTime, bool reversed )
 {
@@ -143,11 +172,18 @@ void RACE_ApiTopThink()
         // has no business riding along on this request. Alternate the standard
         // and reverse-variant boards across cycles (see apiTopFetchReversed) so
         // neither supersedes the other in the native's per-type fetch coalescing;
-        // the first fetch on a fresh map is the base board.
-        if ( apiTopFetchReversed )
+        // the first fetch on a fresh map is the base board. With nobody racing
+        // reversed the alternation is skipped entirely, so the standard board
+        // refreshes every cycle instead of every other one.
+        if ( apiTopFetchReversed && RACE_AnyoneReversed() )
+        {
             RS_ApiFetchTop( rsApiTopUrl.string, "", baseMap + REVERSE_SUFFIX );
+            apiTopFetchReversed = false;
+        }
         else
+        {
             RS_ApiFetchTop( rsApiTopUrl.string, "", baseMap );
-        apiTopFetchReversed = !apiTopFetchReversed;
+            apiTopFetchReversed = true;
+        }
     }
 }

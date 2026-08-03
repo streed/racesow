@@ -83,8 +83,16 @@ const FOLLOW_TIMEOUT_MS = 10_000; // heaviest handler bound; past this, go solo
 export function cache(ttlSeconds, opts = {}) {
   const { key = defaultKey, edge = false } =
     typeof opts === "function" ? { key: opts } : opts;
+  // max-age and stale-while-revalidate are capped independently of the shared
+  // s-maxage, because they are what a BROWSER obeys and they compound: a client
+  // may reuse a body for max-age and then serve it stale for the whole SWR window
+  // on top, so an uncapped pair made a 300s route up to 330s stale in the tab —
+  // long enough for a player to reload a leaderboard twice and still not see the
+  // run they just set. Capping both keeps a reload honest while still absorbing
+  // the burst of calls one page render makes.
   const edgeCC = edge
-    ? `public, max-age=${Math.min(ttlSeconds, 30)}, s-maxage=${ttlSeconds}, stale-while-revalidate=${ttlSeconds}`
+    ? `public, max-age=${Math.min(ttlSeconds, 15)}, s-maxage=${ttlSeconds}, ` +
+      `stale-while-revalidate=${Math.min(ttlSeconds, 30)}`
     : null;
 
   return (req, res, next) => {
@@ -171,12 +179,32 @@ export function cache(ttlSeconds, opts = {}) {
 }
 
 // Explicit invalidation for the rare key that can't wait out its TTL: the
-// game-facing ranks blob must reflect a new record immediately, so the ingest
-// path evicts its key here. `keyString` MUST equal the value the cache()
-// middleware stored (i.e. the same string the route's key fn produced — the
-// "resp:" prefix is added here). No-op when Redis is absent/unready, so a down
-// cache is never an error — the short TTL still bounds staleness.
+// game-facing ranks and topscores blobs must reflect a new record immediately,
+// so the ingest path evicts their keys here. `keyString` MUST equal the value the
+// cache() middleware stored (i.e. the same string the route's key fn produced —
+// the "resp:" prefix is added here). No-op when Redis is absent/unready, so a
+// down cache is never an error — the short TTL still bounds staleness.
+//
+// The delete is issued TWICE, immediately and again after a short delay. A single
+// DEL loses a race that the game is unusually good at losing: a read that missed
+// the cache before the record landed is still running the handler, and its SET
+// (fired from the wrapped res.send, with no notion of an eviction that happened
+// meanwhile) lands AFTER our DEL and re-poisons the key with a pre-record body —
+// for a full TTL, which is exactly the staleness the eviction exists to prevent.
+// The second DEL sweeps up any such writer, since the handlers involved run in
+// milliseconds. Cheap (one extra DEL per new record), correct in the common case,
+// and no worse than today in the pathological one. The alternative — versioning
+// the key — costs a Redis round trip on every READ and strands superseded bodies
+// until their own TTL, which is a bad trade for a payload fetched a few times a
+// minute.
+const REINVALIDATE_MS = 1000;
+
 export function invalidate(keyString) {
   if (!client || !ready) return;
-  client.del("resp:" + keyString).catch(() => {});
+  const key = "resp:" + keyString;
+  client.del(key).catch(() => {});
+  const t = setTimeout(() => {
+    if (client && ready) client.del(key).catch(() => {});
+  }, REINVALIDATE_MS);
+  t.unref?.(); // never hold the process open over a cache sweep
 }

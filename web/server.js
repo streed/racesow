@@ -197,9 +197,18 @@ const renderLimiter = rateLimiter({ windowMs: 60_000, max: 60 });
 // fan-out isn't affected, but bounds a direct-to-:8080 flood.
 const apiLimiter = rateLimiter({ windowMs: 60_000, max: 600 });
 // Ingest: keyed by the authenticated server so one server can't starve others.
+// Deliberately generous, because a 429 here is not a delay — it is data loss. The
+// reporting native treats any 4xx on a report as "the API rejected this body,
+// retrying can never help" and DROPS it (g_rs_api.cpp, doPost branch), so a
+// throttled finish is gone for good rather than retried like a 5xx. One finish
+// can also cost several requests against this bucket (the record itself, then the
+// ghost trajectory and the demo pointer, each its own authed mount), and bursts
+// are structural: end-of-map flushes every connected player's counters at once.
+// 10/s sustained per server leaves room for a full server doing all of that while
+// still bounding a runaway or compromised feed.
 const ingestLimiter = rateLimiter({
   windowMs: 60_000,
-  max: 120,
+  max: 600,
   key: (req) => "ingest:" + (req.ingest ? req.ingest.serverId ?? req.ingest.serverName : req.ip),
 });
 // Public map-flag submissions: per IP, well under the read budget so a script
@@ -253,8 +262,11 @@ function mapDetailLimit(raw) {
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // Hot read endpoints are Redis-cached (short TTL). /overview is the heaviest
-// aggregate and the most-hit page-load call, so it gets the longest window.
-api.get("/overview", cache(120, { edge: true }), wrap(async (_req, res) => res.json(await race.overview())));
+// aggregate and the most-hit page-load call, so it carries a wider window than
+// the per-map/per-player reads — but not by much: the homepage also carries the
+// two feeds people watch for their own run ("Recent PBs" and "Recent Finishes"),
+// so it is cached as a live feed, not as a summary.
+api.get("/overview", cache(45, { edge: true }), wrap(async (_req, res) => res.json(await race.overview())));
 api.get("/servers", wrap(async (_req, res) => res.json({ servers: await race.servers() })));
 
 // One enrolled server: its DB record (name, status, records, last-seen,
@@ -315,7 +327,9 @@ function heatmapMeta(id) {
   }
 }
 
-api.get("/maps/:id", cache(60, { edge: true, key: (req) => `${req.path}?limit=${mapDetailLimit(req.query.limit)}` }), wrap(async (req, res) => {
+// The map leaderboard is the web-side scoreboard: it is where a player goes to
+// see the run they just set, so it gets the shortest TTL of the public reads.
+api.get("/maps/:id", cache(30, { edge: true, key: (req) => `${req.path}?limit=${mapDetailLimit(req.query.limit)}` }), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid map id" });
   const detail = await race.mapDetail(id, { limit: mapDetailLimit(req.query.limit) });
@@ -398,7 +412,9 @@ api.post(
 
 api.get("/players", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.players(req.query))));
 
-api.get("/players/:id", cache(60, { edge: true }), wrap(async (req, res) => {
+// Profiles list the player's own recent finishes — same "did my run land?"
+// question as the map board, so the same short TTL.
+api.get("/players/:id", cache(30, { edge: true }), wrap(async (req, res) => {
   const id = asInt(req.params.id);
   if (id == null) return res.status(400).json({ error: "invalid player id" });
   const detail = await race.playerDetail(id, req.query);
@@ -520,8 +536,10 @@ api.get("/search", cache(60), wrap(async (req, res) => res.json(await race.searc
 
 // New records after a race id — the Discord announcer polls this (it has no
 // database access; margin-to-#2 and version names are computed here). Public
-// read: nothing the site's recent-records feed doesn't already show.
-api.get("/records", cache(60), wrap(async (req, res) => {
+// read: nothing the site's recent-records feed doesn't already show. Short TTL:
+// the whole point of the consumer is to announce a record promptly, and the
+// cursor (after_id) means a poll that finds nothing new is a cheap empty answer.
+api.get("/records", cache(20), wrap(async (req, res) => {
   res.json(
     await race.recordsAfter({
       afterId: asInt(req.query.after_id) ?? 0,
@@ -620,7 +638,14 @@ api.post(
 // every server connected to this API serves the same in-game `top` lists,
 // HUD record lines and record announcements. Public read — it exposes
 // nothing the map leaderboard pages don't already show.
-api.get("/game/topscores", cache(120), wrap(async (req, res) => {
+//
+// Evicted by /api/ingest the moment a record lands on the map, for the same
+// reason ranks is (below) and one more: apitop.as fetches this out of band to
+// VERIFY a pending "new server record" announcement, so a board left stale for
+// the full TTL could confirm a record another node had already beaten — a false
+// announce, not just a late one.
+const topscoresCacheKey = (map) => `/api/game/topscores?map=${String(map || "").toLowerCase()}`;
+api.get("/game/topscores", cache(120, { key: (req) => topscoresCacheKey(req.query.map) }), wrap(async (req, res) => {
   const body = await race.gameTopscoresText(req.query.map);
   if (body == null) return res.status(404).type("text/plain").send("// unknown map\n");
   res.type("text/plain").send(body);
@@ -629,7 +654,10 @@ api.get("/game/topscores", cache(120), wrap(async (req, res) => {
 // Shared cache-key builder for the ranks blob so the store path (the cache()
 // middleware below) and the eviction path (the ingest handler) agree on the
 // exact key regardless of Express req.path/mount quirks. Lowercased to match the
-// map name the game fetches with.
+// map name the game fetches with. (cache()'s defaultKey would build a
+// MOUNT-RELATIVE key here — req.path is "/game/ranks", without the "/api" — so
+// an eviction written against the public URL would silently miss. Both game
+// payloads therefore name their key explicitly rather than inheriting it.)
 const ranksCacheKey = (map) => `/api/game/ranks?map=${String(map || "").toLowerCase()}`;
 
 // True per-player global ranks for game servers (hrace/ranks.as polls this ~60s
@@ -1477,6 +1505,21 @@ api.post(
         source,
         serverId: req.ingest.serverId,
       });
+      // Evict BEFORE the touchServer round trip below, not after: the game asks
+      // for a fresh board within seconds of a finish (hrace/ranks.as fires an
+      // off-schedule pull), so every millisecond the stale blob stays readable is
+      // a millisecond that pull can come back with the pre-finish board.
+      if (counts.inserted || counts.improved) {
+        // A new/improved time reorders the whole map's ranks (it bumps everyone
+        // it passed), so evict the map's cached blobs — the next game fetch
+        // recomputes them. `map` already carries the effective name (incl. any
+        // "-reversed" variant the game reported under); both key builders
+        // lowercase. Topscores rides along because the same record changes the
+        // top-50 board every server shows as `top`, its HUD record lines, and the
+        // board apitop.as verifies a record announcement against.
+        invalidate(ranksCacheKey(map));
+        invalidate(topscoresCacheKey(map));
+      }
       if (req.ingest.serverId != null) {
         await race.touchServer(req.ingest.serverId, counts.inserted + counts.improved);
       }
@@ -1486,11 +1529,6 @@ api.post(
           `ingest ${map} from ${req.ingest.serverName} [${source}]: +${counts.inserted} new, ${counts.improved} improved`
         );
         scheduleAggregateRefresh();
-        // A new/improved time reorders the whole map's ranks (it bumps everyone
-        // it passed), so evict the map's cached ranks blob — the next game fetch
-        // recomputes it. `map` already carries the effective name (incl. any
-        // "-reversed" variant the game reported under). ranksCacheKey lowercases.
-        invalidate(ranksCacheKey(map));
       }
       // Live finishes may complete achievement rules even when no PB changed,
       // so this triggers on every racelog batch (topscores re-syncs excluded —

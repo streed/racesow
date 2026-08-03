@@ -466,6 +466,10 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
             // returning player showed a blank scoreboard "Pos" / time until they
             // re-finished this session.) Then stamp the true global rank.
             player.seedBestFromBoard();
+            // The nick may have just changed, so any rank stamped from a finish
+            // under the OLD one no longer describes this player — drop it before
+            // re-reading the board, or the hold would keep showing it.
+            RACE_ClearFinishRankStamp( player );
             RACE_ApplyGlobalRankTo( player );
             // A rename changes which DB record is "theirs": re-fetch on the new
             // clean name so best_recordTime/Pos follow the current nick.
