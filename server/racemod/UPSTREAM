@@ -4,6 +4,43 @@ Upstream: https://github.com/DenMSC/wsw-race
 Branch:   racemod
 Commit:   c63f9f394657f4e091fa5f6ca04da2ddfd9b404c (2021-09-16)
 
-Local additions:
-  - source/progs/gametypes/hrace/racelog.as  (race-finish event log for the
-    stats collector; see ../../collector/)
+Licence:  GPL-2.0-or-later. See ../../COPYING and ../../AUTHORS. Upstream marks
+          only hrace.as and hrace/entities/items.as with the "Copyright (C)
+          2009-2010 Chasseur de bots" header; this fork keeps that convention.
+
+Divergence from upstream, as of 2026-08-10 (measured against c63f9f3):
+
+  7 files UNCHANGED
+      hrace/position.as, hrace/table.as, and hrace/entities/{accuracy,gates,
+      items,shooters,target_delay,target_speed}.as
+
+  11 files MODIFIED   (base fixes and racesow.org code are interleaved here)
+      hrace/player.as    +1835      hrace.as              +640
+      hrace/commands.as   +516      hrace/recordtime.as   +151
+      hrace/utils.as       +60      hrace/entities/timers.as  +40
+      hrace/math.as        +18      hrace/quickmenu.as     +16
+      hrace/entities/trigger_push_velocity.as +10
+      hrace/checkpoint.as   +6      hrace/entities/target_init.as (net 0)
+
+  23 files NEW
+      announcement apitop awards blockedmaps demos entityfinder ghostbot
+      lastmaps lastrecords maprotate mapweapons meshvote mirror motd
+      playerrecord positionstore racelog ranks savedstarts serverhop
+      tournament  + entities/xonotic
+
+  0 files deleted.
+
+Two things to know before changing anything here:
+
+  * The .as files compile at SERVER BOOT, not at docker build. A green build
+    proves nothing — run server/test/boot-test.sh against the image. Warsow's
+    AngelScript is stricter than Warfork's, so boot Warsow first.
+
+  * ONE source tree feeds BOTH games. The Warfork image copies these scripts
+    and applies warfork/scriptpatches/patch-scripts-as2024.py on top (AS2024
+    `.length` -> `.length()`, and stubbing the Client demo methods Warfork
+    lacks). Do not fork the tree to accommodate one engine.
+
+Upstream is NOT stock-engine-clean either: c63f9f3 itself calls RS_QueryPjState,
+RS_ResetPjState (hrace/player.as) and G_RemoveProjectiles (hrace.as), all of
+which come from racesow engine patches rather than stock Warsow/Warfork.

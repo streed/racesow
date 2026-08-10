@@ -259,6 +259,17 @@ into `backups/db/`; restore with `pg_restore` (see the script header).
   optional shared `INGEST_TOKEN` default is a well-known placeholder, so set a
   real one or leave it empty before exposing port 8080.
 
+## Licence
+
+**GPL-2.0-or-later** — see [COPYING](COPYING) for the full text and
+[AUTHORS](AUTHORS) for provenance.
+
+The race gametype in `server/racemod/` descends from the Warsow `hrace`
+gametype ("Copyright (C) 2009-2010 Chasseur de bots", GPL-2.0-or-later) by way
+of [DenMSC/wsw-race](https://github.com/DenMSC/wsw-race) branch `racemod`, and
+is a derivative work under that licence. The rest of the project is
+distributed under the same terms.
+
 ## Credits
 
 Warsow by the Warsow team · racemod by **hettoo** & **DenMSC** · race database &

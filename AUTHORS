@@ -1,0 +1,49 @@
+Authors and provenance
+======================
+
+This project is licensed under the GNU General Public License version 2 or
+later; see COPYING for the full text. The licence descends from the Warsow
+"hrace" race gametype, whose source headers carry the copyright notice below,
+and applies to the whole of server/racemod/ as a derivative work.
+
+The race gametype (server/racemod/)
+-----------------------------------
+
+Chasseur de bots
+    Original author of the Warsow hrace race gametype.
+    "Copyright (C) 2009-2010 Chasseur de bots", GPL-2.0-or-later — the notice
+    carried by source/progs/gametypes/hrace.as and hrace/entities/items.as.
+    (Upstream marks only those two files; this fork keeps that convention
+    rather than adding headers the original project did not carry.)
+
+hettoo
+    Author of much of the practice/recall tooling this lineage is built on.
+    hrace/positionstore.as is noted in-file as "ported verbatim from
+    hettoo/wsw-race@racemod", and hrace.as carries several "hettoo:"-attributed
+    behaviours (spawn handling, the practicemode message on spectators, and
+    skipping warmup/countdown).
+
+DenMSC ("msc")
+    Maintainer of https://github.com/DenMSC/wsw-race, branch `racemod`, which
+    is the exact upstream this fork was taken from at commit
+    c63f9f394657f4e091fa5f6ca04da2ddfd9b404c (2021-09-16). Several behaviours
+    in hrace.as remain attributed "msc:" in-line (permanent practicemode
+    message, the MAX_ACCEL replacement, the overtime check).
+
+racesow.org contributors
+    Sean Reed and contributors, 2026 — the racesow.org layer: central stats
+    reporting, the cross-server mesh, tournaments, achievements, the WR ghost,
+    live map/MOTD/announcement polling, and the base-gametype fixes listed in
+    the project's upstream-patch queue.
+
+The surrounding server, site and infrastructure
+-----------------------------------------------
+
+Everything outside server/racemod/ (the web application, engine patches,
+Docker images, deployment tooling) is by the racesow.org contributors, and is
+distributed under the same licence.
+
+Third-party components retain their own licences: Warsow and Warfork
+themselves, the qfusion engine lineage the enginepatches apply to, and the
+prejump/projectile natives vendored from Gelmo/warfork-racemod into
+warfork/enginepatches/.
