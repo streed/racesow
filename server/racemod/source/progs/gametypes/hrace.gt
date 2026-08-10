@@ -23,6 +23,7 @@ hrace/entities/xonotic.as;
 hrace/utils.as;
 hrace/entityfinder.as;
 hrace/commands.as;
+hrace/flag.as;
 hrace/player.as;
 hrace/math.as;
 hrace/position.as;
