@@ -1053,3 +1053,42 @@ String RACE_HookCallvotePassedTarget( const String &in votename )
         return tourneymap_pick;
     return "";
 }
+
+// --- /help integration -------------------------------------------------------
+// The tournament commands used to be documented inside base commands.as, which
+// meant a build without this module would still advertise /tournament, /tmaps
+// and /tourneyvote in `/help` and then answer "unknown command" for all three.
+// Pure strings, so they never blocked compilation — just a promise the base mod
+// could not keep.
+
+void RACE_HookHelpList( Table@ cmdlist )
+{
+    cmdlist.addCell( "/tournament [code]" );
+    cmdlist.addCell( "Show the tournament that's on - or enter it with the code from the website." );
+
+    cmdlist.addCell( "/tmaps" );
+    cmdlist.addCell( "List the current tournament's map pool." );
+
+    cmdlist.addCell( "/tourneyvote [map]" );
+    cmdlist.addCell( "Calls a vote to move the server onto a tournament map (a pool number, a name, or nothing for a random one)." );
+}
+
+bool RACE_HookHelpTopic( Client@ client, const String &in command )
+{
+    if ( command != "tournament" && command != "tourney" && command != "tmaps"
+            && command != "tourneyvote" && command != "tvote" )
+        return false;
+
+    client.printMessage( S_COLOR_YELLOW + "/tournament" + "\n" );
+    client.printMessage( S_COLOR_WHITE + "- Shows the tournament that is running (or next up), its map pool and how to enter." + "\n" );
+    client.printMessage( S_COLOR_YELLOW + "/tournament <code>" + "\n" );
+    client.printMessage( S_COLOR_WHITE + "- Enters you into the tournament using the code from the website." + "\n" );
+    client.printMessage( S_COLOR_YELLOW + "/tournament join" + "\n" );
+    client.printMessage( S_COLOR_WHITE + "- Prints where to get a code if you do not have one yet." + "\n" );
+    client.printMessage( S_COLOR_YELLOW + "/tmaps" + "\n" );
+    client.printMessage( S_COLOR_WHITE + "- Lists the current tournament's map pool, numbered for /tourneyvote." + "\n" );
+    client.printMessage( S_COLOR_YELLOW + "/tourneyvote [map]" + "\n" );
+    client.printMessage( S_COLOR_WHITE + "- Calls a vote to move onto a pool map: a /tmaps number, part of a name, or nothing for a random one." + "\n" );
+    client.printMessage( S_COLOR_WHITE + "- Every run you set on a pool map before the tournament ends counts, whenever you entered." + "\n" );
+    return true;
+}

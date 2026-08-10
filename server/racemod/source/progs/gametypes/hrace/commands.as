@@ -730,14 +730,10 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/copystart <player>" );
         cmdlist.addCell( "Start where another player on the server starts (this session only)." );
 
-        cmdlist.addCell( "/tournament [code]" );
-        cmdlist.addCell( "Show the tournament that's on - or enter it with the code from the website." );
-
-        cmdlist.addCell( "/tmaps" );
-        cmdlist.addCell( "List the current tournament's map pool." );
-
-        cmdlist.addCell( "/tourneyvote [map]" );
-        cmdlist.addCell( "Calls a vote to move the server onto a tournament map (a pool number, a name, or nothing for a random one)." );
+        // Optional layers add their own rows here. A base build adds none, so a
+        // server without the racesow.org overlay does not advertise commands
+        // that would answer "unknown command".
+        RACE_HookHelpList( cmdlist );
 
         for ( uint i = 0; i < cmdlist.numRows(); i++ )
             client.printMessage( cmdlist.getRow(i) + "\n" );
@@ -753,21 +749,6 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
     {
         client.printMessage( S_COLOR_YELLOW + "/kill /racerestart" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Respawns you. I mean srsly.. that's it." + "\n" );
-    }
-    else if ( command == "tournament" || command == "tourney" || command == "tmaps" )
-    {
-        client.printMessage( S_COLOR_YELLOW + "/tournament" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Shows the tournament that is running (or next up), its map pool and how to enter." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/tournament <code>" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Enters you using the code you got on racesow.org. Dashes and case don't matter." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/tournament join" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Enters you right now under the name you are playing as, no website needed." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/tmaps" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Just the map pool, numbered." + "\n" );
-        client.printMessage( S_COLOR_YELLOW + "/tourneyvote [map]" + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Calls a vote to move this server onto a pool map: a /tmaps number, a name or part of one," + "\n" );
-        client.printMessage( S_COLOR_WHITE + "  or nothing at all for a random pool map that isn't this one." + "\n" );
-        client.printMessage( S_COLOR_WHITE + "- Every run you set on a pool map before the tournament ends counts, whenever you entered." + "\n" );
     }
     else if ( command == "practicemode" )
     {
@@ -809,6 +790,13 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         client.printMessage( S_COLOR_YELLOW + "/position load" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Teleports you to your saved position depending on which mode you are in." + "\n" );
         client.printMessage( S_COLOR_WHITE + "  Note: This command does not work during race." + "\n" );
+    }
+    // Topics owned by an optional layer (racesow.org: /tournament, /tmaps,
+    // /tourneyvote). Checked before the base topics so an overlay can also
+    // document a command it added; a base build answers false to everything and
+    // the chain carries on unchanged.
+    else if ( RACE_HookHelpTopic( client, command ) )
+    {
     }
     else if ( command == "position" && subcommand == "find" )
     {
