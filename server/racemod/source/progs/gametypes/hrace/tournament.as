@@ -24,9 +24,12 @@
 //      reply landing minutes later would print to whoever holds the slot then),
 //      so a failure simply asks them to try again.
 //
-//   3. Getting everyone onto the right map. "callvote tourneymap [name]" picks
+//   3. Getting everyone onto the right map. "callvote tourneymap [mask]" picks
 //      from the pool and reuses the proven randmap change path (set
-//      randmap_passed, launch POSTMATCH — see commands.as).
+//      randmap_passed, launch POSTMATCH — see commands.as). The mask is a
+//      /tmaps row number, a map name, part of one, or nothing at all for a
+//      random pool map; "/tourneyvote [mask]" is the shortcut that resolves it
+//      and calls that same vote for the resolved map by name.
 //
 //   4. Telling people it is on. A tournament nobody hears about is a tournament
 //      nobody enters, and the website is the only other place it is advertised.
@@ -366,7 +369,7 @@ void RACE_TourneyPitch( Client@ client )
 
     // Assign-then-branch again: which nudge follows depends on where they are.
     String tail = S_COLOR_WHITE + "Pool: " + S_COLOR_ORANGE + "/tmaps" + S_COLOR_WHITE + " - switch to one with "
-        + S_COLOR_ORANGE + "callvote tourneymap" + S_COLOR_WHITE + ".\n";
+        + S_COLOR_ORANGE + "/tourneyvote" + S_COLOR_WHITE + ".\n";
     if ( RACE_TourneyOnPoolMap() )
         tail = S_COLOR_GREEN + "This map is in the pool" + S_COLOR_WHITE + " - your next run scores.\n";
     RACE_TourneyPrintLine( client, tail );
@@ -775,24 +778,93 @@ bool Cmd_TourneyMaps( Client@ client, const String &cmdString, const String &arg
     if ( raceTourneyMaps.length() > shown )
         client.printMessage( S_COLOR_YELLOW + "...and " + ( raceTourneyMaps.length() - shown )
             + " more - the full pool is on the website.\n" );
+    // The list is numbered, so say what the numbers are for: /tourneyvote takes
+    // a row number, and without this the numbering is decoration.
+    client.printMessage( S_COLOR_WHITE + "Move the server onto one with " + S_COLOR_ORANGE
+        + "/tourneyvote <number>" + S_COLOR_WHITE + " - or " + S_COLOR_ORANGE + "/tourneyvote"
+        + S_COLOR_WHITE + " for a random one.\n" );
     return true;
 }
 
-// Pick the map a "callvote tourneymap [name]" should switch to.
+// How many pool maps the last RACE_PickTourneyMap call had to choose between.
+// A global rather than a second out parameter for the same reason
+// randmap_matches is one: the draw and the line that announces it are one step
+// apart in the caller and nothing can run in between.
+uint raceTourneyPickMatches = 0;
+
+/*
+ * /tourneyvote [mask]  call the vote to move this server onto a pool map.
+ *
+ * The mask is the same one "callvote tourneymap" takes — nothing, "*", a /tmaps
+ * row number, a map name or part of one — and this resolves it HERE, then calls
+ * the vote for the resolved map by name. Two things come out of resolving first:
+ * a mask that matches nothing says so to the one player who typed it instead of
+ * opening a vote that dies on validation, and the vote everyone sees quotes the
+ * actual map rather than "*" (the engine's "called a vote" line prints the
+ * argument verbatim).
+ *
+ * The vote itself is the ordinary callvote — same majority, same timeout, same
+ * one-at-a-time rule. This is a shortcut into it, not a second way to move the
+ * server.
+ */
+bool Cmd_TourneyVote( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    if ( rsApiTourneyUrl.string.length() == 0 )
+    {
+        client.printMessage( S_COLOR_RED + "Tournaments are not available on this server.\n" );
+        return false;
+    }
+
+    String why = "";
+    String picked = RACE_PickTourneyMap( argsString.getToken( 0 ), why );
+    if ( picked.length() == 0 )
+    {
+        client.printMessage( S_COLOR_RED + why + "\n" );
+        return false;
+    }
+
+    // Pass the resolved NAME, never the mask: the vote re-resolves its argument
+    // and an exact name beats every other form of match, so what gets loaded is
+    // exactly what was announced here — no second draw.
+    String vote = "callvote tourneymap " + picked;
+    if ( raceTourneyPickMatches > 1 )
+        client.printMessage( S_COLOR_WHITE + "Picked " + S_COLOR_YELLOW + picked + S_COLOR_WHITE
+            + " out of " + raceTourneyPickMatches + " matching pool maps.\n" );
+    // Same fallback as /hop: a server-issued command can be ignored client-side,
+    // so the line they can type themselves is always on screen.
+    client.printMessage( S_COLOR_WHITE + "Calling the vote ... if nothing happens, type: "
+        + S_COLOR_YELLOW + vote + "\n" );
+    client.execGameCommand( vote );
+    return true;
+}
+
+// Pick the map a "callvote tourneymap [map]" should switch to.
 //
-// With no argument: a random pool map that is installed, not blocked and not
-// the current one — so repeated votes walk the pool instead of re-picking where
-// everyone already is. With an argument: that pool map, if it is installed.
-// Returns "" when there is nothing to switch to; `why` explains it.
+// The argument matches the way the rest of the mod matches, because a player who
+// has just read /tmaps types back what /tmaps showed them:
+//
+//   (nothing)   a random pool map that isn't the one everyone is already on
+//   3           the third map of the pool, as /tmaps numbers it
+//   coldrun     that map
+//   aurora      a random pool map whose name contains "aurora"
+//
+// An exact name always beats a substring, so a pool holding both "coldrun" and
+// "coldrun2" can still be voted onto "coldrun". Anything that resolves to the
+// map already loaded is refused rather than drawn: it would pass, reload the
+// same map and read as a broken vote.
 //
 // "Installed" is resolved by INTERSECTING the pool with the engine's own map
 // list rather than probing each name: GetMapsByPattern is the proven
 // enumeration every other vote path uses (it walks ML_GetMapByNum and already
 // drops moderator-blocked maps), so this can never vote the server onto a map
 // the box never downloaded — which would fail the change and strand it.
+//
+// Returns "" when there is nothing to switch to; `why` explains it in a line
+// meant to be printed straight at the caller.
 String RACE_PickTourneyMap( const String &in wanted, String &out why )
 {
     why = "";
+    raceTourneyPickMatches = 0;
     if ( !raceTourneyKnown || raceTourneyMaps.length() == 0 )
     {
         why = "No tournament pool is available right now.";
@@ -802,43 +874,93 @@ String RACE_PickTourneyMap( const String &in wanted, String &out why )
     Cvar mapnameCvar( "mapname", "", 0 );
     String current = mapnameCvar.string.removeColorTokens().tolower();
     String want = wanted.removeColorTokens().tolower();
+    if ( want == "*" )
+        want = ""; // same "surprise me" spelling randmap takes
+
+    // A bare number is a /tmaps row: that listing is numbered, so it is what
+    // gets read out loud. Resolved against the WHOLE pool — the list they saw —
+    // rather than the installed subset, or the numbers would not line up. A map
+    // actually NAMED in digits (there are maps called "001") wins over the row
+    // number, because that is the one reading of the argument that can only have
+    // been meant literally.
+    bool namedExactly = false;
+    for ( uint i = 0; want.length() > 0 && i < raceTourneyMaps.length(); i++ )
+    {
+        if ( raceTourneyMaps[i] == want )
+        {
+            namedExactly = true;
+            break;
+        }
+    }
+    if ( want.length() > 0 && !namedExactly && want.isNumeric() )
+    {
+        int n = want.toInt();
+        if ( n < 1 || n > int( raceTourneyMaps.length() ) )
+        {
+            why = "There is no pool map " + n + ". /tmaps lists the "
+                + raceTourneyMaps.length() + " there are.";
+            return "";
+        }
+        want = raceTourneyMaps[n - 1];
+    }
 
     // Empty pattern = every installed, non-blocked map. Deliberately NOT
-    // passing `ignore`: with an explicit map argument the current map is a
-    // legitimate (if pointless) choice, and the no-argument path filters it
-    // below anyway.
+    // passing `ignore`: the current map is filtered below, where knowing that
+    // it was what the argument asked for is what makes the refusal readable.
     String pattern = "";
     String[] installed = GetMapsByPattern( pattern );
 
-    String[] pool;
+    String[] exact;
+    String[] loose;
+    bool namedCurrent = false;
     for ( uint i = 0; i < raceTourneyMaps.length(); i++ )
     {
         String m = raceTourneyMaps[i];
-        if ( want.length() > 0 && m != want )
+        bool isExact = ( want.length() > 0 && m == want );
+        if ( want.length() > 0 && !isExact && !PatternMatch( m, want ) )
             continue;
-        if ( want.length() == 0 && m == current )
-            continue; // no-op vote
 
-        // Insert the ENGINE's spelling, not the lowercased feed name: that is
+        // Never a candidate, but remember that they asked for it: "you are
+        // already there" and "no such map" are different answers.
+        if ( m == current )
+        {
+            namedCurrent = true;
+            continue;
+        }
+
+        // Take the ENGINE's spelling, not the lowercased feed name: that is
         // what gets handed to `map <name>`, and it is the form every other
         // vote path (randmap, meshvote, the idle rotation) passes through.
         for ( uint j = 0; j < installed.length(); j++ )
         {
             if ( installed[j].removeColorTokens().tolower() == m )
             {
-                pool.insertLast( installed[j] );
+                if ( isExact )
+                    exact.insertLast( installed[j] );
+                else
+                    loose.insertLast( installed[j] );
                 break;
             }
         }
     }
 
+    // Assign-then-branch rather than a ternary over an array (Warsow-AS
+    // strictness): the exact hit wins outright when there is one.
+    String[] pool = loose;
+    if ( exact.length() > 0 )
+        pool = exact;
+
     if ( pool.length() == 0 )
     {
-        if ( want.length() > 0 )
-            why = "\"" + want + "\" is not an installed, unblocked map in the tournament pool.";
+        if ( namedCurrent )
+            why = "This server is already on " + current + ".";
+        else if ( want.length() > 0 )
+            why = "\"" + want + "\" is not an installed, unblocked map in the tournament pool. Try /tmaps.";
         else
             why = "No other tournament map is installed on this server.";
         return "";
     }
+
+    raceTourneyPickMatches = pool.length();
     return pool[randrange( pool.length() )];
 }

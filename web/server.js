@@ -27,6 +27,10 @@ import {
   phaseOf,
   PHASE_LABEL,
   joinOpen,
+  MONTHLY_SERIES_KEY,
+  MONTHLY_SERIES_NAME,
+  monthPeriodKey,
+  monthlyWindow,
 } from "./tournaments.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -434,6 +438,15 @@ api.get("/players/:id/sr", cache(60, { edge: true }), wrap(async (req, res) => {
   res.json(bd);
 }));
 
+// The Skill Rating distribution across the whole ranked board: a histogram plus
+// the median / p90 marks. Deliberately carries no player — every profile draws
+// the same curve and marks its own spot on it from the `srPlace` already in its
+// payload, so this is ONE answer the whole site shares. It only moves when the
+// aggregates are rebuilt, hence the long cache.
+api.get("/sr/distribution", cache(300, { edge: true }), wrap(async (_req, res) => {
+  res.json(await race.srDistribution());
+}));
+
 // Public achievements directory: every active definition with rarity + recent
 // earners. Hidden achievements come back masked (tier + earner count only).
 api.get("/achievements", cache(300, { edge: true }), wrap(async (_req, res) => {
@@ -763,6 +776,48 @@ api.get("/game/blocked-maps", cache(30), wrap(async (_req, res) => {
   res.type("text/plain").send(names.length ? names.join("\n") + "\n" : "");
 }));
 
+// Out-of-band ops channel for a game box's healthcheck watchdog
+// (server/gamehealth.sh), polled every healthcheck interval.
+//
+// This is how an admin force-restart reaches a server that has stopped talking.
+// The panel's older Restart sends `quit` over RCON, which the engine itself has
+// to answer — and in the failure mode that actually matters (fatal game error →
+// game module gone, process spinning) it answers nothing at all: no getinfo, no
+// getstatus, no RCON. The watchdog is a separate process on the box, so it keeps
+// polling regardless, and because the poll is OUTBOUND this works for the US
+// node with no inbound port and no Docker socket anywhere.
+//
+// Deliberately NOT wrapped in cache(): a cached "restart":true would be replayed
+// to every poller for the whole TTL and bounce servers that were never targeted.
+// claimServerRestart clears the flag in the same statement that reads it, so a
+// pending restart is handed out at most once.
+api.get(
+  "/game/ops",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  wrap(async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    // The legacy shared token identifies no particular server, so it must never
+    // be able to claim a restart — it would bounce whichever box happened to ask.
+    if (req.ingest.serverId == null) return res.json({ restart: false });
+    const restart = await race.claimServerRestart(req.ingest.serverId);
+    if (restart) {
+      recordEvent(
+        req.ingest.serverId,
+        `force-restart collected by the server watchdog — engine restart in progress`,
+        "maintenance"
+      );
+    }
+    res.json({ restart });
+  })
+);
+
 // Per-map weapon inventory for the game servers: the gametype polls this
 // (hrace/mapweapons.as via RS_ApiFetchMapWeapons) so `callvote randmap rl` /
 // `randmap strafe` can filter the vote pool by what a map plays like. Plain
@@ -1019,6 +1074,17 @@ setTimeout(scheduleAchievementEval, 15_000).unref();
 // its podium. The query is one indexed range scan that returns nothing
 // 99.99% of the time.
 const TOURNAMENT_SWEEP_MS = Math.max(60_000, parseInt(process.env.TOURNAMENT_SWEEP_MS || "300000", 10));
+// The automatic Monthly Cup is armed by an env var, NOT by a site_setting row.
+// site_setting is dumped WHOLESALE into the public backup (no key filter), so a
+// stored `enabled` flag would both ship publicly and leave a restored mirror
+// with an ARMED generator quietly creating tournaments — precisely the failure
+// the adjacent maintenance_* backup filter exists to prevent. An env var cannot
+// be inherited by a restore, and the emergency stop is one rolling deploy.
+const MONTHLY_CUP = /^(1|true|yes|on)$/i.test(String(process.env.MONTHLY_CUP || ""));
+// Which period we have already warned about a slug collision for. In-memory and
+// per-replica on purpose: the point is to stop a five-minutely repeat within one
+// process, and a restart re-warning once is the correct behaviour anyway.
+let lastSlugTakenPeriod = null;
 let tournamentSweepRunning = false;
 async function sweepTournaments() {
   if (shuttingDown || tournamentSweepRunning) return;
@@ -1035,10 +1101,91 @@ async function sweepTournaments() {
     for (const s of r.scheduled) {
       recordEvent(null, `tournaments: scheduled next edition ${s.slug} (starts ${new Date(s.startsAt * 1000).toISOString()})`, "system");
     }
+    // A tournament that failed to finalize is data the players are waiting on —
+    // it must not be swallowed by the outer catch, which would report the first
+    // failure and hide the rest.
+    for (const f of r.failed || []) {
+      recordEvent(null, `tournaments: FAILED to process tournament ${f.id}: ${f.error}`, "system", "error");
+    }
   } catch (e) {
-    console.error("tournament finalizer failed (will retry):", e?.message ?? e);
+    // recordEvent, not console.error. The previous bare console.error reached
+    // neither /admin/logs nor Sentry (instrument.mjs configures no console
+    // integration), so a persistently throwing sweep produced one stdout line
+    // per replica per five minutes and nothing an operator would ever see.
+    recordEvent(null, `tournaments: finalizer failed (will retry): ${e?.message ?? e}`, "system", "error");
+    Sentry.captureException(e, { tags: { where: "sweepTournaments" } }); // no-op when unconfigured
   } finally {
     tournamentSweepRunning = false;
+  }
+
+  // The Monthly Cup generator is a SEPARATE standing question with its own
+  // error boundary, deliberately outside the block above: finalization mints
+  // trophies players are waiting for, and a bug in month-scheduling must never
+  // be able to stop it.
+  if (!MONTHLY_CUP || shuttingDown) return;
+  try {
+    const m = await race.scheduleMonthlyEdition();
+    // Stay quiet ONLY for the genuinely uneventful outcomes. Gating purely on
+    // `wrote` made every error decision unreachable dead code — including
+    // slug-taken, which writes no row precisely BECAUSE it could not, and which
+    // is the one outcome the operator must see. That produced exactly the
+    // silent-forever loop the discrimination in scheduleMonthlyEdition exists to
+    // prevent: retry every five minutes until the window opens, then lose the
+    // month with no log line, no decision row and nothing in the panel.
+    const QUIET = new Set(["already-decided", "window-open", "blocked-race", "invalid-period"]);
+    if (QUIET.has(m.decision) || (!m.wrote && m.decision !== "slug-taken")) return;
+    if (m.decision === "scheduled" || m.decision === "forced") {
+      const pool = (m.pool || []).map((p) => p.mapName).join(", ");
+      recordEvent(
+        null,
+        `monthly cup: scheduled ${m.slug} for ${m.period} (${new Date(m.window.startsAt * 1000).toISOString()}) — pool: ${pool}` +
+          (m.decision === "forced" ? " [FORCED]" : ""),
+        "system"
+      );
+    } else if (m.decision === "blocked") {
+      const by = (m.detail?.blockedBy || []).map((b) => b.slug).join(", ");
+      recordEvent(
+        null,
+        `monthly cup: ${m.period} BLOCKED — the first week is already booked by ${by}. ` +
+          `Cancel it before the window opens and the edition schedules itself.`,
+        "system",
+        "warn"
+      );
+    } else if (m.decision === "skipped_overlap") {
+      recordEvent(
+        null,
+        `monthly cup: ${m.period} SKIPPED — pool shares ${(m.detail?.collided || []).join(", ")} with the previous edition`,
+        "system",
+        "warn"
+      );
+    } else if (m.decision === "skipped_thin") {
+      recordEvent(null, `monthly cup: ${m.period} SKIPPED — ${m.detail?.reason}`, "system", "warn");
+    } else if (m.decision === "cancelled") {
+      recordEvent(null, `monthly cup: ${m.period} will not run — an operator cancelled its edition`, "system", "warn");
+    } else if (m.decision === "slug-taken") {
+      // Not a peer race: a real row is squatting the slug and no amount of
+      // retrying will clear it. This one writes NO decision row (it could not),
+      // so it has none of recordAutoPeriod's built-in de-duplication — without
+      // the guard below it would emit one error every five minutes until the
+      // window opens, ~216 lines into a 20,000-row ring buffer shared with four
+      // game servers.
+      if (lastSlugTakenPeriod !== m.period) {
+        lastSlugTakenPeriod = m.period;
+        recordEvent(
+          null,
+          `monthly cup: ${m.period} CANNOT be created — the slug is already used by another ` +
+            `tournament (${m.error}). Nothing will schedule this month until that row is renamed, ` +
+            `deleted, or its window freed.`,
+          "system",
+          "error"
+        );
+      }
+    }
+  } catch (e) {
+    // Never write a decision row on a thrown error — a transient fault must not
+    // permanently decide the month.
+    recordEvent(null, `monthly cup: generator failed (will retry): ${e?.message ?? e}`, "system", "error");
+    Sentry.captureException(e, { tags: { where: "scheduleMonthlyEdition" } }); // no-op when unconfigured
   }
 }
 let tournamentSweepTimer = setInterval(sweepTournaments, TOURNAMENT_SWEEP_MS);
@@ -2870,6 +3017,11 @@ function tournamentFormHtml(session, t, maps, action, { defaultStart = null } = 
       <span class="meta">draft = invisible on the site · published = live on the calendar</span></label>
     <label>Map pool — one map name per line (they must already exist on the site)
       <textarea name="maps" rows="8" required placeholder="hrace_line&#10;pornstar&#10;…">${v(maps)}</textarea></label>
+    ${t && phaseOf(t) === "live"
+      ? `<p class="msg err">This tournament is <b>live</b>. The pool is resolved when the board is
+          read, not frozen — so REMOVING a map here deletes every point already scored on it and
+          reorders the standings under players who are watching them. Adding one is safe.</p>`
+      : ""}
     <label><input type="checkbox" name="joinOpen" style="width:auto" ${!t || t.join_open ? "checked" : ""}> Accepting entries</label>
     <label>Repeat every N days after it ends (0 = one-off)
       <input name="repeatEveryDays" type="number" min="0" max="365" value="${v(t ? t.repeat_every_days : 0)}"></label>
@@ -2897,9 +3049,146 @@ function tournamentInput(body) {
   };
 }
 
+// The Monthly Cup panel. Read-only apart from one force button: everything it
+// shows is either a constant or a decision row, and a decision that has already
+// been made is not something to edit — it is something to override explicitly.
+//
+// The panel exists because a SKIPPED month and a BROKEN generator look identical
+// from outside, and server_log is a capped ring buffer that will have pruned the
+// explanation long before anyone asks. This is where the durable answer lives.
+async function monthlyCupPanelHtml(session, armed) {
+  if (!armed) {
+    return `<div class="card" style="margin-bottom:14px">
+      <h2 style="margin-top:0">${escHtml(MONTHLY_SERIES_NAME)}</h2>
+      <p class="meta">Not armed on this instance. Set <code>MONTHLY_CUP=1</code> in the web
+        service environment and roll the web layer to enable it.</p></div>`;
+  }
+  // Preview the next period that can still BE decided. For all but ~18 hours a
+  // month the current period's window has already opened, so previewing it would
+  // show a month the generator can no longer touch — and, once its edition
+  // exists, would report the live cup as its own blocker.
+  const now = Math.floor(Date.now() / 1000);
+  let period = monthPeriodKey(now);
+  if (now >= monthlyWindow(period).startsAt) period = monthPeriodKey(monthlyWindow(period).startsAt + 40 * 86400);
+  const [decisions, preview] = await Promise.all([
+    race.autoPeriods(MONTHLY_SERIES_KEY, 12),
+    // dryRun suppresses only the WRITES — it reads the same state the real pass
+    // reads, so the preview cannot claim it "would pick" a month that is already
+    // decided.
+    race.scheduleMonthlyEdition({ dryRun: true, period, now })
+      .catch((e) => ({ decision: "preview-failed", error: e?.message })),
+  ]);
+  const win = monthlyWindow(period);
+  const rows = decisions.length
+    ? decisions
+        .map((d) => {
+          const detail = d.detail || {};
+          // A month that was forced records as `scheduled` — once the edition
+          // exists that IS the decision, and leaving it non-terminal would make
+          // the generator re-decide it forever. The override survives in
+          // detail.reason, so surface it here or the panel quietly loses the one
+          // fact an operator most wants to see.
+          const why =
+            d.decision === "scheduled" || d.decision === "forced"
+              ? (detail.reason && /forced/i.test(detail.reason) ? `[${detail.reason}] ` : "") +
+                (detail.pool || []).map((p) => p.map).join(", ")
+              : d.decision === "blocked"
+                ? `booked by ${(detail.blockedBy || []).map((b) => b.slug).join(", ")}`
+                : d.decision === "skipped_overlap"
+                  ? `shares ${(detail.collided || []).join(", ")} with the previous edition`
+                  : detail.reason || "";
+          // Offer the override only where it can actually take effect: once the
+          // window has opened the generator does nothing, so the button would be
+          // a no-op that reports success.
+          const canForce =
+            (d.decision === "skipped_overlap" || d.decision === "skipped_thin") &&
+            monthlyWindow(d.period) && now < monthlyWindow(d.period).startsAt;
+          return `<tr>
+            <td><b>${escHtml(d.period)}</b></td>
+            <td><span class="tag">${escHtml(d.decision)}</span></td>
+            <td class="meta">${escHtml(why)}</td>
+            <td class="meta">${d.tournament_id ? `<a href="/admin/tournaments/${d.tournament_id}">edition ↗</a>` : ""}
+              ${canForce
+                ? `<form class="inline" method="post" action="/admin/tournaments/monthly/${escHtml(d.period)}/force">
+                     <input type="hidden" name="_csrf" value="${escHtml(session.csrf)}">
+                     <button type="submit">Run this month anyway</button></form>`
+                : ""}</td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="4" class="meta">No decisions recorded yet.</td></tr>`;
+
+  const previewHtml =
+    preview.decision === "preview-failed"
+      ? `<span class="meta">preview unavailable: ${escHtml(String(preview.error || ""))}</span>`
+      : preview.decision === "scheduled" || preview.decision === "forced"
+        ? `would pick <b>${escHtml((preview.pool || []).map((p) => p.mapName).join(", "))}</b>`
+        : `would record <span class="tag">${escHtml(preview.decision)}</span> — ${escHtml(String(preview.detail?.reason || ""))}`;
+
+  return `<div class="card" style="margin-bottom:14px">
+    <h2 style="margin-top:0">${escHtml(MONTHLY_SERIES_NAME)} <span class="tag">armed</span></h2>
+    <p class="meta">First week of every month (day 1 18:00 → day 8 18:00 UTC), pooled from the
+      most-finished maps of the previous month. A month whose pool shares any map with the
+      previous edition is skipped.</p>
+    <p class="meta"><b>${escHtml(period)}</b> window:
+      ${win ? `${fmtWhen(win.startsAt)} → ${fmtWhen(win.endsAt)}` : "—"} · on today's data it ${previewHtml}</p>
+    <table><thead><tr><th>Month</th><th>Decision</th><th>Why</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>
+  </div>`;
+}
+
+// Warn — never block — when a hand-booked window would eat a Monthly Cup slot.
+//
+// Precedence is first come, first served: the automatic series does not outrank
+// a deliberate operator booking, and auto-cancelling the blocker would destroy
+// real intent. But the block is otherwise invisible until it silently happens,
+// and there is a compounding dynamic worth interrupting: a skipped month leaves
+// the first week free, an admin books it, that booking blocks the NEXT edition,
+// and every step looks locally reasonable while the series quietly stops.
+function monthlyBlockWarning(startsAt, endsAt, row = null) {
+  if (!MONTHLY_CUP) return "";
+  // The Monthly Cup's own edition occupies the Monthly Cup's own slot by
+  // construction, so warning about it would tell an admin to cancel the very
+  // tournament they are editing in order to unblock it.
+  if (row && (row.created_by === "auto-monthly" || row.series_key === MONTHLY_SERIES_KEY)) return "";
+  const hit = [];
+  const now = Math.floor(Date.now() / 1000);
+  let period = monthPeriodKey(now);
+  for (let i = 0; i < 14 && hit.length < 3; i++) {
+    const w = monthlyWindow(period);
+    if (!w) break;
+    if (w.endsAt > now && Number(startsAt) < w.endsAt && w.startsAt < Number(endsAt)) hit.push(period);
+    // Step to the next month via the window's own start, so month lengths and
+    // the year rollover are handled by the same arithmetic as everywhere else.
+    period = monthPeriodKey(w.startsAt + 40 * 86400);
+  }
+  return hit.length
+    ? ` NOTE: this window overlaps the Monthly Cup slot for ${hit.join(", ")}, which will be ` +
+      `recorded as blocked and will NOT run. Cancel or move this tournament before the 1st to free it.`
+    : "";
+}
+
+admin.post("/tournaments/monthly/:period/force", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const period = String(req.params.period || "");
+  if (!/^\d{4}-\d{2}$/.test(period))
+    return res.redirect(303, `/admin/tournaments?error=${encodeURIComponent("Bad period.")}`);
+  const n = await race.forceMonthlyPeriod(MONTHLY_SERIES_KEY, period, req.session.username);
+  if (n && n.error) return res.redirect(303, `/admin/tournaments?error=${encodeURIComponent(n.error)}`);
+  if (!n)
+    return res.redirect(303, `/admin/tournaments?error=${encodeURIComponent(
+      "Only a skipped month can be forced — that one already produced an edition or is still open."
+    )}`);
+  recordEvent(null, `monthly cup: ${period} forced by ${req.session.username}`, "system", "warn");
+  res.redirect(303, `/admin/tournaments?done=${encodeURIComponent(
+    `${period} will be re-decided on the next sweep (within ${Math.round(TOURNAMENT_SWEEP_MS / 60000)} min), ignoring the overlap rule.`
+  )}`);
+}));
+
 admin.get("/tournaments", requireAuth, wrap(async (req, res) => {
   const done = req.query.done ? `<div class="msg ok">${escHtml(String(req.query.done))}</div>` : "";
   const err = req.query.error ? `<div class="msg err">${escHtml(String(req.query.error))}</div>` : "";
+  const monthly = await monthlyCupPanelHtml(req.session, MONTHLY_CUP);
   const { rows } = await race.tournaments({ includeDrafts: true, limit: 200 });
   const body = rows.length
     ? `<table><thead><tr><th>Tournament</th><th>Window (UTC)</th><th>Phase</th><th>Maps</th><th>Entrants</th><th>Scoring</th></tr></thead><tbody>${rows
@@ -2922,6 +3211,7 @@ admin.get("/tournaments", requireAuth, wrap(async (req, res) => {
       <code>/tournament &lt;code&gt;</code> · public calendar at
       <a href="/tournaments" target="_blank" rel="noopener">/tournaments ↗</a>.</p>
     ${done}${err}
+    ${monthly}
     <div class="actions" style="margin-bottom:14px"><a class="btn" href="/admin/tournaments/new">+ New tournament</a></div>
     ${body}`, req.session);
 }));
@@ -2962,9 +3252,9 @@ admin.post("/tournaments/new", requireAuth, wrap(async (req, res) => {
   if (created && created.conflict)
     return res.redirect(303, `/admin/tournaments/new?error=${encodeURIComponent(TOURNAMENT_OVERLAP_RACE)}`);
   if (!created) return res.redirect(303, `/admin/tournaments/new?error=${encodeURIComponent("That slug is already taken.")}`);
-  const note = created.unraced.length
+  const note = (created.unraced.length
     ? `Created. Heads up — nobody has ever finished these pool maps, so check for a typo: ${created.unraced.join(", ")}`
-    : "Created.";
+    : "Created.") + monthlyBlockWarning(v.value.starts_at, v.value.ends_at);
   recordEvent(null, `tournament created: ${v.value.slug} by ${req.session.username}`, "system");
   res.redirect(303, `/admin/tournaments/${created.id}?done=${encodeURIComponent(note)}`);
 }));
@@ -3054,9 +3344,20 @@ admin.post("/tournaments/:id", requireAuth, wrap(async (req, res) => {
   if (r === null) return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent("That slug is already taken.")}`);
   if (!r.rows)
     return res.redirect(303, `/admin/tournaments/${id}?error=${encodeURIComponent("Not saved — a finalized tournament can't be edited.")}`);
-  const note = r.unraced.length
+  // The edit route logged NOTHING until now, while create and status-flip both
+  // did. That asymmetry mattered little when a pool was hand-typed once; it
+  // matters a lot now that editing the pool is the designated correction path
+  // for a bad automatic selection, and that setTournamentMaps is
+  // DELETE-then-INSERT over a pool resolved at read time.
+  recordEvent(
+    null,
+    `tournament edited: ${v.value.slug} by ${req.session.username} — pool now [${v.value.mapNames.join(", ")}]`,
+    "system"
+  );
+  const warn = monthlyBlockWarning(v.value.starts_at, v.value.ends_at, await race.tournamentById(id));
+  const note = (r.unraced.length
     ? `Saved. Heads up — nobody has ever finished these pool maps, so check for a typo: ${r.unraced.join(", ")}`
-    : "Saved.";
+    : "Saved.") + warn;
   res.redirect(303, `/admin/tournaments/${id}?done=${encodeURIComponent(note)}`);
 }));
 
@@ -3211,16 +3512,25 @@ admin.get("/servers", requireAuth, wrap(async (req, res) => {
         const state = li && li.online
           ? `<span class="st-resolved">online</span>${li.map ? ` · ${escHtml(li.map)}` : ""}${li.players ? ` · ${li.players.length}p` : ""}`
           : `<span class="st-dismissed">offline</span>`;
+        // A force-restart sits pending until the box's watchdog polls for it, so
+        // say so — otherwise a moderator sees "nothing happened" for up to a
+        // healthcheck interval and clicks again.
+        const pending = s.restart_requested_at
+          ? `<div class="note">force-restart pending since ${fmtWhen(s.restart_requested_at)}${
+              s.restart_requested_by ? ` (${escHtml(s.restart_requested_by)})` : ""
+            } — the server collects it on its next check</div>`
+          : "";
+        const forceBtn = `<a class="btn danger" href="/admin/servers/${s.id}/force-restart">Force restart</a>`;
         return `<tr>
-          <td>${escHtml(s.name)}${s.status !== "trusted" ? ` <span class="st-dismissed">(${escHtml(s.status)})</span>` : ""}</td>
+          <td>${escHtml(s.name)}${s.status !== "trusted" ? ` <span class="st-dismissed">(${escHtml(s.status)})</span>` : ""}${pending}</td>
           <td class="meta">${s.address ? escHtml(s.address) : "—"}</td>
           <td>${s.rcon ? '<span class="st-resolved">yes</span>' : '<span class="st-dismissed">no</span>'}</td>
           <td>${state}</td>
           <td class="meta">${fmtWhen(s.last_seen_at)}</td>
           <td>${
             isAdmin
-              ? `${s.rcon ? `<a class="btn" href="/admin/servers/${s.id}/rcon">Console</a> <a class="btn danger" href="/admin/servers/${s.id}/restart">Restart</a> ` : ""}<a class="btn" href="/admin/logs?server=${s.id}">Logs</a>`
-              : (s.rcon ? `<a class="btn danger" href="/admin/servers/${s.id}/restart">Restart</a>` : `<span class="meta">—</span>`)
+              ? `${s.rcon ? `<a class="btn" href="/admin/servers/${s.id}/rcon">Console</a> <a class="btn danger" href="/admin/servers/${s.id}/restart">Restart</a> ` : ""}${forceBtn} <a class="btn" href="/admin/logs?server=${s.id}">Logs</a>`
+              : `${s.rcon ? `<a class="btn danger" href="/admin/servers/${s.id}/restart">Restart</a> ` : ""}${forceBtn}`
           }</td>
         </tr>`;
       }).join("")
@@ -3400,6 +3710,78 @@ admin.post("/servers/:id/restart", requireAuth, wrap(async (req, res) => {
       : `Sent restart to ${s.name}. It wasn't showing as online, but if it was up it'll relaunch within a few seconds.`
     : `Couldn't restart ${s.name}: ${result.error || (result.authFailed ? "bad rcon password" : "no reply")}.`;
   res.redirect(303, `/admin/servers?${result.ok ? "done" : "error"}=` + encodeURIComponent(summary));
+}));
+
+// Force restart — the one that still works when the server has stopped talking.
+//
+// The RCON Restart above needs the engine to receive and act on `quit`. A wedged
+// engine (fatal game error, game module gone, process spinning) receives
+// nothing, which is exactly when someone reaches for this page. So instead of
+// sending anything, we raise a flag and let the box's healthcheck watchdog
+// collect it on its next poll and kill the engine locally. Slower (one
+// healthcheck interval) but it does not depend on the thing that is broken.
+admin.get("/servers/:id/force-restart", requireAuth, wrap(async (req, res) => {
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad server id");
+  const s = await race.serverById(id);
+  if (!s) return res.status(404).type("text/plain").send("server not found");
+  const csrf = escHtml(req.session.csrf);
+  const li = (live.getLive().servers || []).find((x) => x.id === s.id) || null;
+  const playing = li && li.online && Array.isArray(li.players) ? li.players.length : 0;
+  const impact = playing
+    ? `<b>${playing}</b> player${playing === 1 ? " is" : "s are"} connected right now and will be dropped.`
+    : "No players are showing as connected.";
+  const pending = s.restart_requested_at
+    ? `<div class="msg err">A force-restart is already pending since ${fmtWhen(s.restart_requested_at)}${
+        s.restart_requested_by ? ` (by ${escHtml(s.restart_requested_by)})` : ""
+      } and has not been collected yet. If the box is offline entirely, no watchdog is running to collect it.
+      <form class="inline" method="post" action="/admin/servers/${s.id}/force-restart" style="margin-top:8px">
+        <input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="action" value="cancel">
+        <button type="submit">Withdraw the pending request</button></form></div>`
+    : "";
+  sendAdmin(res, `Force restart · ${s.name}`, `
+    <div class="crumbs"><a href="/admin/servers">← servers</a></div>
+    <h1>Force restart ${escHtml(s.name)}?</h1>
+    <p class="sub">${s.address ? escHtml(s.address) : "no address"}</p>
+    ${pending}
+    <div class="card">
+      <p>This does <b>not</b> send anything to the server. It flags a restart that the
+         server's own healthcheck watchdog picks up on its next check — usually within
+         about 20&nbsp;seconds — and acts on locally, by restarting the game engine.
+         A server that only just started holds the request until it has finished
+         booting, rather than being killed mid-startup.</p>
+      <p>Use this when the ordinary <a href="/admin/servers/${s.id}/restart">Restart</a> does nothing —
+         a wedged engine stops answering RCON and the server browser alike, so
+         <span style="font-family:monospace">quit</span> never arrives. This path does not need the engine
+         to be working; it only needs the box to be up. ${impact}</p>
+      <form class="inline" method="post" action="/admin/servers/${s.id}/force-restart">
+        <input type="hidden" name="_csrf" value="${csrf}">
+        <button class="danger" type="submit">Flag a force restart</button>
+        <a class="btn" href="/admin/servers" style="margin-left:8px">Cancel</a>
+      </form>
+    </div>`, req.session);
+}));
+
+admin.post("/servers/:id/force-restart", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const id = asInt(req.params.id);
+  if (id == null) return res.status(400).type("text/plain").send("bad server id");
+  const s = await race.serverById(id);
+  if (!s) return res.status(404).type("text/plain").send("server not found");
+
+  if ((req.body || {}).action === "cancel") {
+    await race.cancelServerRestart(s.id);
+    recordEvent(s.id, `force-restart request withdrawn by ${req.session.username}`, "maintenance");
+    return res.redirect(303, "/admin/servers?done=" + encodeURIComponent(`Withdrew the pending force restart for ${s.name}.`));
+  }
+
+  await race.requestServerRestart(s.id, req.session.username);
+  recordEvent(s.id, `force-restart flagged by ${req.session.username} (awaiting the server's watchdog poll)`, "maintenance", "warn");
+  res.redirect(
+    303,
+    "/admin/servers?done=" +
+      encodeURIComponent(`Force restart flagged for ${s.name} — it should be collected within ~20s.`)
+  );
 }));
 
 admin.get("/logs", requireAdmin, wrap(async (req, res) => {

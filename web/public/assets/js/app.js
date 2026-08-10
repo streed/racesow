@@ -561,6 +561,126 @@ function wireSrBreakdown(playerId) {
   });
 }
 
+/* ---- Skill Rating distribution (where you stand) ------------------------ *
+ * The whole ranked board as a histogram with one bar lit up: yours. A rating on
+ * its own says nothing — 412 is only meaningful next to the shape of everyone
+ * else's — so the number the card actually leads with is the percentile, which
+ * the server counts exactly (`srPlace`) rather than reading off a bucket.
+ *
+ * The curve is identical on every profile, so it is fetched once from the
+ * shared /sr/distribution and only the marker moves. That also means the card
+ * degrades cleanly: the percentile is already in the profile payload, so a
+ * failed histogram fetch loses the picture, not the answer.                  */
+function srDistCard() {
+  return `
+    <div class="page-title" style="font-size:20px">SKILL RATING <span class="accent">·</span> where you stand</div>
+    <div class="panel srdist" id="srdist"><div class="srdist-note">Loading the rating distribution…</div></div>`;
+}
+
+// One bar per rating band, height = how many ranked players are in it, with the
+// player's own band lit and their exact rating marked. Single series, so no
+// legend: the title names it and the marker is direct-labelled.
+function srDistChart(dist, place, sr) {
+  const W = 660, H = 176, padL = 42, padR = 14, padT = 28, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const lo = dist.lo, hi = dist.hi, baseY = H - padB;
+  const n = (v) => v.toFixed(1);
+  const maxC = Math.max(1, ...dist.buckets.map((b) => b.count));
+  const slot = plotW / dist.buckets.length;
+  // Ratings -> px. Clamped because the marker draws from a live rating while the
+  // histogram bounds come from a cached snapshot: between the two, a new WR can
+  // put someone a few points outside the range the buckets were built for.
+  const xOf = (v) => padL + Math.max(0, Math.min(1, (v - lo) / (hi - lo || 1))) * plotW;
+
+  const bars = dist.buckets
+    .map((b, i) => {
+      const h = (b.count / maxC) * plotH;
+      // The top band is closed at both ends (nothing is above it), so a rating
+      // sitting exactly on `hi` belongs to it rather than to nothing.
+      const last = i === dist.buckets.length - 1;
+      const mine = place != null && sr >= b.lo && (sr < b.hi || (last && sr <= b.hi));
+      // 2px of surface between bars: adjacent fills must never touch.
+      return `<rect class="srdbar${mine ? " me" : ""}" x="${n(padL + i * slot)}" y="${n(baseY - h)}"
+        width="${n(Math.max(1, slot - 2))}" height="${n(h)}" rx="2"
+        ><title>${fmtNum(b.lo)}–${fmtNum(b.hi)} SR · ${fmtNum(b.count)} player${b.count === 1 ? "" : "s"}</title></rect>`;
+    })
+    .join("");
+
+  // Median reference, dropped when it would sit on top of an axis-end label.
+  const medX = xOf(dist.median);
+  const medLabel =
+    medX > padL + 54 && medX < W - padR - 54
+      ? `<text class="sraxd srdmedl" x="${n(medX)}" y="${H - 6}" text-anchor="middle">median ${fmtNum(dist.median)}</text>`
+      : "";
+  const median =
+    dist.median == null
+      ? ""
+      : `<line class="srdmed" x1="${n(medX)}" y1="${padT}" x2="${n(medX)}" y2="${baseY}"/>${medLabel}`;
+
+  let marker = "";
+  if (place != null) {
+    const x = xOf(sr);
+    // Keep the label inside the plot: anchored middle in open space, flipped to
+    // start/end near the edges so it can never run off the chart.
+    const anchor = x < padL + 46 ? "start" : x > W - padR - 46 ? "end" : "middle";
+    const lx = anchor === "start" ? padL : anchor === "end" ? W - padR : x;
+    marker = `
+      <line class="srdme" x1="${n(x)}" y1="${padT - 10}" x2="${n(x)}" y2="${baseY}"/>
+      <text class="srdmel" x="${n(lx)}" y="${padT - 14}" text-anchor="${anchor}">YOU · ${fmtNum(sr)}</text>`;
+  }
+
+  const aria =
+    place != null
+      ? `Skill Rating distribution of ${fmtNum(dist.total)} ranked players from ${fmtNum(lo)} to ${fmtNum(hi)}; this player is at ${fmtNum(sr)}, ahead of ${place.percentile}% of them`
+      : `Skill Rating distribution of ${fmtNum(dist.total)} ranked players from ${fmtNum(lo)} to ${fmtNum(hi)}`;
+
+  return `
+    <svg class="srchart srdchart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(aria)}">
+      <line class="srgrid" x1="${padL}" y1="${padT}" x2="${W - padR}" y2="${padT}"/>
+      <text class="sraxl" x="${padL - 7}" y="${padT}" text-anchor="end" dominant-baseline="middle">${fmtNum(maxC)}</text>
+      ${bars}
+      ${median}
+      ${marker}
+      <line class="srdaxis" x1="${padL}" y1="${baseY}" x2="${W - padR}" y2="${baseY}"/>
+      <text class="sraxd" x="${padL}" y="${H - 6}" text-anchor="start">${fmtNum(lo)}</text>
+      <text class="sraxd" x="${W - padR}" y="${H - 6}" text-anchor="end">${fmtNum(hi)}</text>
+    </svg>`;
+}
+
+function renderSrDist(dist, place, sr) {
+  if (!dist || !dist.total || !dist.buckets || !dist.buckets.length)
+    return `<div class="srdist-note">No ratings on the board yet.</div>`;
+
+  // Unranked (no standings row): the curve is still worth showing, but there is
+  // no place on it to claim.
+  const head =
+    place == null
+      ? `<div class="srdist-head"><div class="srdist-sub">Not on the rating board yet — set a time on a map two other players have raced and a rating (and a place on this curve) starts building.</div></div>`
+      : `<div class="srdist-head">
+          <div class="srdist-pct"><div class="n">${place.percentile.toFixed(1)}<span class="sfx">th</span></div><div class="l">percentile</div></div>
+          <div class="srdist-sub">Ahead of <b>${place.percentile.toFixed(1)}%</b> of the ${fmtNum(place.total)} ranked players
+            <span class="sep">·</span> <b>#${fmtNum(place.rank)}</b> by rating
+            <span class="sep">·</span> top <b>${(100 - place.percentile).toFixed(1)}%</b></div>
+        </div>`;
+
+  return `${head}
+    ${srDistChart(dist, place, sr)}
+    <div class="srdist-cap">Every ranked player, bucketed by rating: each bar is a rating band and its height is how many players sit in it. Hover a bar for the count.</div>`;
+}
+
+// Fetched after the profile renders (the percentile itself is already on screen
+// from the profile payload, so this only fills in the picture).
+async function wireSrDistribution(d) {
+  const host = document.getElementById("srdist");
+  if (!host) return;
+  const sr = d.standing ? d.standing.sr : null;
+  try {
+    host.innerHTML = renderSrDist(await api("/sr/distribution"), d.srPlace || null, sr);
+  } catch (e) {
+    host.innerHTML = `<div class="srdist-note">Couldn't load the rating distribution (${esc(e.message)}).</div>`;
+  }
+}
+
 // Air-strafe quality trend: the by-day average accel efficiency (how close the
 // player stays to the ideal strafe angle) over the rolling window, mirroring the
 // SR-history card but themed distinctly and formatted as a percentage.
@@ -1210,6 +1330,8 @@ async function viewPlayer(id, params) {
       <div>${strafeQualityCard(d.strafeHistory)}</div>
     </div>
 
+    ${srDistCard()}
+
     ${trophiesCard(d.trophies)}
 
     ${achievementsCard(d.achievements)}
@@ -1256,6 +1378,7 @@ async function viewPlayer(id, params) {
     );
   wireSort(`#/player/${id}`, state, ["map", "time", "rank", "attempts"]);
   wireSrBreakdown(d.id); // canonical id — the breakdown endpoint resolves either, but keep the link stable
+  wireSrDistribution(d);
   wireAchievements(d.id);
   // (The address bar is already the clean /player/<id> path from pushState —
   // where the server-rendered OG tags for Discord/social unfurls live.)
@@ -1835,7 +1958,7 @@ const ABOUT_FAQ = [
   ["Can I watch a record?",
     "Yes. Open any map and look for a <b>▶ replay</b> badge to watch the ghost right in your browser, or <b>⬇ demo</b> to download it. To play a demo back in Warsow, drop the file in your <span class=\"mono\">racemod/demos</span> folder and run <span class=\"mono\">demo &lt;file&gt;</span> in the console."],
   ["How is the ranking worked out?",
-    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: on each map it measures how close your time is to the world record, weighted by how many players you beat, and your rating is the average across <b>50 map slots</b> on a 0–1000 scale, filled by your strongest maps. Everyone is measured on the same 50, so a deep catalog and a short one are compared like for like — but that also means all 50 count: a slow run inside them pulls the number down, and it's worth going back to improve your weakest. Any slot you haven't filled yet sits at the starting rating, so a short catalog climbs as you race more maps. Because every run is measured against the current world record, your SR can also drift down even when you haven't raced. If someone lowers a record on one of your best maps, you sit a little further from the top. Only contested maps count (you and at least two other players with a time on it). Any profile's Skill Rating card has a <b>“Which maps make up this rating?”</b> dropdown that lists exactly which maps went into the number, in order. World records and podium finishes are tracked separately on your profile."],
+    "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: on each map it measures how close your time is to the world record, weighted by how many players you beat, and your rating is the average across <b>50 map slots</b> on a 0–1000 scale, filled by your strongest maps. Everyone is measured on the same 50, so a deep catalog and a short one are compared like for like — but that also means all 50 count: a slow run inside them pulls the number down, and it's worth going back to improve your weakest. Any slot you haven't filled yet sits at the starting rating, so a short catalog climbs as you race more maps. Because every run is measured against the current world record, your SR can also drift down even when you haven't raced. If someone lowers a record on one of your best maps, you sit a little further from the top. Only contested maps count (you and at least two other players with a time on it). Any profile's Skill Rating card has a <b>“Which maps make up this rating?”</b> dropdown that lists exactly which maps went into the number, in order, and a <b>“where you stand”</b> chart underneath that plots every ranked player's rating so you can see which percentile yours falls in. World records and podium finishes are tracked separately on your profile."],
   ["A map is broken or shouldn't be here — what do I do?",
     "Flag it for review. In-game, type <span class=\"mono\">/flag</span> while you're on the map (add a reason if you like, e.g. <span class=\"mono\">/flag broken</span>). Or open the map on this site and hit <b>⚑ Flag this map for review</b>. Moderators check flagged maps and can pull a bad one from the vote pool and map cycle."],
 ];
@@ -2576,8 +2699,9 @@ async function viewTournament(slug) {
           ? "Scoring is <b>total time</b>: your best time on each pool map, added up. Only players who finish <em>every</em> map are ranked."
           : "Scoring is <b>placement points</b>: on each pool map your best time is ranked against the other entrants, and the top 15 score 100 / 85 / 75 / … points. Your total is the sum across the pool."
       }</p>
-      <p>In-game: <code>/tournament</code> shows what's on, <code>/tmaps</code> lists the pool, and
-        <code>callvote tourneymap</code> moves the server onto a pool map.</p>
+      <p>In-game: <code>/tournament</code> shows what's on, <code>/tmaps</code> lists the pool numbered, and
+        <code>/tourneyvote &lt;number&gt;</code> calls the vote to move the server onto one of them
+        (no argument picks a random pool map).</p>
     </div>`;
 
   wireTournamentJoin(t.slug);

@@ -76,6 +76,22 @@ services:
       MIRROR_SECRET: "${MIRROR_SECRET:-}"      # SAME shared key as the Warsow nodes
       MIRROR_PORT: "44451"
       MIRROR_TAG: "${WF_MIRROR_TAG:-}"         # US-WF / EU-WF
+    # Same watchdog as the Warsow tier, and this is the tier that proved it was
+    # needed: on 2026-08-08 the idle rotation switched to a map whose brush
+    # models won't load, the game module died ("GClip_SetBrushModel: NULL model
+    # in 'trigger_multiple'"), and the engine then spun at 100% CPU answering
+    # nothing for 38 hours. The container never exited, so `restart:
+    # unless-stopped` had nothing to react to and Docker reported it Up.
+    # gamehealth.sh probes with getinfo and restarts the engine when it stops
+    # replying. (It signals the engine, which is why warfork/entrypoint.sh now
+    # supervises it as a child instead of exec'ing it — signals to PID 1 are
+    # discarded by the kernel.)
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gamehealth.sh"]
+      interval: 20s
+      timeout: 15s
+      retries: 6          # ~2 min of unbroken silence before a restart
+      start_period: 240s  # cold boot answers nothing for a while
     volumes:
       # SHARED map pool — identical host dir the Warsow service mounts. Read-only.
       # The entrypoint symlinks these pk3s into the racesow fs_game dir so the

@@ -96,13 +96,30 @@ rule, enforced in four layers of increasing firmness:
    the previous one ends, so a series is structurally incapable of colliding
    with itself; `scheduleNextEdition` additionally skips a slot somebody else
    has taken.
+
+   > **`repeat_every_days` is not the period.** Placement is
+   > `prev.ends_at + repeat_gap_days * 86400` — the *gap* is what spaces
+   > editions, and `repeat_every_days` is only a catch-up **stride**, used to
+   > roll forward past windows that are already entirely in the past (a series
+   > dormant while the site was down resumes *next*, rather than replaying every
+   > missed week). The effective cadence is therefore `duration + gap`: a 7-day
+   > edition with the form's defaults repeats every **8 days**, not every 30.
+   > This is also why no fixed day count can express "the first week of every
+   > month" — see [monthly-cup-design.md](monthly-cup-design.md), which uses
+   > calendar arithmetic and a separate generator instead.
 4. **The schema refuses it.** `tournament_no_overlap` (migration
    `20260801140000000`) is an `EXCLUDE USING gist` over
    `int8range(starts_at, ends_at)` `WHERE status <> 'cancelled'`. The calendar
-   has three writers — the form, the status flip and the background series
-   scheduler — so a check living in any one of them is a check the other two
-   can walk around. Create/update/status map the resulting `23P01` to a plain
-   "that window was taken while you were saving" instead of a 500.
+   now has **four** writers — the form, the status flip, the background series
+   scheduler and the Monthly Cup generator — so a check living in any one of
+   them is a check the other three can walk around. Create/update/status map the
+   resulting `23P01` to a plain "that window was taken while you were saving"
+   instead of a 500.
+
+   Note the predicate is `status <> 'cancelled'`, so a **draft** still occupies
+   its slot. That is deliberate (a draft is a reservation), but it means a
+   forgotten draft silently blocks the calendar — including a Monthly Cup
+   edition, which records the block rather than failing quietly.
 
 The reason is not tidiness: **the in-game side can only advertise one.** The
 game feed carries a single `T` line, `/tournament join` enters you into
@@ -143,8 +160,9 @@ default 5 min) on **both** web replicas, plus once ~20s after boot.
 | `/tournament` (`/tourney`) | What's on, its window, its pool, and how to enter |
 | `/tournament <code>` | Redeem a website code — case and dashes don't matter |
 | `/tournament join` | Enter right now as the nick you're playing under |
-| `/tmaps` | Just the map pool |
-| `callvote tourneymap [map]` | Move the server onto a pool map |
+| `/tmaps` | Just the map pool, numbered |
+| `/tourneyvote [mask]` | Call the vote to move the server onto a pool map |
+| `callvote tourneymap [mask]` | The same vote, called directly |
 
 `hrace/tournament.as` polls `GET /api/game/tournament` every 60s through the
 `RS_ApiFetchTourney` native and caches the parsed result, so the commands answer
@@ -166,6 +184,28 @@ shred a multi-word tournament name.
 enumeration (`GetMapsByPattern`) before voting, so the server can never be voted
 onto a map this box never downloaded — and then reuses `randmap`'s proven change
 path (`randmap_passed` + `launchState(MATCH_STATE_POSTMATCH)`).
+
+The mask is whatever the player has in front of them: nothing or `*` for a
+random pool map that isn't the current one, a `/tmaps` row number, a map name,
+or part of one (an exact name always beats a substring, and a map literally
+named in digits beats the row number). Anything that resolves only to the map
+already loaded is refused rather than passed as a no-op reload.
+
+`/tourneyvote [mask]` is the shortcut: it resolves the mask *before* opening the
+vote and then calls `callvote tourneymap <resolved name>`, so a mask that
+matches nothing is a private error instead of a vote that dies on validation,
+and the vote everyone sees names the actual map. It is the ordinary callvote
+underneath — same majority, same timeout, same one-at-a-time rule.
+
+**The draw happens once per vote, not once per validation.** The engine
+re-validates a vote in flight about once a second; `tourneymap_pick` /
+`tourneymap_arg` in `hrace/commands.as` are what make every one of those calls
+answer with the map that was announced. A pick is re-drawn only when there is
+none yet (which is also what makes a vote called in the first second of a map
+work at all), when the argument changed, or when the last validation is older
+than `RANDMAP_DELAY_MAX`. `Cmd_CallvotePassed` reads that same pick back and
+refuses to end the match if it is somehow empty — ending it would kick everyone
+to intermission and reload the same map.
 
 ### The two new natives
 
@@ -220,4 +260,23 @@ owns the wording without AngelScript having to parse JSON.
 | `web/public/assets/js/app.js` | `/tournaments` calendar, `/tournaments/:slug`, profile trophy shelf |
 | `server/racemod/source/progs/gametypes/hrace/tournament.as` | in-game commands + the vote |
 | `server/enginepatches/g_rs_api.cpp` | the two native families |
-| `web/test/tournaments.test.js` | 28 tests covering all of the above |
+| `web/test/tournaments.test.js` | tests covering all of the above, plus the Monthly Cup |
+
+## The Monthly Cup
+
+An automatic series covering the first week of every month, pooled from the
+previous month's most-finished maps, which skips the month when that pool
+repeats. It is layered on top of everything above — an ordinary `published`
+tournament with a `series_key`, created by a generator rather than by the form —
+and is documented separately in
+**[monthly-cup-design.md](monthly-cup-design.md)**.
+
+Two things to know here, because they constrain this document's subject:
+
+- Auto editions carry `repeat_every_days = 0` on purpose, which is what keeps
+  the fixed-day chain scheduler above from also driving them. `updateTournament`
+  pins those fields to 0 for `created_by = 'auto-monthly'` rows so an admin save
+  cannot undo it.
+- The generator is a **second** reconciliation pass in `sweepTournaments`, with
+  its own error boundary. Finalization mints trophies players are waiting for, so
+  a bug in month-scheduling must never be able to stop it.

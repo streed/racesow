@@ -21,6 +21,11 @@ import {
   validateTournament,
   gameTourneyText,
   CODE_LEN,
+  monthPeriodKey,
+  monthlyWindow,
+  prevMonthWindow,
+  prevPeriodKey,
+  decideMonthlyPool,
 } from "../tournaments.js";
 import { createTestDb } from "./pg-util.js";
 import crypto from "node:crypto";
@@ -713,4 +718,592 @@ test("drafts stay out of every public read", async (t) => {
   assert.equal(await race.tournamentBySlug("secret"), null);
   assert.equal((await race.tournaments({ includeDrafts: true })).rows.length, 1);
   assert.equal(await race.gameTourneyText(now), "RSTOURNEY\n");
+});
+
+// ===================== The Monthly Cup =====================================
+// The automatic monthly series: calendar arithmetic, the popularity metric and
+// its exclusions, the skip rule, and the exactly-once claim that lets the
+// generator run on both web replicas every five minutes.
+// Design + rationale: docs/monthly-cup-design.md.
+
+// Epoch seconds for a UTC wall-clock, so a test can state the date it means.
+const utc = (y, m, d, h = 0) => Date.UTC(y, m - 1, d, h) / 1000;
+
+// Seed `n` finishes on `map` by `n` distinct players, inside the given month.
+async function seedFinishes(race, map, n, at, { players = n, base = 30_000 } = {}) {
+  for (let i = 0; i < n; i++) {
+    await ingestAt(race, map, `p${i % players}`, base + i, at + i);
+  }
+}
+
+test("monthlyWindow is exactly one week, half-open, for every month 2026-2030", () => {
+  const WEEK = 7 * DAY;
+  for (let y = 2026; y <= 2030; y++) {
+    for (let m = 1; m <= 12; m++) {
+      const period = `${y}-${String(m).padStart(2, "0")}`;
+      const w = monthlyWindow(period);
+      assert.equal(w.endsAt - w.startsAt, WEEK, `${period} is not a week long`);
+      // Anchored to day-of-month, so month length and leap years are irrelevant.
+      assert.equal(w.startsAt, utc(y, m, 1, 18), `${period} starts on the wrong day`);
+      assert.equal(w.endsAt, utc(y, m, 8, 18), `${period} ends on the wrong day`);
+    }
+  }
+});
+
+test("period keys round-trip through the window without shifting a month", () => {
+  // monthPeriodKey is 1-BASED and Date.UTC is 0-BASED. A round-trip that shifts
+  // by one would compute the right-looking window while measuring popularity
+  // over the CURRENT, still-incomplete month — silent wrong data.
+  for (let m = 1; m <= 12; m++) {
+    const mid = utc(2026, m, 15, 12);
+    const period = monthPeriodKey(mid);
+    assert.equal(period, `2026-${String(m).padStart(2, "0")}`);
+    const w = monthlyWindow(period);
+    assert.equal(w.startsAt, utc(2026, m, 1, 18));
+    // The measurement window is the WHOLE previous calendar month, and its
+    // upper bound is the deciding month's 00:00.
+    const p = prevMonthWindow(period);
+    assert.equal(p.until, utc(2026, m, 1, 0), `${period} measures the wrong upper bound`);
+  }
+});
+
+test("prevMonthWindow rolls back across the year boundary and respects month lengths", () => {
+  const jan = prevMonthWindow("2027-01");
+  assert.equal(jan.since, utc(2026, 12, 1), "2027-01 must look back at December 2026");
+  assert.equal(jan.until, utc(2027, 1, 1));
+  assert.equal((jan.until - jan.since) / DAY, 31, "December is 31 days");
+  assert.equal((prevMonthWindow("2027-03").until - prevMonthWindow("2027-03").since) / DAY, 28, "Feb 2027");
+  assert.equal((prevMonthWindow("2028-03").until - prevMonthWindow("2028-03").since) / DAY, 29, "Feb 2028 is a leap year");
+  assert.equal((prevMonthWindow("2026-05").until - prevMonthWindow("2026-05").since) / DAY, 30, "April");
+  assert.equal(prevPeriodKey("2027-01"), "2026-12");
+});
+
+test("the pool is the previous month's most-FINISHED maps", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  await seedFinishes(race, "alpha", 9, jul, { players: 3 });
+  await seedFinishes(race, "bravo", 6, jul, { players: 2 });
+  await seedFinishes(race, "charlie", 4, jul, { players: 2 });
+  await seedFinishes(race, "delta", 3, jul, { players: 2 });
+  await seedFinishes(race, "echo", 2, jul, { players: 2 });
+  const p = prevMonthWindow("2026-08");
+  const got = await race.monthlyPoolCandidates({ since: p.since, until: p.until });
+  assert.deepEqual(got.slice(0, 4).map((c) => c.mapName), ["alpha", "bravo", "charlie", "delta"]);
+  assert.equal(got[0].finishes, 9);
+  assert.equal(got[0].finishers, 3);
+});
+
+test("popularity excludes blocked, reversed, mixed-case and single-finisher maps", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  await seedFinishes(race, "keeper", 6, jul, { players: 2 });
+  // 22 finishes but only ONE player — exactly the grinder shape the floor exists
+  // to stop from owning a raw-count metric.
+  await seedFinishes(race, "grinder", 22, jul, { players: 1 });
+  await seedFinishes(race, "blocked-map", 8, jul, { players: 3 });
+  await seedFinishes(race, "coldrun-reversed", 8, jul, { players: 3 });
+  await race.pool.query(
+    "INSERT INTO map_block (map_id, blocked_at, blocked_by) SELECT id, 1, 'test' FROM map WHERE name = 'blocked-map'"
+  );
+  // A map row whose name is not canonical lower-case: the auto pool inserts by
+  // id but setTournamentMaps re-resolves by lower-cased NAME, so pooling this
+  // would silently move the pool to a different, empty map row on any re-save.
+  await race.pool.query("INSERT INTO map (name) VALUES ('MixedCase')");
+  await race.pool.query(
+    `INSERT INTO finish (player_id, map_id, version_id, time, created_at)
+     SELECT 1, (SELECT id FROM map WHERE name='MixedCase'), 1, 1000, $1`, [jul]
+  );
+
+  const p = prevMonthWindow("2026-08");
+  const names = (await race.monthlyPoolCandidates({ since: p.since, until: p.until })).map((c) => c.mapName);
+  assert.ok(names.includes("keeper"));
+  assert.ok(!names.includes("grinder"), "single-finisher map survived the floor");
+  assert.ok(!names.includes("blocked-map"), "a blocked map is unreachable in-game and must not be pooled");
+  assert.ok(!names.includes("coldrun-reversed"), "no pk3 contains a -reversed .bsp");
+  assert.ok(!names.includes("MixedCase"), "a non-canonical-case map would round-trip to an empty map row");
+
+  // ...and the floor is the only thing keeping the grinder out.
+  const loose = await race.monthlyPoolCandidates({ since: p.since, until: p.until, minFinishers: 1 });
+  assert.ok(loose.map((c) => c.mapName).includes("grinder"), "minFinishers=1 must disable the floor");
+});
+
+test("the candidate order is total and stable regardless of insert order", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  // A dead tie on BOTH finishes and finishers, to force the name key.
+  for (const m of ["zulu", "alpha", "mike"]) await seedFinishes(race, m, 4, jul, { players: 2 });
+  const p = prevMonthWindow("2026-08");
+  const first = (await race.monthlyPoolCandidates({ since: p.since, until: p.until })).map((c) => c.mapName);
+  const again = (await race.monthlyPoolCandidates({ since: p.since, until: p.until })).map((c) => c.mapName);
+  assert.deepEqual(first, again, "the same inputs produced a different order");
+  assert.deepEqual(first, ["alpha", "mike", "zulu"], "the name tie-break must be alphabetical and byte-stable");
+});
+
+test("finishes inside a tournament's own window on its own pool maps do not count", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  await seedFinishes(race, "hot", 12, jul, { players: 3 });
+  await seedFinishes(race, "organic", 5, jul, { players: 2 });
+  const p = prevMonthWindow("2026-08");
+
+  // Before: the concentrated map leads.
+  const before = await race.monthlyPoolCandidates({ since: p.since, until: p.until });
+  assert.equal(before[0].mapName, "hot");
+
+  // A published tournament covering those finishes, pooling that very map. The
+  // tournament is what concentrated the play, so counting it would make the pool
+  // a fixed point.
+  await makeTournament(race, {
+    slug: "jul", name: "Jul", start: utc(2026, 7, 1), end: utc(2026, 7, 20), maps: ["hot"],
+  });
+  const after = await race.monthlyPoolCandidates({ since: p.since, until: p.until });
+  assert.ok(!after.map((c) => c.mapName).includes("hot"), "tournament-driven play still counted");
+  assert.ok(after.map((c) => c.mapName).includes("organic"), "ordinary play must be unaffected");
+
+  // A DRAFT concentrates no play at all, so it must not subtract anything —
+  // otherwise a forgotten long draft silently erases months of popularity data.
+  await race.pool.query("UPDATE tournament SET status = 'draft' WHERE slug = 'jul'");
+  const draft = await race.monthlyPoolCandidates({ since: p.since, until: p.until });
+  assert.ok(draft.map((c) => c.mapName).includes("hot"), "a draft must not subtract play");
+
+  // ...and the exclusion can be turned off entirely.
+  await race.pool.query("UPDATE tournament SET status = 'published' WHERE slug = 'jul'");
+  const off = await race.monthlyPoolCandidates({
+    since: p.since, until: p.until, excludeTournamentWindows: false,
+  });
+  assert.ok(off.map((c) => c.mapName).includes("hot"));
+});
+
+test("decideMonthlyPool: the skip rule, thin months and the forced escalation", () => {
+  const cand = (...names) => names.map((n, i) => ({ mapId: i + 1, mapName: n, finishes: 10 - i, finishers: 3 }));
+  const pool4 = cand("a", "b", "c", "d");
+
+  // No previous edition — the bootstrap path.
+  assert.equal(decideMonthlyPool({ candidates: pool4, prevPoolIds: [] }).decision, "scheduled");
+  // Disjoint from the previous edition.
+  assert.equal(decideMonthlyPool({ candidates: pool4, prevPoolIds: [99] }).decision, "scheduled");
+  // ONE shared map is enough to skip the whole month.
+  const one = decideMonthlyPool({ candidates: pool4, prevPoolIds: [2] });
+  assert.equal(one.decision, "skipped_overlap");
+  assert.deepEqual(one.detail.collided, ["b"], "the colliding map must be named");
+  assert.deepEqual(one.pool, [], "a skipped month must not carry a pool");
+
+  // Thin months skip rather than run short, and the thin check wins over the
+  // overlap check — reporting a collision about a pool that was never viable
+  // would send an operator hunting the wrong problem.
+  assert.equal(decideMonthlyPool({ candidates: [], prevPoolIds: [] }).decision, "skipped_thin");
+  const thin = decideMonthlyPool({ candidates: cand("a", "b", "c"), prevPoolIds: [1] });
+  assert.equal(thin.decision, "skipped_thin");
+  assert.equal(thin.detail.candidates.length, 3, "the ranked candidates must be recorded for diagnosis");
+  // ...unless a shorter pool is explicitly allowed.
+  assert.equal(decideMonthlyPool({ candidates: cand("a", "b", "c"), prevPoolIds: [], minPool: 3 }).decision, "scheduled");
+
+  // The escalation. Without it the rule DEADLOCKS rather than alternating: its
+  // comparand only advances when an edition actually runs.
+  assert.equal(decideMonthlyPool({ candidates: pool4, prevPoolIds: [2], skipStreak: 1 }).decision, "skipped_overlap");
+  const forced = decideMonthlyPool({ candidates: pool4, prevPoolIds: [2], skipStreak: 2 });
+  assert.equal(forced.decision, "forced");
+  assert.equal(forced.pool.length, 4, "a forced month must still carry its pool");
+  // ...and it can be switched off to keep the rule absolutely literal.
+  assert.equal(
+    decideMonthlyPool({ candidates: pool4, prevPoolIds: [2], skipStreak: 9, maxSkipStreak: 0 }).decision,
+    "skipped_overlap"
+  );
+});
+
+test("the generator materialises an edition with its pool, exactly once", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4], ["echo", 3]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const now = utc(2026, 8, 1, 1); // 01:00 on the 1st, before the 18:00 window
+
+  const r = await race.scheduleMonthlyEdition({ now });
+  assert.equal(r.decision, "scheduled");
+  assert.equal(r.wrote, true);
+  assert.equal(r.slug, "monthly-cup-2026-08");
+  assert.deepEqual(r.pool.map((p) => p.mapName), ["alpha", "bravo", "charlie", "delta"]);
+
+  const t1 = await race.tournamentBySlug("monthly-cup-2026-08");
+  assert.equal(t1.status, "published");
+  assert.equal(t1.starts_at, utc(2026, 8, 1, 18));
+  assert.equal(t1.ends_at, utc(2026, 8, 8, 18));
+  assert.equal(t1.scoring, "points");
+  // repeat_every_days MUST be 0 — that is what keeps the fixed-day chain
+  // scheduler from also driving this series.
+  assert.equal(t1.repeat_every_days, 0);
+  assert.equal(t1.series_key, "monthly-cup");
+  assert.deepEqual((await race.tournamentMaps(t1.id)).map((m) => m.name),
+    ["alpha", "bravo", "charlie", "delta"]);
+
+  // Idempotent: a second pass is a no-op and creates no second edition.
+  const again = await race.scheduleMonthlyEdition({ now });
+  assert.equal(again.wrote, false);
+  assert.equal(again.decision, "scheduled");
+  const all = await race.tournaments({ includeDrafts: true });
+  assert.equal(all.rows.filter((x) => x.series_key === "monthly-cup").length, 1);
+});
+
+test("two replicas racing produce exactly one edition, and the loser never inserts", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const now = utc(2026, 8, 1, 1);
+  // Both replicas run the same sweep at the same moment.
+  const [a, b] = await Promise.all([
+    race.scheduleMonthlyEdition({ now }),
+    race.scheduleMonthlyEdition({ now }),
+  ]);
+  const wrote = [a, b].filter((r) => r.wrote);
+  assert.equal(wrote.length, 1, "both replicas claimed the month");
+  // Assert the MECHANISM, not just the count. Two outcomes are legitimate and
+  // Promise.all does not guarantee which: a true overlap makes the loser bail on
+  // the period claim ('already-decided'), while a fully-serialised pair makes it
+  // short-circuit on the committed terminal decision ('scheduled', wrote:false).
+  // What must NEVER happen is the loser reaching the tournament INSERT and being
+  // rescued by a slug collision — that is what the naive version does, and it
+  // stops working the moment the slug is free.
+  const loser = [a, b].find((r) => !r.wrote);
+  assert.ok(
+    loser.decision === "already-decided" || loser.decision === "scheduled",
+    `loser bailed via ${loser.decision}, not the period claim or the terminal short-circuit`
+  );
+  assert.notEqual(loser.decision, "slug-taken", "the loser reached the tournament INSERT");
+  const all = await race.tournaments({ includeDrafts: true });
+  assert.equal(all.rows.filter((x) => x.series_key === "monthly-cup").length, 1);
+});
+
+test("the skip rule compares against the last edition that RAN, and never against itself", async (t) => {
+  const race = await freshDb(t);
+  const jun = utc(2026, 6, 10);
+  const jul = utc(2026, 7, 10);
+  // July's edition pools alpha/bravo/charlie/delta.
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jun, { players: 2 });
+  }
+  const julNow = utc(2026, 7, 1, 1);
+  const july = await race.scheduleMonthlyEdition({ now: julNow });
+  assert.equal(july.decision, "scheduled");
+
+  // Re-deciding the SAME month must report already-decided — never
+  // skipped_overlap against its own pool. With a `starts_at <= now` comparand
+  // this is exactly the case that silently cancels a live tournament.
+  const redo = await race.scheduleMonthlyEdition({ now: julNow });
+  assert.equal(redo.decision, "scheduled");
+  assert.equal(redo.wrote, false);
+
+  // August measures July. Overlapping maps -> the month is skipped.
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const augNow = utc(2026, 8, 1, 1);
+  const aug = await race.scheduleMonthlyEdition({ now: augNow, excludeTournamentWindows: false });
+  assert.equal(aug.decision, "skipped_overlap");
+  assert.ok((aug.detail.collided || []).length > 0);
+  assert.equal(await race.tournamentBySlug("monthly-cup-2026-08"), null, "a skipped month must create nothing");
+
+  // The streak counts only consecutive terminal skips.
+  assert.equal(await race.monthlySkipStreak("monthly-cup", "2026-09"), 1);
+  assert.equal(await race.monthlySkipStreak("monthly-cup", "2026-08"), 0);
+});
+
+test("a cancelled edition is not the comparand, and a cancelled blocker frees the month", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const now = utc(2026, 8, 1, 1);
+
+  // A hand-booked tournament straddling day 1 takes the slot: first come, first
+  // served, and the automatic series does NOT outrank a deliberate booking.
+  const blocker = await makeTournament(race, {
+    slug: "clash", name: "Clash", start: utc(2026, 7, 30), end: utc(2026, 8, 3), maps: ["alpha"],
+  });
+  const blocked = await race.scheduleMonthlyEdition({ now });
+  assert.equal(blocked.decision, "blocked");
+  assert.equal(blocked.wrote, true, "the first block must be recorded");
+  assert.equal(blocked.detail.blockedBy[0].slug, "clash", "the blocker must be named so it can be cleared");
+
+  // Blocked is logged ONCE, not every sweep — a week-long block would otherwise
+  // emit ~2000 identical warnings.
+  for (let i = 0; i < 5; i++) {
+    assert.equal((await race.scheduleMonthlyEdition({ now })).wrote, false, "a repeat block re-logged");
+  }
+
+  // Cancelling the blocker HEALS the month with no operator action: `blocked` is
+  // deliberately non-terminal.
+  await race.setTournamentStatus(blocker.id, "cancelled", "test-admin");
+  const healed = await race.scheduleMonthlyEdition({ now });
+  assert.equal(healed.decision, "scheduled");
+  assert.equal(healed.wrote, true);
+  assert.ok(await race.tournamentBySlug("monthly-cup-2026-08"));
+});
+
+test("a DRAFT tournament also blocks the slot, because drafts hold the calendar", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const blocker = await makeTournament(race, {
+    slug: "hidden", name: "Hidden", start: utc(2026, 7, 30), end: utc(2026, 8, 3), maps: ["alpha"],
+  });
+  await race.setTournamentStatus(blocker.id, "draft", "test-admin");
+  const r = await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 1) });
+  assert.equal(r.decision, "blocked", "the exclusion constraint covers drafts (status <> 'cancelled')");
+});
+
+test("a month whose window has already opened is not a skip and records nothing", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  // One second after the window opens. A month the generator could not reach in
+  // time was never a decision — recording it as a skip is the exact confusion
+  // the durable record exists to prevent, and it is what would otherwise fire an
+  // alarm on the day this ships.
+  const late = await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 18) + 1 });
+  assert.equal(late.decision, "window-open");
+  assert.equal(late.wrote, false);
+  assert.equal(await race.autoPeriod("monthly-cup", "2026-08"), null, "a late month must leave no row");
+
+  // An hour before, it still materialises.
+  const ok = await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 17) });
+  assert.equal(ok.decision, "scheduled");
+});
+
+test("a squatted slug is reported as actionable, not mistaken for a peer race", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  // A pre-existing row holding the slug at a NON-overlapping window. Postgres
+  // raises the slug 23505 before the window 23P01, so a handler that did not
+  // discriminate would read this as "the other replica won" and loop forever
+  // with no decision row and no log line.
+  await makeTournament(race, {
+    slug: "monthly-cup-2026-08", name: "Squatter",
+    start: utc(2026, 9, 1), end: utc(2026, 9, 2), maps: ["alpha"],
+  });
+  const r = await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 1) });
+  assert.equal(r.decision, "slug-taken");
+  assert.equal(r.wrote, false);
+});
+
+test("a finalized auto edition is invisible to the fixed-day chain scheduler", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const r = await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 1) });
+  await race.finalizeTournament(r.tournamentId, utc(2026, 8, 8, 19));
+  // finalizeDueTournaments' orphan reconciliation gates on repeat_every_days > 0.
+  // If an auto edition ever leaked a non-zero value, two schedulers would drive
+  // the same series — one of them with arithmetic that cannot express a month.
+  const out = await race.finalizeDueTournaments(utc(2026, 8, 8, 20));
+  assert.deepEqual(out.scheduled, [], "the chain scheduler picked up a Monthly Cup edition");
+  assert.deepEqual(out.failed, []);
+});
+
+test("an admin save cannot hand an auto edition back to the chain scheduler", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const r = await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 1) });
+  const t1 = await race.tournamentById(r.tournamentId);
+  const v = validateTournament({
+    name: t1.name, slug: t1.slug, description: t1.description,
+    startsAt: toAdminTime(t1.starts_at), endsAt: toAdminTime(t1.ends_at),
+    scoring: t1.scoring, status: "published", joinOpen: true,
+    maps: ["alpha", "bravo"], repeatEveryDays: 30, repeatGapDays: 1,
+  });
+  await race.updateTournament(t1.id, v.value, "test-admin");
+  const after = await race.tournamentById(t1.id);
+  assert.equal(after.repeat_every_days, 0, "the form put the chain scheduler back on an auto edition");
+  assert.equal(after.repeat_gap_days, 0);
+  // The pool edit itself must still work — it is the correction path for a bad
+  // automatic selection.
+  assert.deepEqual((await race.tournamentMaps(t1.id)).map((m) => m.name), ["alpha", "bravo"]);
+});
+
+test("the force button re-decides a skipped month, bypassing only the overlap rule", async (t) => {
+  const race = await freshDb(t);
+  const jun = utc(2026, 6, 10);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jun, { players: 2 });
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  await race.scheduleMonthlyEdition({ now: utc(2026, 7, 1, 1) });
+  const aug = await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 1), excludeTournamentWindows: false });
+  assert.equal(aug.decision, "skipped_overlap");
+
+  const before = utc(2026, 8, 1, 1); // still inside the pre-window slack
+  assert.equal(await race.forceMonthlyPeriod("monthly-cup", "2026-08", "admin", before), 1);
+  const forced = await race.scheduleMonthlyEdition({ now: before, excludeTournamentWindows: false });
+  assert.equal(forced.decision, "forced");
+  assert.ok(await race.tournamentBySlug("monthly-cup-2026-08"));
+
+  // A month that already produced an edition cannot be forced — that would be a
+  // request to double-book the calendar.
+  // ...checked while July's own window is still ahead, so the refusal is about
+  // the decision being terminal rather than about the clock.
+  assert.equal(await race.forceMonthlyPeriod("monthly-cup", "2026-07", "admin", utc(2026, 7, 1, 1)), 0);
+});
+
+test("a force is refused once the window has opened, instead of silently doing nothing", async (t) => {
+  const race = await freshDb(t);
+  const jun = utc(2026, 6, 10);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jun, { players: 2 });
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  await race.scheduleMonthlyEdition({ now: utc(2026, 7, 1, 1) });
+  await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 1), excludeTournamentWindows: false });
+
+  // The generator does nothing once now >= startsAt, so a force accepted here
+  // would be a permanent no-op that reported success — AND, because 'forced' is
+  // non-terminal, it would stop the month counting toward the escalation streak.
+  const late = await race.forceMonthlyPeriod("monthly-cup", "2026-08", "admin", utc(2026, 8, 1, 18) + 1);
+  assert.ok(late && late.error, "a force after the window opened must be refused");
+  assert.equal((await race.autoPeriod("monthly-cup", "2026-08")).decision, "skipped_overlap",
+    "the skip record must survive a refused force");
+});
+
+test("a forced month that never materialised still counts as a skip", async (t) => {
+  const race = await freshDb(t);
+  await race.recordAutoPeriod("monthly-cup", "2026-06", "skipped_overlap", {}, 1);
+  await race.pool.query(
+    `INSERT INTO tournament_auto_period (series_key, period, decision, detail, decided_at)
+     VALUES ('monthly-cup','2026-07','forced','{}'::jsonb, 1)`
+  );
+  // Two months in a row that did not run. A mistaken force must not reset the
+  // escalation and push the automatic rescue further away.
+  assert.equal(await race.monthlySkipStreak("monthly-cup", "2026-08"), 2);
+});
+
+test("a terminal decision can never be downgraded by a later pass", async (t) => {
+  const race = await freshDb(t);
+  await race.recordAutoPeriod("monthly-cup", "2026-08", "scheduled", { pool: [] }, 1);
+  const r = await race.recordAutoPeriod("monthly-cup", "2026-08", "blocked", { reason: "nope" }, 2);
+  assert.equal(r.changed, false);
+  assert.equal(r.blockedByTerminal, true);
+  assert.equal((await race.autoPeriod("monthly-cup", "2026-08")).decision, "scheduled",
+    "a committed decision was overwritten");
+});
+
+test("a blocked record refreshes its detail while still logging only on a change", async (t) => {
+  const race = await freshDb(t);
+  const a = await race.recordAutoPeriod("monthly-cup", "2026-08", "blocked", { blockedBy: [{ slug: "one" }] }, 1);
+  assert.equal(a.changed, true, "the first block must log");
+  const b = await race.recordAutoPeriod("monthly-cup", "2026-08", "blocked", { blockedBy: [{ slug: "two" }] }, 2);
+  assert.equal(b.changed, false, "an unchanged decision must not re-log");
+  // ...but the durable record must not go on naming a blocker that has been
+  // replaced, or an operator chases a tournament that is no longer in the way.
+  const row = await race.autoPeriod("monthly-cup", "2026-08");
+  assert.equal(row.detail.blockedBy[0].slug, "two", "the detail went stale");
+  assert.equal(row.decided_at, 2);
+});
+
+test("an existing edition is the answer, not a blocker, when the decision row is lost", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const now = utc(2026, 8, 1, 1);
+  const first = await race.scheduleMonthlyEdition({ now });
+  assert.equal(first.decision, "scheduled");
+
+  // Lose the decision row but keep the tournament — a partial restore, or a
+  // restore of a dump predating this table. The edition necessarily overlaps its
+  // own window, so treating it as a blocker would make the month block itself
+  // forever while telling the operator to cancel the very cup being blocked.
+  await race.pool.query("DELETE FROM tournament_auto_period");
+  const healed = await race.scheduleMonthlyEdition({ now });
+  assert.equal(healed.decision, "scheduled", `the edition blocked itself (${healed.decision})`);
+  assert.equal(healed.tournamentId, first.tournamentId);
+  const row = await race.autoPeriod("monthly-cup", "2026-08");
+  assert.equal(row.decision, "scheduled");
+  assert.equal(row.tournament_id, first.tournamentId, "the rebuilt record must point at the edition");
+});
+
+test("cancelling this month's cup is a terminal decision, not an endless slug collision", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const now = utc(2026, 8, 1, 1);
+  const first = await race.scheduleMonthlyEdition({ now });
+  await race.setTournamentStatus(first.tournamentId, "cancelled", "admin");
+  await race.pool.query("DELETE FROM tournament_auto_period");
+
+  // A cancelled row is invisible to the calendar constraint but still owns the
+  // UNIQUE slug, so without an explicit branch this retries the same doomed
+  // INSERT every five minutes until the window opens.
+  const r = await race.scheduleMonthlyEdition({ now });
+  assert.equal(r.decision, "cancelled");
+  const again = await race.scheduleMonthlyEdition({ now });
+  assert.equal(again.wrote, false, "a cancelled month must stop being re-decided");
+});
+
+test("an operator's force survives a block that lands before the next sweep", async (t) => {
+  const race = await freshDb(t);
+  const jun = utc(2026, 6, 10);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jun, { players: 2 });
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const now = utc(2026, 8, 1, 1);
+  await race.scheduleMonthlyEdition({ now: utc(2026, 7, 1, 1) });
+  await race.scheduleMonthlyEdition({ now, excludeTournamentWindows: false });
+  await race.forceMonthlyPeriod("monthly-cup", "2026-08", "admin", now);
+
+  // Somebody books the slot; the generator records `blocked`, overwriting the
+  // 'forced' decision. The override must not be destroyed by that.
+  const blocker = await makeTournament(race, {
+    slug: "clash", name: "Clash", start: utc(2026, 7, 30), end: utc(2026, 8, 3), maps: ["alpha"],
+  });
+  assert.equal((await race.scheduleMonthlyEdition({ now, excludeTournamentWindows: false })).decision, "blocked");
+  await race.setTournamentStatus(blocker.id, "cancelled", "admin");
+
+  const after = await race.scheduleMonthlyEdition({ now, excludeTournamentWindows: false });
+  assert.equal(after.decision, "forced", `the force was lost (${after.decision})`);
+  assert.ok(await race.tournamentBySlug("monthly-cup-2026-08"));
+});
+
+test("the game feed for an auto edition is shaped exactly like a hand-made one", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 1) });
+  const feed = await race.gameTourneyText(utc(2026, 8, 2, 12));
+  const lines = feed.trim().split("\n");
+  assert.equal(lines[0], "RSTOURNEY");
+  assert.equal(lines.filter((l) => l.startsWith("T\t")).length, 1);
+  assert.equal(lines.filter((l) => l.startsWith("S\t")).length, 1);
+  assert.equal(lines.filter((l) => l.startsWith("M\t")).length, 4);
+  assert.match(lines.find((l) => l.startsWith("S\t")), /^S\tlive\t/);
+});
+
+test("a skipped month leaves the game feed silent rather than stale", async (t) => {
+  const race = await freshDb(t);
+  // Nothing raced last month at all -> skipped_thin, no edition, no feed body.
+  const r = await race.scheduleMonthlyEdition({ now: utc(2026, 8, 1, 1) });
+  assert.equal(r.decision, "skipped_thin");
+  assert.equal(await race.gameTourneyText(utc(2026, 8, 2, 12)), "RSTOURNEY\n");
 });

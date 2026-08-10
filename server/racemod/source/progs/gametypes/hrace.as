@@ -255,6 +255,8 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_Tournament( client, cmdString, argsString, argc );
     else if ( cmdString == "tmaps" )
         return Cmd_TourneyMaps( client, cmdString, argsString, argc );
+    else if ( cmdString == "tourneyvote" || cmdString == "tvote" )
+        return Cmd_TourneyVote( client, cmdString, argsString, argc );
 
     G_PrintMsg( null, "unknown: " + cmdString + "\n" );
 
@@ -1299,7 +1301,7 @@ void GT_InitGametype()
     gametype.author = "Warsow Development Team";
 
     // Pure-index a (silent) sound that lives inside the client UI pak
-    // (racemod_ui_v7_local.pk3, built from server/clientdata). This puts the
+    // (racemod_ui_v8_local.pk3, built from server/clientdata). This puts the
     // pak on the sv_pure list as a *referenced* file, so connecting clients
     // download it from this server over the game connection. The pak must NOT
     // be *pure-named: clients only fetch explicit-pure paks from the official
@@ -1419,13 +1421,15 @@ void GT_InitGametype()
     G_RegisterCommand( "tournament" );
     G_RegisterCommand( "tourney" );
     G_RegisterCommand( "tmaps" );
+    G_RegisterCommand( "tourneyvote" );
+    G_RegisterCommand( "tvote" );
 
     RACE_MirrorInit(); // registers "who" and "watch"
     RACE_GhostInit();
 
     // add votes
     G_RegisterCallvote( "randmap", "<* | pattern>", "string", "Changes to a random map" );
-    G_RegisterCallvote( "tourneymap", "<map>", "string", "Changes to a map from the current tournament pool" );
+    G_RegisterCallvote( "tourneymap", "<* | # | map | pattern>", "string", "Changes to a map from the current tournament pool" );
 
     // msc: practicemode message
     practiceModeMsg = G_RegisterHelpMessage(S_COLOR_CYAN + "Practicing");
@@ -1433,7 +1437,7 @@ void GT_InitGametype()
 
     // msc: force pk3 download — the marker version MUST match the pak built
     // in server/Dockerfile (asserted there at build time)
-    G_SoundIndex( "racemod_ui_v7.txt", true );
+    G_SoundIndex( "racemod_ui_v8.txt", true );
     G_SoundIndex( "missing_tex.txt", true );
 
     demoRecording = false;

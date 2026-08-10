@@ -57,7 +57,7 @@ lives in `configs/server.cfg` and is `+exec`'d at launch. Secrets like
 
 ## Client downloads (the UI pak, custom maps)
 
-Connecting clients automatically download `racemod_ui_v4_local.pk3` (and any
+Connecting clients automatically download `racemod_ui_v8_local.pk3` (and any
 pure-referenced content they lack). Two transports:
 
 - **UDP (default).** Chunks flow over the game port itself — nothing extra to
@@ -81,6 +81,32 @@ pure-referenced content they lack). Two transports:
 Either way, clients first try the hardcoded official mirror
 (`update.warsow.gg`, long dead) and log one `Web download failed` before using
 our transport — harmless.
+
+### Player preference cvars
+
+The UI pak registers a couple of `CVAR_ARCHIVE|CVAR_USERINFO` client cvars that
+the gametype reads back out of userinfo, so a player's choice needs no server
+state and takes effect the moment they flip it (no reconnect):
+
+| Cvar | Default | What it does |
+|---|---|---|
+| `cg_raceShowWorldRecord` | `0` | Opt **in** to seeing the world-record ghost racer (details under the mesh notes below). |
+| `cg_raceShowAchievements` | `1` | Opt **out** of the "Achievement unlocked" feed: your own popups, other players' unlocks, and the ones relayed from mesh peers. Your unlocks are still announced to everyone else and to the mesh — this mutes your console, not you. |
+
+Both are checkboxes under *Race Options → Game Options*. Any client can also set
+them from the console — use `setau` (set + archive + userinfo), since a plain
+`set` creates a cvar the server never sees:
+
+```
+setau cg_raceShowAchievements 0    // quiet
+setau cg_raceShowAchievements 1    // back on
+```
+
+**Bumping the pak.** The pak name carries a version (`v8`) because clients cache
+it by name and a same-named pak with a different checksum fails the pure check
+for everyone holding the old copy. Any change under `clientdata/` therefore
+means renaming the marker file and every reference to it — see
+`clientdata/UPSTREAM` for the checklist.
 
 ## Maps
 
@@ -234,7 +260,7 @@ In-game, players use **`/who`** to list every peer's roster and
   0 (or unset) the server reads it from the client's userinfo and culls the ghost
   from just that player's snapshot; set to 1 the ghost is streamed to that client.
   Either way mesh ghosts, other players' views, and the scoreboard are untouched.
-  The cvar is registered by the racemod UI pak (`racemod_ui_v7_local.pk3`); it
+  The cvar is registered by the racemod UI pak (`racemod_ui_v8_local.pk3`); it
   needs no engine change on the client. (The stock `cg_raceGhostsAlpha 0` also
   hides it, but hides *all* race ghosts including mesh ones; `cg_raceGhosts` does
   not affect the player-model ghost at all — it only shells projectiles.)
@@ -316,9 +342,12 @@ so two harness processes form a genuine two-node mesh off-engine.
   compiles the gametype at runtime — there is no separate script-compile step.
 - **`clientdata/`** — the racemod client menu + HUD (vendored from
   `DenMSC/racemod_data`, see `clientdata/UPSTREAM`), packaged as
-  `racemod/racemod_ui_v4_local_21pure.pk3`. The `*21pure` name puts it on the
-  `sv_pure` list so connecting clients download it automatically; it powers the
-  in-game **"Race" options** menu (`gametypemenu` → `menu_open racemod_main`).
+  `racemod/racemod_ui_v8_local.pk3`. The name deliberately does *not* end in
+  `pure` (clients only fetch explicit-pure paks from the dead official mirror);
+  instead `GT_InitGametype` pure-indexes the `racemod_ui_v8.txt` marker inside
+  it, which lists the pak as a *referenced* file so connecting clients download
+  it straight from this server. It powers the in-game **"Race" options** menu
+  (`gametypemenu` → `menu_open racemod_main`).
 - **Pure setup** — `sv_pure 1` with `sv_pure_forcemodulepk3
   "basewsw/modules_21.pk3"`: clients verify against the *stock* modules pak
   they already have, while the server's patched module pak is deliberately

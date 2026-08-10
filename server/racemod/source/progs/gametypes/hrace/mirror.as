@@ -216,7 +216,9 @@ void RACE_MirrorRenderActivity( const String &in tag, const String &in actor, co
         if ( title.length() == 0 )
             title = tier; // degenerate payload: show something rather than nothing
         String color = RACE_AwardTierColor( tier );
-        G_PrintMsg( null, head + " " + color + "unlocked " + S_COLOR_WHITE + "["
+        // Per-viewer, like a local unlock: a player who set cg_raceShowAchievements
+        // 0 is opting out of the achievement feed as a whole, peers included.
+        RACE_AwardsBroadcast( head + " " + color + "unlocked " + S_COLOR_WHITE + "["
                 + color + title + S_COLOR_WHITE + "]\n" );
     }
     else if ( kind == "rec" )

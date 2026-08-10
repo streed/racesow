@@ -54,6 +54,10 @@ const SECRETS = {
   // rows themselves are public; these two columns are not.
   achievementAuthor: "admin_ach_author_sentinel",
   tournamentAuthor: "admin_trn_author_sentinel",
+  // The admin who overrode a Monthly Cup skip. It lives INSIDE a JSONB blob
+  // rather than its own column, which is exactly why it is easy to miss: a
+  // wholesale dump of the decision table would publish it.
+  monthlyForcedBy: "admin_forced_the_cup_sentinel",
 };
 const PUBLIC = {
   map: "backuptest_map",
@@ -134,6 +138,12 @@ async function seed(pool) {
     `INSERT INTO tournament_trophy (tournament_id, player_id, place, awarded_at) VALUES (${trn}, 1, 1, $1)`,
     [now]
   );
+  // A Monthly Cup decision. The pool/reason is public record; forcedBy is not.
+  await pool.query(
+    `INSERT INTO tournament_auto_period (series_key, period, decision, tournament_id, detail, decided_at)
+     VALUES ('monthly-cup', '2026-08', 'forced', ${trn}, $1::jsonb, $2)`,
+    [JSON.stringify({ reason: "forced by an operator", forcedBy: SECRETS.monthlyForcedBy }), now]
+  );
 }
 
 // Run backup.sh against `dbUrl`, unzip into `dir`, return { sql, files, meta }.
@@ -175,7 +185,17 @@ test("backup keeps race records and drops every secret", { skip: !TOOLS && "pg_d
   // Server/achievement/tournament data is re-added through sanitized column lists.
   assert.match(sql, /COPY public\.server \(id, name, status, created_at, last_seen_at, records\)/);
   assert.match(sql, /COPY public\.achievement \(id, slug, title, description, tier, rule, time_window/);
-  assert.match(sql, /COPY public\.tournament \(id, slug, name, description, starts_at, ends_at/);
+  // The FULL column list, not a prefix. A prefix regex is precisely how a new
+  // `tournament` column gets silently dropped from the public backup while both
+  // of these tests stay green.
+  assert.match(
+    sql,
+    /COPY public\.tournament \(id, slug, name, description, starts_at, ends_at, status, scoring, join_open, repeat_every_days, repeat_gap_days, series_key, edition, finalized_at, created_at, updated_at, created_by\)/
+  );
+  assert.match(
+    sql,
+    /COPY public\.tournament_auto_period \(series_key, period, decision, tournament_id, detail, decided_at\)/
+  );
 
   // --- Every secret is gone -------------------------------------------------
   for (const [label, value] of Object.entries(SECRETS)) {
@@ -247,6 +267,7 @@ test("backup restores into an empty database with secrets absent", { skip: !TOOL
     "tournament_map",
     "tournament_standing",
     "tournament_trophy",
+    "tournament_auto_period",
   ]) {
     const before = await srcN(`SELECT count(*) n FROM ${tbl}`);
     assert.ok(before > 0, `fixture seeded ${tbl}`);

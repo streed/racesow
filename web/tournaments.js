@@ -320,6 +320,232 @@ export function overlaps(aStart, aEnd, bStart, bEnd) {
   return Number(aStart) < Number(bEnd) && Number(bStart) < Number(aEnd);
 }
 
+// ===================== The Monthly Cup ======================================
+// An automatic series covering the FIRST WEEK of every month, pooled from the
+// four most-finished maps of the PREVIOUS calendar month, which skips the month
+// entirely when that pool shares any map with the previous edition. Design and
+// rationale: docs/monthly-cup-design.md.
+//
+// Everything in this section is PURE — no clock beyond an injected `now`, no
+// database — so the whole skip rule, the thin-data policy and the calendar
+// arithmetic are unit-testable without a Postgres.
+//
+// This is deliberately NOT built on repeat_every_days/repeat_gap_days. Those
+// place the next edition at `prev.ends_at + gap*86400` (repeat_every_days is
+// only a catch-up stride for windows already entirely past), so the effective
+// cadence is duration+gap and no fixed day count can express "the first week of
+// every month" — a 7-day edition on the form's defaults repeats every 8 days.
+// Auto editions therefore carry repeat_every_days = 0, which is precisely what
+// keeps the chain scheduler (which gates on repeat_every_days > 0) away from
+// them.
+
+export const MONTHLY_SERIES_KEY = "monthly-cup";
+export const MONTHLY_SERIES_NAME = "Monthly Cup";
+// 18:00 UTC = 20:00 CEST / 14:00 EDT, a sensible evening start (the first
+// hand-made tournament started 20:15Z). The other half of the choice: the
+// generator computes at ~00:05 on the 1st and books for 18:00, which leaves
+// ~18 hours of slack for a deploy blip or an outage before the window opens.
+// It is NOT about letting the previous month's data settle — finish.created_at
+// is the INGEST clock, so live traffic cannot backdate into a closed month.
+export const MONTHLY_START_HOUR_UTC = 18;
+export const MONTHLY_POOL_SIZE = 4;
+// Below this many eligible maps the month is skipped rather than run short.
+// "The 4 most popular maps" is the product; a 2-map tournament is a different
+// one. Lower it to run short pools instead.
+export const MONTHLY_MIN_POOL = 4;
+// Minimum DISTINCT canonical finishers for a map to be eligible. The one guard
+// on a raw-finish-count metric: this network had 23 distinct finishers in the
+// month this was designed against, so one regular practising for a WR outvotes
+// everybody. Set to 1 to disable the floor.
+export const MONTHLY_MIN_FINISHERS = 2;
+export const MONTHLY_SCORING = "points";
+// A FIXED over-fetch, not poolSize*N. The censor pass runs in JS after the
+// query (the word matcher has no SQL form), so a short list would let a run of
+// censored maps at the top masquerade as a thin month.
+export const MONTHLY_CANDIDATE_FETCH = 40;
+// Force an edition after this many consecutive skips. The skip rule does not
+// merely alternate: its comparand only advances when an edition actually RUNS,
+// so one durably popular map would otherwise skip every subsequent month
+// forever. 0 disables forcing and keeps the rule absolutely literal.
+export const MONTHLY_MAX_SKIP_STREAK = 2;
+
+// 'YYYY-MM' for the month containing `nowSec`, UTC.
+//
+// The period string is the unit every function here takes, and that is not
+// fussiness: this key is 1-BASED while Date.UTC's month argument is 0-BASED, so
+// code that splits a period and passes the month straight into Date.UTC shifts
+// the window a month forward AND makes the look-back read the current,
+// still-incomplete month. Keeping the string as the currency means the ± 1 is
+// applied in exactly one place (parsePeriod) instead of at every call site.
+export function monthPeriodKey(nowSec = Math.floor(Date.now() / 1000)) {
+  const d = new Date(Number(nowSec) * 1000);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+// 'YYYY-MM' -> {y, m} with m ZERO-BASED, ready for Date.UTC. Returns null for
+// anything unparseable so callers reject rather than silently computing 1970.
+function parsePeriod(period) {
+  const m = /^(\d{4})-(\d{2})$/.exec(String(period || "").trim());
+  if (!m) return null;
+  const y = +m[1];
+  const mo = +m[2];
+  if (mo < 1 || mo > 12) return null;
+  return { y, m: mo - 1 };
+}
+
+// The window an edition for `period` would occupy: day 1 18:00 UTC to day 8
+// 18:00 UTC. Exactly 604800s for every month (verified across 2026-2030,
+// leap years included) because it is anchored to day-of-month, not to month
+// length. Half-open like every other window here.
+export function monthlyWindow(period) {
+  const p = parsePeriod(period);
+  if (!p) return null;
+  const startsAt = Date.UTC(p.y, p.m, 1, MONTHLY_START_HOUR_UTC) / 1000;
+  const endsAt = Date.UTC(p.y, p.m, 8, MONTHLY_START_HOUR_UTC) / 1000;
+  return { startsAt, endsAt };
+}
+
+// The measurement window for `period`: the whole PREVIOUS calendar month, UTC,
+// half-open. Date.UTC normalises a negative month, so period '2027-01' correctly
+// looks back at December 2026 (Date.UTC(2027, -1, 1) === 2026-12-01).
+export function prevMonthWindow(period) {
+  const p = parsePeriod(period);
+  if (!p) return null;
+  return {
+    since: Date.UTC(p.y, p.m - 1, 1) / 1000,
+    until: Date.UTC(p.y, p.m, 1) / 1000,
+  };
+}
+
+// The month before `period`, as a period string. Used to walk the skip streak
+// backwards.
+export function prevPeriodKey(period) {
+  const p = parsePeriod(period);
+  if (!p) return null;
+  const d = new Date(Date.UTC(p.y, p.m - 1, 1));
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+// Decisions this series can reach. Only the first three are terminal; `blocked`
+// and `forced` are re-decided on the next pass (see the migration header).
+export const MONTHLY_TERMINAL = new Set(["scheduled", "skipped_overlap", "skipped_thin", "cancelled"]);
+
+// The whole rule, as a pure function.
+//
+//   candidates  [{mapId, mapName, finishes, finishers}], already ranked and
+//               already censor-filtered by the caller
+//   prevPoolIds map ids of the last edition that ACTUALLY RAN — never a
+//               hypothetical pool for a month that was itself skipped, which is
+//               what stops the series deadlocking after its first skip
+//   skipStreak  consecutive terminal skips immediately preceding this month
+//   forced      operator override: bypasses ONLY the overlap rule
+//
+// Returns {decision, pool, detail}. The thin check runs BEFORE the overlap
+// check: with fewer than MONTHLY_MIN_POOL maps there is no pool to compare, and
+// reporting "it collided" about a pool that was never viable would send an
+// operator hunting the wrong problem.
+export function decideMonthlyPool({
+  candidates = [],
+  prevPoolIds = [],
+  skipStreak = 0,
+  forced = false,
+  poolSize = MONTHLY_POOL_SIZE,
+  minPool = MONTHLY_MIN_POOL,
+  maxSkipStreak = MONTHLY_MAX_SKIP_STREAK,
+} = {}) {
+  const ranked = candidates.slice(0, poolSize);
+  if (ranked.length < minPool) {
+    return {
+      decision: "skipped_thin",
+      pool: [],
+      detail: {
+        reason: `only ${ranked.length} eligible map${ranked.length === 1 ? "" : "s"}, need ${minPool}`,
+        eligible: ranked.length,
+        needed: minPool,
+        // The full ranked list, so an operator can see whether the month was
+        // genuinely quiet or the finisher floor was simply set too high.
+        candidates: candidates.map((c) => ({
+          map: c.mapName, finishes: c.finishes, finishers: c.finishers,
+        })),
+      },
+    };
+  }
+
+  const prev = new Set((prevPoolIds || []).map(Number));
+  const collisions = ranked.filter((c) => prev.has(Number(c.mapId)));
+  const pool = ranked.map((c) => ({ mapId: Number(c.mapId), mapName: c.mapName }));
+  const chosen = {
+    pool: ranked.map((c) => ({
+      map: c.mapName, finishes: c.finishes, finishers: c.finishers,
+    })),
+  };
+
+  if (collisions.length && !forced) {
+    // The escalation. Without it the rule can deadlock outright rather than
+    // alternate, because the comparand only moves forward when an edition runs.
+    if (maxSkipStreak > 0 && skipStreak >= maxSkipStreak) {
+      return {
+        decision: "forced",
+        pool,
+        detail: {
+          ...chosen,
+          reason: `forced after ${skipStreak} consecutive skips`,
+          skipStreak,
+          collided: collisions.map((c) => c.mapName),
+        },
+      };
+    }
+    return {
+      decision: "skipped_overlap",
+      pool: [],
+      detail: {
+        ...chosen,
+        reason: `shares ${collisions.length} map${collisions.length === 1 ? "" : "s"} with the previous edition`,
+        collided: collisions.map((c) => c.mapName),
+        collidedIds: collisions.map((c) => Number(c.mapId)),
+        skipStreak,
+      },
+    };
+  }
+
+  return {
+    decision: forced ? "forced" : "scheduled",
+    pool,
+    detail: forced
+      ? { ...chosen, reason: "forced by an operator", collided: collisions.map((c) => c.mapName) }
+      : chosen,
+  };
+}
+
+// Slug/name for an edition. Identity is anchored to the MONTH, never to
+// `prev.edition + 1` — that is what makes cancelling a month survivable. The
+// chain scheduler derives its successor's slug from the predecessor's edition
+// number, so a cancelled edition there collides on the unique slug forever and
+// silently ends the series. Here, September is always 'monthly-cup-2026-09'
+// whatever happened in August.
+export function monthlySlug(period) {
+  return `${MONTHLY_SERIES_KEY}-${period}`;
+}
+
+export function monthlyName(period) {
+  const p = parsePeriod(period);
+  if (!p) return MONTHLY_SERIES_NAME;
+  const month = new Date(Date.UTC(p.y, p.m, 1)).toLocaleString("en-US", { month: "long", timeZone: "UTC" });
+  return `${MONTHLY_SERIES_NAME} — ${month} ${p.y}`;
+}
+
+export function monthlyDescription(period) {
+  const prev = prevMonthWindow(period);
+  const when = prev
+    ? new Date(prev.since * 1000).toLocaleString("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
+    : "last month";
+  return (
+    `The ${MONTHLY_POOL_SIZE} most-finished maps of ${when}, raced over the first week of the month. ` +
+    `Entry is free — type /tournament join on any Racesow server and every run you set on a pool map counts.`
+  );
+}
+
+
 // The plain-text payload the game servers poll (hrace/tournament.as via the
 // RS_ApiFetchTourney native). Same shape as the other game feeds: a sentinel
 // first line the native uses to reject captive-portal / proxy bodies that

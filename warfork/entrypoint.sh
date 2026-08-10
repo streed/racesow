@@ -118,6 +118,21 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     echo "set g_gametype \"${G_GAMETYPE}\""
     echo "set g_maprotation \"${MAP_ROTATION}\""
     [ -n "${MAPLIST}" ]            && echo "set g_maplist \"${MAPLIST}\""
+    # Idle map rotation (hrace/maprotate.as) reads this private copy of the
+    # rotation list rather than g_maplist — an AngelScript Cvar handle on that
+    # engine-owned cvar would re-register it with an empty default and wipe it.
+    #
+    # This line is NOT optional on Warfork. RACE_PickIdleMap fails open when the
+    # cvar is empty: it falls back to GetMapsByFilter, i.e. EVERY installed map.
+    # Warfork mounts the whole ~4,250-pk3 mirror, and a chunk of those maps are
+    # unloadable on this engine — rotating onto one raises
+    # "GClip_SetBrushModel: NULL model in 'trigger_multiple'", which tears down
+    # the game module while the process keeps running and the socket stays bound.
+    # The container never exits, so nothing restarts it. That wedged EU Warfork
+    # on 2026-08-06 and again on 2026-08-08 (38h), and US Warfork on 2026-08-09
+    # (12h, on aryshok_mew). Warsow never hit it because its entrypoint has
+    # always written this cvar, confining rotation to the vetted mappool.
+    [ -n "${MAPLIST}" ]            && echo "set rs_idle_pool \"${MAPLIST}\""
     [ -n "${RCON_PASSWORD}" ]      && echo "set rcon_password \"${RCON_PASSWORD}\""
     [ -n "${SV_UPLOADS_BASEURL}" ] && echo "set sv_uploads_baseurl \"${SV_UPLOADS_BASEURL}\""
     echo "set sv_demodir \"\""
@@ -193,6 +208,43 @@ set -- \
 [ -n "${FIRST_MAP}" ]  && set -- "$@" +map "${FIRST_MAP}"
 [ -n "${EXTRA_ARGS}" ] && set -- "$@" ${EXTRA_ARGS}
 
-echo ">> launching wf_server.x86_64 $*"
-# Line-buffer so `docker logs` isn't frozen mid-startup by glibc pipe buffering.
-exec stdbuf -oL -eL "${WF_DIR}/wf_server.x86_64" "$@"
+# --- supervise loop -----------------------------------------------------------
+# The engine deliberately runs as a background CHILD rather than via `exec`.
+# Two things depend on it not being PID 1:
+#
+#  1. gamehealth.sh (the Docker healthcheck) restarts a wedged engine by
+#     signalling it. The kernel discards in-namespace signals to PID 1 unless
+#     PID 1 installed a handler, so `kill -9 1` from inside the container
+#     reports success and does nothing — verified against this very image.
+#  2. A crash then costs ~5s here instead of a full container recreate, matching
+#     the Warsow tier (server/entrypoint.sh) so both games behave the same and
+#     the admin panel's restart copy is true of either.
+#
+# The TERM trap forwards the signal so `docker stop` still shuts the engine down
+# cleanly (final topscores write, rs_api queue drain) instead of letting it be
+# SIGKILLed when the stop grace expires.
+ENGINE_PIDFILE="${ENGINE_PIDFILE:-/tmp/engine.pid}"
+server_pid=""
+shutdown() {
+    echo "Shutting down."
+    rm -f "${ENGINE_PIDFILE}" 2>/dev/null || true
+    if [ -n "${server_pid}" ]; then
+        kill -TERM "${server_pid}" 2>/dev/null || true
+        wait "${server_pid}" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap shutdown INT TERM
+
+while true; do
+    echo ">> launching wf_server.x86_64 $*"
+    # Line-buffer so `docker logs` isn't frozen mid-startup by glibc pipe buffering.
+    stdbuf -oL -eL "${WF_DIR}/wf_server.x86_64" "$@" &
+    server_pid=$!
+    echo "${server_pid}" > "${ENGINE_PIDFILE}" 2>/dev/null || true
+    wait "${server_pid}" || true
+    server_pid=""
+    rm -f "${ENGINE_PIDFILE}" 2>/dev/null || true
+    echo ">> server exited, restarting in 5s..."
+    sleep 5
+done

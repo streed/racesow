@@ -65,6 +65,28 @@ services:
       MIRROR_SECRET: "${MIRROR_SECRET:-}"   # shared HMAC key: openssl rand -hex 24
       MIRROR_PORT: "${MIRROR_PORT:-44450}"
       MIRROR_TAG: "${MIRROR_TAG:-}"         # short id shown as [TAG] in chat
+    # Liveness = "the engine still answers its own protocol", not "the process
+    # exists". A fatal game error leaves the engine running and spinning while
+    # the port goes silent, so `restart: unless-stopped` above never fires — it
+    # only watches for an exit. gamehealth.sh sends a real getinfo datagram and,
+    # after RS_HEALTH_FAILS misses in a row, kills the engine so entrypoint.sh
+    # relaunches it (~5s). It also collects an admin force-restart from
+    # /admin/servers. See server/gamehealth.sh.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gamehealth.sh"]
+      interval: 20s
+      # Generous: one run may probe (3s), poll the ops endpoint (4s) and then
+      # TERM->KILL the engine (3s). A healthcheck killed mid-restart would leave
+      # the engine half-signalled.
+      timeout: 15s
+      # 6 x 20s = ~2 min of unbroken silence before a restart. Comfortably longer
+      # than any real map load, so a slow level change is never mistaken for a
+      # wedge; the script uses the same limit for its own kill decision.
+      retries: 6
+      # Mounting thousands of pk3s and compiling the gametype answers nothing for
+      # a while. The script independently grants a fresh engine RS_HEALTH_GRACE
+      # seconds, so a cold start can never be killed as if it were wedged.
+      start_period: 240s
     volumes:
       - ./server/maps:/warsow/maps_extra:ro
       # Local record files (topscores) + finish-event audit log, persisted

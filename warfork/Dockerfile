@@ -167,8 +167,8 @@ RUN set -eux; \
     rm -rf /tmp/racesow; \
     unzip -p "${WF_DIR}/${FS_GAME}/hrace.pk3" progs/gametypes/hrace.gt >/dev/null
 
-# --- client UI/HUD pak (racehud v7 + the "Race options" menu) -----------------
-# hrace.as GT_InitGametype pure-indexes racemod_ui_v7.txt, so with sv_pure the
+# --- client UI/HUD pak (racehud v8 + the "Race options" menu) -----------------
+# hrace.as GT_InitGametype pure-indexes racemod_ui_v8.txt, so with sv_pure the
 # connecting client is told to download this pak automatically (it is the same
 # ui/porkui/ RmlUi system Warfork's basewf uses). Deterministic pak (fixed
 # mtimes, sorted, UTC) so every server references the same checksum. The name
@@ -177,18 +177,20 @@ RUN set -eux; \
 COPY server/clientdata /tmp/clientdata
 RUN set -eux; \
     cd /tmp/clientdata; \
-    find ui huds gfx scripts sounds racemod_ui_v7.txt -exec touch -t 200901010000.00 {} +; \
-    find ui huds gfx scripts sounds racemod_ui_v7.txt -type f ! -name '.*' | sort \
-        | TZ=UTC zip -X -D "${WF_DIR}/${FS_GAME}/racemod_ui_v7_local.pk3" -@; \
-    unzip -p "${WF_DIR}/${FS_GAME}/hrace.pk3" progs/gametypes/hrace.as | grep -q 'racemod_ui_v7.txt'; \
-    unzip -Z1 "${WF_DIR}/${FS_GAME}/racemod_ui_v7_local.pk3" | grep -qx 'racemod_ui_v7.txt'; \
+    find ui huds gfx scripts sounds racemod_ui_v8.txt -exec touch -t 200901010000.00 {} +; \
+    find ui huds gfx scripts sounds racemod_ui_v8.txt -type f ! -name '.*' | sort \
+        | TZ=UTC zip -X -D "${WF_DIR}/${FS_GAME}/racemod_ui_v8_local.pk3" -@; \
+    unzip -p "${WF_DIR}/${FS_GAME}/hrace.pk3" progs/gametypes/hrace.as | grep -q 'racemod_ui_v8.txt'; \
+    unzip -Z1 "${WF_DIR}/${FS_GAME}/racemod_ui_v8_local.pk3" | grep -qx 'racemod_ui_v8.txt'; \
     rm -rf /tmp/clientdata
 
 # --- server config + shared map cycle + entrypoint ---------------------------
 COPY warfork/configs/server.cfg "${WF_DIR}/${FS_GAME}/configs/server/server.cfg"
 COPY server/configs/mappool.txt "${WF_DIR}/${FS_GAME}/mappool.txt"
 COPY warfork/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Same watchdog as the Warsow image — one script, both games (it reads SV_PORT).
+COPY server/gamehealth.sh /usr/local/bin/gamehealth.sh
+RUN chmod +x /entrypoint.sh /usr/local/bin/gamehealth.sh
 
 RUN useradd -r -m -d /home/warfork warfork \
     && mkdir -p "${WF_DIR}/${FS_GAME}/demos" "${WF_DIR}/${FS_GAME}/topscores" "${WF_DIR}/${FS_GAME}/racelog" \

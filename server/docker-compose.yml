@@ -84,6 +84,17 @@ services:
       # Extra engine cvars appended to the server command line. Prod names the
       # TV/mirror client so the site can filter it out of the live view.
       EXTRA_ARGS: "+set rs_tv_name RACESOW-TV"
+    # The engine can die without exiting: a fatal game error tears down the game
+    # module and leaves the process spinning while the port answers nothing, so
+    # `restart: unless-stopped` never triggers. gamehealth.sh probes with a real
+    # getinfo datagram and restarts the engine after ~2 min of silence; it also
+    # picks up an admin force-restart from /admin/servers. See server/gamehealth.sh.
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gamehealth.sh"]
+      interval: 20s
+      timeout: 15s        # one run may probe, poll ops, then TERM->KILL
+      retries: 6          # ~2 min of unbroken silence before a restart
+      start_period: 240s  # cold boot (thousands of pk3s) answers nothing for a while
     networks:
       - default
       # The central stats stack's network (created by the repo-root compose),

@@ -327,3 +327,100 @@ test("rcon/broadcast POSTs require a valid CSRF token", async () => {
   const bad = await postForm("/admin/broadcast", cookie, { _csrf: "deadbeef", message: "nope" });
   assert.equal(bad.status, 403);
 });
+
+// ------------------------------------------------- force restart (polled) ---
+// The RCON restart above needs the engine to receive `quit`. A wedged engine
+// receives nothing at all, so the force-restart path deliberately sends nothing
+// and instead parks a flag the box's healthcheck watchdog collects by polling
+// GET /api/game/ops. These tests pin the property that matters most: a pending
+// restart is handed out AT MOST ONCE, so a wedged box cannot be caught in a
+// restart loop by repeated polls.
+test("force restart is delivered by poll, exactly once, and only to the right server", async () => {
+  const { cookie, csrf } = await login();
+
+  const ops = (token) => fetch(`${base}/api/game/ops`, { headers: { authorization: `Bearer ${token}` } });
+
+  // Nothing pending: the watchdog is told to do nothing.
+  assert.deepEqual(await (await ops(SRV_TOKEN)).json(), { restart: false });
+
+  // Flag one from the admin panel. Note it sends NO rcon — that's the point.
+  rconRx.length = 0;
+  const flagged = await postForm(`/admin/servers/${serverId}/force-restart`, cookie, { _csrf: csrf });
+  assert.equal(flagged.status, 303);
+  assert.match(flagged.headers.get("location"), /done=/);
+  assert.equal(rconRx.length, 0, "force restart must not depend on rcon");
+  assert.ok((await race.serverById(serverId)).restart_requested_at, "flag is persisted");
+
+  // A different server's token must not collect someone else's restart.
+  const otherTok = "tok-" + crypto.randomBytes(6).toString("hex");
+  const { id: otherId } = await race.enrollServer("other-box", otherTok);
+  assert.deepEqual(await (await ops(otherTok)).json(), { restart: false });
+  assert.ok((await race.serverById(serverId)).restart_requested_at, "still pending for the target");
+
+  // The target collects it once...
+  assert.deepEqual(await (await ops(SRV_TOKEN)).json(), { restart: true });
+  // ...and never again: a second poll (or a duplicate) must not bounce it twice.
+  assert.deepEqual(await (await ops(SRV_TOKEN)).json(), { restart: false });
+
+  const row = await race.serverById(serverId);
+  assert.equal(row.restart_requested_at, null, "cleared as it was handed out");
+  assert.ok(row.restart_acked_at, "collection is stamped for the admin UI");
+
+  // recordEvent is fire-and-forget, so the rows land just after the responses.
+  await new Promise((r) => setTimeout(r, 200));
+  const logged = (await race.pool.query("SELECT line FROM server_log ORDER BY id DESC LIMIT 8")).rows;
+  assert.ok(logged.some((l) => /force-restart flagged by/.test(l.line)), "request audit-logged");
+  assert.ok(logged.some((l) => /force-restart collected/.test(l.line)), "collection audit-logged");
+  await race.pool.query("DELETE FROM server WHERE id = $1", [otherId]);
+});
+
+test("claimServerRestart is atomic: concurrent polls yield a single restart", async () => {
+  await race.requestServerRestart(serverId, "racer");
+  const claims = await Promise.all(Array.from({ length: 8 }, () => race.claimServerRestart(serverId)));
+  assert.equal(claims.filter(Boolean).length, 1, "exactly one poller may claim it");
+  assert.equal((await race.serverById(serverId)).restart_requested_at, null);
+});
+
+test("the ops endpoint refuses unauthenticated and shared-token callers", async () => {
+  await race.requestServerRestart(serverId, "racer");
+
+  assert.equal((await fetch(`${base}/api/game/ops`)).status, 401);
+  assert.equal(
+    (await fetch(`${base}/api/game/ops`, { headers: { authorization: "Bearer nope" } })).status,
+    401
+  );
+  // Still pending — a rejected caller must not have consumed it.
+  assert.ok((await race.serverById(serverId)).restart_requested_at, "unauth poll did not claim it");
+
+  // A revoked server is refused outright.
+  await race.pool.query("UPDATE server SET status='revoked' WHERE id=$1", [serverId]);
+  assert.equal(
+    (await fetch(`${base}/api/game/ops`, { headers: { authorization: `Bearer ${SRV_TOKEN}` } })).status,
+    403
+  );
+  await race.pool.query("UPDATE server SET status='trusted' WHERE id=$1", [serverId]);
+
+  // Never cached: a cached "restart":true would be replayed to other boxes.
+  const res = await fetch(`${base}/api/game/ops`, { headers: { authorization: `Bearer ${SRV_TOKEN}` } });
+  assert.match(res.headers.get("cache-control") || "", /no-store/);
+  assert.deepEqual(await res.json(), { restart: true });
+});
+
+test("a pending force restart can be withdrawn before the box collects it", async () => {
+  const { cookie, csrf } = await login();
+  await postForm(`/admin/servers/${serverId}/force-restart`, cookie, { _csrf: csrf });
+  assert.ok((await race.serverById(serverId)).restart_requested_at);
+
+  const page = await (await fetch(`${base}/admin/servers`, { headers: { cookie } })).text();
+  assert.match(page, /force-restart pending since/, "the servers list shows it is still pending");
+
+  const cancelled = await postForm(`/admin/servers/${serverId}/force-restart`, cookie, {
+    _csrf: csrf,
+    action: "cancel",
+  });
+  assert.equal(cancelled.status, 303);
+  assert.equal((await race.serverById(serverId)).restart_requested_at, null);
+
+  const res = await fetch(`${base}/api/game/ops`, { headers: { authorization: `Bearer ${SRV_TOKEN}` } });
+  assert.deepEqual(await res.json(), { restart: false }, "a withdrawn request is not delivered");
+});

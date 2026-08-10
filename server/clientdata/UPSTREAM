@@ -5,14 +5,18 @@ Commit:   9aa3560a82cc4adcd7e8adb215f2fc205bfda40e (2024-04-02)
 
 Contents: the "Racemod Options" gametype menu (ui/porkui/racemod_main.rml and
 friends) plus the ale_racemod HUD and strafe-arrow assets. Packaged by the
-server Dockerfile into racemod_ui_v7_local.pk3. The name deliberately does NOT
+server Dockerfile into racemod_ui_v8_local.pk3. The name deliberately does NOT
 end in "pure" (clients only fetch explicit-pure paks from the dead official
-mirror); instead the gametype pure-indexes the racemod_ui_v7.txt marker inside
+mirror); instead the gametype pure-indexes the racemod_ui_v8.txt marker inside
 it (GT_InitGametype in hrace.as), so with sv_pure 1 connecting clients download
-it from this server automatically. Bump the marker + pak version (v7 -> v8,
-here + hrace.as + Dockerfile + tv/Dockerfile + server.cfg) whenever the
-contents change, or clients holding the old same-named pak fail the pure check.
+it from this server automatically. Bump the marker + pak version (v8 -> v9,
+here + hrace.as + Dockerfile + warfork/Dockerfile + tv/Dockerfile + server.cfg
++ README) whenever the contents change, or clients holding the old same-named
+pak fail the pure check.
 
 Local additions (diverges from upstream):
   - ui/porkui/racemod_main.rml: "Race in reverse" / "Toggle triggers" command
     buttons + Binds rows, for the reverse race mode (see racemod/UPSTREAM).
+  - ui/porkui/racemod_main.rml: the cg_raceShowWorldRecord and
+    cg_raceShowAchievements Game Options checkboxes (CVAR_USERINFO client cvars
+    the server reads back — hrace/ghostbot.as and hrace/awards.as).

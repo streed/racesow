@@ -374,6 +374,32 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .srchart.strafechart .srline { stroke: var(--cyan); }
 .srchart.strafechart .srdot { fill: var(--cyan); }
 
+/* ---------- skill-rating distribution (player profile) ----------
+   One histogram of the whole ranked board, drawn identically on every profile
+   with a different bar lit. The bars are the recessive series (they are context,
+   not the message); gold is reserved for "this is you" here exactly as it is on
+   the stat tiles and the SR trend's current value. The marker is never colour
+   alone — it is a rule plus a direct label. */
+.srdist { padding: 16px 18px 14px; margin-bottom: 24px; }
+.srdist-head { display: flex; align-items: baseline; gap: 20px; flex-wrap: wrap; margin-bottom: 8px; }
+.srdist-pct .n { font-family: var(--cond); font-weight: 800; font-style: italic; font-size: 30px; color: var(--gold); font-variant-numeric: tabular-nums; }
+.srdist-pct .n .sfx { font-size: 17px; font-weight: 700; }
+.srdist-pct .l { font-family: var(--cond); text-transform: uppercase; letter-spacing: 1.5px; font-size: 11px; color: var(--muted); margin-left: 8px; }
+.srdist-sub { color: var(--muted); font-size: 13.5px; line-height: 1.5; }
+.srdist-sub b { color: var(--text); font-variant-numeric: tabular-nums; }
+.srdist-sub .sep { color: var(--faint); margin: 0 2px; }
+.srdist-note { color: var(--muted); font-size: 14px; padding: 6px 2px; }
+.srdist-cap { color: var(--faint); font-size: 12.5px; margin-top: 8px; }
+.srdchart { max-width: 100%; }
+.srdchart .srdbar { fill: rgba(255,106,26,.30); transition: fill .12s; }
+.srdchart .srdbar:hover { fill: rgba(255,106,26,.55); }
+.srdchart .srdbar.me { fill: var(--gold); }
+.srdchart .srdaxis { stroke: var(--line-2); stroke-width: 1; }
+.srdchart .srdmed { stroke: var(--faint); stroke-width: 1; stroke-dasharray: 3 4; }
+.srdchart .srdme { stroke: var(--gold); stroke-width: 2; }
+.srdchart .srdmel { fill: var(--gold); font-family: var(--cond); font-weight: 700; font-size: 12px; letter-spacing: .6px; }
+.srdchart .srdmedl { fill: var(--faint); }
+
 /* ---------- "which maps make up this rating" dropdown ---------- */
 /* Collapsed inside the SR card; the marker is our own caret so the summary can
    be styled like the rest of the site's condensed labels. */

@@ -353,6 +353,29 @@ test("SR breakdown endpoint serves the maps behind a player's rating", async () 
   assert.equal((await fetch(`${base}/api/players/abc/sr`)).status, 400);
 });
 
+test("SR distribution endpoint serves the board's shape, and profiles a place on it", async () => {
+  const dist = await get("/sr/distribution");
+  assert.ok(dist.total > 0, "the board has ranked players");
+  assert.ok(Array.isArray(dist.buckets) && dist.buckets.length > 1, "bucketed");
+  assert.equal(
+    dist.buckets.reduce((a, b) => a + b.count, 0),
+    dist.total,
+    "the buckets account for every ranked player"
+  );
+  assert.ok(dist.lo <= dist.median && dist.median <= dist.hi, "median sits inside the range");
+  // Carries no player: this one response is shared by every profile.
+  assert.ok(!("percentile" in dist) && !("player" in dist), "player-independent payload");
+
+  const id = (await get("/players?q=Strafer")).rows[0].id;
+  const pd = await get(`/players/${id}`);
+  assert.ok(pd.srPlace, "a ranked profile knows its place");
+  assert.equal(pd.srPlace.total, dist.total, "measured against the same board");
+  assert.ok(pd.srPlace.percentile >= 0 && pd.srPlace.percentile <= 100, "percentile in range");
+  assert.ok(pd.srPlace.rank >= 1 && pd.srPlace.rank <= dist.total, "rank in range");
+  // The rating the marker is drawn at is inside the range the buckets cover.
+  assert.ok(pd.standing.sr >= dist.lo && pd.standing.sr <= dist.hi, "SR falls on the chart");
+});
+
 test("re-sending the same finish is idempotent for records", async () => {
   const body = gameBody({ map: "testmap2", name: "Rep", time: 30000, cps: [15000] });
   const first = await ingest(body);

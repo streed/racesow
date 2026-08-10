@@ -217,6 +217,17 @@ CSRF via `checkCsrf`, 303-redirect-with-`?ok=1`, nav link added to
 > with the map field carrying "<tier> <title...>". A map change resets the
 > per-slot state and re-seeds, so an award landing exactly during the switch is
 > site-only — accepted (best-effort flair, not the record).
+>
+> **Per-player opt-out (added later):** the client cvar
+> `cg_raceShowAchievements` (`CVAR_ARCHIVE|CVAR_USERINFO`, default 1, a Race
+> Options checkbox in the UI pak — bumped to `v8` for it) silences the feed for
+> one viewer. It is a pure display filter applied at print time
+> (`RACE_AwardsWantedBy`): polling, the high-water mark and the mesh broadcast
+> are untouched, so re-enabling shows what lands next instead of a backlog, and
+> an opted-out player's unlocks still reach everyone else. The server-wide line
+> can't use `G_PrintMsg( null, ... )` any more — `RACE_AwardsBroadcast` walks
+> the clients so each viewer's choice is honoured, including for the mesh's
+> `"ach"` lines.
 
 Most awards will trigger from a finish that happened seconds earlier on that
 very server, but evaluation is web-side, so announcement is a poll with ~60s

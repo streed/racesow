@@ -42,6 +42,22 @@ import {
   joinOpen,
   generateCode,
   gameTourneyText,
+  MONTHLY_SERIES_KEY,
+  MONTHLY_POOL_SIZE,
+  MONTHLY_MIN_POOL,
+  MONTHLY_MIN_FINISHERS,
+  MONTHLY_SCORING,
+  MONTHLY_CANDIDATE_FETCH,
+  MONTHLY_MAX_SKIP_STREAK,
+  MONTHLY_TERMINAL,
+  monthPeriodKey,
+  monthlyWindow,
+  prevMonthWindow,
+  prevPeriodKey,
+  decideMonthlyPool,
+  monthlySlug,
+  monthlyName,
+  monthlyDescription,
 } from "./tournaments.js";
 
 // Async (thread-pool) compression for the request/ingest paths — the sync
@@ -849,7 +865,9 @@ class RaceDB {
   // One server's full admin row, including the RCON secret + address. Admin-only.
   async serverById(id) {
     const row = await this.one(
-      "SELECT id, name, status, created_at, last_seen_at, records, address, rcon_password FROM server WHERE id = $1",
+      `SELECT id, name, status, created_at, last_seen_at, records, address, rcon_password,
+              restart_requested_at, restart_requested_by, restart_acked_at
+       FROM server WHERE id = $1`,
       [id]
     );
     if (!row) return null;
@@ -859,6 +877,8 @@ class RaceDB {
       created_at: num(row.created_at),
       last_seen_at: num(row.last_seen_at),
       records: num(row.records),
+      restart_requested_at: num(row.restart_requested_at),
+      restart_acked_at: num(row.restart_acked_at),
     };
   }
 
@@ -868,7 +888,8 @@ class RaceDB {
     return (
       await this.all(
         `SELECT id, name, status, created_at, last_seen_at, records, address,
-                (rcon_password IS NOT NULL) AS rcon
+                (rcon_password IS NOT NULL) AS rcon,
+                restart_requested_at, restart_requested_by, restart_acked_at
          FROM server ORDER BY last_seen_at DESC NULLS LAST, id`
       )
     ).map((s) => ({
@@ -878,7 +899,47 @@ class RaceDB {
       last_seen_at: num(s.last_seen_at),
       records: num(s.records),
       rcon: !!s.rcon,
+      restart_requested_at: num(s.restart_requested_at),
+      restart_acked_at: num(s.restart_acked_at),
     }));
+  }
+
+  // --- Force restart (poll-delivered) -----------------------------------------
+  // Raise the flag the box's healthcheck watchdog collects on its next poll.
+  // Unlike the RCON `quit` path this needs nothing from the engine, so it also
+  // works on a server that has stopped answering entirely — the case that
+  // motivated it. Re-requesting just refreshes the stamp.
+  async requestServerRestart(serverId, by, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.pool.query(
+      `UPDATE server SET restart_requested_at = $1, restart_requested_by = $2, restart_acked_at = NULL
+       WHERE id = $3`,
+      [now, by || null, serverId]
+    );
+    return r.rowCount > 0;
+  }
+
+  // Hand a pending request to the box, exactly once. The clear happens in the
+  // same statement that reads it, so two watchdog polls racing (or a poll that
+  // arrives twice) cannot both come away with a restart and bounce the server
+  // repeatedly. Returns true only for the caller that actually claimed it.
+  async claimServerRestart(serverId, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.pool.query(
+      `UPDATE server SET restart_requested_at = NULL, restart_acked_at = $1
+       WHERE id = $2 AND restart_requested_at IS NOT NULL
+       RETURNING id`,
+      [now, serverId]
+    );
+    return r.rowCount > 0;
+  }
+
+  // Withdraw a request that has not been collected yet (admin changed their
+  // mind, or the box was fixed another way).
+  async cancelServerRestart(serverId) {
+    const r = await this.pool.query(
+      "UPDATE server SET restart_requested_at = NULL, restart_requested_by = NULL WHERE id = $1",
+      [serverId]
+    );
+    return r.rowCount > 0;
   }
 
   // Servers a broadcast/maintenance rcon can actually reach: trusted, with both
@@ -2133,6 +2194,31 @@ class RaceDB {
     if (!lastPt || lastPt.day !== today) srHistory.push({ day: today, sr: curSr });
     else lastPt.sr = curSr;
 
+    // Where this rating sits among everyone else's. Counted here rather than
+    // derived client-side from the shared histogram (/api/sr/distribution),
+    // because a bucket only knows "somewhere in this 18-point band" and the
+    // percentile is the one number the card is actually about. Ranked only:
+    // a player with no standings row is not on the board to have a place on it.
+    let srPlace = null;
+    if (standing.rank != null) {
+      const pos = await this.one(
+        `SELECT COUNT(*)::int                            AS total,
+                COUNT(*) FILTER (WHERE sr <  $1)::int    AS below,
+                COUNT(*) FILTER (WHERE sr >  $1)::int    AS above
+           FROM standings`,
+        [curSr]
+      );
+      const total = num(pos.total);
+      if (total > 0)
+        srPlace = {
+          total,
+          // "Ahead of N% of ranked players" — ties are neither ahead nor
+          // behind, so they sit outside both this and `rank` by design.
+          percentile: Math.round((num(pos.below) / total) * 1000) / 10,
+          rank: num(pos.above) + 1,
+        };
+    }
+
     const groupWhere = "player_id IN (SELECT id FROM player WHERE canonical_id = $1)";
     const finishes = num(
       (await this.one(`SELECT COALESCE(SUM(finishes),0) c FROM run_tally WHERE ${groupWhere}`, [canonId])).c
@@ -2302,6 +2388,7 @@ class RaceDB {
       aliases,
       standing,
       srHistory,
+      srPlace,
       strafeHistory,
       finishes,
       attempts,
@@ -2317,6 +2404,66 @@ class RaceDB {
       recentFinishes: await this.recentFinishes({ limit: 5, playerId: canonId }),
       versions,
       records: { total, limit: lim, offset: off, rows: records },
+    };
+  }
+
+  // The shape of the whole SR board: how many ranked players sit in each slice
+  // of the rating scale, plus the quartile marks. Player-independent on purpose
+  // — every profile draws the SAME histogram and only marks a different spot on
+  // it (the marker's position comes from `srPlace` on the profile payload), so
+  // this is one cacheable answer for the entire site rather than one per player.
+  //
+  // The buckets span the OBSERVED range rather than the nominal 0–1000: real
+  // ratings occupy a fraction of that scale (the fill prior pins most players
+  // into a few hundred points of it), and bucketing the empty 900 points would
+  // spend most of the chart drawing nothing. Bounds are snapped outward to a
+  // round 10 so the axis labels read as numbers a player recognises.
+  async srDistribution({ buckets = 40 } = {}) {
+    const n = Math.max(4, Math.min(120, Math.trunc(buckets) || 40));
+    const b = await this.one(
+      `SELECT COUNT(*)::int                   AS total,
+              (FLOOR(MIN(sr) / 10.0) * 10)::int AS lo,
+              (CEIL (MAX(sr) / 10.0) * 10)::int AS hi,
+              PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sr)::int AS p50
+         FROM standings`
+    );
+    const total = num(b && b.total);
+    if (!total) return { total: 0, lo: 0, hi: 0, width: 0, buckets: [], median: null };
+
+    const lo = num(b.lo);
+    // A board where everyone shares one rating (a fresh install, or one player)
+    // would give a zero-width range, and width_bucket rejects lo = hi.
+    const hi = Math.max(num(b.hi), lo + 10);
+
+    // width_bucket returns n+1 for a value exactly at the upper bound — LEAST
+    // folds that top edge back into the last bucket instead of losing the
+    // highest-rated player off the end of the chart.
+    const rows = await this.all(
+      `SELECT LEAST(width_bucket(sr::float, $1::float, $2::float, $3), $3)::int AS idx,
+              COUNT(*)::int AS c
+         FROM standings
+        GROUP BY 1
+        ORDER BY 1`,
+      [lo, hi, n]
+    );
+
+    const counts = new Array(n).fill(0);
+    for (const r of rows) {
+      const i = num(r.idx) - 1; // width_bucket is 1-based
+      if (i >= 0 && i < n) counts[i] += num(r.c);
+    }
+    const width = (hi - lo) / n;
+    return {
+      total,
+      lo,
+      hi,
+      width,
+      median: num(b.p50),
+      buckets: counts.map((count, i) => ({
+        lo: Math.round(lo + i * width),
+        hi: Math.round(lo + (i + 1) * width),
+        count,
+      })),
     };
   }
 
@@ -4193,8 +4340,17 @@ class RaceDB {
     let r;
     try {
       r = await this.pool.query(
+        // An auto-monthly edition keeps repeat_every_days at 0 no matter what
+        // the form posts. The chain scheduler gates on repeat_every_days > 0,
+        // so a stray non-zero here would hand a Monthly Cup edition to the
+        // fixed-day roll-forward as well — two schedulers writing the same
+        // series, one of them with arithmetic that cannot express a month.
+        // Enforced in the UPDATE rather than the route because the form is not
+        // the only writer.
         `UPDATE tournament SET slug=$2, name=$3, description=$4, starts_at=$5, ends_at=$6,
-                status=$7, scoring=$8, join_open=$9, repeat_every_days=$10, repeat_gap_days=$11,
+                status=$7, scoring=$8, join_open=$9,
+                repeat_every_days = CASE WHEN created_by = 'auto-monthly' THEN 0 ELSE $10 END,
+                repeat_gap_days   = CASE WHEN created_by = 'auto-monthly' THEN 0 ELSE $11 END,
                 updated_at=$12, updated_by=$13
          WHERE id = $1 AND status <> 'finalized'`,
         [
@@ -4615,12 +4771,22 @@ class RaceDB {
       "SELECT id FROM tournament WHERE status = 'published' AND ends_at <= $1 ORDER BY ends_at",
       [now]
     );
-    const out = { finalized: 0, trophies: 0, scheduled: [] };
+    // Per-item isolation. Without it one tournament that throws (a corrupt
+    // detail payload, a map deleted mid-freeze) takes finalization, trophies AND
+    // the series reconciliation down with it for every OTHER tournament too —
+    // and the sweep's single outer catch reports it once every five minutes with
+    // no indication of which row is poisoned. Failures are collected and
+    // surfaced so the caller can log them.
+    const out = { finalized: 0, trophies: 0, scheduled: [], failed: [] };
     for (const d of due) {
-      const r = await this.finalizeTournament(num(d.id), now);
-      if (!r.finalized) continue;
-      out.finalized++;
-      out.trophies += r.trophies;
+      try {
+        const r = await this.finalizeTournament(num(d.id), now);
+        if (!r.finalized) continue;
+        out.finalized++;
+        out.trophies += r.trophies;
+      } catch (e) {
+        out.failed.push({ id: num(d.id), error: e?.message ?? String(e) });
+      }
     }
 
     // Reconcile: the latest finalized edition of every recurring series that
@@ -4638,10 +4804,493 @@ class RaceDB {
        ORDER BY t.ends_at`
     );
     for (const o of orphans) {
-      const next = await this.scheduleNextEdition(this._tournamentRow(o), now);
-      if (next) out.scheduled.push(next);
+      try {
+        const next = await this.scheduleNextEdition(this._tournamentRow(o), now);
+        if (next) out.scheduled.push(next);
+      } catch (e) {
+        out.failed.push({ id: num(o.id), error: e?.message ?? String(e) });
+      }
     }
     return out;
+  }
+
+  // ------------------------------------------------------------------------
+  // The Monthly Cup — automatic monthly series
+  // ------------------------------------------------------------------------
+  // See docs/monthly-cup-design.md. The pure rule lives in tournaments.js; this
+  // is the data access plus the one transaction that materialises an edition.
+
+  // The previous month's most-FINISHED maps.
+  //
+  // The metric is raw COUNT(*) over the finish log, windowed to a calendar
+  // month. `finish` is the only table that can answer this at all: run_tally is
+  // a history-less cumulative counter and `race` holds PBs only, so a windowed
+  // `race` count would mean "new personal bests set", not "played".
+  //
+  // Returns rows already ranked, NOT yet censor-filtered — the caller does that
+  // in JS because the censor word matcher is an in-memory matcher with no SQL
+  // form, and the game feed necessarily sends map names raw (a censored map
+  // would otherwise be announced uncensored in-game while showing starred on the
+  // site).
+  async monthlyPoolCandidates({
+    since,
+    until,
+    minFinishers = MONTHLY_MIN_FINISHERS,
+    limit = MONTHLY_CANDIDATE_FETCH,
+    excludeTournamentWindows = true,
+  } = {}) {
+    // The tournament is itself the strongest concentrator of play on its own
+    // pool — `callvote tourneymap` actively moves servers onto those maps — so
+    // counting finishes made INSIDE a tournament window on that tournament's own
+    // pool maps would make the pool a fixed point: September's pool would equal
+    // August's forever. Subtracting them makes the metric mean "popular in
+    // ordinary play".
+    //
+    // status IN ('published','finalized') is load-bearing. `<> 'cancelled'`
+    // would also match a forgotten DRAFT, which concentrates no play whatsoever
+    // and (drafts may run up to 90 days) could silently subtract a quarter's
+    // worth of popularity data.
+    const tourneyExclusion = excludeTournamentWindows
+      ? `AND NOT EXISTS (
+           SELECT 1 FROM tournament t
+             JOIN tournament_map tm ON tm.tournament_id = t.id AND tm.map_id = m.id
+            WHERE t.status IN ('published','finalized')
+              AND f.created_at >= t.starts_at
+              AND f.created_at <  t.ends_at
+         )`
+      : "";
+    return (
+      await this.all(
+        `SELECT m.id                                                   AS map_id,
+                m.name                                                 AS map_name,
+                COUNT(*)::int                                          AS finishes,
+                COUNT(DISTINCT COALESCE(pl.canonical_id, pl.id))::int  AS finishers
+           FROM finish f
+           JOIN player pl ON pl.id = f.player_id
+           JOIN map    m  ON m.id  = f.map_id
+          WHERE f.created_at >= $1
+            AND f.created_at <  $2
+            -- A reverse run is its own map row "<map>-reversed". No pk3 contains
+            -- that .bsp, so "callvote tourneymap" can never reach it: it would
+            -- score and be unplayable.
+            AND m.name NOT LIKE '%-reversed'
+            -- Canonical case only. The auto pool is inserted BY MAP ID, but
+            -- setTournamentMaps lowercases and get-or-creates BY NAME, so a
+            -- mixed-case pool map would round-trip into a DIFFERENT, empty map
+            -- row on any admin re-save — and because standingsQuery resolves the
+            -- pool at READ time, every point already scored on it would vanish
+            -- with no error at all.
+            AND m.name = lower(m.name)
+            -- Blocked maps are stripped from every in-game vote path, so a
+            -- blocked pool map is another unreachable entry.
+            AND NOT EXISTS (SELECT 1 FROM map_block b WHERE b.map_id = m.id)
+            ${tourneyExclusion}
+          GROUP BY m.id, m.name
+         HAVING COUNT(DISTINCT COALESCE(pl.canonical_id, pl.id)) >= $3
+          -- Ties are common at this site's scale, and under the skip rule a tie
+          -- at the last pool slot can decide whether the month runs at all, so
+          -- the order has to be TOTAL and stable. finishers breaks most ties in
+          -- practice; map.name is UNIQUE so the name key always resolves the
+          -- rest, and COLLATE "C" keeps it byte-stable regardless of the
+          -- server's locale.
+          ORDER BY finishes DESC, finishers DESC, m.name COLLATE "C" ASC
+          LIMIT $4`,
+        [Math.trunc(since), Math.trunc(until), Math.max(1, Math.trunc(minFinishers)), clampLimit(limit, 40, 200)]
+      )
+    ).map((r) => ({
+      mapId: num(r.map_id),
+      mapName: r.map_name,
+      finishes: num(r.finishes),
+      finishers: num(r.finishers),
+    }));
+  }
+
+  // The pool of the last edition of this series that ACTUALLY RAN, as map ids.
+  //
+  // Bounded by the WINDOW being decided, never by `now`. With `starts_at <= now`
+  // a re-decide of a month whose edition already exists returns that month's OWN
+  // edition as the comparand — whose pool is byte-identical to the one just
+  // recomputed from the same data — so it would intersect fully and record
+  // "skipped_overlap" for a tournament that is live and scoring. Reachable via
+  // the force button, a restore, or a manual row delete.
+  //
+  // Restricted to the series: a hand-made tournament always lands with
+  // series_key NULL (createTournament only sets it when repeat_every_days > 0),
+  // so unrelated admin activity can never become the comparand.
+  async monthlySeriesPrevPool(seriesKey, windowStart) {
+    const prev = await this.one(
+      `SELECT id FROM tournament
+        WHERE series_key = $1 AND status IN ('published','finalized') AND starts_at < $2
+        ORDER BY starts_at DESC, id DESC LIMIT 1`,
+      [seriesKey, Math.trunc(windowStart)]
+    );
+    if (!prev) return { tournamentId: null, mapIds: [] };
+    const ids = await this.all("SELECT map_id FROM tournament_map WHERE tournament_id = $1", [num(prev.id)]);
+    return { tournamentId: num(prev.id), mapIds: ids.map((r) => num(r.map_id)) };
+  }
+
+  _autoPeriodRow(r) {
+    if (!r) return null;
+    return {
+      series_key: r.series_key,
+      period: r.period,
+      decision: r.decision,
+      tournament_id: r.tournament_id == null ? null : num(r.tournament_id),
+      detail: r.detail || {},
+      decided_at: num(r.decided_at),
+    };
+  }
+
+  async autoPeriod(seriesKey, period) {
+    return this._autoPeriodRow(
+      await this.one("SELECT * FROM tournament_auto_period WHERE series_key = $1 AND period = $2", [seriesKey, period])
+    );
+  }
+
+  async autoPeriods(seriesKey, limit = 12) {
+    return (
+      await this.all(
+        `SELECT * FROM tournament_auto_period WHERE series_key = $1
+          ORDER BY period DESC LIMIT $2`,
+        [seriesKey, clampLimit(limit, 12, 120)]
+      )
+    ).map((r) => this._autoPeriodRow(r));
+  }
+
+  // Consecutive TERMINAL skips immediately preceding `period`. Walks backwards
+  // and stops at the first month that is not a skip — including a month with no
+  // row at all, which is the correct stop: a month the generator never reached
+  // (the feature was off, the site was down) is not evidence that the rule is
+  // deadlocked, and counting it would force an edition that nothing justified.
+  async monthlySkipStreak(seriesKey, period, maxLookback = 24) {
+    let streak = 0;
+    let p = prevPeriodKey(period);
+    for (let i = 0; i < maxLookback && p; i++) {
+      const row = await this.autoPeriod(seriesKey, p);
+      if (!row) break;
+      const skipped =
+        row.decision === "skipped_overlap" ||
+        row.decision === "skipped_thin" ||
+        // A force that never produced an edition is still a month that did not
+        // run. Counting it as anything else would let a mistaken click reset the
+        // escalation and push the automatic rescue further away.
+        (row.decision === "forced" && row.tournament_id == null);
+      if (!skipped) break;
+      streak++;
+      p = prevPeriodKey(p);
+    }
+    return streak;
+  }
+
+  // Record a decision that produces NO edition (skipped_thin / skipped_overlap /
+  // blocked). Returns {changed} so the caller logs only when the decision moves
+  // — a month blocked for a week would otherwise emit one identical warning
+  // every sweep, ~2000 of them.
+  async recordAutoPeriod(seriesKey, period, decision, detail, now = Math.floor(Date.now() / 1000)) {
+    // Two guards, and both are load-bearing.
+    //
+    // TERMINAL rows are never downgraded. Without that guard a later pass could
+    // overwrite a committed 'scheduled' with 'blocked' — and since a created
+    // edition necessarily overlaps its own window, the month would then block
+    // itself forever, silently, while telling the operator to cancel the very
+    // cup they are being told is blocked.
+    //
+    // `changed` reports whether the DECISION moved, which is what gates the log
+    // (a week-long block must warn once, not ~2000 times) — but detail and
+    // decided_at are refreshed even when it did not, so the durable record never
+    // goes on naming a blocker that has since been cleared.
+    // Read-then-write rather than deriving the prior value inside RETURNING: a
+    // subquery there reads the statement's own snapshot, which is a subtlety
+    // nobody should have to re-derive to know whether this logs. The extra round
+    // trip costs nothing on a job that runs every five minutes.
+    const prior = await this.autoPeriod(seriesKey, period);
+    if (prior && MONTHLY_TERMINAL.has(prior.decision)) return { changed: false, blockedByTerminal: true };
+    await this.pool.query(
+      `INSERT INTO tournament_auto_period AS ap (series_key, period, decision, detail, decided_at)
+       VALUES ($1,$2,$3,$4::jsonb,$5)
+       ON CONFLICT (series_key, period) DO UPDATE
+         SET decision = EXCLUDED.decision, detail = EXCLUDED.detail, decided_at = EXCLUDED.decided_at
+       WHERE ap.decision NOT IN ('scheduled','skipped_overlap','skipped_thin','cancelled')`,
+      [seriesKey, period, decision, JSON.stringify(detail || {}), now]
+    );
+    return { changed: !prior || prior.decision !== decision };
+  }
+
+  // Mark a month for a forced re-decide (the operator escape hatch). Only a
+  // terminal skip can be forced — forcing a month that already produced an
+  // edition would be a request to double-book the calendar.
+  // Returns rows changed, or {error} when the force cannot take effect.
+  //
+  // A force AFTER the window has opened is refused. It would otherwise be a
+  // permanent no-op that reports success: the generator does nothing once
+  // `now >= startsAt`, so the row would sit at 'forced' forever — and because
+  // 'forced' is non-terminal it would ALSO stop counting toward the skip streak,
+  // silently pushing the automatic escalation further away as a side effect of a
+  // click that did nothing.
+  async forceMonthlyPeriod(seriesKey, period, by, now = Math.floor(Date.now() / 1000)) {
+    const win = monthlyWindow(period);
+    if (!win) return { error: "That is not a month this series can schedule." };
+    if (now >= win.startsAt) {
+      return { error: "That month's window has already opened — it can no longer be re-decided." };
+    }
+    const r = await this.pool.query(
+      `UPDATE tournament_auto_period
+          SET decision = 'forced',
+              -- forcedFrom preserves the decision being overridden, so the skip
+              -- itself survives the override in the audit trail; forceRequestedAt
+              -- is what lets the force survive an intervening 'blocked' write.
+              detail = detail || jsonb_build_object(
+                'forcedBy', $3::text, 'forcedAt', $4::bigint,
+                'forceRequestedAt', $4::bigint, 'forcedFrom', decision),
+              decided_at = $4
+        WHERE series_key = $1 AND period = $2
+          AND decision IN ('skipped_overlap','skipped_thin')`,
+      [seriesKey, period, by || null, now]
+    );
+    return r.rowCount;
+  }
+
+  // Decide the current month for the automatic series, and materialise the
+  // edition if it is to run.
+  //
+  // Every return carries an explicit `wrote` flag, and the sweep logs only when
+  // it is true. Ordered so the cheap, ACTIONABLE condition is checked before the
+  // expensive aggregate: overlappingTournaments is one indexed range scan, and
+  // running it second would mean a month that was both collided and blocked
+  // recorded "skipped_overlap" and never named the blocker an operator can
+  // actually clear.
+  async scheduleMonthlyEdition({
+    seriesKey = MONTHLY_SERIES_KEY,
+    now = Math.floor(Date.now() / 1000),
+    period = null,
+    poolSize = MONTHLY_POOL_SIZE,
+    minPool = MONTHLY_MIN_POOL,
+    minFinishers = MONTHLY_MIN_FINISHERS,
+    scoring = MONTHLY_SCORING,
+    maxSkipStreak = MONTHLY_MAX_SKIP_STREAK,
+    excludeTournamentWindows = true,
+    dryRun = false,
+  } = {}) {
+    const per = period || monthPeriodKey(now);
+    const win = monthlyWindow(per);
+    if (!win) return { period: per, decision: "invalid-period", wrote: false };
+
+    // A month whose window has already opened is not a skip — it is a month the
+    // generator could not reach in time. Writing nothing is what keeps a deploy
+    // mid-month quiet instead of raising an alarm about a month that was never
+    // going to run.
+    if (!dryRun && now >= win.startsAt) return { period: per, decision: "window-open", wrote: false };
+
+    // The preview reads exactly what the real pass reads — only the WRITES are
+    // suppressed. A preview that ignored the existing decision would keep
+    // cheerfully reporting "would pick <maps>" for a month that has already been
+    // decided or lost, which is worse than no preview at all.
+    const existing = await this.autoPeriod(seriesKey, per);
+    if (existing && MONTHLY_TERMINAL.has(existing.decision)) {
+      return { period: per, decision: existing.decision, wrote: false, detail: existing.detail };
+    }
+    // A force survives an intervening block: it is carried in the detail as well
+    // as in the decision, so a `blocked` write in between cannot silently
+    // destroy an operator's override.
+    const forced = Boolean(existing && (existing.decision === "forced" || existing.detail?.forceRequestedAt));
+    const carry = existing?.detail?.forceRequestedAt ? { forceRequestedAt: existing.detail.forceRequestedAt } : {};
+
+    // Is OUR OWN edition for this period already on the calendar? That is not a
+    // blocker — it is the answer. It happens whenever the decision row is lost
+    // but the tournament survives (a partial restore, a manual delete), and
+    // treating it as a blocker would make the month block itself forever.
+    // Checked across EVERY status, because the slug is unique regardless of
+    // status while the calendar constraint ignores cancelled rows — so a
+    // cancelled edition is invisible to overlappingTournaments yet still owns
+    // the slug the insert below would need.
+    const holder = await this.one(
+      "SELECT id, status, series_key, starts_at, ends_at FROM tournament WHERE slug = $1",
+      [monthlySlug(per)]
+    );
+    // ...and it is only OURS if it is this series at exactly this window. A row
+    // that merely happens to hold the slug — an admin's hand-made cup, a restore
+    // from another instance — is a squatter, and adopting it would silently hand
+    // the month's identity to a tournament nobody scheduled.
+    const mine =
+      holder &&
+      holder.series_key === seriesKey &&
+      num(holder.starts_at) === win.startsAt &&
+      num(holder.ends_at) === win.endsAt
+        ? holder
+        : null;
+    if (holder && !mine) {
+      // Reported here rather than by letting the INSERT fail, so the diagnosis
+      // does not depend on which unique constraint Postgres happens to raise
+      // first (the slug 23505 fires before the calendar 23P01, which is what
+      // made this look like a lost peer race).
+      return {
+        period: per, decision: "slug-taken", wrote: false,
+        error: `slug ${monthlySlug(per)} is held by tournament ${num(holder.id)} (${holder.status})`,
+      };
+    }
+    if (mine) {
+      const status = mine.status;
+      // An operator cancelling this month's cup IS the decision. Recording it
+      // terminally is what stops the generator retrying the slug every five
+      // minutes for the rest of the day.
+      const decision = status === "cancelled" ? "cancelled" : "scheduled";
+      const detail = {
+        ...carry,
+        reason: status === "cancelled"
+          ? "an operator cancelled this month's edition"
+          : "the edition already exists (decision record was rebuilt from the calendar)",
+        period: per, tournamentId: num(mine.id), status,
+      };
+      if (dryRun) return { period: per, decision, wrote: false, detail, window: win };
+      const { changed } = await this.recordAutoPeriod(seriesKey, per, decision, detail, now);
+      if (changed) {
+        await this.pool.query(
+          "UPDATE tournament_auto_period SET tournament_id = $3 WHERE series_key = $1 AND period = $2",
+          [seriesKey, per, num(mine.id)]
+        );
+      }
+      return { period: per, decision, wrote: changed, detail, tournamentId: num(mine.id), window: win };
+    }
+
+    // The calendar rule is never bypassed, not even by a force.
+    const blockers = await this.overlappingTournaments(win.startsAt, win.endsAt);
+    if (blockers.length) {
+      const detail = {
+        ...carry,
+        reason: "the calendar slot is taken",
+        blockedBy: blockers.map((b) => ({
+          id: b.id, slug: b.slug, name: b.name, status: b.status,
+          startsAt: b.starts_at, endsAt: b.ends_at,
+        })),
+        window: { startsAt: win.startsAt, endsAt: win.endsAt },
+      };
+      if (dryRun) return { period: per, decision: "blocked", wrote: false, detail, window: win };
+      const { changed } = await this.recordAutoPeriod(seriesKey, per, "blocked", detail, now);
+      return { period: per, decision: "blocked", wrote: changed, detail, window: win };
+    }
+
+    const look = prevMonthWindow(per);
+    const raw = await this.monthlyPoolCandidates({
+      since: look.since,
+      until: look.until,
+      minFinishers,
+      limit: MONTHLY_CANDIDATE_FETCH,
+      excludeTournamentWindows,
+    });
+    // Censor in JS over the over-fetch (see monthlyPoolCandidates).
+    const candidates = raw.filter((c) => this._cnMap(c.mapName, c.mapId) === c.mapName);
+
+    const prev = await this.monthlySeriesPrevPool(seriesKey, win.startsAt);
+    const skipStreak = await this.monthlySkipStreak(seriesKey, per);
+    const decided = decideMonthlyPool({
+      candidates, prevPoolIds: prev.mapIds, skipStreak, forced, poolSize, minPool, maxSkipStreak,
+    });
+    const detail = {
+      ...carry,
+      ...decided.detail,
+      period: per,
+      measured: { since: look.since, until: look.until },
+      window: { startsAt: win.startsAt, endsAt: win.endsAt },
+      previousEditionId: prev.tournamentId,
+    };
+
+    if (dryRun) {
+      return { period: per, decision: decided.decision, wrote: false, detail, pool: decided.pool, window: win };
+    }
+
+    if (decided.decision === "skipped_thin" || decided.decision === "skipped_overlap") {
+      const { changed } = await this.recordAutoPeriod(seriesKey, per, decided.decision, detail, now);
+      return { period: per, decision: decided.decision, wrote: changed, detail };
+    }
+
+    // Materialise. Row + pool + claim in ONE transaction: the whole reason this
+    // design is safe is that a tournament never exists without its pool, so
+    // "published with an empty pool" — which would announce 0 maps in-game,
+    // freeze an empty result and mint no trophies — is unreachable rather than
+    // merely guarded.
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // The claim goes FIRST and is checked by rowCount. This is the entire
+      // two-replica story: ON CONFLICT DO NOTHING raises NOTHING and returns
+      // zero rows, so a loser watching only for an exception would carry on and
+      // create a second edition.
+      const claim = await client.query(
+        `INSERT INTO tournament_auto_period (series_key, period, decision, detail, decided_at)
+         VALUES ($1,$2,$3,$4::jsonb,$5)
+         ON CONFLICT (series_key, period) DO UPDATE
+           SET decision = EXCLUDED.decision, detail = EXCLUDED.detail, decided_at = EXCLUDED.decided_at
+         WHERE tournament_auto_period.decision IN ('blocked','forced')
+         RETURNING period`,
+        [seriesKey, per, "scheduled", JSON.stringify(detail), now]
+      );
+      if (!claim.rowCount) {
+        await client.query("ROLLBACK");
+        return { period: per, decision: "already-decided", wrote: false };
+      }
+
+      const trow = (
+        await client.query(
+          `INSERT INTO tournament
+             (slug, name, description, starts_at, ends_at, status, scoring, join_open,
+              repeat_every_days, repeat_gap_days, series_key, edition, created_at, created_by)
+           VALUES ($1,$2,$3,$4,$5,'published',$6,TRUE,0,0,$7,$8,$9,'auto-monthly') RETURNING id`,
+          [
+            monthlySlug(per), monthlyName(per), monthlyDescription(per),
+            win.startsAt, win.endsAt, scoring, seriesKey,
+            // Edition numbers the calendar for display only; the identity that
+            // matters is the month, which is in the slug.
+            (await this._monthlyEditionNumber(client, seriesKey)) + 1,
+            now,
+          ]
+        )
+      ).rows[0];
+      const tournamentId = num(trow.id);
+
+      let pos = 0;
+      for (const m of decided.pool) {
+        await client.query(
+          "INSERT INTO tournament_map (tournament_id, map_id, position) VALUES ($1,$2,$3)",
+          [tournamentId, m.mapId, pos++]
+        );
+      }
+      await client.query(
+        "UPDATE tournament_auto_period SET tournament_id = $3 WHERE series_key = $1 AND period = $2",
+        [seriesKey, per, tournamentId]
+      );
+
+      await client.query("COMMIT");
+      return {
+        period: per, decision: decided.decision, wrote: true, tournamentId,
+        slug: monthlySlug(per), pool: decided.pool, detail, window: win,
+      };
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      // Discriminate, because these two are NOT the same event and the naive
+      // handler conflates them. With both the slug and the window colliding
+      // Postgres raises the slug 23505 FIRST and never reaches 23P01, so a
+      // leftover row named e.g. "monthly-cup-2026-09" (a restore, a rolled-back
+      // experiment, an admin) would look exactly like "the other replica won"
+      // and loop silently forever with no decision row ever written.
+      if (e.code === "23505" && /auto_period/.test(e.constraint || "")) {
+        return { period: per, decision: "already-decided", wrote: false };
+      }
+      if (e.code === "23505") {
+        return { period: per, decision: "slug-taken", wrote: false, error: e.constraint || "unique violation" };
+      }
+      if (e.code === "23P01") {
+        return { period: per, decision: "blocked-race", wrote: false };
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  async _monthlyEditionNumber(client, seriesKey) {
+    const r = await client.query("SELECT COALESCE(MAX(edition), 0) e FROM tournament WHERE series_key = $1", [seriesKey]);
+    return num(r.rows[0].e) || 0;
   }
 
   // ------------------------------------------------------------------------

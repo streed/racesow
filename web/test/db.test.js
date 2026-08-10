@@ -200,6 +200,58 @@ test("strafe quality is null when a player has no reported runs", async (t) => {
   assert.deepEqual(pd.strafeHistory, []);
 });
 
+test("SR distribution buckets the whole board, and a profile knows its place on it", async (t) => {
+  const race = await freshDb(t);
+
+  // One contested map with a spread-out field: 12 players, each slower than the
+  // last, so the ratings land at distinct points rather than all on the prior.
+  const field = [];
+  for (let i = 0; i < 12; i++) field.push(finish(`p${i}`, 30000 + i * 4000));
+  await race.ingest({ version: VER, map: "arena", source: "racelog", records: field });
+  await race.refreshAggregates();
+
+  const dist = await race.srDistribution();
+  const board = (await race.players({ sort: "sr", limit: 200 })).rows;
+
+  // Every ranked player is in exactly one bucket — nobody is lost off either
+  // end (the top edge is the one that width_bucket would otherwise drop).
+  assert.equal(dist.total, board.length, "total counts the whole standings board");
+  assert.equal(
+    dist.buckets.reduce((a, b) => a + b.count, 0),
+    board.length,
+    "every ranked player lands in a bucket"
+  );
+  assert.ok(dist.lo <= Math.min(...board.map((r) => r.sr)), "lo covers the weakest rating");
+  assert.ok(dist.hi >= Math.max(...board.map((r) => r.sr)), "hi covers the strongest rating");
+  // Buckets tile the range with no gap and no overlap.
+  for (let i = 1; i < dist.buckets.length; i++)
+    assert.equal(dist.buckets[i].lo, dist.buckets[i - 1].hi, `bucket ${i} starts where ${i - 1} ends`);
+
+  // The fastest player's percentile: ahead of everyone he beat, and #1 by rating.
+  const top = board[0];
+  const pd = await race.playerDetail(top.id);
+  assert.equal(pd.srPlace.total, board.length);
+  assert.equal(pd.srPlace.rank, 1, "the highest rating is #1 by rating");
+  const below = board.filter((r) => r.sr < top.sr).length;
+  assert.equal(
+    pd.srPlace.percentile,
+    Math.round((below / board.length) * 1000) / 10,
+    "percentile is the share of the board rated lower"
+  );
+
+  // ...and the slowest is at the other end: nobody rates below him.
+  const last = board[board.length - 1];
+  const pdLast = await race.playerDetail(last.id);
+  assert.equal(pdLast.srPlace.percentile, 0, "the weakest rating is ahead of nobody");
+  assert.equal(pdLast.srPlace.rank, board.filter((r) => r.sr > last.sr).length + 1);
+
+  // The player's rating actually falls inside the bucket the chart would light.
+  const hit = dist.buckets.find(
+    (b, i) => top.sr >= b.lo && (top.sr < b.hi || i === dist.buckets.length - 1)
+  );
+  assert.ok(hit, `a bucket contains SR ${top.sr}`);
+});
+
 test("skill rating (SR) rewards closeness to the WR over breadth of maps", async (t) => {
   const race = await freshDb(t);
 

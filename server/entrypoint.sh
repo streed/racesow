@@ -439,12 +439,22 @@ _ship_flush() {
     # Detach the POST so the read loop keeps draining the FIFO while curl runs
     # (a synchronous curl could fill the pipe and stall the engine). curl bounds
     # itself with --max-time; failures are ignored (best-effort logs).
-    printf '%s' "${_ship_buf}" | (
-        curl -fsS --max-time 6 -X POST \
+    #
+    # The nesting is deliberate: the OUTER subshell runs in the FOREGROUND and the
+    # curl is backgrounded INSIDE it. Backgrounding the curl directly from here
+    # leaks a zombie per flush forever. log_shipper's loop is built entirely from
+    # builtins (read, printf, arithmetic), so it never forks and never calls
+    # waitpid -- and dash keeps a finished background job as a zombie until
+    # something waits. US Warsow held 5,624 of them after 18h uptime (~5/min,
+    # bounded only by the 5am restart cron). Here the shell waits for the outer
+    # subshell (which exits immediately), and that wait reaps any pending zombies;
+    # the curl is orphaned to PID 1, whose `wait "${server_pid}"` reaps it in turn.
+    (
+        printf '%s' "${_ship_buf}" | curl -fsS --max-time 6 -X POST \
             -H "Authorization: Bearer ${INGEST_TOKEN}" \
             -H "Content-Type: text/plain" \
-            --data-binary @- "${LOG_INGEST_URL}" >/dev/null 2>&1 || true
-    ) &
+            --data-binary @- "${LOG_INGEST_URL}" >/dev/null 2>&1 || true &
+    )
     _ship_buf=""
     _ship_n=0
 }
@@ -491,8 +501,12 @@ fi
 # cleanly (no final topscores write, no rs_api queue drain) and gets
 # SIGKILLed when the grace period expires.
 server_pid=""
+# Where the engine's PID is published for the healthcheck watchdog; keep in step
+# with the ENGINE_PIDFILE gamehealth.sh reads.
+ENGINE_PIDFILE="${ENGINE_PIDFILE:-/tmp/engine.pid}"
 shutdown() {
     echo "Shutting down."
+    rm -f "${ENGINE_PIDFILE}" 2>/dev/null || true
     if [ -n "${server_pid}" ]; then
         kill -TERM "${server_pid}" 2>/dev/null || true
         wait "${server_pid}" 2>/dev/null || true
@@ -522,8 +536,14 @@ while true; do
         stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" &
     fi
     server_pid=$!
+    # Publish the PID for gamehealth.sh (the Docker healthcheck): when the engine
+    # wedges — alive but answering nothing — the watchdog signals THIS pid to
+    # force a relaunch through the loop below. It must be the engine's own pid,
+    # never this script's: the kernel discards in-namespace signals to PID 1.
+    echo "${server_pid}" > "${ENGINE_PIDFILE}" 2>/dev/null || true
     wait "${server_pid}" || true
     server_pid=""
+    rm -f "${ENGINE_PIDFILE}" 2>/dev/null || true
     echo ">> server exited, restarting in 5s..."
     sleep 5
 done

@@ -64,16 +64,21 @@ SQL="$WORK/$SQL_NAME"
 # moderation/secret table can never silently leak. The intentionally-excluded
 # tables today are admin_user, admin_session, map_flag, map_block, server_log,
 # censor_term, player_censor, map_censor and tournament_entrant (see the header).
-# config, server, site_setting, achievement and tournament are listed here for
-# their SCHEMA but have their DATA excluded below and re-added sanitized in step
-# 3 (config: bootstrap counters without the maintenance_* keys; server: names
-# only; site_setting: MOTD without the admin username; achievement + tournament:
-# every column except the created_by/updated_by admin usernames). pgmigrations is
-# included so a restored DB boots without re-running the schema migrations.
+# config, server, site_setting, achievement, tournament and
+# tournament_auto_period are listed here for their SCHEMA but have their DATA
+# excluded below and re-added sanitized in step 3 (config: bootstrap counters
+# without the maintenance_* keys; server: names only; site_setting: MOTD without
+# the admin username; achievement + tournament: every column except the
+# created_by/updated_by admin usernames — except that tournament KEEPS the
+# literal 'auto-monthly' marker, which is a machine tag rather than a person and
+# is what identifies a Monthly Cup edition after a restore;
+# tournament_auto_period: every column, with detail.forcedBy stripped).
+# pgmigrations is included so a restored DB boots without re-running the schema
+# migrations.
 # NOTE: when a NEW race-record table is added to the schema, add it here too —
 # and if it carries an admin username or any other operator-only column, give it
 # a sanitized \copy in step 3 instead of dumping its data wholesale.
-TABLES="public.config public.version public.map public.player public.canonical public.race public.checkpoint public.finish public.finish_checkpoint public.run_tally public.player_demo public.player_ghost public.player_saved_start public.sr_history public.map_weapon public.achievement public.player_achievement public.tournament public.tournament_map public.tournament_standing public.tournament_trophy public.site_setting public.server public.pgmigrations"
+TABLES="public.config public.version public.map public.player public.canonical public.race public.checkpoint public.finish public.finish_checkpoint public.run_tally public.player_demo public.player_ghost public.player_saved_start public.sr_history public.map_weapon public.achievement public.player_achievement public.tournament public.tournament_map public.tournament_standing public.tournament_trophy public.tournament_auto_period public.site_setting public.server public.pgmigrations"
 
 echo "[backup] $NOW_ISO building $SQL_NAME"
 
@@ -139,6 +144,7 @@ pg_dump "$DATABASE_URL" \
   --exclude-table-data=public.site_setting \
   --exclude-table-data=public.achievement \
   --exclude-table-data=public.tournament \
+  --exclude-table-data=public.tournament_auto_period \
   >> "$SQL"
 
 # 3) Sanitized game-server rows: id + name + status + counts only. token_hash
@@ -203,11 +209,31 @@ pg_dump "$DATABASE_URL" \
 #     their frozen standings/trophies, but not the in-flight join codes.
 {
   printf '\n-- Sanitized tournaments (creator/editor admin usernames stripped).\n'
-  printf 'COPY public.tournament (id, slug, name, description, starts_at, ends_at, status, scoring, join_open, repeat_every_days, repeat_gap_days, series_key, edition, finalized_at, created_at, updated_at) FROM stdin;\n'
+  printf 'COPY public.tournament (id, slug, name, description, starts_at, ends_at, status, scoring, join_open, repeat_every_days, repeat_gap_days, series_key, edition, finalized_at, created_at, updated_at, created_by) FROM stdin;\n'
+  # created_by is carried ONLY when it is the literal machine marker
+  # 'auto-monthly', never when it is a person. Without it a restored instance
+  # loses the one thing that identifies a Monthly Cup edition as machine-made,
+  # and the guard that pins its repeat fields to 0 (db.js updateTournament)
+  # silently stops applying — handing the edition back to the fixed-day chain
+  # scheduler on the next admin save. Any human username still becomes NULL.
   psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
-    -c "\\copy (SELECT id, slug, name, description, starts_at, ends_at, status, scoring, join_open, repeat_every_days, repeat_gap_days, series_key, edition, finalized_at, created_at, updated_at FROM public.tournament ORDER BY id) TO STDOUT"
+    -c "\\copy (SELECT id, slug, name, description, starts_at, ends_at, status, scoring, join_open, repeat_every_days, repeat_gap_days, series_key, edition, finalized_at, created_at, updated_at, CASE WHEN created_by = 'auto-monthly' THEN created_by END FROM public.tournament ORDER BY id) TO STDOUT"
   printf '\\.\n'
   printf "SELECT pg_catalog.setval(pg_get_serial_sequence('public.tournament','id'), (SELECT COALESCE(MAX(id), 1) FROM public.tournament), (SELECT COUNT(*) > 0 FROM public.tournament));\n"
+} >> "$SQL"
+
+# 3f) Sanitized Monthly Cup decision rows. The table is the durable record of
+#     why a month did or did not run, so a restore that dropped it would land
+#     with editions present and no decisions and re-decide months that already
+#     ran. Only `detail.forcedBy` is operator data — an admin username recorded
+#     when somebody overrode the skip rule — so it is stripped with `-` and
+#     everything else survives intact.
+{
+  printf '\n-- Sanitized Monthly Cup decisions (forcing admin username stripped).\n'
+  printf 'COPY public.tournament_auto_period (series_key, period, decision, tournament_id, detail, decided_at) FROM stdin;\n'
+  psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
+    -c "\\copy (SELECT series_key, period, decision, tournament_id, detail - 'forcedBy', decided_at FROM public.tournament_auto_period ORDER BY series_key, period) TO STDOUT"
+  printf '\\.\n'
 } >> "$SQL"
 
 # 2c) post-data: primary keys, indexes and foreign keys, emitted last so every
@@ -275,8 +301,8 @@ cat > "$WORK/manifest.json" <<EOF
   "sql_file": "$SQL_NAME",
   "sql_bytes": $SQL_BYTES,
   "row_counts": { "race": ${RACES:-0}, "finish": ${FINISHES:-0}, "player": ${PLAYERS:-0}, "map": ${MAPS:-0} },
-  "included": ["races","finishes","checkpoints","run_tally","players","maps","versions","player_demo","player_ghost","player_saved_start","sr_history","map_weapon","achievement","player_achievement","tournament","tournament_map","tournament_standing","tournament_trophy","motd","server names"],
-  "excluded": ["admin_user","admin_session","ingest API tokens","server IP addresses","map_flag","map_block","server_log","censor_term","player_censor","map_censor","tournament_entrant (entry codes)","MOTD admin username","achievement/tournament admin usernames","maintenance-mode admin","mesh keys"]
+  "included": ["races","finishes","checkpoints","run_tally","players","maps","versions","player_demo","player_ghost","player_saved_start","sr_history","map_weapon","achievement","player_achievement","tournament","tournament_map","tournament_standing","tournament_trophy","tournament_auto_period","motd","server names"],
+  "excluded": ["admin_user","admin_session","ingest API tokens","server IP addresses","map_flag","map_block","server_log","censor_term","player_censor","map_censor","tournament_entrant (entry codes)","MOTD admin username","achievement/tournament admin usernames","Monthly Cup forcing admin","maintenance-mode admin","mesh keys"]
 }
 EOF
 
@@ -313,8 +339,8 @@ cat > "$OUT_DIR/.${BASENAME}-latest.json.tmp" <<EOF
   "sha256": "$SHA",
   "download_url": "/backup/${BASENAME}-latest.zip",
   "row_counts": { "race": ${RACES:-0}, "finish": ${FINISHES:-0}, "player": ${PLAYERS:-0}, "map": ${MAPS:-0} },
-  "included": ["races","finishes","checkpoints","run_tally","players","maps","versions","player_demo","player_ghost","player_saved_start","sr_history","map_weapon","achievement","player_achievement","tournament","tournament_map","tournament_standing","tournament_trophy","motd","server names"],
-  "excluded": ["admin accounts & sessions","ingest API tokens","game-server IP addresses","moderation flags & blocks (map_flag, map_block)","rcon/ops audit log","name-censor list & overrides","tournament entry codes","MOTD admin username","achievement & tournament admin usernames","maintenance-mode admin","mesh keys"]
+  "included": ["races","finishes","checkpoints","run_tally","players","maps","versions","player_demo","player_ghost","player_saved_start","sr_history","map_weapon","achievement","player_achievement","tournament","tournament_map","tournament_standing","tournament_trophy","tournament_auto_period","motd","server names"],
+  "excluded": ["admin accounts & sessions","ingest API tokens","game-server IP addresses","moderation flags & blocks (map_flag, map_block)","rcon/ops audit log","name-censor list & overrides","tournament entry codes","MOTD admin username","achievement & tournament admin usernames","Monthly Cup forcing admin","maintenance-mode admin","mesh keys"]
 }
 EOF
 mv "$OUT_DIR/.${BASENAME}-latest.json.tmp" "$OUT_DIR/${BASENAME}-latest.json"

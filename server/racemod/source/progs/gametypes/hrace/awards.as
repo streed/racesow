@@ -21,6 +21,12 @@
 // Fail-open: empty cvar = feature off; a failed fetch or seed just retries on
 // the next interval (still as a seed if the mark was never set, so history
 // can't spam even after web downtime at join).
+//
+// Players who don't want the flair silence it per-client with the client cvar
+// cg_raceShowAchievements (RACE_AwardsWantedBy). That is purely a DISPLAY
+// filter: the poll, the high-water mark and the mesh broadcast run regardless,
+// so toggling it back on shows what happens NEXT rather than replaying a
+// backlog, and an opted-out player's own unlocks still reach everybody else.
 
 Cvar rsApiAwardsUrl( "rs_api_awards_url", "", 0 );
 
@@ -36,6 +42,47 @@ String RACE_AwardTierColor( const String &in tier )
     if ( tier == "silver" )
         return S_COLOR_WHITE;
     return S_COLOR_ORANGE; // bronze
+}
+
+// Does this client want to see achievement announcements? cg_raceShowAchievements
+// is a CVAR_ARCHIVE|CVAR_USERINFO client cvar (registered by the racemod UI pak
+// as a checkbox in Race Options, or set by hand with `setau`), so the server just
+// reads it out of userinfo - no command and no server-side preference to store,
+// and a live toggle takes effect on the next line with no reconnect.
+// Opt-OUT, unlike the WR ghost's opt-in cg_raceShowWorldRecord: only an explicit
+// "0" silences the feed, so an unset cvar - every client without the pak - keeps
+// the announcements it has today.
+bool RACE_AwardsWantedBy( Client@ client )
+{
+    if ( @client == null )
+        return false;
+    return client.getUserInfoKey( "cg_raceShowAchievements" ) != "0";
+}
+
+// Print an achievement feed line to every client that hasn't opted out. Stands
+// in for G_PrintMsg( null, ... ), whose broadcast form can't skip a client, so
+// honouring a per-viewer choice means addressing each client individually.
+// Mirror bots are skipped: they have no userinfo of their own (so they'd read as
+// opted in) and no console to render it. The TV client deliberately is NOT
+// skipped - it holds no cvar either, and the stream keeps showing the feed.
+void RACE_AwardsBroadcast( const String &in line )
+{
+    // A null-target G_PrintMsg also mirrors to the server console (so unlocks
+    // show up in `docker logs` / the admin log console); per-client prints do
+    // not, so mirror it by hand or the feed vanishes from the logs.
+    G_Print( line );
+
+    for ( int i = 0; i < maxClients; i++ )
+    {
+        Client@ client = G_GetClient( i );
+        if ( @client == null || client.state() < CS_SPAWNED )
+            continue;
+        if ( RACE_MirrorIsFakeClient( client ) )
+            continue;
+        if ( !RACE_AwardsWantedBy( client ) )
+            continue;
+        client.printMessage( line );
+    }
 }
 
 // Kick off a per-slot awards fetch. `after` >= 0 polls for rows above that
@@ -59,21 +106,27 @@ void RACE_TriggerAwardsFetch( Player@ player, int after )
     RS_ApiFetchAwards( rsApiAwardsUrl.string, "", cleanName, after, player.client.playerNum );
 }
 
-// Announce one fresh award to the earner, the local server and the mesh.
+// Announce one fresh award to the earner, the local server and the mesh. Only
+// the earner's own popup + line answer to their cg_raceShowAchievements; the
+// server-wide line is filtered per RECIPIENT and the mesh flair always goes
+// out, so opting out mutes your console, not your unlocks.
 void RACE_AnnounceAward( Player@ player, const String &in tier, const String &in title, const String &in desc )
 {
     Client@ client = player.client;
     String color = RACE_AwardTierColor( tier );
 
-    client.addAward( color + "Achievement unlocked: " + title );
-    // Assign-then-append: no String ?: — Warsow's older AS rejects a ternary
-    // mixing a concat VALUE with a literal (see savedstarts deploy gotcha).
-    String descNote = "";
-    if ( desc.length() > 0 )
-        descNote = " - " + desc;
-    client.printMessage( color + "Achievement unlocked: " + S_COLOR_WHITE + title
-        + descNote + S_COLOR_WHITE + " (" + color + tier + S_COLOR_WHITE + ")\n" );
-    G_PrintMsg( null, S_COLOR_ORANGE + ">> " + S_COLOR_WHITE + client.name + " " + color
+    if ( RACE_AwardsWantedBy( client ) )
+    {
+        client.addAward( color + "Achievement unlocked: " + title );
+        // Assign-then-append: no String ?: — Warsow's older AS rejects a ternary
+        // mixing a concat VALUE with a literal (see savedstarts deploy gotcha).
+        String descNote = "";
+        if ( desc.length() > 0 )
+            descNote = " - " + desc;
+        client.printMessage( color + "Achievement unlocked: " + S_COLOR_WHITE + title
+            + descNote + S_COLOR_WHITE + " (" + color + tier + S_COLOR_WHITE + ")\n" );
+    }
+    RACE_AwardsBroadcast( S_COLOR_ORANGE + ">> " + S_COLOR_WHITE + client.name + " " + color
         + "unlocked " + S_COLOR_WHITE + "[" + color + title + S_COLOR_WHITE + "]\n" );
     // Cross-server flair on the mesh activity feed (mirror.as kind "ach"): the
     // trailing free-text field carries "<tier> <title...>" — tier first because
@@ -141,7 +194,7 @@ void RACE_ParseAwards( Player@ player, const String &in text )
         }
     }
 
-    if ( extra > 0 )
+    if ( extra > 0 && RACE_AwardsWantedBy( player.client ) )
         player.client.printMessage( S_COLOR_YELLOW + "...and " + extra
             + " more achievements - see your profile on racesow.org\n" );
 
