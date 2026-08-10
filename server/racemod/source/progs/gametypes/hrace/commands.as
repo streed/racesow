@@ -32,24 +32,23 @@ String randmap;
 String randmap_passed = "";
 uint randmap_time = 0;
 uint randmap_matches;
-// `tourneymap`'s own bookkeeping, deliberately NOT the randmap slots above: the
-// two vote types must never be able to hand each other a pick. tourneymap_pick
-// is the map THIS vote resolved to and tourneymap_arg the argument it resolved
-// from; together with tourneymap_time they are what makes every re-validation of
-// a vote in flight answer with the map it announced instead of drawing again
-// (see Cmd_CallvoteValidate). Only randmap_passed is shared, and only once a
-// vote has actually passed — the engine allows one vote at a time, so one map
-// change in flight is a property of the engine, not of a shared variable.
-uint tourneymap_time = 0;
-String tourneymap_pick = "";
-String tourneymap_arg = "";
-uint tourneymap_matches = 0;
 const uint RANDMAP_DELAY_MIN = 80;
 const uint RANDMAP_DELAY_MAX = 1100;
+
+// Verdicts an optional layer can return for a callvote it may or may not own.
+// Kept as plain ints rather than an enum so the hook signature is identical in
+// the base and racesow.org implementations with no shared type to keep in step.
+const int CALLVOTE_UNHANDLED = 0;   // not my vote — keep looking
+const int CALLVOTE_VALID     = 1;   // mine, and allowed
+const int CALLVOTE_REJECTED  = 2;   // mine, refused; the hook printed the reason
 
 bool Cmd_CallvoteValidate( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
     String votename = argsString.getToken( 0 );
+
+    // Asked exactly once per validation. See the reuse note at the else-if below:
+    // an implementation may DRAW a map here, so this must not be called twice.
+    int hookedVote = RACE_HookCallvoteValidate( client, votename, argsString );
 
     if ( votename == "randmap" )
     {
@@ -89,52 +88,20 @@ bool Cmd_CallvoteValidate( Client@ client, const String &cmdString, const String
 
         randmap_time = levelTime;
     }
-    else if ( votename == "tourneymap" )
+    else if ( hookedVote != CALLVOTE_UNHANDLED )
     {
-        // The engine calls callvotevalidate MORE THAN ONCE for a single vote —
-        // once when it is called and again roughly every second it stays open —
-        // so the pool draw has to happen once per VOTE, not once per call, or
-        // the vote announces one map and loads another. randmap does that with
-        // its delay dance alone; this keeps the drawn map itself (and the
-        // argument it was drawn for), which makes reuse a positive test rather
-        // than an inference from the clock:
+        // An optional layer owns this vote name (racesow.org: tourneymap).
+        // UNHANDLED = nobody claimed it, so we fall through to "Unknown
+        // callvote" below; VALID = claimed and allowed; REJECTED = claimed and
+        // refused, and the hook has already told the caller why.
         //
-        //   nothing drawn yet -> draw (the clock alone would skip this in the
-        //                        first second of a map, and the vote would then
-        //                        pass with no map at all)
-        //   argument changed  -> draw (a different vote, whatever the clock says)
-        //   pick gone stale   -> draw (a later vote; the one in flight is
-        //                        re-validated well inside RANDMAP_DELAY_MAX)
-        String want = argsString.getToken( 1 );
-        if ( tourneymap_pick.length() == 0
-             || want != tourneymap_arg
-             || levelTime - tourneymap_time > RANDMAP_DELAY_MAX )
-        {
-            String why = "";
-            String picked = RACE_PickTourneyMap( want, why );
-            if ( picked.length() == 0 )
-            {
-                client.printMessage( S_COLOR_RED + why + "\n" );
-                return false;
-            }
-            tourneymap_pick = picked;
-            tourneymap_arg = want;
-            tourneymap_matches = raceTourneyPickMatches;
-
-            // Announce on the DRAW, not on a particular re-validation: the
-            // engine's own "called a vote" line quotes the player's argument,
-            // which for the no-argument form names no map at all, so this is
-            // the only place anyone is told what they are voting for. Doing it
-            // here also means it is said exactly once however often the engine
-            // re-validates.
-            String note = S_COLOR_YELLOW + "Tournament map: " + S_COLOR_WHITE + tourneymap_pick;
-            if ( tourneymap_matches > 1 )
-                note += S_COLOR_YELLOW + " (out of " + S_COLOR_WHITE + tourneymap_matches
-                    + S_COLOR_YELLOW + " pool maps that match)";
-            G_PrintMsg( null, note + "\n" );
-        }
-
-        tourneymap_time = levelTime;
+        // Called ONCE, above, and the answer reused: the engine re-validates an
+        // open vote roughly every second, and the tourneymap implementation
+        // draws its map on a validate call. Asking twice here would draw twice
+        // and the vote would announce one map and load another — the exact bug
+        // the once-per-vote bookkeeping in that module exists to prevent.
+        if ( hookedVote == CALLVOTE_REJECTED )
+            return false;
     }
     else
     {
@@ -152,11 +119,15 @@ bool Cmd_CallvotePassed( Client@ client, const String &cmdString, const String &
     // Both take the one proven map-change path: hand the map to randmap_passed
     // and end the match, which is what actually runs `map <name>` (see
     // GT_MatchStateFinished). Each reads back its OWN pick.
-    if ( votename == "randmap" || votename == "tourneymap" )
+    // Ownership is asked SEPARATELY from the pick, because an empty pick is a
+    // real state that must still be reported. Keying "is this my vote?" off a
+    // non-empty target would make a hooked vote that drew nothing look like a
+    // vote nobody owns, and it would fall silently past the error below —
+    // passing a vote that changes nothing and says nothing.
+    bool hookOwns = RACE_HookOwnsCallvote( votename );
+    if ( votename == "randmap" || hookOwns )
     {
-        String target = randmap;
-        if ( votename == "tourneymap" )
-            target = tourneymap_pick;
+        String target = hookOwns ? RACE_HookCallvotePassedTarget( votename ) : randmap;
 
         // Nothing drawn means nothing to change to. Ending the match anyway
         // would kick everyone to the intermission and reload the same map,

@@ -964,3 +964,92 @@ String RACE_PickTourneyMap( const String &in wanted, String &out why )
     raceTourneyPickMatches = pool.length();
     return pool[randrange( pool.length() )];
 }
+
+///*****************************************************************
+/// Callvote hooks — the racesow.org implementation of the two hook points
+/// base commands.as offers for vote names it does not own itself.
+///
+/// `tourneymap` used to be a branch inside Cmd_CallvoteValidate, which meant
+/// the BASE vote handler called RACE_PickTourneyMap and read
+/// raceTourneyPickMatches — two symbols that vanish with this module. The
+/// bookkeeping below moved with it, deliberately kept separate from randmap's
+/// slots so the two vote types can never hand each other a pick.
+///*****************************************************************
+
+uint tourneymap_time = 0;
+String tourneymap_pick = "";
+String tourneymap_arg = "";
+uint tourneymap_matches = 0;
+
+// Claim `tourneymap`; return CALLVOTE_UNHANDLED for anything else so the base
+// handler carries on to its own vote names and finally to "Unknown callvote".
+int RACE_HookCallvoteValidate( Client@ client, const String &in votename, const String &in argsString )
+{
+    if ( votename != "tourneymap" )
+        return CALLVOTE_UNHANDLED;
+
+    // The engine calls callvotevalidate MORE THAN ONCE for a single vote —
+    // once when it is called and again roughly every second it stays open —
+    // so the pool draw has to happen once per VOTE, not once per call, or
+    // the vote announces one map and loads another. randmap does that with
+    // its delay dance alone; this keeps the drawn map itself (and the
+    // argument it was drawn for), which makes reuse a positive test rather
+    // than an inference from the clock:
+    //
+    //   nothing drawn yet -> draw (the clock alone would skip this in the
+    //                        first second of a map, and the vote would then
+    //                        pass with no map at all)
+    //   argument changed  -> draw (a different vote, whatever the clock says)
+    //   pick gone stale   -> draw (a later vote; the one in flight is
+    //                        re-validated well inside RANDMAP_DELAY_MAX)
+    String want = argsString.getToken( 1 );
+    if ( tourneymap_pick.length() == 0
+         || want != tourneymap_arg
+         || levelTime - tourneymap_time > RANDMAP_DELAY_MAX )
+    {
+        String why = "";
+        String picked = RACE_PickTourneyMap( want, why );
+        if ( picked.length() == 0 )
+        {
+            client.printMessage( S_COLOR_RED + why + "\n" );
+            return CALLVOTE_REJECTED;
+        }
+        tourneymap_pick = picked;
+        tourneymap_arg = want;
+        tourneymap_matches = raceTourneyPickMatches;
+
+        // Announce on the DRAW, not on a particular re-validation: the
+        // engine's own "called a vote" line quotes the player's argument,
+        // which for the no-argument form names no map at all, so this is
+        // the only place anyone is told what they are voting for. Doing it
+        // here also means it is said exactly once however often the engine
+        // re-validates.
+        String note = S_COLOR_YELLOW + "Tournament map: " + S_COLOR_WHITE + tourneymap_pick;
+        if ( tourneymap_matches > 1 )
+            note += S_COLOR_YELLOW + " (out of " + S_COLOR_WHITE + tourneymap_matches
+                + S_COLOR_YELLOW + " pool maps that match)";
+        G_PrintMsg( null, note + "\n" );
+    }
+
+    tourneymap_time = levelTime;
+    return CALLVOTE_VALID;
+}
+
+// Does this layer own the vote at all? Asked separately from the pick below so
+// that "my vote, but nothing was drawn" stays distinguishable from "not my
+// vote" — otherwise a tourneymap vote that resolved to nothing would slip past
+// the base handler's "the vote passed but no map was chosen" guard and pass
+// silently, changing nothing.
+bool RACE_HookOwnsCallvote( const String &in votename )
+{
+    return votename == "tourneymap";
+}
+
+// The map a hooked vote resolved to, read by Cmd_CallvotePassed only when
+// RACE_HookOwnsCallvote said yes. May legitimately be empty.
+String RACE_HookCallvotePassedTarget( const String &in votename )
+{
+    if ( votename == "tourneymap" )
+        return tourneymap_pick;
+    return "";
+}
