@@ -158,3 +158,70 @@ String RACE_TimeDiffString( uint time, uint reference, bool clean )
     else
         return S_COLOR_RED + "+" + RACE_TimeToString( time - reference );
 }
+
+// --- moved here so the base gametype owns them -------------------------------
+// The three below used to live in racesow.org-specific modules, which meant the
+// base race rules had to call INTO the optional layer to answer questions that
+// are entirely about base behaviour. Moving them deletes those seams outright
+// rather than papering over them with a hook, and none of them needs a native.
+
+// Reverse mode (see /reverse in commands.as): a run raced backwards through the
+// course is a wholly separate record set, never distinguished by a flag —
+// instead every map-scoped identity uses this suffixed name. The suffix is
+// deliberately regex-safe (no spaces) so it survives the read endpoints and the
+// top-board map-name filter unchanged.
+const String REVERSE_SUFFIX = "-reversed";
+
+// The effective map name for a run: "<map>-reversed" for a reversed run, else
+// the plain lowercased BSP name.
+//
+// This is BASE, not reporting, however much it looks like reporting: it names
+// the topscores FILE the gametype reads and writes (recordtime.as). Left in the
+// optional layer and stubbed, a base build and a racesow.org build would keep
+// two different leaderboards for the same reversed map.
+String RACE_EffectiveMapName( bool reversed )
+{
+    Cvar mapNameVar( "mapname", "", 0 );
+    String mapName = mapNameVar.string.tolower();
+    return reversed ? mapName + REVERSE_SUFFIX : mapName;
+}
+
+// Strip a string down to something safe to publish in a serverinfo value:
+// colour tokens out, then ASCII printables only, minus the characters that
+// terminate or confuse an infostring ( \ " ; : , ). Truncates to maxLen.
+//
+// Named for what it does rather than for the mesh, which was its first caller.
+String RACE_CleanForServerInfo( const String &in raw, uint maxLen )
+{
+    String s = raw.removeColorTokens();
+    String clean = "";
+    for ( uint i = 0; i < s.length() && clean.length() < maxLen; i++ )
+    {
+        uint8 c = s[i];
+        if ( c < uint8(0x20) || c > uint8(0x7E) )       // control / non-ASCII
+            continue;
+        if ( c == uint8(0x5C) || c == uint8(0x22) || c == uint8(0x3B)   // \ " ;
+                || c == uint8(0x3A) || c == uint8(0x2C) )                // : ,
+            continue;
+        clean += s.substr( i, 1 );
+    }
+    return clean;
+}
+
+// Real (non-puppet) players on the team, for the autorecord toggle in hrace.as
+// so neither the WR ghost nor mesh bots keep a match recording forever.
+//
+// This one MUST be base and must not be stubbed: a no-op returning 0 reads as
+// "the server is empty", and match autorecord would then never start for
+// anybody.
+int RACE_RealPlayerCount()
+{
+    int n = 0;
+    Team@ team = G_GetTeam( TEAM_PLAYERS );
+    for ( int i = 0; @team.ent( i ) != null; i++ )
+    {
+        if ( !RACE_IsPuppetNum( team.ent( i ).client.playerNum ) )
+            n++;
+    }
+    return n;
+}

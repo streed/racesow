@@ -94,19 +94,6 @@ bool RACE_WrGhostEnabled()
     return rsWrGhost.boolean && rsWrGhostUrl.string.length() > 0;
 }
 
-// Real (non-fake-client) players on the team — used for the autorecord toggle
-// in hrace.as so neither the WR ghost nor mesh bots keep it recording forever.
-int RACE_RealPlayerCount()
-{
-    int n = 0;
-    Team@ team = G_GetTeam( TEAM_PLAYERS );
-    for ( int i = 0; @team.ent( i ) != null; i++ )
-    {
-        if ( !RS_MirrorBotIs( team.ent( i ).client.playerNum ) )
-            n++;
-    }
-    return n;
-}
 
 void RACE_GhostInit()
 {

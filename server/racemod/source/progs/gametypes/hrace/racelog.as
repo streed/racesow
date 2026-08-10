@@ -17,24 +17,6 @@
 
 const String RACELOG_FILE = "racelog/events.log";
 
-// Reverse mode (see /reverse in commands.as): a run raced backwards through the
-// course is a wholly separate record set. It is never distinguished by a flag —
-// instead every map-scoped identity (the API report, the topscores file, the
-// live top board, demos and ghosts) uses this suffixed name, so the stats site
-// auto-creates a distinct "<map>-reversed" level with its own leaderboard. The
-// suffix is deliberately regex-safe (no spaces) so it passes the game-facing
-// read endpoints and the RS_ApiFetchTop native's map-name filter unchanged.
-const String REVERSE_SUFFIX = "-reversed";
-
-// The effective map name for a run: "<map>-reversed" for a reversed run, else
-// the plain lowercased BSP name. Used everywhere a per-run map identity is
-// derived (reporting, attempts, topscores, demos, ghosts).
-String RACE_EffectiveMapName( bool reversed )
-{
-    Cvar mapNameVar( "mapname", "", 0 );
-    String mapName = mapNameVar.string.tolower();
-    return reversed ? mapName + REVERSE_SUFFIX : mapName;
-}
 
 // Direct-to-API reporting (RS_ApiReportRace native, see the deployment repo's
 // server/enginepatches/g_rs_api.cpp). When rs_api_url is set, every finish is

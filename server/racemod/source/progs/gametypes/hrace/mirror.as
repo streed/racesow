@@ -460,22 +460,6 @@ const uint MESH_STATUS_MAX = 63; // MAX_INFO_VALUE (64) - 1
 // that we use as a field/record delimiter ( : , ), and cap the length, so a
 // stray map or tag name can neither corrupt the encoding nor get the whole
 // cvar rejected by the engine's Info_Validate.
-String RACE_MeshStatusClean( const String &in raw, uint maxLen )
-{
-    String s = raw.removeColorTokens();
-    String clean = "";
-    for ( uint i = 0; i < s.length() && clean.length() < maxLen; i++ )
-    {
-        uint8 c = s[i];
-        if ( c < uint8(0x20) || c > uint8(0x7E) )       // control / non-ASCII
-            continue;
-        if ( c == uint8(0x5C) || c == uint8(0x22) || c == uint8(0x3B)   // \ " ;
-                || c == uint8(0x3A) || c == uint8(0x2C) )                // : ,
-            continue;
-        clean += s.substr( i, 1 );
-    }
-    return clean;
-}
 
 // Build "TAG:map:players,TAG:map:players,..." for every peer we currently hear
 // (peers time out of the snapshot when silent, so the list is exactly the live
@@ -489,10 +473,10 @@ void RACE_MirrorPublishStatus()
     for ( int i = 0; i < pc; i++ )
     {
         String rawTag = RS_MirrorPeerTag( i );
-        String tag = RACE_MeshStatusClean( rawTag, 6 );
+        String tag = RACE_CleanForServerInfo( rawTag, 6 );
         if ( tag.length() == 0 )
             continue;
-        String map = RACE_MeshStatusClean( RS_MirrorPeerMap( i ), 16 );
+        String map = RACE_CleanForServerInfo( RS_MirrorPeerMap( i ), 16 );
 
         int players = 0;
         for ( uint j = 0; j < mirrorPlayers.length(); j++ )

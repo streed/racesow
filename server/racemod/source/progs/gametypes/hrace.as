@@ -56,7 +56,7 @@ Cvar rs_tv_name( "rs_tv_name", "", 0 );
 // The clean name of whoever the director is currently showing, published into
 // serverinfo (CVAR_SERVERINFO) so the capture encoder can read it via getstatus
 // and the website can caption "watching <player>". Empty = free-fly / idle.
-// (Kept < MAX_INFO_VALUE and sanitized via RACE_MeshStatusClean before setting.)
+// (Kept < MAX_INFO_VALUE and sanitized via RACE_CleanForServerInfo before setting.)
 Cvar rs_tv_pov( "rs_tv_pov", "", CVAR_SERVERINFO );
 // Auto-join genuine humans to the players team on connect. A dedicated race
 // server is meant to drop you straight into the run: the Warsow client
@@ -1015,7 +1015,7 @@ void RACE_TvDirectorThink()
         tv.chaseTarget = target;
         // Publish who we're showing so the site can caption "watching <player>".
         Client@ subj = RACE_EntClient( target );
-        String pov = ( @subj !is null ) ? RACE_MeshStatusClean( subj.name, 31 ) : "";
+        String pov = ( @subj !is null ) ? RACE_CleanForServerInfo( subj.name, 31 ) : "";
         if ( pov != rs_tv_pov.string )
             rs_tv_pov.set( pov );
     }
