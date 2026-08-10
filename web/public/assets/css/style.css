@@ -389,6 +389,9 @@ table.data td.num, table.data thead th.num { text-align: right; font-variant-num
 .srdist-sub b { color: var(--text); font-variant-numeric: tabular-nums; }
 .srdist-sub .sep { color: var(--faint); margin: 0 2px; }
 .srdist-note { color: var(--muted); font-size: 14px; padding: 6px 2px; }
+/* An unpublished Skill Rating. Muted so a table of real ratings doesn't read as
+   if these players scored a dash, and the profile tile matches the table cell. */
+.sr-unranked { color: var(--muted); }
 .srdist-cap { color: var(--faint); font-size: 12.5px; margin-top: 8px; }
 .srdchart { max-width: 100%; }
 .srdchart .srdbar { fill: rgba(255,106,26,.30); transition: fill .12s; }

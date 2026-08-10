@@ -6,7 +6,7 @@
 // so tests are independent and order-free.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { openDatabase, simplifyName, normToken, identKey, canonKey, rebuildCanonical, sha256, SR_MU, SR_MIN_FIELD } from "../db.js";
+import { openDatabase, simplifyName, normToken, identKey, canonKey, rebuildCanonical, sha256, SR_MU, SR_MIN_FIELD, SR_MIN_MAPS } from "../db.js";
 import { createTestDb } from "./pg-util.js";
 
 async function freshDb(t) {
@@ -203,11 +203,15 @@ test("strafe quality is null when a player has no reported runs", async (t) => {
 test("SR distribution buckets the whole board, and a profile knows its place on it", async (t) => {
   const race = await freshDb(t);
 
-  // One contested map with a spread-out field: 12 players, each slower than the
+  // Contested maps with a spread-out field: 12 players, each slower than the
   // last, so the ratings land at distinct points rather than all on the prior.
-  const field = [];
-  for (let i = 0; i < 12; i++) field.push(finish(`p${i}`, 30000 + i * 4000));
-  await race.ingest({ version: VER, map: "arena", source: "racelog", records: field });
+  // SR_MIN_MAPS maps rather than one, so every player is RANKED — the
+  // distribution counts only published ratings.
+  for (let m = 0; m < SR_MIN_MAPS; m++) {
+    const field = [];
+    for (let i = 0; i < 12; i++) field.push(finish(`p${i}`, 30000 + i * 4000 + m * 100));
+    await race.ingest({ version: VER, map: `arena${m}`, source: "racelog", records: field });
+  }
   await race.refreshAggregates();
 
   const dist = await race.srDistribution();
@@ -297,9 +301,18 @@ test("skill rating (SR) rewards closeness to the WR over breadth of maps", async
   // prove nothing, so he sits at exactly the bare prior.
   assert.equal(breadth.sr, Math.round(1000 * SR_MU), `Breadth SR ${breadth.sr} is the prior`);
 
-  // sort=sr actually orders the board by SR descending.
-  const board = (await race.players({ sort: "sr", limit: 200 })).rows.map((r) => r.sr);
-  for (let i = 1; i < board.length; i++) assert.ok(board[i - 1] >= board[i], "players sorted by SR desc");
+  // sort=sr orders the board by SR descending WITHIN the published ratings, and
+  // parks the unranked (< SR_MIN_MAPS finished maps) after all of them — their
+  // stored number is mostly the fill prior, so it is not a rating to sort by.
+  const rows = (await race.players({ sort: "sr", limit: 200 })).rows;
+  const firstUnranked = rows.findIndex((r) => !r.srRanked);
+  const ranked = firstUnranked === -1 ? rows : rows.slice(0, firstUnranked);
+  const unranked = firstUnranked === -1 ? [] : rows.slice(firstUnranked);
+  assert.ok(unranked.every((r) => !r.srRanked), "ranked players all come first");
+  for (let i = 1; i < ranked.length; i++)
+    assert.ok(ranked[i - 1].sr >= ranked[i].sr, "ranked players sorted by SR desc");
+  for (let i = 1; i < unranked.length; i++)
+    assert.ok(unranked[i - 1].sr >= unranked[i].sr, "unranked tail still ordered by the raw value");
 });
 
 test("SR averages the top 50: same sample for everyone, weak maps included", async (t) => {
@@ -1190,8 +1203,23 @@ test("gamePlayerRecordText: the header carries the player's global Skill Rating"
       finish("Epsilon", 38000),
     ],
   });
-  // Rho races only the OTHER map: rated, but with nothing on MAP.
-  await race.ingest({ version: VER, map: OTHER, source: "racelog", records: [finish("Rho", 20000)] });
+  // Rho races only the OTHER maps: rated, but with nothing on MAP.
+  // Everyone needs SR_MIN_MAPS finished maps before a rating is published, so
+  // give all six players that many contested maps. MAP itself is left exactly as
+  // ingested above, so Nova's rank/total/time on it are untouched.
+  for (let m = 0; m < SR_MIN_MAPS; m++) {
+    await race.ingest({
+      version: VER, map: m === 0 ? OTHER : `${OTHER}_${m}`, source: "racelog",
+      records: [
+        finish("Rho", 20000),
+        finish("Nova", 30000 + m),
+        finish("Beta", 32000 + m),
+        finish("Gamma", 34000 + m),
+        finish("Delta", 36000 + m),
+        finish("Epsilon", 38000 + m),
+      ],
+    });
+  }
   await race.refreshAggregates();
 
   const nova = await race.gamePlayerRecordText(MAP, "nova");
@@ -1267,4 +1295,72 @@ test("saved starts: upsert, per-player text, canonical match, replace, delete", 
   assert.match(afterDel, /\nreverse /, "reverse start survives");
   assert.equal(await race.deletePlayerSavedStart({ map: M, name: "Nova", mode: "race" }), false, "already gone => false");
   assert.equal(await race.deletePlayerSavedStart({ map: "no_such_map", name: "Nova", mode: "race" }), false, "unknown map => false");
+});
+
+test("SR is unpublished until a player has finished SR_MIN_MAPS maps", async (t) => {
+  const race = await freshDb(t);
+
+  // `veteran` races every map, `rookie` only the first SR_MIN_MAPS - 1, so the
+  // two differ ONLY in how many maps they have finished. Each map carries a
+  // third player so the field is contested (SR_MIN_FIELD) and the maps qualify.
+  const maps = SR_MIN_MAPS + 1;
+  for (let m = 0; m < maps; m++) {
+    const field = [finish("veteran", 30000), finish("filler", 45000)];
+    if (m < SR_MIN_MAPS - 1) field.push(finish("rookie", 31000));
+    await race.ingest({ version: VER, map: `qual${m}`, source: "racelog", records: field });
+  }
+  await race.refreshAggregates();
+
+  const byName = async (n) => (await race.players({ q: n, limit: 10 })).rows[0];
+  const vet = await byName("veteran");
+  const rook = await byName("rookie");
+  assert.equal(rook.maps, SR_MIN_MAPS - 1, "rookie sits one map under the bar");
+  assert.ok(vet.maps >= SR_MIN_MAPS, "veteran is over it");
+
+  // Both still appear in the directory — the floor hides a RATING, not a player.
+  assert.equal(vet.srRanked, true);
+  assert.equal(rook.srRanked, false);
+  assert.ok(rook.sr > 0, "the underlying number is still computed and stored");
+
+  // The distribution counts only ranked players.
+  const dist = await race.srDistribution();
+  const ranked = (await race.players({ sort: "sr", limit: 500 })).rows.filter((r) => r.srRanked);
+  assert.equal(dist.total, ranked.length, "distribution population == ranked players");
+  assert.ok(dist.total >= 1 && dist.total < (await race.players({ limit: 500 })).rows.length,
+    "and that is fewer than everyone on the board");
+  assert.equal(dist.minMaps, SR_MIN_MAPS, "the chart is told what its population is");
+  assert.equal(
+    dist.buckets.reduce((a, b) => a + b.count, 0),
+    ranked.length,
+    "every ranked player still lands in exactly one bucket"
+  );
+
+  // Profile: the rookie gets no place on the curve and is told what is missing.
+  const rookPd = await race.playerDetail(rook.id);
+  assert.equal(rookPd.standing.srRanked, false);
+  assert.equal(rookPd.standing.srMapsToRank, 1, "one more map to go");
+  assert.equal(rookPd.srPlace, null, "no percentile against a board they're not on");
+  assert.deepEqual(rookPd.srHistory, [], "and no trend line for an unpublished rating");
+
+  const vetPd = await race.playerDetail(vet.id);
+  assert.equal(vetPd.standing.srRanked, true);
+  assert.equal(vetPd.standing.srMapsToRank, 0);
+  assert.ok(vetPd.srPlace, "a ranked player keeps their place");
+  assert.equal(vetPd.srPlace.total, ranked.length, "measured against ranked players only");
+
+  // In-game scoreboard: an unranked player's SR column is blank, not a placeholder.
+  assert.equal(await race.playerSkillRating("rookie"), 0);
+  assert.ok((await race.playerSkillRating("veteran")) > 0);
+
+  // Sorting by SR puts the unpublished ratings last in BOTH directions.
+  const desc = (await race.players({ sort: "sr", order: "desc", limit: 500 })).rows;
+  const asc = (await race.players({ sort: "sr", order: "asc", limit: 500 })).rows;
+  for (const list of [desc, asc]) {
+    const firstUnranked = list.findIndex((r) => !r.srRanked);
+    if (firstUnranked !== -1)
+      assert.ok(
+        list.slice(firstUnranked).every((r) => !r.srRanked),
+        "ranked players all come before unranked ones"
+      );
+  }
 });

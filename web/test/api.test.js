@@ -9,6 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { ADMIN_URL } from "./pg-util.js";
+import { SR_MIN_MAPS } from "../db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_JS = path.join(__dirname, "..", "server.js");
@@ -293,6 +294,26 @@ test("strafe quality rides a finish through ingest onto the player profile", asy
   assert.equal(pd.strafeHistory[0].quality, 77.5);
   assert.equal(pd.strafeHistory[0].max, 85);
   assert.equal(pd.strafeHistory[0].min, 70);
+});
+
+// A Skill Rating is only published once a player has finished SR_MIN_MAPS maps,
+// so the SR tests below need Strafer over that bar. Each map carries three
+// finishers to clear SR_MIN_FIELD, otherwise the maps never qualify and the
+// rating stays at the bare prior no matter how many there are.
+test("SR fixture: give Strafer enough contested maps to be ranked", async () => {
+  for (let m = 0; m < SR_MIN_MAPS; m++) {
+    const recs = ["Strafer", "Pacer", "Trailer"]
+      .map((n, i) => `{"name":"${n}","login":"","time":${30000 + i * 5000 + m},"attempts":1,"checkpoints":[]}`)
+      .join(",");
+    assert.equal(
+      (await ingest(`{"version":"wsw 2.1","map":"srmap${m}","source":"racelog","records":[${recs}]}`)).status,
+      200
+    );
+  }
+  await new Promise((r) => setTimeout(r, 3600)); // aggregate debounce
+  const id = (await get("/players?q=Strafer")).rows[0].id;
+  const pd = await get(`/players/${id}`);
+  assert.equal(pd.standing.srRanked, true, "Strafer is now a ranked player");
 });
 
 test("player profile carries a 30-day Skill Rating history ending at the current SR", async () => {

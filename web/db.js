@@ -162,6 +162,33 @@ export const SR_MIN_FIELD = 3;
 // enforces a common sample size.
 export const SR_FILL_W = Math.log2(1 + SR_MIN_FIELD);
 
+// How many maps a player must have finished before their SR counts as a rating
+// at all. Below this they are UNRANKED: no number on the leaderboard, no place,
+// no bar on the distribution, no daily history point — the value is still
+// computed and stored, it just isn't published as a rating.
+//
+// The fixed-K formula gives everyone a number, including someone with one PB,
+// by padding their 49 empty slots at the prior. That is the right way to make
+// ratings COMPARABLE, but it produces a rating that is mostly padding: on the
+// 2026-08-10 board, 6,699 of 9,201 players (73%) sat under 5 maps, and their
+// SRs span just 284-451 (stddev 19) around the prior because the padding
+// dominates whatever they actually raced. Publishing that as a skill rating
+// says almost nothing about the player, and it buries the 2,502 rated players
+// (97-982, stddev 186) under a spike of near-identical placeholder numbers.
+//
+// Five is the point where a quarter of the slots that decide the number are the
+// player's own runs rather than the prior. NOTE this deliberately WIDENS the
+// published distribution (removing the spike raises stddev 104 -> 186); it is a
+// fix for "this number is meaningless", not a fix for chart spread.
+export const SR_MIN_MAPS = 5;
+
+// Is this standings row publishable as a rating? One predicate, used by every
+// read path, so "unranked" can never mean different things on the leaderboard,
+// the profile and the distribution.
+export function srIsRanked(maps) {
+  return num(maps) >= SR_MIN_MAPS;
+}
+
 // How many days of per-player Skill Rating history to retain (rolling window).
 // One SR value is snapshotted per player per UTC day at the tail of an aggregate
 // refresh (snapshotSrHistory), and anything older than this many days is pruned
@@ -664,7 +691,9 @@ class RaceDB {
          FROM standings s JOIN player p ON p.id = s.player_id
          ORDER BY s.rank LIMIT 20`
       )
-    ).map((r) => this._censorNamed({ ...r, rank: num(r.rank), id: num(r.id) }, num(r.id)));
+    ).map((r) =>
+      this._censorNamed({ ...r, rank: num(r.rank), id: num(r.id), srRanked: srIsRanked(r.maps) }, num(r.id))
+    );
     const recent = await this.recentRecords(8);
     const recentFinishes = await this.recentFinishes({ limit: 10 });
     const lastUpdate = await this.one("SELECT value FROM config WHERE key='last_update'");
@@ -1087,9 +1116,13 @@ class RaceDB {
     if (!cleanKey) return 0;
     try {
       const row = await this.one(
+        // Unranked players (< SR_MIN_MAPS) are filtered out here rather than
+        // zeroed after the MAX: otherwise one unranked alias could out-rank the
+        // player's real rated group and blank an SR the scoreboard should show.
         `SELECT MAX(s.sr)::int AS sr
          FROM standings s
-         WHERE s.player_id IN (
+         WHERE s.maps >= ${SR_MIN_MAPS}
+           AND s.player_id IN (
            SELECT DISTINCT pl.canonical_id FROM player pl
            WHERE trim(regexp_replace(
                    lower(regexp_replace(pl.name, '\\^[0-9]', '', 'g')),
@@ -2099,6 +2132,10 @@ class RaceDB {
     // Players with no recorded activity yet (last_active NULL) sort last in
     // either direction, so the "last raced" ordering never leads with blanks.
     const nulls = col === PLAYER_SORTS.active ? " NULLS LAST" : "";
+    // Sorting by SR asks "who is best" — so the unpublished ratings go last in
+    // BOTH directions rather than filling the ascending page with placeholder
+    // numbers that are not ratings at all.
+    const rankedFirst = col === PLAYER_SORTS.sr ? `(s.maps >= ${SR_MIN_MAPS}) DESC, ` : "";
     const lim = clampLimit(limit);
     const off = toOffset(offset);
     // Match a search against ANY name variant (trgm-indexed), then map to its
@@ -2119,7 +2156,7 @@ class RaceDB {
                 s.points, s.sr, s.wr, s.podium, s.maps, s.last_active
          FROM standings s JOIN player p ON p.id = s.player_id
          ${where}
-         ORDER BY ${col} ${direction}${nulls}, s.rank ASC
+         ORDER BY ${rankedFirst}${col} ${direction}${nulls}, s.rank ASC
          LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
         [...args, lim, off]
       )
@@ -2129,6 +2166,9 @@ class RaceDB {
           ...r,
           rank: num(r.rank),
           id: num(r.id),
+          // The directory still lists everyone; the SR column just renders "—"
+          // for players whose rating is not published yet.
+          srRanked: srIsRanked(r.maps),
           last_active: r.last_active != null ? num(r.last_active) : null,
         },
         num(r.id)
@@ -2155,6 +2195,13 @@ class RaceDB {
       [canonId]
     )) || { rank: null, points: 0, sr: 0, wr: 0, podium: 0, maps: 0 };
     if (standing.rank != null) standing.rank = num(standing.rank);
+    // SR is published only once the player has finished SR_MIN_MAPS maps; below
+    // that the number is mostly the fill prior, not them. The raw `sr` stays on
+    // the payload (the breakdown still explains how it is built) — `srRanked`
+    // is what decides whether it is shown AS a rating.
+    standing.srRanked = srIsRanked(standing.maps);
+    standing.srMinMaps = SR_MIN_MAPS;
+    standing.srMapsToRank = Math.max(0, SR_MIN_MAPS - num(standing.maps));
 
     // Rolling-window Skill Rating history for the profile trend chart: the stored
     // daily points (oldest -> newest), already capped to SR_HISTORY_DAYS server
@@ -2190,22 +2237,39 @@ class RaceDB {
       )
     ).map((r) => ({ day: r.day, sr: num(r.sr) }));
     const curSr = num(standing.sr);
-    const lastPt = srHistory[srHistory.length - 1];
-    if (!lastPt || lastPt.day !== today) srHistory.push({ day: today, sr: curSr });
-    else lastPt.sr = curSr;
+    // An unranked player shows no trend at all. The daily snapshot stopped
+    // writing them, but rows banked BEFORE the SR_MIN_MAPS floor existed are
+    // still in the table for up to SR_HISTORY_DAYS — without this they would
+    // draw a decaying chart for a rating the rest of the page refuses to show.
+    if (!standing.srRanked) srHistory.length = 0;
+    // Today's live value is appended only for a ranked player. Doing it
+    // unconditionally would draw a one-point trend for someone with no published
+    // rating — and the daily snapshot no longer writes them, so that point would
+    // be the only thing on the chart.
+    if (standing.srRanked) {
+      const lastPt = srHistory[srHistory.length - 1];
+      // Today's stored snapshot is refreshed to the live value rather than left
+      // as whatever it was when the day's rows were written.
+      if (!lastPt || lastPt.day !== today) srHistory.push({ day: today, sr: curSr });
+      else lastPt.sr = curSr;
+    }
 
     // Where this rating sits among everyone else's. Counted here rather than
     // derived client-side from the shared histogram (/api/sr/distribution),
     // because a bucket only knows "somewhere in this 18-point band" and the
     // percentile is the one number the card is actually about. Ranked only:
     // a player with no standings row is not on the board to have a place on it.
+    // Both the place and the population it is a place IN are ranked-only, so an
+    // unranked player gets no percentile at all rather than one measured against
+    // a board they are not on.
     let srPlace = null;
-    if (standing.rank != null) {
+    if (standing.rank != null && srIsRanked(standing.maps)) {
       const pos = await this.one(
         `SELECT COUNT(*)::int                            AS total,
                 COUNT(*) FILTER (WHERE sr <  $1)::int    AS below,
                 COUNT(*) FILTER (WHERE sr >  $1)::int    AS above
-           FROM standings`,
+           FROM standings
+          WHERE maps >= ${SR_MIN_MAPS}`,
         [curSr]
       );
       const total = num(pos.total);
@@ -2418,6 +2482,12 @@ class RaceDB {
   // into a few hundred points of it), and bucketing the empty 900 points would
   // spend most of the chart drawing nothing. Bounds are snapped outward to a
   // round 10 so the axis labels read as numbers a player recognises.
+  //
+  // Only RANKED players (>= SR_MIN_MAPS) are counted, matching the leaderboard —
+  // a histogram over a different population than the board beside it is worse
+  // than no histogram. This removes the spike that used to sit on the prior
+  // (73% of rows, all within 284-451) and therefore makes the chart WIDER, not
+  // narrower: what is left is the real spread of rated players.
   async srDistribution({ buckets = 40 } = {}) {
     const n = Math.max(4, Math.min(120, Math.trunc(buckets) || 40));
     const b = await this.one(
@@ -2425,10 +2495,12 @@ class RaceDB {
               (FLOOR(MIN(sr) / 10.0) * 10)::int AS lo,
               (CEIL (MAX(sr) / 10.0) * 10)::int AS hi,
               PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sr)::int AS p50
-         FROM standings`
+         FROM standings
+        WHERE maps >= ${SR_MIN_MAPS}`
     );
     const total = num(b && b.total);
-    if (!total) return { total: 0, lo: 0, hi: 0, width: 0, buckets: [], median: null };
+    if (!total)
+      return { total: 0, lo: 0, hi: 0, width: 0, minMaps: SR_MIN_MAPS, buckets: [], median: null };
 
     const lo = num(b.lo);
     // A board where everyone shares one rating (a fresh install, or one player)
@@ -2442,6 +2514,7 @@ class RaceDB {
       `SELECT LEAST(width_bucket(sr::float, $1::float, $2::float, $3), $3)::int AS idx,
               COUNT(*)::int AS c
          FROM standings
+        WHERE maps >= ${SR_MIN_MAPS}
         GROUP BY 1
         ORDER BY 1`,
       [lo, hi, n]
@@ -2458,6 +2531,10 @@ class RaceDB {
       lo,
       hi,
       width,
+      // Surfaced so the chart can say what its population IS. Without it the
+      // histogram silently describes a different set of players than the
+      // leaderboard next to it, and `total` looks like the whole community.
+      minMaps: SR_MIN_MAPS,
       median: num(b.p50),
       buckets: counts.map((count, i) => ({
         lo: Math.round(lo + i * width),
@@ -2824,8 +2901,12 @@ class RaceDB {
       const taken = await client.query("SELECT 1 FROM sr_history WHERE day = $1 LIMIT 1", [day]);
       if (taken.rows.length === 0) {
         await client.query(
+          // Ranked players only: an unranked player has no published rating, so
+          // there is no trend to record. Their history starts the day they cross
+          // SR_MIN_MAPS — the chart then shows the rating from when it began to
+          // mean something rather than a flat run of prior-valued placeholders.
           `INSERT INTO sr_history (player_id, day, sr)
-           SELECT player_id, $1::date, sr FROM standings
+           SELECT player_id, $1::date, sr FROM standings WHERE maps >= ${SR_MIN_MAPS}
            ON CONFLICT (player_id, day) DO UPDATE SET sr = EXCLUDED.sr`,
           [day]
         );

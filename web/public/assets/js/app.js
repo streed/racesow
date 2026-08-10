@@ -101,6 +101,16 @@ function fmtNum(n) {
   return (n || 0).toLocaleString("en-US");
 }
 
+/* A Skill Rating cell. Unranked players (too few finished maps — the server
+ * decides, and sends srRanked) show a dash: their stored rating is mostly the
+ * fill prior, so printing it would read as a real rating. Rows from older
+ * payloads have no srRanked and keep rendering the number. */
+function srCell(p) {
+  return p && p.srRanked === false
+    ? `<span class="sr-unranked" title="Unrated — not enough finished maps yet">—</span>`
+    : fmtNum(p ? p.sr : 0);
+}
+
 /* game units -> compact distance, e.g. 12500 -> "12.5k u", 3200000 -> "3.2M u" */
 function fmtDist(u) {
   if (u == null) return "—";
@@ -261,7 +271,7 @@ async function viewOverview() {
                 <td class="rankcell ${rankClass(p.rank)}">${p.rank}</td>
                 <td>${wname(p.name)}</td>
                 <td class="num">${fmtNum(p.points)}</td>
-                <td class="num">${fmtNum(p.sr)}</td>
+                <td class="num">${srCell(p)}</td>
                 <td class="num">${fmtNum(p.wr)}</td>
                 <td class="num">${fmtNum(p.maps)}</td>
               </tr>`).join("")}
@@ -647,15 +657,22 @@ function srDistChart(dist, place, sr) {
     </svg>`;
 }
 
-function renderSrDist(dist, place, sr) {
+function renderSrDist(dist, place, sr, standing) {
   if (!dist || !dist.total || !dist.buckets || !dist.buckets.length)
     return `<div class="srdist-note">No ratings on the board yet.</div>`;
 
-  // Unranked (no standings row): the curve is still worth showing, but there is
-  // no place on it to claim.
+  const minMaps = dist.minMaps || 0;
+  // Two different reasons to have no place on the curve, and they need different
+  // advice: not enough maps yet (say how many are left), or maps that no-one else
+  // has raced so nothing qualifies.
+  const toGo = standing && standing.srMapsToRank ? standing.srMapsToRank : 0;
   const head =
     place == null
-      ? `<div class="srdist-head"><div class="srdist-sub">Not on the rating board yet — set a time on a map two other players have raced and a rating (and a place on this curve) starts building.</div></div>`
+      ? `<div class="srdist-head"><div class="srdist-sub">${
+          toGo > 0
+            ? `Not rated yet — a Skill Rating starts at <b>${fmtNum(minMaps)}</b> finished maps, so there ${toGo === 1 ? "is" : "are"} <b>${fmtNum(toGo)}</b> to go. Below that the number would be mostly the starting rating rather than your runs.`
+            : `Not on the rating board yet — set a time on a map two other players have raced and a rating (and a place on this curve) starts building.`
+        }</div></div>`
       : `<div class="srdist-head">
           <div class="srdist-pct"><div class="n">${place.percentile.toFixed(1)}<span class="sfx">th</span></div><div class="l">percentile</div></div>
           <div class="srdist-sub">Ahead of <b>${place.percentile.toFixed(1)}%</b> of the ${fmtNum(place.total)} ranked players
@@ -665,7 +682,9 @@ function renderSrDist(dist, place, sr) {
 
   return `${head}
     ${srDistChart(dist, place, sr)}
-    <div class="srdist-cap">Every ranked player, bucketed by rating: each bar is a rating band and its height is how many players sit in it. Hover a bar for the count.</div>`;
+    <div class="srdist-cap">Every rated player${
+      minMaps ? ` (${fmtNum(minMaps)}+ finished maps)` : ""
+    }, bucketed by rating: each bar is a rating band and its height is how many players sit in it. Hover a bar for the count.</div>`;
 }
 
 // Fetched after the profile renders (the percentile itself is already on screen
@@ -673,9 +692,13 @@ function renderSrDist(dist, place, sr) {
 async function wireSrDistribution(d) {
   const host = document.getElementById("srdist");
   if (!host) return;
-  const sr = d.standing ? d.standing.sr : null;
+  // An unranked player has no marker to place: their stored sr is a
+  // placeholder, so drawing "YOU" at it would put them on a curve they are
+  // deliberately not counted in.
+  const ranked = !d.standing || d.standing.srRanked !== false;
+  const sr = d.standing && ranked ? d.standing.sr : null;
   try {
-    host.innerHTML = renderSrDist(await api("/sr/distribution"), d.srPlace || null, sr);
+    host.innerHTML = renderSrDist(await api("/sr/distribution"), d.srPlace || null, sr, d.standing);
   } catch (e) {
     host.innerHTML = `<div class="srdist-note">Couldn't load the rating distribution (${esc(e.message)}).</div>`;
   }
@@ -1004,7 +1027,7 @@ async function viewPlayers(params) {
               <td class="rankcell ${rankClass(p.rank)}">${p.rank}</td>
               <td>${wname(p.name)}</td>
               <td class="num">${fmtNum(p.points)}</td>
-              <td class="num">${fmtNum(p.sr)}</td>
+              <td class="num">${srCell(p)}</td>
               <td class="num">${fmtNum(p.wr)}</td>
               <td class="num">${fmtNum(p.podium)}</td>
               <td class="num">${fmtNum(p.maps)}</td>
@@ -1305,7 +1328,9 @@ async function viewPlayer(id, params) {
 
     <div class="statrow">
       <div class="s hl"><div class="n">${fmtNum(s.points)}</div><div class="l">Points</div></div>
-      <div class="s hl" title="Skill Rating — how close your strongest runs get to the world record, against real fields (0–1000)"><div class="n">${fmtNum(s.sr)}</div><div class="l">Skill Rating</div></div>
+      ${s.srRanked === false
+        ? `<div class="s hl" title="A Skill Rating needs ${fmtNum(s.srMinMaps)} finished maps — below that the number would be mostly the starting rating rather than your runs. ${fmtNum(s.srMapsToRank)} to go."><div class="n sr-unranked">—</div><div class="l">Skill Rating · ${fmtNum(s.srMapsToRank)} map${s.srMapsToRank === 1 ? "" : "s"} to go</div></div>`
+        : `<div class="s hl" title="Skill Rating — how close your strongest runs get to the world record, against real fields (0–1000)"><div class="n">${fmtNum(s.sr)}</div><div class="l">Skill Rating</div></div>`}
       <div class="s"><div class="n">${fmtNum(s.wr)}</div><div class="l">World Records</div></div>
       <div class="s"><div class="n">${fmtNum(s.podium)}</div><div class="l">Podiums</div></div>
       <div class="s"><div class="n">${fmtNum(s.maps)}</div><div class="l">Maps Raced</div></div>
