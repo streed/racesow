@@ -61,7 +61,7 @@ bool RACE_AnyHumanPresent()
         Client@ client = G_GetClient( i );
         if ( @client == null || client.state() < CS_SPAWNED )
             continue; // empty slot, or still connecting/downloading
-        if ( RACE_MirrorIsFakeClient( client ) )
+        if ( RACE_IsPuppet( client ) )
             continue;
         if ( RACE_IsTvClient( client ) )
             continue;

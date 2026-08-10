@@ -1758,7 +1758,7 @@ class Player
         // Mirror bots (and any fake client) are puppets driven by the mesh
         // stream, not real input — they must never enter a race, so they can
         // never count an attempt or set a record on this server.
-        if ( RACE_MirrorIsFakeClient( this.client ) )
+        if ( RACE_IsPuppet( this.client ) )
             return false;
 
         // Auto-recall: starting a practice run from a recalled position starts
@@ -2342,7 +2342,7 @@ class Player
         // Belt-and-suspenders: a fake client should never be inRace (startRace
         // refuses them), but never log a finish, report to the API, or write a
         // top score for one even if some other path gets here.
-        if ( RACE_MirrorIsFakeClient( this.client ) )
+        if ( RACE_IsPuppet( this.client ) )
             return;
 
         if ( this.practicing && !this.recalled )

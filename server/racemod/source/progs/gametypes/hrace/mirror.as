@@ -539,6 +539,37 @@ bool RACE_MirrorIsFakeClient( Client@ client )
     return @ent != null && ( ent.svflags & SVF_FAKECLIENT ) != 0;
 }
 
+// Canonical "is this slot a puppet rather than a person?" predicate.
+//
+// The base gametype asked this three different ways — RS_MirrorBotIs( int ),
+// RACE_MirrorIsFakeClient( Client@ ), and an equality test against
+// raceGhostBotSlot — which meant the base files reached directly for a mesh
+// native and a ghost-module global just to answer one question. These two names
+// are the single way to ask it, so that when the racesow.org layer is gated out
+// there is exactly one thing to reimplement.
+//
+// Two NAMES rather than an int/Client@ overload pair: overload resolution
+// across script sections differs between Warsow's AngelScript 2.29 and
+// Warfork's AS2024, and this predicate is called from the scoreboard build, so
+// a silent mis-resolution would be expensive to find.
+//
+// Note the deliberate asymmetry, preserved exactly from the call sites these
+// replaced: the Client@ form also accepts anything flagged SVF_FAKECLIENT,
+// the int form asks the mesh layer only. Widening the int form would change
+// who is skipped in GT_ThinkRules, so it is left alone here.
+//
+// SVF_FAKECLIENT is a STOCK engine flag, which is what makes a base-only
+// implementation of this predicate possible with no natives at all.
+bool RACE_IsPuppet( Client@ client )
+{
+    return RACE_MirrorIsFakeClient( client );
+}
+
+bool RACE_IsPuppetNum( int playerNum )
+{
+    return RS_MirrorBotIs( playerNum );
+}
+
 void RACE_MirrorPlayerJoined( Client@ client )
 {
     if ( !RACE_MirrorEnabled() || @client == null )

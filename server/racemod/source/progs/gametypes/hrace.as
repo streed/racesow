@@ -384,7 +384,7 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
             // (commands.as, Cmd_RaceRestart).
             if ( rs_autojoin.integer != 0
                     && client.team == TEAM_SPECTATOR
-                    && !RACE_MirrorIsFakeClient( client )
+                    && !RACE_IsPuppet( client )
                     && !RACE_IsTvClient( client ) )
             {
                 client.team = TEAM_PLAYERS;
@@ -505,7 +505,7 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     // Mirror bots (fake clients representing remote players) are driven entirely
     // by the mesh layer — skip the normal race spawn setup so it doesn't fight
     // their frozen, streamed position/view.
-    if ( RS_MirrorBotIs( ent.client.playerNum ) )
+    if ( RACE_IsPuppetNum( ent.client.playerNum ) )
         return;
 
     // Re-apply this player's cg_raceShowWorldRecord choice: a level reload zeroes
@@ -755,7 +755,7 @@ void GT_ThinkRules()
             continue;
 
         // mirror bots are driven by the mesh layer, not the race rules
-        if ( RS_MirrorBotIs( i ) )
+        if ( RACE_IsPuppetNum( i ) )
             continue;
 
         //delayed rules
@@ -918,7 +918,7 @@ int RACE_TvPickTarget()
         Client@ c = @e.client;
         if ( @c is null || c.state() < CS_SPAWNED )
             continue;
-        if ( RS_MirrorBotIs( c.playerNum ) )      // ghost/mesh bots are never shown
+        if ( RACE_IsPuppetNum( c.playerNum ) )      // ghost/mesh bots are never shown
             continue;
         if ( anyEnt == 0 )
             anyEnt = e.entNum;
@@ -944,7 +944,7 @@ bool RACE_TvTargetValid( int entNum )
     Client@ c = RACE_EntClient( entNum );
     if ( @c is null || c.state() < CS_SPAWNED )
         return false;
-    if ( RS_MirrorBotIs( c.playerNum ) )
+    if ( RACE_IsPuppetNum( c.playerNum ) )
         return false;
     return c.team != TEAM_SPECTATOR;
 }
@@ -1082,7 +1082,7 @@ bool Pending_AnyRacing(bool respawn = false)
         // Mesh bots are remote players, not local match participants: never let
         // a mirrored racer keep the local match in overtime, and never yank a
         // bot to spectator here (consistent with GT_ThinkRules / GT_PlayerRespawn).
-        if ( RS_MirrorBotIs( i ) )
+        if ( RACE_IsPuppetNum( i ) )
             continue;
 
         Player@ player = RACE_GetPlayer( client );
