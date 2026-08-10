@@ -65,6 +65,14 @@ services:
       MIRROR_SECRET: "${MIRROR_SECRET:-}"   # shared HMAC key: openssl rand -hex 24
       MIRROR_PORT: "${MIRROR_PORT:-44450}"
       MIRROR_TAG: "${MIRROR_TAG:-}"         # short id shown as [TAG] in chat
+      # Name the TV/mirror client so the site can filter it out of the live view
+      # — and so hrace/maprotate.as can tell it apart from a real player. The
+      # camera is connected 24/7 by design; if RACE_IsTvClient can't match it,
+      # RACE_AnyHumanPresent counts it as a person and idle rotation never fires.
+      # Matches the EU service in server/docker-compose.yml. This lived as an
+      # uncommitted edit on the US box until 2026-08-10; declaring it here keeps
+      # the box reconcilable with a plain `git pull`.
+      EXTRA_ARGS: "+set rs_tv_name RACESOW-TV"
     # Liveness = "the engine still answers its own protocol", not "the process
     # exists". A fatal game error leaves the engine running and spinning while
     # the port goes silent, so `restart: unless-stopped` above never fires — it
