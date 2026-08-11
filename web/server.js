@@ -1364,11 +1364,17 @@ async function authenticateIngest(req) {
   const srv = await race.serverByTokenHash(sha256(token));
   if (srv) {
     if (srv.status === "revoked") return { revoked: true };
-    return { serverId: srv.id, serverName: srv.name };
+    // server.status is trusted|quarantined|revoked. Everything except revoked
+    // may report as before, but `trusted` gates the few actions that let a
+    // server create central state rather than just append to its own — see
+    // POST /game/flag. A quarantined server keeps reporting and keeps being
+    // watchable; it just stops being taken at its word.
+    return { serverId: srv.id, serverName: srv.name, status: srv.status, trusted: srv.status === "trusted" };
   }
-  // Legacy shared token.
+  // Legacy shared token. Not attributable to a box and not individually
+  // revocable, so it is never `trusted` for state-creating actions.
   if (INGEST_TOKEN_HASH && tokenMatches(token, INGEST_TOKEN_HASH)) {
-    return { serverId: null, serverName: "shared" };
+    return { serverId: null, serverName: "shared", status: "shared", trusted: false };
   }
   return null;
 }
@@ -1796,8 +1802,29 @@ api.post(
     const reason = FLAG_REASONS.includes(body.reason) ? body.reason : "other";
     let note = typeof body.note === "string" ? body.note.trim().slice(0, FLAG_NOTE_MAX) : "";
     if (!note) note = null;
-    const mapId = await race.mapIdByName(mapName);
-    if (mapId == null) return res.status(404).json({ error: "unknown map" });
+    // A map that has never been finished has no `map` row, so flagging it used
+    // to 404 — which excluded exactly the population most worth flagging: a map
+    // that CRASHES ON LOAD can never have produced a finish. An enrolled,
+    // trusted server may therefore bring the row into existence.
+    //
+    // Trust is the per-server enrolment (server.status = 'trusted'), not merely
+    // "presented a valid token": the legacy shared token is not attributable to
+    // a box and cannot be revoked on its own, and a quarantined server is one
+    // an admin has already decided not to take at its word. Both keep the 404.
+    //
+    // Note this makes the map publicly listable (maps() filters only on
+    // map_block) with zero records until a moderator acts on the flag. That is
+    // the intended trade: the alternative is that broken maps stay invisible.
+    let mapId = await race.mapIdByName(mapName);
+    let mapCreated = false;
+    if (mapId == null) {
+      if (!req.ingest.trusted) return res.status(404).json({ error: "unknown map" });
+      mapId = await race.ensureMapByName(mapName);
+      // Rejected by the charset check — a name the engine could never have
+      // loaded, so treat it as a bad request rather than minting a row.
+      if (mapId == null) return res.status(400).json({ error: "invalid map name" });
+      mapCreated = true;
+    }
     // Dedupe per player: prefer the auth login, else the display name, else the
     // reporting server (so an anonymous /flag still can't be spammed endlessly).
     const who =
@@ -1811,8 +1838,12 @@ api.post(
       typeof body.player === "string" && body.player ? simplifyName(body.player).slice(0, MAX_NAME_LEN) || null : null;
     const r = await race.flagMap({ mapId, reason, note, reporterHash, reporterName });
     if (!r.ok) return res.status(404).json({ error: "unknown map" });
-    recordEvent(req.ingest.serverId, `/flag ${mapName} from ${req.ingest.serverName} (${reason})${r.duplicate ? " [dup]" : ""}`);
-    res.json({ ok: true, duplicate: !!r.duplicate });
+    recordEvent(
+      req.ingest.serverId,
+      `/flag ${mapName} from ${req.ingest.serverName} (${reason})` +
+        `${r.duplicate ? " [dup]" : ""}${mapCreated ? " [new map]" : ""}`
+    );
+    res.json({ ok: true, duplicate: !!r.duplicate, mapCreated });
   })
 );
 

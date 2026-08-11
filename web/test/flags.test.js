@@ -64,6 +64,7 @@ test("flagMap: creates a flag, dedupes the same reporter+reason, keeps distinct 
   const miss = await race.flagMap({ mapId: 999999, reason: "broken", reporterHash: rep });
   assert.equal(miss.ok, false);
 
+
   const summary = await race.openFlagSummary();
   assert.equal(summary.length, 1);
   const g = summary[0];
@@ -196,4 +197,47 @@ test("sessions: valid lookup, expiry self-cleans, delete, and cascade on admin r
   await race.createSession({ tokenHash: sha256(raw3), adminId: admin.id, csrf: "c3", expiresAt: now + 3600, now });
   await race.removeAdmin("mod");
   assert.equal(await race.getSession(sha256(raw3), now + 10), null);
+});
+
+// A map that crashes the server on load has, by definition, never been
+// finished — so it has no `map` row and nothing to hang a flag on. This is the
+// get-or-create that lets a trusted server report one anyway.
+test("ensureMapByName: creates unknown maps, is idempotent, and rejects junk names", async (t) => {
+  const race = await freshDb(t);
+
+  // Creates a row that did not exist.
+  assert.equal(await race.mapIdByName("neverfinished1"), null);
+  const id = await race.ensureMapByName("neverfinished1");
+  assert.ok(Number.isInteger(id) && id > 0);
+  assert.equal(await race.mapIdByName("neverfinished1"), id);
+
+  // Idempotent: the same name returns the same id rather than raising a unique
+  // violation. Four game servers can hit the same broken map at once.
+  assert.equal(await race.ensureMapByName("neverfinished1"), id);
+
+  // Returns the EXISTING id for a map that was already there — it must never
+  // duplicate or renumber a real map.
+  const existing = await makeMap(race, "coldrun");
+  assert.equal(await race.ensureMapByName("coldrun"), existing);
+  // Case is normalised the same way mapIdByName normalises it.
+  assert.equal(await race.ensureMapByName("ColdRun"), existing);
+
+  // Junk never mints a row: path traversal, spaces, leading punctuation,
+  // separators that would break the generated cfg lines, and empties. Refusal
+  // is null — never a partial row.
+  const junk = ["../../etc/passwd", "a b", "", "  ", "-leading", ".leading", "/abs",
+                "semi;colon", "quo\"te", "UPPER SPACE", null, undefined];
+  for (const bad of junk) {
+    assert.equal(await race.ensureMapByName(bad), null, `expected null for ${JSON.stringify(bad)}`);
+  }
+  const { c } = await race.one("SELECT COUNT(*) c FROM map");
+  assert.equal(Number(c), 2, "junk names must not have created any rows");
+
+  // The flag then lands on the created row like any other, and reaches the queue.
+  const newId = await race.ensureMapByName("neverfinished2");
+  const r = await race.flagMap({ mapId: newId, reason: "broken", reporterHash: sha256("gameflag:crashguard") });
+  assert.equal(r.ok, true);
+  assert.equal(r.created, true);
+  const summary = await race.openFlagSummary();
+  assert.ok(summary.some((g) => g.name === "neverfinished2"), "the new map shows in the moderator queue");
 });

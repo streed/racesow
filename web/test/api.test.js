@@ -9,7 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { ADMIN_URL } from "./pg-util.js";
-import { SR_MIN_MAPS } from "../db.js";
+import { SR_MIN_MAPS, sha256 } from "../db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_JS = path.join(__dirname, "..", "server.js");
@@ -675,4 +675,95 @@ test("/api/game/saved-start round-trips /savestart via /api/ingest/saved-start (
   const after = await (await getText("map=startmap&name=nova")).text();
   assert.doesNotMatch(after, /\nrace /, "race start cleared");
   assert.match(after, /\nreverse /, "reverse start survives");
+});
+
+// POST /api/game/flag on a map with no `map` row.
+//
+// A map that crashes the server on load can never have produced a finish, so it
+// never has a row — which used to mean the maps most worth flagging were the
+// only ones that could not be flagged. An enrolled TRUSTED server may now
+// create the row. Trust here is server.status, not "presented a valid token":
+// the legacy shared token is not attributable to a box, and a quarantined
+// server is one an admin already decided not to take at its word.
+test("game flag: only a trusted enrolled server may flag a map that does not exist yet", async () => {
+  const tok = { trusted: "tok-trusted-aaaaaaaaaaaa", quar: "tok-quarantined-bbbbbbbb", revoked: "tok-revoked-cccccccccc" };
+  const now = Math.floor(Date.now() / 1000);
+  for (const [name, status, t] of [
+    ["EU trusted", "trusted", tok.trusted],
+    ["EU quarantined", "quarantined", tok.quar],
+    ["EU revoked", "revoked", tok.revoked],
+  ]) {
+    await dbQuery(
+      `INSERT INTO server (name, token_hash, status, created_at)
+       VALUES ('${name}', '${sha256(t)}', '${status}', ${now})`
+    );
+  }
+
+  const flag = async (token, body) => {
+    const r = await fetch(`${base}/api/game/flag`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    return { status: r.status, json: await r.json().catch(() => ({})) };
+  };
+  const mapRows = async (name) =>
+    Number((await dbQuery(`SELECT COUNT(*) c FROM map WHERE name = '${name}'`)).rows[0].c);
+
+  // The legacy shared token cannot mint a map, even though it authenticates.
+  const shared = await flag(TOKEN, { map: "crashmap-shared", reason: "broken" });
+  assert.equal(shared.status, 404, "shared token must not create a map");
+  assert.equal(await mapRows("crashmap-shared"), 0);
+
+  // Neither can a quarantined server.
+  const quar = await flag(tok.quar, { map: "crashmap-quar", reason: "broken" });
+  assert.equal(quar.status, 404, "quarantined server must not create a map");
+  assert.equal(await mapRows("crashmap-quar"), 0);
+
+  // A revoked server is rejected earlier, at auth.
+  const rev = await flag(tok.revoked, { map: "crashmap-rev", reason: "broken" });
+  assert.equal(rev.status, 403);
+  assert.equal(await mapRows("crashmap-rev"), 0);
+
+  // A trusted server can — this is the whole point of the change.
+  const ok = await flag(tok.trusted, {
+    map: "crashmap-new",
+    reason: "broken",
+    login: "crashguard",
+    note: "[auto] map-load failure (exit 1): GClip_SetBrushModel: NULL model",
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.ok, true);
+  assert.equal(ok.json.mapCreated, true, "the response says the map was created");
+  assert.equal(await mapRows("crashmap-new"), 1);
+
+  // ...and the flag is really in the moderator queue against that new map.
+  const q = await dbQuery(
+    `SELECT f.reason, f.note FROM map_flag f JOIN map m ON m.id = f.map_id
+     WHERE m.name = 'crashmap-new' AND f.status = 'open'`
+  );
+  assert.equal(q.rows.length, 1);
+  assert.equal(q.rows[0].reason, "broken");
+
+  // Repeating it (four nodes hitting the same broken map) neither duplicates
+  // the map nor the flag, and no longer reports the map as newly created.
+  const again = await flag(tok.trusted, { map: "crashmap-new", reason: "broken", login: "crashguard" });
+  assert.equal(again.status, 200);
+  assert.equal(again.json.duplicate, true);
+  assert.equal(again.json.mapCreated, false);
+  assert.equal(await mapRows("crashmap-new"), 1);
+
+  // A name the engine could never have loaded is a bad request, not a new row.
+  for (const bad of ["../../etc/passwd", "has space", "-leading"]) {
+    const r = await flag(tok.trusted, { map: bad, reason: "broken" });
+    assert.equal(r.status, 400, `expected 400 for ${JSON.stringify(bad)}`);
+  }
+  assert.equal(Number((await dbQuery("SELECT COUNT(*) c FROM map WHERE name LIKE '%passwd%'")).rows[0].c), 0);
+
+  // Regression: flagging a map that DOES exist is unchanged, and reports that
+  // it created nothing.
+  await ingest(gameBody({ map: "flagexisting", name: "Nova", time: 1000 }));
+  const known = await flag(tok.trusted, { map: "flagexisting", reason: "offensive", login: "someone" });
+  assert.equal(known.status, 200);
+  assert.equal(known.json.mapCreated, false);
 });

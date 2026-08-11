@@ -988,6 +988,28 @@ class RaceDB {
     const row = await this.one("SELECT id FROM map WHERE name = $1", [String(name).toLowerCase()]);
     return row ? num(row.id) : null;
   }
+  // Get-or-create by name. DO UPDATE (a no-op rewrite of the unique key) makes
+  // RETURNING yield the row even when a concurrent transaction inserted it
+  // first — a plain INSERT would raise a unique violation and abort. Same
+  // idiom as the ingest and tournament-pool paths.
+  //
+  // This MINTS A ROW, so it is deliberately not a drop-in for mapIdByName.
+  // Every map row is publicly listable (db.js maps() filters only on
+  // map_block), so callers must decide the name is trustworthy first. The
+  // charset check is a floor, not that decision: it stops path traversal and
+  // control characters, it cannot tell a real map from a typo.
+  //
+  // Returns null for a name that fails the charset check — never a partial row.
+  async ensureMapByName(name) {
+    const n = String(name || "").toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(n)) return null;
+    const row = await this.one(
+      `INSERT INTO map (name) VALUES ($1)
+       ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+      [n]
+    );
+    return row ? num(row.id) : null;
+  }
   // Real (un-censored) map name for a map id. Used by the /map/:id/padpork
   // redirect so an offensive map name resolves to its external page WITHOUT the
   // name ever reaching the client.
