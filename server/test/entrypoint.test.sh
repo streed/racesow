@@ -116,4 +116,41 @@ env -i PATH="${PATH}" HOME="${HOME}" WARSOW_DIR="${box5}" \
 [ -f "${box5}/launch-args.txt" ] && fail "entrypoint launched despite an injection char in MIRROR_SECRET"
 grep -qi 'ERROR' "${box5}/entrypoint.log" || fail "expected an error message for the injection char"
 
+# --- Case 6: sv_defaultmap must never be the boot map ------------------------
+# sv_defaultmap is the engine's last resort (SV_CheckDefaultMap), and the ONLY
+# moment it is read is when the boot map failed to come up. Aiming it at the
+# boot map therefore guarantees the fallback retries the map that just died.
+# Verified against the real image: with sv_defaultmap == the boot map, a
+# recoverable "Couldn't find map" boot became a server that never spawned a
+# level at all; with a different map it recovered and the gametype initialised.
+BOX6="$(sandbox defaultmap)"
+# Give it a pool of three real "installed" maps so MAPLIST has a second entry.
+mkdir -p "${TMP}/pk3/maps"
+: > "${TMP}/pk3/maps/alpha.bsp"; : > "${TMP}/pk3/maps/bravo.bsp"; : > "${TMP}/pk3/maps/charlie.bsp"
+( cd "${TMP}/pk3" && zip -qr "${BOX6}/basewsw/pool.pk3" maps ) 2>/dev/null || true
+if [ -f "${BOX6}/basewsw/pool.pk3" ]; then
+    printf '%s\n' alpha bravo charlie > "${BOX6}/racemod/mappool.txt"
+    run_entrypoint "${BOX6}"
+    CFG6="${BOX6}/racemod/configs/server/env.cfg"
+    boot6="$(grep -c '^+map$' "${BOX6}/launch-args.txt" || true)"
+    first6="$(grep -A1 '^+map$' "${BOX6}/launch-args.txt" | tail -1)"
+    dflt6="$(sed -n 's/^set sv_defaultmap "\(.*\)"$/\1/p' "${CFG6}")"
+    [ -n "${dflt6}" ] || fail "sv_defaultmap was not written to env.cfg"
+    [ "${dflt6}" != "${first6}" ] || \
+        fail "sv_defaultmap ('${dflt6}') must differ from the boot map ('${first6}')"
+    grep -qx 'set sv_defaultmap "bravo"' "${CFG6}" || \
+        fail "expected sv_defaultmap to be the SECOND pool entry, got '${dflt6}'"
+
+    # A single-entry pool has no second map, so the line must be OMITTED rather
+    # than aimed at the boot map — the engine's own default still works.
+    BOX7="$(sandbox defaultmap-single)"
+    cp "${BOX6}/basewsw/pool.pk3" "${BOX7}/basewsw/pool.pk3"
+    printf '%s\n' alpha > "${BOX7}/racemod/mappool.txt"
+    run_entrypoint "${BOX7}"
+    grep -q 'sv_defaultmap' "${BOX7}/racemod/configs/server/env.cfg" && \
+        fail "a single-map pool must not set sv_defaultmap (it would equal the boot map)"
+else
+    echo "SKIP: case 6 needs zip"
+fi
+
 echo "OK: entrypoint contract tests passed"

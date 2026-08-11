@@ -14,8 +14,14 @@
 # answer its own protocol". We send the same out-of-band `getinfo` datagram the
 # master-server browser sends and require an `infoResponse` back. That is the
 # exact probe that distinguished dead-from-alive during the incident: a wedged
-# engine answers nothing, while the socket stays bound (so there is no ICMP
-# refusal either — the read simply times out).
+# engine answers nothing at all.
+#
+# (An earlier version of this comment claimed the socket "stays bound, so there
+# is no ICMP refusal either". That was extrapolated from a SIGSTOP rehearsal,
+# not from the real wedge, and it is wrong: the ERR_DROP path reaches
+# SV_ShutdownGame, which calls NET_CloseSocket on the UDP sockets before it
+# unwinds. Either way the probe behaves the same — no infoResponse comes back —
+# which is why the recovery logic never depended on the distinction.)
 #
 # RECOVERY. After $RS_HEALTH_FAILS consecutive misses we kill the engine, and
 # the layer above brings it back:
@@ -44,6 +50,10 @@ FAIL_LIMIT="${RS_HEALTH_FAILS:-6}"          # consecutive misses before a kill
 GRACE="${RS_HEALTH_GRACE:-240}"             # seconds a freshly launched engine gets
 PIDFILE="${ENGINE_PIDFILE:-/tmp/engine.pid}"
 STATE="${TMPDIR:-/tmp}/gamehealth.fails"
+# The crash guard's breadcrumb dir (crashguard.sh CG_RUN). This script owns the
+# CONFIRMATION half of the attribution: the entrypoint records which map the
+# engine is loading, and only a real infoResponse proves that map came up.
+CG_RUN="${RS_CRASHGUARD_RUN:-${TMPDIR:-/tmp}/crashguard}"
 
 log() { echo ">> gamehealth: $*"; }
 
@@ -151,6 +161,20 @@ fi
 
 if probe; then
     echo 0 > "${STATE}" 2>/dev/null || true
+    # The engine answered its own protocol, so whatever map it was loading is
+    # now genuinely serving. Retire the breadcrumb to `lastgood` and clear it.
+    #
+    # This is what keeps the crash guard honest in BOTH directions. Clearing it
+    # means a server that dies hours later — OOM, host reboot, an operator
+    # `docker restart` — is never blamed on the map it happens to be running.
+    # Leaving it set until this point means a map that dies during load IS
+    # blamed, whether that load happened at boot or three hours in, because the
+    # confirmation never arrived. Duration heuristics cannot tell those apart;
+    # this can.
+    if [ -s "${CG_RUN}/loading" ]; then
+        cat "${CG_RUN}/loading" > "${CG_RUN}/lastgood" 2>/dev/null || true
+        : > "${CG_RUN}/loading" 2>/dev/null || true
+    fi
     exit 0
 fi
 

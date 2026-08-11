@@ -59,6 +59,26 @@ cd "${WARSOW_DIR}"
 # (the mod now logs it, but pre-creating here as our uid avoids it entirely).
 MOD_DIR="${WARSOW_DIR}/${FS_GAME}"
 
+# Bad-map crash recovery: the console tap, the per-launch boot-map choice, the
+# local quarantine and the relaunch backoff. Sourced here (before the console
+# drainer and the restart loop, both of which call into it) so CG_ENABLED is
+# defined by the time anything branches on it. Falls back to inert stubs if the
+# file is missing, so an older image layout still boots.
+CRASHGUARD_SH="${CRASHGUARD_SH:-$(dirname "$0")/crashguard.sh}"
+if [ -r "${CRASHGUARD_SH}" ]; then
+    # shellcheck disable=SC1090  # path is image-layout dependent, resolved above
+    . "${CRASHGUARD_SH}"
+else
+    echo ">> WARNING: ${CRASHGUARD_SH} not found; bad-map crash recovery is OFF" >&2
+    CG_ENABLED=0
+    cg_init()      { :; }
+    cg_scan_line() { :; }
+    cg_arm()       { :; }
+    cg_verdict()   { :; }
+    cg_sleep()     { sleep 5; }
+    cg_pick_map()  { printf '%s' "$1"; }
+fi
+
 # Clear any stale extracted game modules. The engine unpacks libgame_x86_64.so
 # from modules_racesow_21pure.pk3 into a tempmodules_* dir and reuses it if
 # present; wiping it guarantees the current (patched) module is re-extracted
@@ -190,6 +210,23 @@ fi
 FIRST_MAP="${MAPLIST%% *}"
 : "${FIRST_MAP:=race}"
 
+# The engine's own last-resort map (sv_defaultmap, consulted by
+# SV_CheckDefaultMap when the server finds itself dead with no map). It must be
+# a DIFFERENT map from the boot map: the only time the engine reads it is when
+# the boot map did not come up, so pointing it at FIRST_MAP guarantees the
+# fallback retries the map that just failed and the server stays dead. That is
+# not hypothetical — booting with sv_defaultmap=FIRST_MAP turned a recoverable
+# "Couldn't find map: ui" into a server that never spawned a level at all,
+# while the stock default recovered it.
+#
+# So: the SECOND entry of the vetted pool. Empty when the pool has fewer than
+# two entries, in which case we emit nothing and the engine keeps its own
+# compiled default (wdm1/wfdm1) — a stock deathmatch map is a poor race
+# fallback, but a working one beats a broken one.
+FALLBACK_MAP="${MAPLIST#* }"
+FALLBACK_MAP="${FALLBACK_MAP%% *}"
+[ "${FALLBACK_MAP}" = "${MAPLIST}" ] && FALLBACK_MAP=""
+
 # --- Mirror mesh sanity checks ------------------------------------------------
 # The peers list rides in a single generated cfg line, so it shares the
 # engine's 1024-char command buffer hazard with g_maplist above: a chopped
@@ -296,6 +333,25 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     # the value (which nothing re-sets), breaking the engine's own rotation and
     # the vote pool. A private cvar like this is safe (same pattern as rs_api_*).
     echo "set rs_idle_pool \"${MAPLIST}\""
+    # Engine-level map-load recovery, aimed at a race map. When a map fails to
+    # load the engine raises Com_Error(ERR_DROP), which tears the server down
+    # (game module unloaded, UDP socket closed, svs.initialized=false) and
+    # longjmps out. From then on SV_Frame takes its `!svs.initialized` branch,
+    # which calls SV_CheckDefaultMap() -> `map $sv_defaultmap`. That recovery
+    # already ships and already works; it just pointed at the stock DEATHMATCH
+    # map, because nothing ever set the cvar. FALLBACK_MAP (computed above) is
+    # the second entry of the vetted pool — deliberately NOT the boot map, see
+    # the comment there. Omitted entirely when the pool is too short, so the
+    # engine keeps its own working default rather than getting a broken one.
+    #
+    # Two limits, deliberately not papered over here:
+    #  - It is a ONE-SHOT. svc.autostarted (sv_main.c) latches on first use and
+    #    SV_ShutdownGame memsets svs, not svc, so a second failed load in the
+    #    same process wedges at 100% CPU. crashguard.sh + gamehealth.sh cover that.
+    #  - It recovers the PROCESS, not the SESSION: the ERR_DROP teardown already
+    #    sent SV_FinalMessage and freed svs.clients, so every player is dropped
+    #    to the connfailed menu and must reconnect by hand.
+    [ -n "${FALLBACK_MAP}" ]       && echo "set sv_defaultmap \"${FALLBACK_MAP}\""
     [ -n "${RCON_PASSWORD}" ]      && echo "set rcon_password \"${RCON_PASSWORD}\""
     # HTTP pak mirror: when set, the engine redirects pak downloads there
     # instead of the (patched) UDP transfer. Must be reachable by game clients.
@@ -406,7 +462,10 @@ set -- \
     +exec configs/server/env.cfg
 
 [ -n "${EXTRA_ARGS}" ] && set -- "$@" ${EXTRA_ARGS}
-set -- "$@" +map "${FIRST_MAP}"
+# NOTE: `+map` is deliberately NOT baked into "$@" here. It is appended per
+# launch inside the restart loop, because the whole point of the crash guard is
+# that the boot map can change between relaunches. Baking it in above the loop
+# is what made a bad boot map an unbreakable 5-second bootloop.
 
 # --- Console log shipping (optional) ----------------------------------------
 # When enabled, the engine's stdout/stderr is redirected into a FIFO that a
@@ -436,6 +495,8 @@ _ship_buf=""
 _ship_n=0
 _ship_flush() {
     [ "${_ship_n}" -gt 0 ] || return 0
+    # Shipping is optional; the FIFO is not (the crash guard taps it too).
+    [ -n "${LOG_INGEST_URL}" ] || { _ship_buf=""; _ship_n=0; return 0; }
     # Detach the POST so the read loop keeps draining the FIFO while curl runs
     # (a synchronous curl could fill the pipe and stall the engine). curl bounds
     # itself with --max-time; failures are ignored (best-effort logs).
@@ -465,6 +526,9 @@ log_shipper() {
             continue
         fi
         printf '%s\n' "${_line}"            # keep docker logs intact
+        # Bad-map attribution. BUILTIN-ONLY -- this loop never forks, so it never
+        # reaps, and one fork per line is one zombie per line (see above).
+        cg_scan_line "${_line}"
         _ship_buf="${_ship_buf}${_line}
 "
         _ship_n=$((_ship_n + 1))
@@ -475,9 +539,19 @@ log_shipper() {
 
 if [ "${LOG_SHIP}" != "0" ] && [ -n "${INGEST_URL}" ] && [ -n "${INGEST_TOKEN}" ]; then
     LOG_INGEST_URL="${INGEST_URL%/api/ingest}/api/ingest/log"
+fi
+# The FIFO is no longer only about shipping: the crash guard taps the same
+# stream for the engine's `SpawnServer: <map>` line, which is how a failed load
+# gets attributed to a map. So it comes up whenever EITHER consumer wants it,
+# and an agent-tier box with no ingest credentials still gets crash recovery.
+if [ -n "${LOG_INGEST_URL}" ] || [ "${CG_ENABLED}" = "1" ]; then
     CONSOLE_FIFO="$(mktemp -u "${TMPDIR:-/tmp}/wsw-console.XXXXXX")"
     if mkfifo "${CONSOLE_FIFO}" 2>/dev/null; then
-        echo ">> shipping console logs to ${LOG_INGEST_URL}"
+        if [ -n "${LOG_INGEST_URL}" ]; then
+            echo ">> shipping console logs to ${LOG_INGEST_URL}"
+        else
+            echo ">> console tap active for the crash guard (log shipping off)"
+        fi
         # Hold BOTH ends open for the whole lifetime (see SAFETY above).
         exec 9<> "${CONSOLE_FIFO}"
         # Supervised drainer: reads via the inherited fd 9, respawned if it ever
@@ -485,9 +559,13 @@ if [ "${LOG_SHIP}" != "0" ] && [ -n "${INGEST_URL}" ] && [ -n "${INGEST_TOKEN}" 
         ( while true; do log_shipper <&9; sleep 1; done ) &
         SHIPPER_PID=$!
         # Periodic flush: inject the sentinel every LOG_FLUSH_SECS so a quiet
-        # server still ships its last lines promptly.
-        ( while true; do sleep "${LOG_FLUSH_SECS}"; printf '%s\n' "${SENTINEL}" >&9 2>/dev/null || exit 0; done ) &
-        HEARTBEAT_PID=$!
+        # server still ships its last lines promptly. Only needed when something
+        # is actually being shipped — the crash-guard tap acts on each line as it
+        # arrives and has nothing to flush.
+        if [ -n "${LOG_INGEST_URL}" ]; then
+            ( while true; do sleep "${LOG_FLUSH_SECS}"; printf '%s\n' "${SENTINEL}" >&9 2>/dev/null || exit 0; done ) &
+            HEARTBEAT_PID=$!
+        fi
     else
         echo ">> WARNING: could not create console FIFO; log shipping disabled" >&2
         CONSOLE_FIFO=""
@@ -522,18 +600,26 @@ shutdown() {
     exit 0
 }
 trap shutdown INT TERM
+
+cg_init
+
 while true; do
-    export_pakshare
-    echo ">> launching wsw_server.x86_64 $*"
+    # Recomputed EVERY iteration: skips maps this box has already watched the
+    # engine die on, and re-fetches the central blocklist so a map another node
+    # quarantined never becomes this node's boot map.
+    boot_map="$(cg_pick_map "${FIRST_MAP}")"
+    cg_arm "${boot_map}"
+    launched_at="$(date +%s)"
+    echo ">> launching wsw_server.x86_64 $* +map ${boot_map}"
     # Force line-buffered stdout/stderr. In a detached container the engine's
     # stdout is a pipe, so glibc block-buffers it and `docker logs` looks frozen
     # mid-startup. stdbuf keeps output flowing even if no TTY is allocated.
     # With shipping on, redirect stdout+stderr into the FIFO (a plain `>` so $!
     # is still the engine); the background shipper echoes it back to docker logs.
     if [ -n "${CONSOLE_FIFO}" ]; then
-        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" > "${CONSOLE_FIFO}" 2>&1 &
+        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" +map "${boot_map}" > "${CONSOLE_FIFO}" 2>&1 &
     else
-        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" &
+        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" +map "${boot_map}" &
     fi
     server_pid=$!
     # Publish the PID for gamehealth.sh (the Docker healthcheck): when the engine
@@ -541,9 +627,24 @@ while true; do
     # force a relaunch through the loop below. It must be the engine's own pid,
     # never this script's: the kernel discards in-namespace signals to PID 1.
     echo "${server_pid}" > "${ENGINE_PIDFILE}" 2>/dev/null || true
-    wait "${server_pid}" || true
+    # Capture the status instead of discarding it: a clean quit (0), a watchdog
+    # SIGTERM (143), a Sys_Error (1) and a SIGABRT (134) used to be
+    # indistinguishable here, which is half the reason a bootloop was invisible.
+    # `|| status=$?` is required under `set -e` — a bare failing `wait` aborts.
+    status=0
+    wait "${server_pid}" || status=$?
     server_pid=""
     rm -f "${ENGINE_PIDFILE}" 2>/dev/null || true
-    echo ">> server exited, restarting in 5s..."
-    sleep 5
+    ran=$(( $(date +%s) - launched_at ))
+    echo ">> server exited (status ${status}) after ${ran}s"
+    cg_verdict "${status}" "${ran}"
+    # Refresh the pak/demo share only after a run long enough to have produced
+    # anything. This used to be unconditional at the TOP of the loop, which meant
+    # a 5-second crash loop re-stat'd the whole 4,000+ pk3 mirror twelve times a
+    # minute — the supervisor actively harming the box it was nursing. Container
+    # startup already did the initial export above.
+    if [ "${ran}" -ge "${CG_HEALTHY_SECS:-90}" ]; then
+        export_pakshare
+    fi
+    cg_sleep
 done

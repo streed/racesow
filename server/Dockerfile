@@ -351,11 +351,14 @@ RUN set -eux; \
 COPY configs/server.cfg  "${WARSOW_DIR}/${FS_GAME}/configs/server/server.cfg"
 COPY configs/mappool.txt "${WARSOW_DIR}/${FS_GAME}/mappool.txt"
 COPY entrypoint.sh       /entrypoint.sh
+# Bad-map crash recovery, sourced by the entrypoint from its own directory.
+# Must sit beside /entrypoint.sh or the entrypoint falls back to inert stubs.
+COPY crashguard.sh       /crashguard.sh
 # Docker HEALTHCHECK + wedged-engine watchdog (compose wires it up; see the
 # header in gamehealth.sh for why "process alive" is not a useful health signal
 # for this engine).
 COPY gamehealth.sh       /usr/local/bin/gamehealth.sh
-RUN chmod +x /entrypoint.sh /usr/local/bin/gamehealth.sh
+RUN chmod +x /entrypoint.sh /crashguard.sh /usr/local/bin/gamehealth.sh
 
 # Run as a non-root user. /pakshare is the export point for the optional HTTP
 # pak mirror (docker-compose.yml pakserver); pre-owning it makes the named

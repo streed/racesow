@@ -188,9 +188,13 @@ RUN set -eux; \
 COPY warfork/configs/server.cfg "${WF_DIR}/${FS_GAME}/configs/server/server.cfg"
 COPY server/configs/mappool.txt "${WF_DIR}/${FS_GAME}/mappool.txt"
 COPY warfork/entrypoint.sh /entrypoint.sh
+# Bad-map crash recovery. Shared verbatim with the Warsow image (it is POSIX sh
+# and reads only MAPLIST/INSTALLED/INGEST_*), so both games get the same
+# quarantine semantics from one file. Must sit beside /entrypoint.sh.
+COPY server/crashguard.sh  /crashguard.sh
 # Same watchdog as the Warsow image — one script, both games (it reads SV_PORT).
 COPY server/gamehealth.sh /usr/local/bin/gamehealth.sh
-RUN chmod +x /entrypoint.sh /usr/local/bin/gamehealth.sh
+RUN chmod +x /entrypoint.sh /crashguard.sh /usr/local/bin/gamehealth.sh
 
 RUN useradd -r -m -d /home/warfork warfork \
     && mkdir -p "${WF_DIR}/${FS_GAME}/demos" "${WF_DIR}/${FS_GAME}/topscores" "${WF_DIR}/${FS_GAME}/racelog" \

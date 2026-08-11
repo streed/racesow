@@ -12,6 +12,26 @@ WF_DIR=${WF_DIR:-/warfork}
 FS_GAME=${FS_GAME:-racesow}
 MOD_DIR="${WF_DIR}/${FS_GAME}"
 
+# Bad-map crash recovery, shared verbatim with the Warsow tier
+# (server/crashguard.sh). This tier needs it most: Warfork still runs upstream's
+# fatal GClip_SetBrushModel, so an unloadable map in the ~4,250-pk3 mirror takes
+# the server down where Warsow shrugs it off. Sourced before the console tap and
+# the supervise loop, both of which call into it.
+CRASHGUARD_SH="${CRASHGUARD_SH:-$(dirname "$0")/crashguard.sh}"
+if [ -r "${CRASHGUARD_SH}" ]; then
+    # shellcheck disable=SC1090
+    . "${CRASHGUARD_SH}"
+else
+    echo ">> WARNING: ${CRASHGUARD_SH} not found; bad-map crash recovery is OFF" >&2
+    CG_ENABLED=0
+    cg_init()      { :; }
+    cg_scan_line() { :; }
+    cg_arm()       { :; }
+    cg_verdict()   { :; }
+    cg_sleep()     { sleep 5; }
+    cg_pick_map()  { printf '%s' "$1"; }
+fi
+
 # The shared RS_Api* natives (server/enginepatches/g_rs_api.cpp) build their libc
 # write paths from $WARSOW_DIR: the live top-scores cache the gametype re-reads
 # for `top`, and the undelivered-report spool. That module is shared with the
@@ -102,6 +122,17 @@ if [ "${#MAPLIST}" -gt 1000 ]; then
 fi
 # Prefer a real installed map to spawn on; fall back to the MAP env default.
 [ -n "${MAPLIST%% *}" ] && FIRST_MAP="${MAPLIST%% *}" || FIRST_MAP="${MAP}"
+# The engine's last-resort map (sv_defaultmap), read by SV_CheckDefaultMap when
+# the server is dead with no map. It MUST differ from the boot map: the only
+# moment it is consulted is when the boot map failed to come up, so aiming it at
+# FIRST_MAP makes the fallback retry the map that just died and the server never
+# recovers. Verified on the Warsow image: sv_defaultmap=FIRST_MAP turned a
+# recoverable bad boot map into a server that never spawned a level.
+# Second pool entry; empty when the pool is too short, in which case we emit
+# nothing and the engine keeps its compiled default (wfdm1).
+FALLBACK_MAP="${MAPLIST#* }"
+FALLBACK_MAP="${FALLBACK_MAP%% *}"
+[ "${FALLBACK_MAP}" = "${MAPLIST}" ] && FALLBACK_MAP=""
 
 # --- generated, env-driven config (exec'd LAST so it wins over default.cfg) ----
 # configs/server holds the generated env.cfg; topscores/race, racelog and demos
@@ -126,13 +157,34 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     # cvar is empty: it falls back to GetMapsByFilter, i.e. EVERY installed map.
     # Warfork mounts the whole ~4,250-pk3 mirror, and a chunk of those maps are
     # unloadable on this engine — rotating onto one raises
-    # "GClip_SetBrushModel: NULL model in 'trigger_multiple'", which tears down
-    # the game module while the process keeps running and the socket stays bound.
-    # The container never exits, so nothing restarts it. That wedged EU Warfork
-    # on 2026-08-06 and again on 2026-08-08 (38h), and US Warfork on 2026-08-09
-    # (12h, on aryshok_mew). Warsow never hit it because its entrypoint has
-    # always written this cvar, confining rotation to the vetted mappool.
+    # "GClip_SetBrushModel: NULL model in 'trigger_multiple'", which reaches
+    # Com_Error(ERR_DROP) -> SV_ShutdownGame: the game module is unloaded, every
+    # client dropped, and the UDP socket CLOSED (NET_CloseSocket, sv_init.c).
+    # The process itself keeps running -- SV_Frame then early-returns past its
+    # only NET_Sleep, so it spins one core at 100% answering nothing. The
+    # container never exits, so nothing restarts it. That wedged EU Warfork on
+    # 2026-08-06 and again on 2026-08-08 (38h), and US Warfork on 2026-08-09
+    # (12h, on aryshok_mew).
+    #
+    # Warsow is immune to this PARTICULAR map defect at the ENGINE level, not
+    # because of this cvar: racemod_2.1 already patched that call site to print,
+    # unlink and return instead of G_Error (see wsw game/g_clip.cpp). Warfork
+    # still runs upstream's fatal version, which is why all three wedges were
+    # Warfork. Confining rotation to the vetted mappool (below) reduces the
+    # exposure; it does not remove it.
     [ -n "${MAPLIST}" ]            && echo "set rs_idle_pool \"${MAPLIST}\""
+    # Arm the engine's own map-load recovery on a RACE map. SV_Frame's
+    # `!svs.initialized` branch calls SV_CheckDefaultMap() -> `map
+    # $sv_defaultmap`, which is exactly the state the teardown above leaves
+    # behind. It ships enabled, but sv_defaultmap defaults to the stock DM map
+    # wfdm1 and nothing ever set it, so the one free recovery a race server gets
+    # dumped everyone onto deathmatch — which is why a mysterious
+    # `SpawnServer: wfdm1` shows up in the logs before a wedge.
+    # FALLBACK_MAP (computed above) is the SECOND pool entry, never the boot map.
+    # NOTE it is a ONE-SHOT -- svc.autostarted latches and SV_ShutdownGame
+    # memsets svs, not svc -- so the SECOND failed load in one process still
+    # wedges; crashguard.sh + gamehealth.sh cover that.
+    [ -n "${FALLBACK_MAP}" ]       && echo "set sv_defaultmap \"${FALLBACK_MAP}\""
     [ -n "${RCON_PASSWORD}" ]      && echo "set rcon_password \"${RCON_PASSWORD}\""
     [ -n "${SV_UPLOADS_BASEURL}" ] && echo "set sv_uploads_baseurl \"${SV_UPLOADS_BASEURL}\""
     echo "set sv_demodir \"\""
@@ -205,8 +257,50 @@ set -- \
     +set sv_http_port "${SV_HTTP_PORT}" \
     +exec configs/server/server.cfg \
     +exec configs/server/env.cfg
-[ -n "${FIRST_MAP}" ]  && set -- "$@" +map "${FIRST_MAP}"
+# NOTE: `+map` is deliberately NOT baked into "$@". It is appended per launch
+# inside the supervise loop so the boot map can change between relaunches — a
+# fixed +map above the loop is what turns one bad boot map into an unbreakable
+# 5-second bootloop. EXTRA_ARGS still lands after it, so WF_EXTRA_ARGS keeps
+# working as the operator override.
 [ -n "${EXTRA_ARGS}" ] && set -- "$@" ${EXTRA_ARGS}
+
+# --- console tap --------------------------------------------------------------
+# The crash guard attributes a failed load to a map by reading the engine's own
+# `SpawnServer: <map>` line, so the console has to pass through this shell. This
+# tier has never had a console FIFO (docker-compose.warfork.yml sets LOG_SHIP,
+# but nothing here consumes it — log SHIPPING is still not implemented on
+# Warfork), so this is the minimal version: echo every line straight back out so
+# `docker logs` is unchanged, and hand it to the tap.
+#
+# Three safety properties, ported deliberately from server/entrypoint.sh rather
+# than reinvented:
+#  1. fd 9 is held O_RDWR for the whole container lifetime. On Linux that never
+#     blocks, so a reader is ALWAYS present: the engine's `> FIFO` open cannot
+#     block and its writes cannot EPIPE, even between engine restarts.
+#  2. The drainer is respawned if it ever dies, so draining always resumes —
+#     a full pipe would back-pressure and stall the engine.
+#  3. The read loop uses builtins only. It never forks, so it never reaps, and
+#     a fork per line would leak a zombie per line.
+CONSOLE_FIFO=""
+DRAINER_PID=""
+console_drainer() {
+    while IFS= read -r _line; do
+        printf '%s\n' "${_line}"
+        cg_scan_line "${_line}"
+    done
+}
+if [ "${CG_ENABLED}" = "1" ]; then
+    CONSOLE_FIFO="$(mktemp -u "${TMPDIR:-/tmp}/wf-console.XXXXXX")"
+    if mkfifo "${CONSOLE_FIFO}" 2>/dev/null; then
+        exec 9<> "${CONSOLE_FIFO}"
+        ( while true; do console_drainer <&9; sleep 1; done ) &
+        DRAINER_PID=$!
+        echo ">> console tap active for the crash guard"
+    else
+        echo ">> WARNING: could not create the console FIFO; map attribution is OFF" >&2
+        CONSOLE_FIFO=""
+    fi
+fi
 
 # --- supervise loop -----------------------------------------------------------
 # The engine deliberately runs as a background CHILD rather than via `exec`.
@@ -232,19 +326,39 @@ shutdown() {
         kill -TERM "${server_pid}" 2>/dev/null || true
         wait "${server_pid}" 2>/dev/null || true
     fi
+    [ -n "${DRAINER_PID}" ] && kill "${DRAINER_PID}" 2>/dev/null || true
     exit 0
 }
 trap shutdown INT TERM
 
+cg_init
+
 while true; do
-    echo ">> launching wf_server.x86_64 $*"
+    # Recomputed EVERY iteration: skips maps this box has already watched the
+    # engine die on, and re-fetches the central blocklist so a map another node
+    # quarantined never becomes this node's boot map.
+    boot_map="$(cg_pick_map "${FIRST_MAP}")"
+    cg_arm "${boot_map}"
+    launched_at="$(date +%s)"
+    echo ">> launching wf_server.x86_64 $* +map ${boot_map}"
     # Line-buffer so `docker logs` isn't frozen mid-startup by glibc pipe buffering.
-    stdbuf -oL -eL "${WF_DIR}/wf_server.x86_64" "$@" &
+    # With the tap up, stdout+stderr go through the FIFO (a plain `>` redirect, so
+    # $! is still the ENGINE — the TERM trap and `wait` must target it directly).
+    if [ -n "${CONSOLE_FIFO}" ]; then
+        stdbuf -oL -eL "${WF_DIR}/wf_server.x86_64" "$@" +map "${boot_map}" > "${CONSOLE_FIFO}" 2>&1 &
+    else
+        stdbuf -oL -eL "${WF_DIR}/wf_server.x86_64" "$@" +map "${boot_map}" &
+    fi
     server_pid=$!
     echo "${server_pid}" > "${ENGINE_PIDFILE}" 2>/dev/null || true
-    wait "${server_pid}" || true
+    # Capture the status rather than discarding it; `|| status=$?` is required
+    # under `set -e`, where a bare failing `wait` would abort the script.
+    status=0
+    wait "${server_pid}" || status=$?
     server_pid=""
     rm -f "${ENGINE_PIDFILE}" 2>/dev/null || true
-    echo ">> server exited, restarting in 5s..."
-    sleep 5
+    ran=$(( $(date +%s) - launched_at ))
+    echo ">> server exited (status ${status}) after ${ran}s"
+    cg_verdict "${status}" "${ran}"
+    cg_sleep
 done
