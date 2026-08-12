@@ -77,6 +77,13 @@ COPY server/enginepatches/patch-motd-live.py /tmp/patch-motd-live.py
 # mesh mirror bots). Same game/p_client.cpp anchors as Warsow 2.1.2 (verified
 # byte-identical in Warfork 2.15.1), so the shared script applies unchanged.
 COPY server/enginepatches/patch-quiet-fakeclient-connect.py /tmp/patch-quiet-fakeclient-connect.py
+# A brush entity with no "model" key must not be fatal. Upstream G_Error's here,
+# which reaches Com_Error(ERR_DROP) -> SV_ShutdownGame and wedges the server
+# (EU 2026-08-06 and 2026-08-08/38h, US 2026-08-09/12h — dvr_el, mntslick07,
+# aryshok_mew, all still installed). Warsow already carries this fix via
+# racemod_2.1; this is the Warfork half. WARFORK-ONLY, so it lives in
+# warfork/enginepatches rather than the shared server/ set.
+COPY warfork/enginepatches/patch-brushmodel-nonfatal.py /tmp/patch-brushmodel-nonfatal.py
 RUN cd source \
     && python3 /tmp/patch-api-natives.py \
     && python3 /tmp/patch-mirror-natives.py \
@@ -84,6 +91,9 @@ RUN cd source \
     && python3 /tmp/patch-status-hide-bots.py \
     && python3 /tmp/patch-motd-live.py \
     && python3 /tmp/patch-quiet-fakeclient-connect.py \
+    && python3 /tmp/patch-brushmodel-nonfatal.py \
+    && grep -q 'entity disabled'          game/g_clip.cpp \
+    && ! grep -q 'G_Error( "GClip_SetBrushModel' game/g_clip.cpp \
     && grep -q 'asFunc_RS_ApiReportRace'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_MirrorRefresh'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchRanks'  game/g_ascript.cpp \

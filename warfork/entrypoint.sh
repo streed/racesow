@@ -87,11 +87,29 @@ fi
 
 # --- Discover installed maps + build the rotation ----------------------------
 # A map is playable if maps/<name>.bsp exists in a pk3 in a scanned dir.
+#
+# `|| continue` rather than `[ -e ] && unzip`: this script runs under
+# `set -euo pipefail`, and with the && form a game dir holding NO pk3s leaves the
+# inner loop's status at 1, which pipefail promotes to a failed pipeline, which
+# fails the assignment, which aborts the entrypoint before it launches anything.
+# The container then exits and `restart: unless-stopped` retries it forever — a
+# silent bootloop with no engine and no error message, one level ABOVE the
+# bootloop crashguard.sh exists to break. (The Warsow entrypoint is `set -eu`
+# with no pipefail, so the pipeline takes `sort -u`'s status and it never bit
+# there.) Production always has the symlinked mirror in the mod dir, so this
+# only fires on an empty or mis-mounted install — exactly when a clear message
+# matters most.
 INSTALLED="$(for dir in "${WF_DIR}/basewf" "${MOD_DIR}"; do
         for pk in "${dir}"/*.pk3; do
-            [ -e "${pk}" ] && unzip -Z1 "${pk}" 2>/dev/null
+            [ -e "${pk}" ] || continue
+            unzip -Z1 "${pk}" 2>/dev/null || true
         done
     done | sed -n 's#^maps/\([^/]*\)\.bsp$#\1#p' | sort -u)"
+if [ -z "${INSTALLED}" ]; then
+    echo ">> WARNING: no maps found in ${WF_DIR}/basewf or ${MOD_DIR}." >&2
+    echo ">>          Is the shared map pool mounted? The server will start on" >&2
+    echo ">>          '${MAP}' and the rotation will be empty." >&2
+fi
 # Drop maps a moderator has blocked (same central list as the Warsow servers).
 # Fail-safe: any fetch error blocks nothing, so a blip never empties rotation.
 if [ -n "${INGEST_URL}" ]; then
