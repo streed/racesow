@@ -192,6 +192,20 @@ cg_record_failure() {
 #   3. whatever we were given, unchanged, rather than refusing to start.
 cg_pick_map() {
     _cg_want="$1"
+
+    # Operator override: force a boot map, bypassing the pool, the quarantine
+    # and the blocklist. This replaces the old "append EXTRA_ARGS after +map"
+    # trick, which only ever worked on Warfork (Warsow appended +map last) and
+    # stopped working on both once +map moved into the loop. Use it to pin a
+    # server to one map, or to reproduce a crash on a map the guard has already
+    # quarantined -- it deliberately does NOT consult the quarantine, so it can
+    # re-run a known-bad map on purpose.
+    if [ -n "${RS_FORCE_MAP:-}" ]; then
+        cg_log "RS_FORCE_MAP set -- booting '${RS_FORCE_MAP}' and ignoring the quarantine"
+        printf '%s' "${RS_FORCE_MAP}"
+        return 0
+    fi
+
     [ "${CG_ENABLED}" = "1" ] || { printf '%s' "${_cg_want}"; return 0; }
 
     _cg_skip=" $(cg_quarantined) "
@@ -327,20 +341,25 @@ cg_sleep() {
 # existing moderator flag queue; RS_CRASHGUARD_REPORT_URL points it at the
 # dedicated map-load endpoint once that ships.
 #
-# REQUIRES A TRUSTED PER-SERVER TOKEN. A map that crashes on load has never been
-# finished, so it has no row in the central database, and POST /api/game/flag
-# creates one only for a server enrolled with status='trusted'. A box running on
-# the legacy shared token, or one an admin has quarantined, gets a 404 here and
-# the crash is recorded locally (the quarantine file) but not centrally. That is
-# deliberate: minting map rows is a state-creating action.
+# This is the NETWORK-WIDE half of the recovery. The local quarantine below
+# protects this box; the POST is what stops the other three nodes from each
+# discovering the same bad map the hard way. Once the central side has enough
+# evidence (two failures, or one on each of two DISTINCT servers) the map joins
+# GET /api/game/blocked-maps, which every box already consumes: the entrypoint
+# subtracts it at boot and the gametype re-fetches it every ~30s.
 #
-# Dedupe: the API keys a game flag by reporter, and we send a constant login, so
-# repeated crashes of the same map from this server collapse to one queue entry
-# instead of one per relaunch — including across all four nodes hitting the same
-# broken map, which land as one map row and one flag per reporting server.
+# REQUIRES A TRUSTED PER-SERVER TOKEN. The endpoint creates central state, so it
+# demands an enrolled server with status='trusted'. A box on the legacy shared
+# token, or one an admin has quarantined, gets a 403 and its crash is recorded
+# LOCALLY only (the quarantine file) — still enough to break its own bootloop.
+#
+# Idempotency is structural on the server side, so nothing here needs retry
+# state: the evidence row is UNIQUE per (server, map, second) and the quarantine
+# is keyed by map name, so four nodes hitting one broken map yield one
+# quarantine with fail_count=4, server_count=4.
 cg_report() {
     [ -n "${INGEST_URL:-}" ] && [ -n "${INGEST_TOKEN:-}" ] || return 0
-    _cg_url="${RS_CRASHGUARD_REPORT_URL:-${INGEST_URL%/api/ingest}/api/game/flag}"
+    _cg_url="${RS_CRASHGUARD_REPORT_URL:-${INGEST_URL%/api/ingest}/api/game/map-load}"
     _cg_map="$1"; _cg_err="$2"; _cg_st="$3"
     # Strip the characters that would break out of the JSON string. The error
     # text is engine output, not ours, so it is not trusted to be clean.
@@ -352,7 +371,7 @@ cg_report() {
         curl -fsS --max-time 8 -X POST \
             -H "Authorization: Bearer ${INGEST_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "{\"map\":\"${_cg_map}\",\"reason\":\"broken\",\"login\":\"crashguard\",\"note\":\"${_cg_note}\"}" \
+            -d "{\"map\":\"${_cg_map}\",\"detector\":\"crashguard\",\"note\":\"${_cg_note}\"}" \
             "${_cg_url}" >/dev/null 2>&1 || true &
     )
     cg_log "reported '${_cg_map}' to ${_cg_url}"
