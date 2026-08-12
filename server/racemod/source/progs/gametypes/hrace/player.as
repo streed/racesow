@@ -17,6 +17,33 @@ const float POSITION_HEIGHT = 24;
 const int MAX_GHOST_FRAMES = 9000; // ~3 min at 50 Hz
 const int GHOST_INTERVAL = 20;     // ms of RACE time between samples (~50 Hz, smoother playback)
 
+// /showslick: the per-player slick-floor overlay (Player.rebuildSlickMarkers).
+// Slick is a surface flag, not an entity, so the overlay is discovered by
+// tracing a grid of downward rays and asking the collision model what each one
+// hit. Budget: SPAN = RADIUS*2+1 = 13, so 169 point traces per rescan, and a
+// rescan only happens when the player crosses a cell.
+const float SLICK_CELL = 64;          // grid pitch in world units
+const int SLICK_RADIUS_CELLS = 6;     // cells sampled in each direction
+const uint SLICK_SCAN_INTERVAL = 400; // ms between rescans while moving
+const float SLICK_PROBE_UP = 64;      // start the ray this far above the player
+const float SLICK_PROBE_DOWN = 512;   // and end it this far below
+const float SLICK_DRAW_LIFT = 2;      // lift the outline off the surface
+const uint SLICK_MAX_BEAMS = 220;     // edict safety cap (see spawnBeam's 300)
+
+// Which SLICK_CELL-wide lattice column a world coordinate falls in. Written out
+// rather than using floor() because the gametype's AngelScript registration does
+// not expose it, and a plain int() cast truncates TOWARDS ZERO — which would
+// make the lattice a half-cell out of step on the negative side of the origin
+// (and most race maps straddle it), so the outline would visibly jump as a
+// player crossed x=0 or y=0.
+int RACE_SlickCell( float v )
+{
+    int q = int( v / SLICK_CELL );
+    if ( v < 0 && float( q ) * SLICK_CELL != v )
+        q -= 1;
+    return q;
+}
+
 const int RECALL_ACTION_TIME = 200;
 const int RECALL_ACTION_JUMP = 5;
 // Frames a recalled player stays frozen (MOVETYPE_NONE) after respawning into a
@@ -179,6 +206,16 @@ class Player
     bool showingTriggers;
     Entity@[] triggerMarkers;
 
+    // /showslick: per-player outline of the slick (icy) floor around the player,
+    // off by default. Rebuilt periodically as they move; freed on toggle-off and
+    // in clear(). Separate entity list from the trigger markers so the two
+    // overlays can be on at once without one freeing the other's beams.
+    bool showingSlick;
+    Entity@[] slickMarkers;
+    uint slickNextScan;
+    Vec3 slickScanOrigin;
+    bool slickScanned;
+
     // "/position find" cursor: last searched entity type + which match to cycle to
     String lastFind;
     uint findIndex;
@@ -308,6 +345,10 @@ class Player
         this.preReverseMain.clear();
         this.showingTriggers = false;
         this.freeTriggerMarkers();
+        this.showingSlick = false;
+        this.freeSlickMarkers();
+        this.slickNextScan = 0;
+        this.slickScanned = false;
         this.lastFind = "";
         this.findIndex = 0;
         // Free (not just drop) any marker dummy: clear() runs on enterGame when a
@@ -600,6 +641,9 @@ class Player
 
         // Trigger-plane markers toggle (a viewing aid, useful in any mode).
         s += this.showingTriggers ? menuItems[MI_HIDE_TRIGGERS] : menuItems[MI_SHOW_TRIGGERS];
+
+        // Slick-floor outline toggle (likewise a viewing aid, off by default).
+        s += this.showingSlick ? menuItems[MI_HIDE_SLICK] : menuItems[MI_SHOW_SLICK];
 
         // "Other servers" jump menu — only when this box has a hop list
         // configured (rs_hop_servers), so an unconfigured server never spends a
@@ -1027,6 +1071,199 @@ class Player
         G_PrintMsg( this.client.getEnt(), msg );
         this.setQuickMenu();
         return true;
+    }
+
+    // /showslick: toggle a per-player outline of the slick (icy) floor around
+    // the player. OFF by default — it is a practice aid, and slick surfaces are
+    // usually textured to be recognisable, so it must be opted into.
+    //
+    // Slick is a SURFACE property (SURF_SLICK on the brushside), not an entity,
+    // so unlike /showtriggers there is nothing to enumerate: the geometry is
+    // discovered by tracing straight down on a grid and asking the collision
+    // model what it hit. That deliberately needs no new engine native and no
+    // scanned map data, so it works on any map the server can load, including
+    // ones the web scanner has never seen.
+    bool toggleSlickMarkers()
+    {
+        if ( this.showingSlick )
+        {
+            this.freeSlickMarkers();
+            this.showingSlick = false;
+            this.slickScanned = false;
+            G_PrintMsg( this.client.getEnt(), "Slick markers off.\n" );
+            this.setQuickMenu();
+            return true;
+        }
+
+        this.showingSlick = true;
+        this.slickScanned = false;
+        this.slickNextScan = 0;      // scan on the very next think
+        uint n = this.rebuildSlickMarkers();
+        // Built like toggleTriggerMarkers': one String appended to, rather than a
+        // ternary mixing a String with a literal.
+        String msg = "Slick markers on: the icy floor near you is outlined in " +
+            S_COLOR_CYAN + "cyan" + S_COLOR_WHITE + ".\n";
+        if ( n == 0 )
+            msg += S_COLOR_YELLOW + "(no slick floor within range - move somewhere icy and it will appear)\n";
+        G_PrintMsg( this.client.getEnt(), msg );
+        this.setQuickMenu();
+        return true;
+    }
+
+    // Per-frame upkeep, called from the GT_ThinkRules client loop. Cheap no-op
+    // unless the overlay is on; rescans only every SLICK_SCAN_INTERVAL and only
+    // once the player has actually moved a cell, so standing still costs nothing.
+    void updateSlickMarkers()
+    {
+        if ( !this.showingSlick )
+            return;
+        Entity@ ent = this.client.getEnt();
+        if ( @ent == null )
+            return;
+        if ( this.slickScanned && levelTime < this.slickNextScan )
+            return;
+        // Grid is snapped to world coordinates, so re-scanning only matters once
+        // the player crosses into a different cell — otherwise the same beams
+        // would be freed and respawned in place, flickering for no reason.
+        float dz = ent.origin.z - this.slickScanOrigin.z;
+        if ( dz < 0 )
+            dz = -dz;
+        if ( this.slickScanned &&
+             RACE_SlickCell( ent.origin.x ) == RACE_SlickCell( this.slickScanOrigin.x ) &&
+             RACE_SlickCell( ent.origin.y ) == RACE_SlickCell( this.slickScanOrigin.y ) &&
+             dz < SLICK_CELL )
+        {
+            this.slickNextScan = levelTime + SLICK_SCAN_INTERVAL;
+            return;
+        }
+        this.rebuildSlickMarkers();
+    }
+
+    // Trace a grid of downward rays around the player, then outline the cells
+    // that landed on slick. Returns how many slick cells were found.
+    //
+    // Only the BOUNDARY between a slick cell and a non-slick one is drawn: on a
+    // fully-slick area that is just the perimeter of the sampled square (a few
+    // dozen beams) rather than one box per cell, which would blow the entity
+    // budget and read as a solid wall of beams.
+    uint rebuildSlickMarkers()
+    {
+        this.freeSlickMarkers();
+        Entity@ ent = this.client.getEnt();
+        if ( @ent == null )
+            return 0;
+
+        this.slickScanned = true;
+        this.slickScanOrigin = ent.origin;
+        this.slickNextScan = levelTime + SLICK_SCAN_INTERVAL;
+
+        int span = SLICK_RADIUS_CELLS * 2 + 1;
+        // Snap to a world-aligned lattice so the outline stays put as the player
+        // walks instead of sliding along with them.
+        int baseX = RACE_SlickCell( ent.origin.x ) - SLICK_RADIUS_CELLS;
+        int baseY = RACE_SlickCell( ent.origin.y ) - SLICK_RADIUS_CELLS;
+
+        // Single-argument form: array elements are value-initialised (false / 0),
+        // same as the uint[] pools elsewhere in the gametype.
+        bool[] slick( uint( span * span ) );
+        float[] hitZ( uint( span * span ) );
+        uint found = 0;
+
+        for ( int gy = 0; gy < span; gy++ )
+        {
+            for ( int gx = 0; gx < span; gx++ )
+            {
+                // Sample the cell CENTRE, so a beam drawn on the cell edge sits
+                // on the surface the sample actually described.
+                float wx = ( float( baseX + gx ) + 0.5f ) * SLICK_CELL;
+                float wy = ( float( baseY + gy ) + 0.5f ) * SLICK_CELL;
+                Trace tr;
+                // A point trace (zero bounds) is what we want: a player-sized
+                // hull would snag on walls a cell away and report their surface.
+                if ( !tr.doTrace( Vec3( wx, wy, ent.origin.z + SLICK_PROBE_UP ),
+                                  Vec3( 0, 0, 0 ), Vec3( 0, 0, 0 ),
+                                  Vec3( wx, wy, ent.origin.z - SLICK_PROBE_DOWN ),
+                                  ent.entNum, MASK_DEADSOLID ) )
+                    continue;
+                if ( tr.startSolid )
+                    continue;
+                if ( ( tr.surfFlags & SURF_SLICK ) == 0 )
+                    continue;
+                uint idx = uint( gy * span + gx );
+                slick[idx] = true;
+                hitZ[idx] = tr.endPos.z;
+                found++;
+            }
+        }
+        if ( found == 0 )
+            return 0;
+
+        int colour = this.rgba( 90, 220, 255, 220 );   // ice blue
+        for ( int gy = 0; gy < span; gy++ )
+        {
+            for ( int gx = 0; gx < span; gx++ )
+            {
+                uint idx = uint( gy * span + gx );
+                if ( !slick[idx] )
+                    continue;
+                float x0 = float( baseX + gx ) * SLICK_CELL;
+                float y0 = float( baseY + gy ) * SLICK_CELL;
+                float x1 = x0 + SLICK_CELL;
+                float y1 = y0 + SLICK_CELL;
+                // Lift the outline clear of the floor so it isn't z-fighting
+                // with the surface it is describing.
+                float z = hitZ[idx] + SLICK_DRAW_LIFT;
+                // An edge is drawn only where this cell meets a non-slick one
+                // (or the edge of the sampled area). The gy/gx bounds checks come
+                // first so the neighbour index is never formed out of range.
+                if ( gy == 0 || !slick[idx - uint( span )] )
+                    this.spawnSlickBeam( Vec3( x0, y0, z ), Vec3( x1, y0, z ), colour, ent );
+                if ( gy == span - 1 || !slick[idx + uint( span )] )
+                    this.spawnSlickBeam( Vec3( x0, y1, z ), Vec3( x1, y1, z ), colour, ent );
+                if ( gx == 0 || !slick[idx - 1] )
+                    this.spawnSlickBeam( Vec3( x0, y0, z ), Vec3( x0, y1, z ), colour, ent );
+                if ( gx == span - 1 || !slick[idx + 1] )
+                    this.spawnSlickBeam( Vec3( x1, y0, z ), Vec3( x1, y1, z ), colour, ent );
+            }
+        }
+        return found;
+    }
+
+    // Same ET_BEAM setup as spawnBeam, but tracked in slickMarkers with its own
+    // budget so /showslick and /showtriggers can be on together.
+    void spawnSlickBeam( Vec3 from, Vec3 to, int colorRGBA, Entity@ owner )
+    {
+        if ( this.slickMarkers.length() >= SLICK_MAX_BEAMS )
+            return;
+        Entity@ beam = G_SpawnEntity( "dummy" );
+        if ( @beam == null )
+            return;
+        beam.type = ET_BEAM;
+        beam.modelindex = 1;                 // ET_BEAM requires a non-zero modelindex
+        beam.frame = 5;                      // thinner than the trigger wireframe
+        beam.colorRGBA = colorRGBA;
+        beam.svflags |= SVF_TRANSMITORIGIN2; // network origin2 (the far endpoint)
+        beam.svflags |= SVF_ONLYOWNER;       // this client only...
+        beam.svflags |= SVF_BROADCAST;       // ...but always transmit (bypass PVS cull)
+        beam.svflags &= ~SVF_NOCLIENT;       // ...and actually transmit it
+        beam.ownerNum = owner.entNum;
+        beam.origin = from;
+        beam.set_origin2( to );
+        beam.linkEntity();
+        this.slickMarkers.push_back( beam );
+    }
+
+    void freeSlickMarkers()
+    {
+        for ( uint i = 0; i < this.slickMarkers.length(); i++ )
+        {
+            if ( @this.slickMarkers[i] != null )
+            {
+                this.slickMarkers[i].unlinkEntity();
+                this.slickMarkers[i].freeEntity();
+            }
+        }
+        this.slickMarkers.resize( 0 );
     }
 
     // Pack an RGBA colour into the int the engine's ET_BEAM colorRGBA expects

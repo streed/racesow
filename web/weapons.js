@@ -20,10 +20,27 @@ export const WEAPONS = [
   { code: "ig", classname: "weapon_instagun", name: "Instagun", aliases: ["instagun", "insta"] },
 ];
 
+// "sl" is a SURFACE tag, not a weapon: it rides in the same code list as the
+// weapons so `callvote randmap slick` and `randmap rl slick` fall out of the
+// existing AND-combining filter for free (see gameMapWeaponsText in db.js and
+// mapweapons.as). It is deliberately NOT in WEAPONS, so it never appears in the
+// map_weapon.weapons column or in a weapon inventory — the measured fraction
+// lives in its own column.
+export const SLICK_CODE = "sl";
+// A map counts as slick once this much of its floor levels are slick surfaces
+// (see bsp.js parseSlick). Calibrated on the full pool: maps with "slick" in the
+// name sit far above it, while incidental slick accents sit below.
+export const SLICK_MIN_FRAC = 0.05;
+export function isSlick(frac) {
+  return Number(frac || 0) >= SLICK_MIN_FRAC;
+}
+
 // Every player spawns holding a gunblade, so a map whose only weapon pickup is a
 // gunblade is still a "strafe" (movement-only) map. gb is excluded from the
 // strafe test but still recorded, so `randmap gb` can find gunblade-pickup maps.
-export const STRAFE_IGNORE = new Set(["gb"]);
+// "sl" is ignored for the same reason: a slick map with no weapons is still a
+// strafe map.
+export const STRAFE_IGNORE = new Set(["gb", SLICK_CODE]);
 
 export const CLASSNAME_TO_CODE = Object.fromEntries(WEAPONS.map((w) => [w.classname, w.code]));
 export const CODE_TO_WEAPON = Object.fromEntries(WEAPONS.map((w) => [w.code, w]));
@@ -51,12 +68,14 @@ export function codesFromEntities(text) {
 
 // Resolve a typed token (2-char code, full name, or alias — case-insensitive) to
 // a weapon code, or null if it isn't a weapon. "strafe" is handled by callers.
+// "slick"/"ice" resolve to the sl surface tag, which filters the same way.
 const TOKEN_TO_CODE = (() => {
   const m = Object.create(null);
   for (const w of WEAPONS) {
     m[w.code] = w.code;
     for (const a of w.aliases) m[a] = w.code;
   }
+  for (const a of [SLICK_CODE, "slick", "ice", "icy"]) m[a] = SLICK_CODE;
   return m;
 })();
 export function tokenToCode(token) {

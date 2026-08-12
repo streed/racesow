@@ -846,19 +846,37 @@ const WEAPON_LABELS = {
 const WEAPON_FILTER_OPTS = [
   ["", "All maps"],
   ["strafe", "Strafe (no weapons)"],
+  ["slick", "Slick (icy floors)"],
   ["rl", "Rocket Launcher"], ["pg", "Plasmagun"], ["gl", "Grenade Launcher"],
   ["rg", "Riotgun"], ["lg", "Lasergun"], ["eb", "Electrobolt"],
   ["mg", "Machinegun"], ["ig", "Instagun"], ["gb", "Gunblade"],
 ];
 
+// A SLICK pill for maps with icy floors, carrying how much of the map is slick
+// (measured from the .bsp — see bsp.js parseSlick). Shown whenever there is any
+// slick at all, so a map with a slick SECTION is still discoverable, but only
+// maps over the threshold are counted as slick maps by the filter and the pill
+// is dimmed below it.
+function slickBadge(m) {
+  const pct = m.slick_pct | 0;
+  if (pct <= 0) return "";
+  const minor = m.is_slick ? "" : " minor";
+  const title = m.is_slick
+    ? `Slick map — ${pct}% of this map's floor is icy`
+    : `Has some slick floor (${pct}%), but not enough to count as a slick map`;
+  return ` <span class="wpn slick${minor}" title="${esc(title)}">SLICK ${pct}%</span>`;
+}
+
 // Little badges after a map name: a STRAFE pill for no-weapon maps, otherwise
 // one code chip per weapon (the gunblade everyone spawns with is not shown).
+// The slick pill is independent — a map can be both strafe and slick.
 function weaponBadges(m) {
-  if (m.is_strafe) return ` <span class="wpn strafe" title="No weapons — strafe map">STRAFE</span>`;
+  const slick = slickBadge(m);
+  if (m.is_strafe) return ` <span class="wpn strafe" title="No weapons — strafe map">STRAFE</span>${slick}`;
   const codes = Array.isArray(m.weapons) ? m.weapons.filter((c) => c !== "gb") : [];
-  return codes.length
+  return (codes.length
     ? " " + codes.map((c) => `<span class="wpn" title="${esc(WEAPON_LABELS[c] || c)}">${esc(c.toUpperCase())}</span>`).join("")
-    : "";
+    : "") + slick;
 }
 
 async function viewMaps(params) {
@@ -1931,6 +1949,7 @@ const ABOUT_CMDS = [
     rows: [
       ["/reverse", "Race the map backwards. Teleports you to your saved reverse start (or the finish line, if you haven't saved one with /savestart) and drops you into noclip to fine-tune the spot; leave noclip (/noclip, or /reverse again) to lock it in as your spawn. Then cross the finish to start."],
       ["/showtriggers", "Toggle markers at the start and finish trigger planes so you can see where to cross. Only you see them."],
+      ["/showslick", "Toggle an outline around the slick (icy) floor near you, so you can see exactly where you lose grip. Off by default; only you see it."],
       ["/reverse off", "Leave reverse mode and go back to a normal run. /kill and restarts return you to your saved reverse start."],
     ],
   },

@@ -113,3 +113,71 @@ test("maps() rows expose weapons + is_strafe for badges", async (t) => {
   assert.deepEqual(byName.puremap.weapons, []);
   assert.equal(byName.puremap.is_strafe, true);
 });
+
+// --- slick (icy floor) tagging ----------------------------------------------
+// The measured fraction lives in its own column; the "sl" tag the game votes on
+// is derived from it at read time (see gameMapWeaponsText / SLICK_MIN_FRAC).
+
+async function setSlick(race, name, frac) {
+  await race.pool.query(
+    `INSERT INTO map_weapon (name, weapons, is_strafe, slick_frac)
+     VALUES ($1, '{}', true, $2)
+     ON CONFLICT (name) DO UPDATE SET slick_frac = EXCLUDED.slick_frac`,
+    [name, frac]
+  );
+}
+
+test("gameMapWeaponsText appends the sl tag for slick maps only", async (t) => {
+  const race = await freshDb(t);
+  await setWeapons(race, "a_icy", []);
+  await setSlick(race, "a_icy", 0.6);
+  await setWeapons(race, "b_trace", ["rl"]);
+  await setSlick(race, "b_trace", 0.01); // below threshold: some slick, not a slick map
+  await setWeapons(race, "c_icyrocket", ["rl"]);
+  await setSlick(race, "c_icyrocket", 0.4);
+  await setWeapons(race, "d_dry", ["pg"]);
+
+  const text = await race.gameMapWeaponsText();
+  assert.equal(text, "a_icy sl\nb_trace rl\nc_icyrocket rl sl\nd_dry pg");
+});
+
+test("maps() ?weapon=slick filters on the measured fraction and ANDs with weapons", async (t) => {
+  const race = await freshDb(t);
+  for (const [i, m] of ["icymap", "icyrocket", "tracemap", "drymap"].entries()) {
+    await race.ingest({ version: VER, map: m, source: "racelog", records: [finish("A", 50000 + i)] });
+  }
+  await race.refreshAggregates();
+  await setWeapons(race, "icymap", []);
+  await setSlick(race, "icymap", 0.6);
+  await setWeapons(race, "icyrocket", ["rl"]);
+  await setSlick(race, "icyrocket", 0.35);
+  await setWeapons(race, "tracemap", ["rl"]);
+  await setSlick(race, "tracemap", 0.01); // below SLICK_MIN_FRAC
+  await setWeapons(race, "drymap", ["rl"]);
+
+  const names = async (weapon) => (await race.maps({ weapon, limit: 100 })).rows.map((r) => r.name).sort();
+  assert.deepEqual(await names("slick"), ["icymap", "icyrocket"]);
+  assert.deepEqual(await names("ice"), ["icymap", "icyrocket"]); // alias
+  assert.deepEqual(await names("rl slick"), ["icyrocket"]);      // AND with a weapon
+  assert.deepEqual(await names("rl"), ["drymap", "icyrocket", "tracemap"]);
+});
+
+test("maps() rows expose slick_pct + is_slick for the badge", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({ version: VER, map: "icymap", source: "racelog", records: [finish("A", 50000)] });
+  await race.ingest({ version: VER, map: "tracemap", source: "racelog", records: [finish("A", 51000)] });
+  await race.ingest({ version: VER, map: "drymap", source: "racelog", records: [finish("A", 52000)] });
+  await race.refreshAggregates();
+  await setSlick(race, "icymap", 0.342);
+  await setSlick(race, "tracemap", 0.02);
+
+  const byName = Object.fromEntries((await race.maps({ limit: 100 })).rows.map((r) => [r.name, r]));
+  assert.equal(byName.icymap.slick_pct, 34);
+  assert.equal(byName.icymap.is_slick, true);
+  // Some slick, but not a slick map: the badge still shows, dimmed.
+  assert.equal(byName.tracemap.slick_pct, 2);
+  assert.equal(byName.tracemap.is_slick, false);
+  // Never scanned for slick at all -> 0, and no badge.
+  assert.equal(byName.drymap.slick_pct, 0);
+  assert.equal(byName.drymap.is_slick, false);
+});

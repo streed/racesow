@@ -4,9 +4,10 @@
 // weapon_* spawn entities and the result stored in the web map_weapon table,
 // served at GET /api/game/map-weapons as plain text, one line per map:
 //   <mapname> <code> <code> ...
-// where <code> is a 2-char weapon code (rl pg gl rg lg eb mg ig gb). A map with
-// no weapons is a bare name (a strafe map). Every player spawns holding a
-// gunblade, so a map whose only weapon is gb is still a strafe map.
+// where <code> is a 2-char weapon code (rl pg gl rg lg eb mg ig gb) or the "sl"
+// surface tag for a slick (icy-floored) map. A map with no weapons is a bare
+// name (a strafe map). Every player spawns holding a gunblade, so a map whose
+// only weapon is gb is still a strafe map — and so is a slick one.
 //
 // The gametype pulls this live (every API_MAPWEAPONS_REFRESH_MS via
 // RS_ApiFetchMapWeapons; the table only moves when the maps are re-scanned, so
@@ -14,6 +15,8 @@
 //   callvote randmap strafe      -> a no-weapon map (or a map named *strafe*)
 //   callvote randmap rl          -> a map with a Rocket Launcher
 //   callvote randmap rl pg       -> a map with BOTH a RL and a PG
+//   callvote randmap slick       -> a map with icy floors
+//   callvote randmap rl slick    -> an icy map that also has a Rocket Launcher
 // Full weapon names and a few aliases work too (rocket, rocketlauncher, ...).
 // Anything the classifier doesn't recognise (or any wildcard) falls through to
 // the classic name-pattern randmap, so existing votes are unchanged.
@@ -43,11 +46,18 @@ String raceMwParsedText = "";
 bool raceMwFilterStrafe = false;
 String[] raceMwFilterCodes;
 
-// A typed token -> its 2-char weapon code, or "" if it isn't a weapon. Accepts
-// the code, the full name, and a few aliases. Mirrors web/weapons.js.
+// A typed token -> its 2-char code, or "" if it isn't one we know. Accepts the
+// code, the full name, and a few aliases. Mirrors web/weapons.js.
+//
+// "sl" is the odd one out: it is a SURFACE tag (the map's floor is slick/icy),
+// not a weapon pickup. It rides in the same per-map code list so that
+// `callvote randmap slick` — and combinations like `randmap rl slick` — reuse
+// the AND-combining filter below unchanged. The only place the difference
+// matters is RACE_MapIsStrafeScan, which must not mistake it for a weapon.
 String RACE_WeaponCode( const String &in tokenIn )
 {
     String t = tokenIn.tolower();
+    if ( t == "sl" || t == "slick" || t == "ice" || t == "icy" ) return "sl";
     if ( t == "gb" || t == "gunblade" ) return "gb";
     if ( t == "mg" || t == "machinegun" ) return "mg";
     if ( t == "rg" || t == "riotgun" || t == "shotgun" ) return "rg";
@@ -197,15 +207,17 @@ bool RACE_MapIsStrafeScan( const String &in name )
     int idx = RACE_MwIndex( name );
     if ( idx < 0 )
         return false;
-    // raceMwCodes[idx] is " code code " (or "  "); any token that isn't gb is a
-    // real weapon, so this is not a strafe map.
+    // raceMwCodes[idx] is " code code " (or "  "); any token that isn't gb or
+    // the sl SURFACE tag is a real weapon, so this is not a strafe map. (A
+    // no-weapon map with icy floors is still very much a strafe map — miss this
+    // and every slick map silently drops out of `randmap strafe`.)
     String pad = raceMwCodes[ uint( idx ) ];
     for ( int i = 0; i < 16; i++ )
     {
         String tok = pad.getToken( i );
         if ( tok.length() == 0 )
             break;
-        if ( tok != "gb" )
+        if ( tok != "gb" && tok != "sl" )
             return false;
     }
     return true;

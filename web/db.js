@@ -32,7 +32,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { runner as pgMigrateRunner } from "node-pg-migrate";
-import { tokenToCode } from "./weapons.js";
+import { tokenToCode, isSlick, SLICK_CODE, SLICK_MIN_FRAC } from "./weapons.js";
 import { buildMatcher, censorName, normalizeTerm } from "./censor.js";
 import { qualifyQuery, progressQuery, periodKey, targetOf, displayMeta } from "./achievements.js";
 import {
@@ -345,12 +345,17 @@ function likeEscape(s) {
 function parseWeaponFilter(param) {
   const codes = [];
   let strafe = false;
+  let slick = false;
   for (const tok of String(param || "").toLowerCase().split(/[\s,]+/).filter(Boolean)) {
     if (tok === "strafe") { strafe = true; continue; }
     const code = tokenToCode(tok);
+    // "sl" is a surface tag with its own column, not a member of the weapons
+    // array — pulling it out here keeps the weapons @> ARRAY[...] test honest
+    // (map_weapon.weapons never contains "sl", so leaving it in matches nothing).
+    if (code === SLICK_CODE) { slick = true; continue; }
     if (code && !codes.includes(code)) codes.push(code);
   }
-  return { codes, strafe };
+  return { codes, strafe, slick };
 }
 
 export async function openDatabase(connectionString) {
@@ -1715,7 +1720,15 @@ class RaceDB {
       args.push(`%${likeEscape(q)}%`);
       conds.push(`mi.name ILIKE $${args.length}`);
     }
-    const { codes, strafe } = parseWeaponFilter(weapon);
+    const { codes, strafe, slick } = parseWeaponFilter(weapon);
+    if (slick) {
+      // Measured slick floor share, thresholded at query time so retuning
+      // SLICK_MIN_FRAC needs no re-scan (partial index on slick_frac > 0).
+      args.push(SLICK_MIN_FRAC);
+      conds.push(
+        `EXISTS (SELECT 1 FROM map_weapon w WHERE w.name = lower(mi.name) AND w.slick_frac >= $${args.length})`
+      );
+    }
     if (codes.length) {
       // weapons @> ARRAY[...] => the map carries ALL requested weapons (GIN idx).
       args.push(codes);
@@ -1736,7 +1749,7 @@ class RaceDB {
       await this.all(
         `SELECT mi.map_id AS id, mi.name, mi.records, mi.finishes, mi.players, mi.wr_time,
                 mi.last_played, mi.wr_pid, mi.wr_version, p.name AS wr_name, p.simplified AS wr_simplified,
-                w.weapons, w.is_strafe
+                w.weapons, w.is_strafe, w.slick_frac
          FROM map_index mi
          LEFT JOIN player p ON p.id = mi.wr_pid
          LEFT JOIN map_weapon w ON w.name = lower(mi.name)
@@ -1755,6 +1768,10 @@ class RaceDB {
       wr_version_name: this.versions[num(r.wr_version)] || null,
       weapons: Array.isArray(r.weapons) ? r.weapons : [],
       is_strafe: !!r.is_strafe,
+      // Rounded to whole percent: the tag reads "Slick 34%", and shipping the
+      // raw float would imply a precision the grid measurement doesn't have.
+      slick_pct: r.slick_frac != null ? Math.round(Number(r.slick_frac) * 100) : 0,
+      is_slick: isSlick(r.slick_frac),
     }, num(r.wr_pid), "wr_name", "wr_simplified"), num(r.id), "name"));
     return { total, limit: lim, offset: off, rows };
   }
@@ -3630,13 +3647,23 @@ class RaceDB {
   // line per scanned map, sorted by name: "<name> code code ...". A strafe map
   // (no weapons) is a bare name with no codes. Sorted so the game can binary
   // search the parsed table.
+  //
+  // A slick map also carries the "sl" SURFACE tag in that same code list, so
+  // `callvote randmap slick` — and combinations like `randmap rl slick` — reuse
+  // the gametype's existing AND-combining filter with no new wire format. The
+  // tag is derived here from the measured fraction rather than stored, so
+  // retuning SLICK_MIN_FRAC does not need a re-scan. mapweapons.as knows to
+  // ignore "sl" when deciding whether a map is a strafe map.
   async gameMapWeaponsText() {
     // COLLATE "C" => byte-order sort, so the gametype can binary search the
     // parsed table with a plain byte compare (AngelScript String has no opCmp).
-    const rows = await this.all('SELECT name, weapons FROM map_weapon ORDER BY name COLLATE "C"');
+    const rows = await this.all(
+      'SELECT name, weapons, slick_frac FROM map_weapon ORDER BY name COLLATE "C"'
+    );
     return rows
       .map((r) => {
-        const codes = Array.isArray(r.weapons) ? r.weapons : [];
+        const codes = Array.isArray(r.weapons) ? [...r.weapons] : [];
+        if (isSlick(r.slick_frac)) codes.push(SLICK_CODE);
         return codes.length ? `${r.name} ${codes.join(" ")}` : r.name;
       })
       .join("\n");

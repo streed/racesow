@@ -62,12 +62,17 @@ export function extractBsp(pk3Path, mapName) {
   return null;
 }
 
-// Scan a .pk3 once and return [{ name, entities }] for every maps/<name>.bsp it
-// carries. The map pool is thousands of packs, so this reads the archive a
-// single time rather than extractBsp-per-map (which re-reads the whole file for
-// each map). `name` is the lowercased bsp basename — the in-game map name, which
-// is NOT always the pack filename. `entities` is the raw lump-0 text (possibly
-// "" for a corrupt/unreadable bsp). Returns [] for an unreadable / non-zip pack.
+// Scan a .pk3 once and return [{ name, entities, slick }] for every
+// maps/<name>.bsp it carries. The map pool is thousands of packs, so this reads
+// the archive a single time rather than extractBsp-per-map (which re-reads the
+// whole file for each map). `name` is the lowercased bsp basename — the in-game
+// map name, which is NOT always the pack filename. `entities` is the raw lump-0
+// text (possibly "" for a corrupt/unreadable bsp) and `slick` is parseSlick's
+// result (null for one we couldn't read). Returns [] for an unreadable / non-zip
+// pack.
+//
+// Both derive from the same inflated buffer on purpose: inflating the pool twice
+// costs ~10 minutes of pure I/O for no benefit.
 export function extractMapEntities(pk3Path) {
   let buf;
   try {
@@ -108,7 +113,11 @@ export function extractMapEntities(pk3Path) {
           bsp = null;
         }
       }
-      out.push({ name: m[1], entities: bsp ? parseEntities(bsp) : "" });
+      out.push({
+        name: m[1],
+        entities: bsp ? parseEntities(bsp) : "",
+        slick: bsp ? parseSlick(bsp) : null,
+      });
     }
     p += 46 + nameLen + extraLen + commentLen;
   }
@@ -353,6 +362,292 @@ export function parseEntities(buf) {
   if (offset < 0 || length < 0 || offset + length > buf.length) return "";
   // Trailing NUL padding is common; strip it so the caller's regex is clean.
   return buf.toString("latin1", offset, offset + length).replace(/\0+$/, "");
+}
+
+// --- slick (ice) surfaces ----------------------------------------------------
+// How much of a map's walkable floor is slick, for the "Slick" map tag, the
+// website filter and `callvote randmap slick` (see scan-map-slick in
+// scan-map-weapons.js).
+//
+// Slick is SURF_SLICK (0x2) on a shaderref, and the collision model takes those
+// flags VERBATIM from the bsp — cm_q3bsp.c CMod_LoadSurfaces does
+// `out->flags = LittleLong( in->flags )` with no re-derivation from the .shader
+// script — so the baked flag IS what makes the player slide. Two consequences
+// worth knowing before touching this:
+//
+//   * It must be read off BRUSHSIDES (lump 9), not the render faces (lump 13)
+//     parseBsp uses. textures/common/slick is a NODRAW brush laid over the
+//     visible geometry, so it owns no draw face at all: scanning faces finds the
+//     shader in the table and zero surfaces using it, scoring every map 0.
+//   * Matching shader NAMES does not work. 899 maps in the pool use
+//     textures/common/slick, but ~50 other shaders carry the flag too
+//     (blxbis/ice_01, gnjstamina/glass_stamina, kabcorp/fzerofloor1, even
+//     noshader and common/caulk), and the single slickest map in the pool
+//     (srr2k5, 99.6%) names its slick shader textures/cos1/cretebase2_s.
+//
+// Each side's real extent comes from its winding: start with a huge quad on the
+// side's plane and clip it against the brush's other planes (side planes point
+// OUTWARD, so the brush interior is dot(n,p) - d <= 0). "Floor" is the engine's
+// own walkable test, ISWALKABLEPLANE in gs_public.h: normal[2] >= 0.7.
+//
+// We do NOT ratio raw 3D areas, because two things break that badly:
+//
+//   * Slick is a COINCIDENT OVERLAY. A mapper lays a nodraw common/slick brush
+//     directly on top of the visible floor brush, so both sides report the exact
+//     same area (in snapslick, common/slick and gothic_floor/largerblock3b3dim
+//     are both 1,061,683,200 to the byte). Summing them counts one floor twice
+//     and roughly halves every map's score.
+//   * Sky and trigger volumes swamp the denominator — 56% of srr2k5's walkable
+//     area is skybox shell and 28% is common/trigger, neither of which is ground
+//     anyone stands on.
+//
+// So instead we rasterize walkable windings onto an XY grid and count each
+// distinct FLOOR LEVEL in each cell once: a cell's (column, height) pair is one
+// piece of ground, and it is slick if any surface at that exact height is slick.
+// The coincident overlay collapses to a single slick level, while genuinely
+// stacked storeys still count separately.
+//
+// Note "topmost surface per cell" was tried first and is wrong: a ceiling slab's
+// TOP face is up-facing too, so a roof over the level (textures/NULL at z=2560
+// in snapslick) outranks the floor in every cell and the map reads 0% slick.
+const SURF_SLICK = 0x2;
+const SURF_SKY = 0x4;
+const SURF_NODRAW = 0x80;
+const CONTENTS_SOLID = 1;
+const CONTENTS_PLAYERCLIP = 0x10000;
+const CONTENTS_TRIGGER = 0x40000000;
+const WALKABLE_Z = 0.7;
+// Grid resolution for the footprint rasterization. 192x192 over the map's
+// walkable bounds is ~37k cells — fine to allocate per map, and fine-grained
+// enough that a narrow slick strafe pad still registers.
+const SLICK_GRID = 192;
+// Clipping scratch: bigger than the ±32768 q3map2 world bound, so the starting
+// quad always fully contains the real winding.
+const WINDING_HUGE = 65536;
+const WINDING_EPS = 0.01;
+
+function baseWinding(n, d) {
+  // Any vector not parallel to n gives a stable tangent basis; pick the axis the
+  // normal leans on least.
+  const ax = Math.abs(n[0]), ay = Math.abs(n[1]), az = Math.abs(n[2]);
+  let up = az >= ax && az >= ay ? [1, 0, 0] : [0, 0, 1];
+  const dot = up[0] * n[0] + up[1] * n[1] + up[2] * n[2];
+  up = [up[0] - n[0] * dot, up[1] - n[1] * dot, up[2] - n[2] * dot];
+  const ul = Math.hypot(up[0], up[1], up[2]) || 1;
+  up = [up[0] / ul, up[1] / ul, up[2] / ul];
+  const rt = [up[1] * n[2] - up[2] * n[1], up[2] * n[0] - up[0] * n[2], up[0] * n[1] - up[1] * n[0]];
+  const org = [n[0] * d, n[1] * d, n[2] * d];
+  const pts = [];
+  for (const [su, sr] of [[-1, -1], [-1, 1], [1, 1], [1, -1]]) {
+    pts.push([
+      org[0] + up[0] * su * WINDING_HUGE + rt[0] * sr * WINDING_HUGE,
+      org[1] + up[1] * su * WINDING_HUGE + rt[1] * sr * WINDING_HUGE,
+      org[2] + up[2] * su * WINDING_HUGE + rt[2] * sr * WINDING_HUGE,
+    ]);
+  }
+  return pts;
+}
+
+// Keep the half of `pts` inside the plane (dot(n,p) - d <= 0), or null if the
+// winding is entirely outside / degenerates below a triangle.
+function clipWinding(pts, n, d) {
+  if (!pts || pts.length < 3) return null;
+  const dists = pts.map((p) => p[0] * n[0] + p[1] * n[1] + p[2] * n[2] - d);
+  if (dists.every((x) => x > WINDING_EPS)) return null;
+  if (dists.every((x) => x <= WINDING_EPS)) return pts;
+  const out = [];
+  for (let i = 0; i < pts.length; i++) {
+    const j = (i + 1) % pts.length;
+    if (dists[i] <= WINDING_EPS) out.push(pts[i]);
+    if ((dists[i] > WINDING_EPS) !== (dists[j] > WINDING_EPS)) {
+      const t = dists[i] / (dists[i] - dists[j]);
+      out.push([
+        pts[i][0] + t * (pts[j][0] - pts[i][0]),
+        pts[i][1] + t * (pts[j][1] - pts[i][1]),
+        pts[i][2] + t * (pts[j][2] - pts[i][2]),
+      ]);
+    }
+  }
+  return out.length >= 3 ? out : null;
+}
+
+// Area of a planar polygon = half the magnitude of its summed edge cross
+// products (fan from vertex 0).
+function windingArea(pts) {
+  let ax = 0, ay = 0, az = 0;
+  for (let i = 1; i + 1 < pts.length; i++) {
+    const ux = pts[i][0] - pts[0][0], uy = pts[i][1] - pts[0][1], uz = pts[i][2] - pts[0][2];
+    const wx = pts[i + 1][0] - pts[0][0], wy = pts[i + 1][1] - pts[0][1], wz = pts[i + 1][2] - pts[0][2];
+    ax += uy * wz - uz * wy;
+    ay += uz * wx - ux * wz;
+    az += ux * wy - uy * wx;
+  }
+  return Math.hypot(ax, ay, az) / 2;
+}
+
+// Returns { frac, brushes, cells, slickCells } or null when the buffer is not a
+// BSP we understand. `frac` is the fraction of the map's walkable footprint
+// whose topmost surface is slick, in [0,1] — 0 for a map with no slick at all.
+//
+// Deliberately NOT filtered for "unreasonably large" sides: an earlier cut
+// dropped sides over ~1e7 sq units to suppress skybox shells, which zeroed
+// snapslick and worstslick, whose slick floor is legitimately one huge sheet.
+export function parseSlick(buf) {
+  if (!buf || buf.length < 8 + 18 * 8) return null;
+  const magic = buf.toString("latin1", 0, 4);
+  if (magic !== "IBSP" && magic !== "FBSP" && magic !== "RBSP") return null;
+  // FBSP/RBSP are BSP_RAVEN: rdbrushside_t carries an extra surfacenum, so the
+  // stride is 12 rather than dbrushside_t's 8. Reading the wrong one garbles
+  // every shadernum.
+  const BS_STRIDE = magic === "IBSP" ? 8 : 12;
+  const lump = (i) => ({ offset: buf.readInt32LE(8 + i * 8), length: buf.readInt32LE(8 + i * 8 + 4) });
+  const lumpOk = (l) => l.offset >= 0 && l.length >= 0 && l.offset + l.length <= buf.length;
+
+  const lSh = lump(1), lPl = lump(2), lBr = lump(8), lBs = lump(9);
+  if (!lumpOk(lSh) || !lumpOk(lPl) || !lumpOk(lBr) || !lumpOk(lBs)) return null;
+
+  // lump 1: dshaderref_t { char name[64]; int flags; int contents; }
+  const nSh = Math.floor(lSh.length / 72);
+  const shFlags = new Int32Array(nSh), shContents = new Int32Array(nSh);
+  for (let i = 0; i < nSh; i++) {
+    shFlags[i] = buf.readInt32LE(lSh.offset + i * 72 + 64);
+    shContents[i] = buf.readInt32LE(lSh.offset + i * 72 + 68);
+  }
+  // lump 2: dplane_t { float normal[3]; float dist; }
+  const nPl = Math.floor(lPl.length / 16);
+  const pnx = new Float32Array(nPl), pny = new Float32Array(nPl), pnz = new Float32Array(nPl);
+  const pd = new Float32Array(nPl);
+  for (let i = 0; i < nPl; i++) {
+    const o = lPl.offset + i * 16;
+    pnx[i] = buf.readFloatLE(o); pny[i] = buf.readFloatLE(o + 4); pnz[i] = buf.readFloatLE(o + 8);
+    pd[i] = buf.readFloatLE(o + 12);
+  }
+  const nBs = Math.floor(lBs.length / BS_STRIDE);
+  const nBr = Math.floor(lBr.length / 12); // dbrush_t { firstside, numsides, shadernum }
+
+  // Pass 1: every walkable side, as an XY polygon plus the plane that gives its
+  // height, and the map's walkable XY bounds.
+  const surfaces = [];
+  let brushes = 0;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let b = 0; b < nBr; b++) {
+    const o = lBr.offset + b * 12;
+    const firstSide = buf.readInt32LE(o);
+    const numSides = buf.readInt32LE(o + 4);
+    const brushShader = buf.readInt32LE(o + 8);
+    // A brush with fewer than 4 sides encloses nothing; the lump is untrusted,
+    // so bounds-check before indexing.
+    if (firstSide < 0 || numSides < 4 || firstSide + numSides > nBs) continue;
+    if (brushShader < 0 || brushShader >= nSh) continue;
+    // Only volumes a player can stand on — skips fog, water and trigger brushes.
+    if (!(shContents[brushShader] & (CONTENTS_SOLID | CONTENTS_PLAYERCLIP))) continue;
+
+    const planes = [];
+    for (let s = 0; s < numSides; s++) {
+      const so = lBs.offset + (firstSide + s) * BS_STRIDE;
+      const planenum = buf.readInt32LE(so);
+      const shadernum = buf.readInt32LE(so + 4);
+      if (planenum < 0 || planenum >= nPl) { planes.push(null); continue; }
+      const flags = shadernum >= 0 && shadernum < nSh ? shFlags[shadernum] : 0;
+      const contents = shadernum >= 0 && shadernum < nSh ? shContents[shadernum] : 0;
+      planes.push({
+        n: [pnx[planenum], pny[planenum], pnz[planenum]],
+        d: pd[planenum],
+        slick: !!(flags & SURF_SLICK),
+        // The BRUSH may be solid while an individual SIDE is skinned with sky,
+        // trigger or a compile-only helper. None of those are ground: sky and
+        // trigger alone are 56% and 28% of srr2k5's walkable area, and caulk /
+        // clip / hull faces are invisible scaffolding. Count real, visible
+        // ground — plus the slick overlay, which is nodraw by design.
+        skip:
+          !!(flags & SURF_SKY) ||
+          !!(contents & CONTENTS_TRIGGER && !(contents & CONTENTS_SOLID)) ||
+          (!!(flags & SURF_NODRAW) && !(flags & SURF_SLICK)),
+      });
+    }
+    let brushSlick = false;
+    for (let s = 0; s < numSides; s++) {
+      const pl = planes[s];
+      if (!pl || pl.skip || pl.n[2] < WALKABLE_Z) continue; // walkable, real ground only
+      let w = baseWinding(pl.n, pl.d);
+      for (let t = 0; t < numSides && w; t++) {
+        if (t !== s && planes[t]) w = clipWinding(w, planes[t].n, planes[t].d);
+      }
+      if (!w) continue;
+      if (!(windingArea(w) > 0)) continue;
+      let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+      for (const p of w) {
+        if (!isFinite(p[0]) || !isFinite(p[1]) || !isFinite(p[2])) { bx0 = Infinity; break; }
+        if (p[0] < bx0) bx0 = p[0];
+        if (p[0] > bx1) bx1 = p[0];
+        if (p[1] < by0) by0 = p[1];
+        if (p[1] > by1) by1 = p[1];
+      }
+      if (!isFinite(bx0)) continue;
+      surfaces.push({ w, n: pl.n, d: pl.d, slick: pl.slick, bx0, by0, bx1, by1 });
+      if (bx0 < minX) minX = bx0;
+      if (by0 < minY) minY = by0;
+      if (bx1 > maxX) maxX = bx1;
+      if (by1 > maxY) maxY = by1;
+      if (pl.slick) brushSlick = true;
+    }
+    if (brushSlick) brushes++;
+  }
+  if (!surfaces.length || !(maxX > minX) || !(maxY > minY)) {
+    return { frac: 0, brushes, cells: 0, slickCells: 0 };
+  }
+
+  // Pass 2: rasterize each footprint and record every distinct (cell, height)
+  // level. Keyed on the height rounded to a unit, so the slick overlay and the
+  // floor it sits on land on the same key and are counted once.
+  const N = SLICK_GRID;
+  const cw = (maxX - minX) / N, ch = (maxY - minY) / N;
+  const levels = new Map(); // cell*Z_SPAN + quantized height -> is slick
+  const Z_SPAN = 1 << 17;   // covers the ±65536 q3map2 world bound
+  for (const s of surfaces) {
+    if (s.n[2] === 0) continue;
+    // Only the cells this surface's bbox touches, clamped to the grid.
+    const c0 = Math.max(0, Math.floor((s.bx0 - minX) / cw));
+    const c1 = Math.min(N - 1, Math.floor((s.bx1 - minX) / cw));
+    const r0 = Math.max(0, Math.floor((s.by0 - minY) / ch));
+    const r1 = Math.min(N - 1, Math.floor((s.by1 - minY) / ch));
+    for (let r = r0; r <= r1; r++) {
+      const y = minY + (r + 0.5) * ch;
+      for (let c = c0; c <= c1; c++) {
+        const x = minX + (c + 0.5) * cw;
+        if (!pointInWindingXY(s.w, x, y)) continue;
+        // Height of this plane above (x,y): nx*x + ny*y + nz*z = d.
+        const z = (s.d - s.n[0] * x - s.n[1] * y) / s.n[2];
+        if (!isFinite(z)) continue;
+        const zq = Math.round(z);
+        if (zq < -Z_SPAN / 2 || zq > Z_SPAN / 2) continue;
+        const key = (r * N + c) * Z_SPAN + (zq + Z_SPAN / 2);
+        if (s.slick) levels.set(key, true);
+        else if (!levels.has(key)) levels.set(key, false);
+      }
+    }
+  }
+  let cells = 0, slickCells = 0;
+  for (const slick of levels.values()) {
+    cells++;
+    if (slick) slickCells++;
+  }
+  return { frac: cells > 0 ? slickCells / cells : 0, brushes, cells, slickCells };
+}
+
+// Point-in-convex-polygon on the XY projection. Windings come out of
+// clipWinding convex, so a consistent sign against every edge is enough; the
+// winding order depends on the plane, so accept all-left OR all-right.
+function pointInWindingXY(w, x, y) {
+  let neg = false, pos = false;
+  for (let i = 0; i < w.length; i++) {
+    const j = (i + 1) % w.length;
+    const cross = (w[j][0] - w[i][0]) * (y - w[i][1]) - (w[j][1] - w[i][1]) * (x - w[i][0]);
+    if (cross < -1e-6) neg = true;
+    else if (cross > 1e-6) pos = true;
+    if (neg && pos) return false;
+  }
+  return true;
 }
 
 // Convenience: maps dir + map name -> parsed map geometry, or null. Strips a

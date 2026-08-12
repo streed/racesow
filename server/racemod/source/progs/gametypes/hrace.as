@@ -215,6 +215,8 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_Reverse( client, cmdString, argsString, argc );
     else if ( cmdString == "showtriggers" )
         return Cmd_ShowTriggers( client, cmdString, argsString, argc );
+    else if ( cmdString == "showslick" )
+        return Cmd_ShowSlick( client, cmdString, argsString, argc );
     else if ( cmdString == "position" )
         return Cmd_Position( client, cmdString, argsString, argc );
     else if ( cmdString == "top" )
@@ -451,6 +453,11 @@ void GT_ScoreEvent( Client@ client, const String &score_event, const String &arg
             // them against the engine's fixed edict budget.
             leaver.freeTriggerMarkers();
             leaver.showingTriggers = false;
+            // Same for the /showslick outline (its own beam pool, up to
+            // SLICK_MAX_BEAMS edicts per player).
+            leaver.freeSlickMarkers();
+            leaver.showingSlick = false;
+            leaver.slickScanned = false;
         }
     }
     else if ( score_event == "userinfochanged" )
@@ -784,6 +791,11 @@ void GT_ThinkRules()
 
         // all stats are set to 0 each frame, so it's only needed to set a stat if it's going to get a value
         @player = RACE_GetPlayer( client );
+
+        // /showslick: refresh the icy-floor outline as the player moves. No-op
+        // unless they turned it on, and self-throttled to SLICK_SCAN_INTERVAL
+        // and to actually changing cell.
+        player.updateSlickMarkers();
         if ( player.inRace || ( player.practicing && player.recalled && client.getEnt().health > 0 ) )
         {
             if ( client.getEnt().moveType == MOVETYPE_NONE )
@@ -1402,6 +1414,7 @@ void GT_InitGametype()
     G_RegisterCommand( "noclip" );
     G_RegisterCommand( "reverse" );
     G_RegisterCommand( "showtriggers" );
+    G_RegisterCommand( "showslick" );
     G_RegisterCommand( "position" );
     G_RegisterCommand( "top" );
     G_RegisterCommand( "mark" );
@@ -1428,7 +1441,7 @@ void GT_InitGametype()
     RACE_GhostInit();
 
     // add votes
-    G_RegisterCallvote( "randmap", "<* | pattern>", "string", "Changes to a random map" );
+    G_RegisterCallvote( "randmap", "<* | pattern | strafe | slick | weapon>", "string", "Changes to a random map" );
     G_RegisterCallvote( "tourneymap", "<* | # | map | pattern>", "string", "Changes to a map from the current tournament pool" );
 
     // msc: practicemode message

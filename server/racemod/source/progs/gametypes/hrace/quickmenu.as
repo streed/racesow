@@ -14,6 +14,8 @@ enum eMenuItems
     MI_REVERSE_OFF,
     MI_SHOW_TRIGGERS,
     MI_HIDE_TRIGGERS,
+    MI_SHOW_SLICK,
+    MI_HIDE_SLICK,
     MI_SERVERS
 };
 
@@ -36,5 +38,7 @@ array<const String@> menuItems = {
     '"Leave reverse mode" "reverse off" ',
     '"Show triggers" "showtriggers" ',
     '"Hide triggers" "showtriggers" ',
+    '"Show slick" "showslick" ',
+    '"Hide slick" "showslick" ',
     '"Other servers" "servers" '
 };

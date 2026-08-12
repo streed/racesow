@@ -57,8 +57,9 @@ bool Cmd_CallvoteValidate( Client@ client, const String &cmdString, const String
             Cvar mapname( "mapname", "", 0 );
             String current = mapname.string;
             // Everything after "randmap" is the filter: a name pattern as before,
-            // or a strafe / weapon filter (e.g. "strafe", "rl", "rl pg") that
-            // GetMapsByFilter resolves against the scanned map weapons.
+            // or a strafe / slick / weapon filter (e.g. "strafe", "slick", "rl",
+            // "rl pg", "rl slick") that GetMapsByFilter resolves against the
+            // scanned map table.
             String pattern = "";
             for ( int t = 1; ; t++ )
             {
@@ -351,6 +352,14 @@ bool Cmd_Reverse( Client@ client, const String &cmdString, const String &argsStr
 bool Cmd_ShowTriggers( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
     return RACE_GetPlayer( client ).toggleTriggerMarkers();
+}
+
+// /showslick — toggle an outline around the slick (icy) floor near the player,
+// so it's obvious where you will and won't keep your grip. Off by default;
+// visible only to the player who ran the command.
+bool Cmd_ShowSlick( Client@ client, const String &cmdString, const String &argsString, int argc )
+{
+    return RACE_GetPlayer( client ).toggleSlickMarkers();
 }
 
 bool Cmd_Position( Client@ client, const String &cmdString, const String &argsString, int argc )
@@ -670,6 +679,9 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/showtriggers" );
         cmdlist.addCell( "Toggle markers showing the start and finish trigger planes (only you see them)." );
 
+        cmdlist.addCell( "/showslick" );
+        cmdlist.addCell( "Toggle an outline around the slick (icy) floor near you (only you see it)." );
+
         cmdlist.addCell( "/position save" );
         cmdlist.addCell( "Saves your position including your weapons as the new spawn position." );
 
@@ -777,6 +789,12 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         client.printMessage( S_COLOR_YELLOW + "/showtriggers" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Toggles translucent markers at the centre of the start and finish trigger planes, so you can" + "\n" );
         client.printMessage( S_COLOR_WHITE + "  see where to cross (handy for reverse mode, where the finish is your start). Only you see them." + "\n" );
+    }
+    else if ( command == "showslick" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/showslick" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Outlines the slick (icy) floor around you in cyan, so you can see exactly where you lose grip" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  before you slide off it. Off by default, follows you as you move, and only you see it." + "\n" );
     }
     else if ( command == "position" && subcommand == "save" )
     {
