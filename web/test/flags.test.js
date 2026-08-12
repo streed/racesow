@@ -241,3 +241,82 @@ test("ensureMapByName: creates unknown maps, is idempotent, and rejects junk nam
   const summary = await race.openFlagSummary();
   assert.ok(summary.some((g) => g.name === "neverfinished2"), "the new map shows in the moderator queue");
 });
+
+// Map quarantine: the network-wide half of bad-map recovery. A map that kills a
+// server on load is reported by that box's crash guard; once the evidence is
+// strong enough the name joins the blocked-maps feed every node already
+// consumes, so one node's crash protects the other three.
+test("map quarantine: activates on repeat failures, on two servers, and reaches blockedMapNames", async (t) => {
+  const race = await freshDb(t);
+  const now = 1780000000;
+  const srv = async (name) =>
+    Number((await race.one(
+      "INSERT INTO server (name, token_hash, status, created_at) VALUES ($1, $2, 'trusted', $3) RETURNING id",
+      [name, sha256(name), now]
+    )).id);
+  const eu = await srv("EU"), us = await srv("US");
+
+  // One failure is not enough — a single fault can be the host, not the map.
+  const a = await race.recordMapLoadFailure({ mapName: "badmap1", serverId: eu, note: "NULL model", now });
+  assert.equal(a.active, false, "one failure must not quarantine");
+  assert.equal(a.failCount, 1);
+  assert.deepEqual(await race.blockedMapNames(now), []);
+
+  // A second failure on the SAME server crosses the default threshold of 2.
+  const b = await race.recordMapLoadFailure({ mapName: "badmap1", serverId: eu, now: now + 5 });
+  assert.equal(b.active, true);
+  assert.equal(b.activatedNow, true, "the caller must be told it JUST activated");
+  assert.deepEqual(await race.blockedMapNames(now + 5), ["badmap1"]);
+
+  // Re-reporting an already-active map must not claim it activated again (that
+  // would file a duplicate moderator flag on every relaunch of a crash loop).
+  const c = await race.recordMapLoadFailure({ mapName: "badmap1", serverId: eu, now: now + 6 });
+  assert.equal(c.activatedNow, false);
+
+  // TWO DISTINCT servers escalate immediately, before the count threshold:
+  // two boxes cannot both hold the same locally-corrupt pk3.
+  const d = await race.recordMapLoadFailure({ mapName: "badmap2", serverId: eu, now });
+  assert.equal(d.active, false);
+  const e = await race.recordMapLoadFailure({ mapName: "badmap2", serverId: us, now });
+  assert.equal(e.active, true, "two distinct servers must escalate on the first failure each");
+  assert.equal(e.serverCount, 2);
+
+  // One server reporting many times is still ONE server.
+  for (let i = 0; i < 5; i++) await race.recordMapLoadFailure({ mapName: "badmap3", serverId: eu, now: now + i });
+  const f = await race.recordMapLoadFailure({ mapName: "badmap3", serverId: eu, now: now + 99 });
+  assert.equal(f.serverCount, 1, "repeat reports from one box must not look like many boxes");
+
+  // Thin evidence expires so a transient local fault self-heals; strong
+  // evidence never does. NB badmap1 is at 3 failures by now (a, b, c), so it is
+  // permanent — use a map that stops at exactly two.
+  assert.ok(b.expiresAt, "a 2-failure quarantine should carry an expiry");
+  assert.equal(f.expiresAt, null, "a >=3-failure quarantine should never expire");
+  await race.recordMapLoadFailure({ mapName: "blip1", serverId: eu, now });
+  const g = await race.recordMapLoadFailure({ mapName: "blip1", serverId: eu, now: now + 1 });
+  assert.equal(g.active, true);
+  assert.ok(g.expiresAt, "2 failures => expiring quarantine");
+  assert.ok((await race.blockedMapNames(now + 2)).includes("blip1"), "served while unexpired");
+  assert.ok(!(await race.blockedMapNames(g.expiresAt + 1)).includes("blip1"),
+    "an expired quarantine must stop being served");
+  assert.ok((await race.blockedMapNames(now + 2)).includes("badmap1"),
+    "a >=3-failure quarantine stays served indefinitely");
+
+  // Moderator clears it -> gone from the feed, evidence retained.
+  assert.equal(await race.clearMapQuarantine("badmap3", "mod"), 1);
+  assert.ok(!(await race.blockedMapNames(now + 100)).includes("badmap3"));
+  const rows = await race.all("SELECT count(*)::int c FROM map_load_failure WHERE map_name = 'badmap3'");
+  assert.equal(rows[0].c, 6, "clearing keeps the evidence");
+
+  // Junk never creates state.
+  const bad = await race.recordMapLoadFailure({ mapName: "../../etc/passwd", serverId: eu, now });
+  assert.equal(bad.ok, false);
+
+  // A moderator block and a machine quarantine coexist without duplicating.
+  const mid = await race.ensureMapByName("badmap2");
+  await race.blockMap(mid, "manual", "mod");
+  const names = await race.blockedMapNames(now);
+  assert.equal(names.filter((n) => n === "badmap2").length, 1, "UNION must not duplicate");
+  // The admin's blocked-maps table stays moderator-only.
+  const adminList = (await race.blockedMaps()).map((r) => r.name);
+  assert.deepEqual(adminList, ["badmap2"], "machine quarantines must not appear as moderator blocks");
+});

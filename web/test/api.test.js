@@ -767,3 +767,79 @@ test("game flag: only a trusted enrolled server may flag a map that does not exi
   assert.equal(known.status, 200);
   assert.equal(known.json.mapCreated, false);
 });
+
+// POST /api/game/map-load — the crash guard's network-wide report. The payoff
+// is that the quarantined name reaches GET /api/game/blocked-maps, which every
+// box already consumes, so one node's crash protects the other three with no
+// game deploy.
+test("game map-load: a trusted server quarantines a bad map into the blocked-maps feed", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const toks = { eu: "tok-ml-eu-aaaaaaaaaaaaaa", us: "tok-ml-us-bbbbbbbbbbbbbb", quar: "tok-ml-q-cccccccccccccc" };
+  for (const [name, status, t] of [
+    ["ML EU", "trusted", toks.eu],
+    ["ML US", "trusted", toks.us],
+    ["ML Q", "quarantined", toks.quar],
+  ]) {
+    await dbQuery(`INSERT INTO server (name, token_hash, status, created_at)
+                   VALUES ('${name}', '${sha256(t)}', '${status}', ${now})`);
+  }
+  const post = async (token, body) => {
+    const r = await fetch(`${base}/api/game/map-load`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    return { status: r.status, json: await r.json().catch(() => ({})) };
+  };
+  const feed = async () => (await (await fetch(`${base}/api/game/blocked-maps`)).text()).split("\n").filter(Boolean);
+
+  // Untrusted callers cannot create central state.
+  assert.equal((await post(TOKEN, { map: "mlmap1" })).status, 403, "shared token rejected");
+  assert.equal((await post(toks.quar, { map: "mlmap1" })).status, 403, "quarantined server rejected");
+  const noauth = await fetch(`${base}/api/game/map-load`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  assert.equal(noauth.status, 401);
+
+  // Junk names are refused outright.
+  assert.equal((await post(toks.eu, { map: "../../etc/passwd" })).status, 400);
+
+  // One failure records but does not quarantine.
+  const r1 = await post(toks.eu, { map: "mlmap1", note: "GClip_SetBrushModel: NULL model" });
+  assert.equal(r1.status, 200);
+  assert.equal(r1.json.quarantined, false);
+  assert.ok(!(await feed()).includes("mlmap1"), "one failure must not reach the feed");
+
+  // A second, from a DIFFERENT node, escalates immediately and reaches the feed
+  // the game servers poll.
+  const r2 = await post(toks.us, { map: "mlmap1", note: "same" });
+  assert.equal(r2.json.quarantined, true);
+  assert.equal(r2.json.serverCount, 2);
+  assert.ok((await feed()).includes("mlmap1"), "quarantined map must reach blocked-maps");
+
+  // It shows up on the moderator queue as a distinct reason, not as "other".
+  const flag = await dbQuery(`SELECT f.reason FROM map_flag f JOIN map m ON m.id = f.map_id
+                              WHERE m.name = 'mlmap1' AND f.status = 'open'`);
+  assert.equal(flag.rows.length, 1);
+  assert.equal(flag.rows[0].reason, "loadfail");
+
+  // Repeat reports are idempotent: no extra flags, no duplicate feed entries.
+  // The queue gets exactly ONE flag, filed by whichever node tipped the
+  // quarantine over — a crash loop across four boxes must not spam it. The
+  // per-server evidence lives in map_load_failure and the quarantine panel.
+  await post(toks.eu, { map: "mlmap1" });
+  await post(toks.us, { map: "mlmap1" });
+  const again = await dbQuery(`SELECT count(*)::int c FROM map_flag f JOIN map m ON m.id = f.map_id
+                               WHERE m.name = 'mlmap1' AND f.status = 'open'`);
+  assert.equal(again.rows[0].c, 1, "one open flag per activation, however many reports arrive");
+  // Evidence is deduped per (server, map, SECOND) — several reporters
+  // describing one event collapse to one row — so four posts fired inside the
+  // same second yield two rows, one per server. (Real reports are >=5s apart:
+  // the crash guard backs off 5/10/30/60/120s.) Asserted as a range so the test
+  // does not flake when the posts straddle a second boundary.
+  const ev = await dbQuery(`SELECT count(*)::int c, count(DISTINCT server_id)::int s
+                            FROM map_load_failure WHERE map_name = 'mlmap1'`);
+  assert.ok(ev.rows[0].c >= 2 && ev.rows[0].c <= 4, `evidence rows: ${ev.rows[0].c}`);
+  assert.equal(ev.rows[0].s, 2, "from two distinct servers");
+  const f2 = await feed();
+  assert.equal(f2.filter((n) => n === "mlmap1").length, 1, "feed must not duplicate");
+});

@@ -1847,6 +1847,83 @@ api.post(
   })
 );
 
+// A game box reporting a map that failed to LOAD (server/crashguard.sh).
+//
+// This is the network-wide half of bad-map recovery: the reporting box has
+// already quarantined the map locally, and this is what stops the OTHER three
+// nodes from each discovering it the hard way. On activation the name joins
+// GET /api/game/blocked-maps, whose two consumers are already deployed — the
+// entrypoint subtracts it at boot, and hrace/blockedmaps.as re-fetches every
+// ~30s — so no game deploy is needed for it to take effect.
+//
+// Same middleware order as /game/flag: auth BEFORE express.json as a DoS guard,
+// then the ingest limiter, then a small body.
+api.post(
+  "/game/map-load",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    // Creating central state, so the same bar as /game/flag: an enrolled,
+    // trusted box. The legacy shared token identifies no server, and a
+    // quarantined one is already not taken at its word.
+    if (!ident.trusted) return res.status(403).json({ error: "server not trusted" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  express.json({ limit: "8kb" }),
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const mapName = typeof body.map === "string" ? body.map.slice(0, MAX_MAP_LEN).toLowerCase() : "";
+    if (!mapName || !/^[a-z0-9][a-z0-9_.-]*$/.test(mapName))
+      return res.status(400).json({ error: "map required" });
+    const note = (typeof body.note === "string" ? body.note.trim().slice(0, FLAG_NOTE_MAX) : "") || null;
+    const detector = typeof body.detector === "string" ? body.detector.slice(0, 32) : "crashguard";
+
+    const r = await race.recordMapLoadFailure({
+      mapName,
+      serverId: req.ingest.serverId,
+      detector,
+      note,
+    });
+    if (!r.ok) return res.status(400).json({ error: r.error || "bad request" });
+
+    if (r.activatedNow) {
+      // Only NOW does a map row get created — a single transient failure never
+      // mints one. Then file it on the moderator queue so a human sees it.
+      const mapId = await race.ensureMapByName(mapName);
+      if (mapId != null) {
+        await race.flagMap({
+          mapId,
+          reason: "loadfail",
+          note,
+          // Filed ONCE, by whichever node's report tipped the quarantine over.
+          // The queue is a "a human should look at this" signal, not the
+          // evidence store — per-server counts live in map_load_failure and are
+          // surfaced by the quarantine panel, so re-flagging per node would be
+          // duplicate noise. The hash must be deterministic and never NULL:
+          // Postgres unique indexes are NULLS DISTINCT, so a null reporter_hash
+          // would mint a fresh flag on every relaunch of a crash loop.
+          reporterHash: sha256(`loadfail:${req.ingest.serverId}:${mapName}`),
+          reporterName: req.ingest.serverName,
+        });
+      }
+      recordEvent(
+        req.ingest.serverId,
+        `map-load quarantine: ${mapName} (${r.failCount} failures on ${r.serverCount} server(s)) — dropped from rotation network-wide`,
+        "maintenance",
+        "error"
+      );
+      // MOUNT-relative key, not "/api/game/blocked-maps" — see the warning at
+      // the cache() helper. Without this the nodes keep the stale list for up
+      // to 30s after a quarantine activates.
+      invalidate("/game/blocked-maps");
+    }
+    res.json({ ok: true, quarantined: !!r.active, failCount: r.failCount, serverCount: r.serverCount });
+  })
+);
+
 // In-game "/savestart": a game server persists a player's chosen START position
 // for the current map (or clears it, when coords is empty, for "/clearstart").
 // Server-token authed like /ingest and keyed by map NAME + player nick (the game
@@ -1938,6 +2015,7 @@ const REASON_LABELS = {
   wrong_name: "Wrong name / metadata",
   duplicate: "Duplicate",
   other: "Other",
+  loadfail: "Crashed the server on load",
 };
 // A constant-cost decoy hash: verified against when the username is unknown so
 // a failed login costs the same scrypt work whether or not the account exists
@@ -2249,11 +2327,74 @@ admin.get("/flags", requireAuth, wrap(async (req, res) => {
         </div>`;
       }).join("")
     : `<div class="empty">No open flags. All clear. 🎉</div>`;
+
+  // Quarantined maps, pinned ABOVE the flag queue. These are machine-generated
+  // and already removed from every server's rotation, so they are not "reports
+  // to triage" — they are an outage that has been contained, and the moderator
+  // decides whether the containment becomes permanent (Block) or was wrong
+  // (Clear). Mixing them into the recency-ordered queue below would bury them.
+  const quar = await race.quarantinedMaps();
+  const quarBody = quar.length
+    ? `<table><thead><tr><th>Map</th><th>Failures</th><th>Servers</th><th>Last error</th><th>Last seen</th><th>Expires</th><th></th></tr></thead>
+       <tbody>${quar.map((q) => `<tr${q.effective ? "" : ' class="muted"'}>
+         <td><b>${escHtml(q.map_name)}</b></td>
+         <td>${q.fail_count}</td>
+         <td>${q.server_count}${q.server_name ? ` <span class="meta">(last: ${escHtml(q.server_name)})</span>` : ""}</td>
+         <td class="note">${q.last_note ? escHtml(String(q.last_note).slice(0, 160)) : "—"}</td>
+         <td>${fmtWhen(q.last_failed_at)}</td>
+         <td>${!q.effective ? "cleared" : q.expires_at ? fmtWhen(q.expires_at) : "never"}</td>
+         <td>
+           <form class="inline" method="post" action="/admin/quarantine/${encodeURIComponent(q.map_name)}/clear">
+             <input type="hidden" name="_csrf" value="${csrf}">
+             <button class="ok" type="submit" title="Lift the quarantine — the map returns to rotation">Clear</button>
+           </form>
+           <form class="inline" method="post" action="/admin/quarantine/${encodeURIComponent(q.map_name)}/block">
+             <input type="hidden" name="_csrf" value="${csrf}">
+             <button class="danger" type="submit" title="Make it a permanent moderator block">Block permanently</button>
+           </form>
+         </td></tr>`).join("")}</tbody></table>`
+    : "";
+  const quarSection = quar.length
+    ? `<h1>Quarantined maps</h1>
+       <p class="sub">Reported by the game servers as failing to load. Already dropped from
+          every server's rotation and vote pool — no action is required to keep players safe.</p>
+       ${quarBody}<hr style="margin:24px 0">`
+    : "";
+
   sendAdmin(res, "Flag queue", `
+    ${quarSection}
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
       <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a> · <a href="/admin/tournaments">tournaments</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a>` : ""} · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
+}));
+
+// Lift a quarantine: the map goes back into rotation on the next blocklist
+// fetch (~30s in-game, next restart for the boot map). The failure evidence is
+// deliberately kept — a map that is cleared and immediately quarantines itself
+// again is exactly the thing a moderator needs to be able to see.
+admin.post("/quarantine/:map/clear", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const name = String(req.params.map || "").toLowerCase();
+  const n = await race.clearMapQuarantine(name, req.session.username);
+  if (!n) return res.status(404).type("text/plain").send("no such quarantine");
+  invalidate("/game/blocked-maps");
+  res.redirect(303, `/admin/flags?done=${encodeURIComponent(`Cleared the quarantine on ${name}. It returns to rotation within ~30s.`)}`);
+}));
+
+// Promote a machine quarantine to a permanent moderator block. This is the
+// deliberate human decision map_block's migration reserves for a human; the
+// quarantine is then cleared so the map is not listed twice.
+admin.post("/quarantine/:map/block", requireAuth, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const name = String(req.params.map || "").toLowerCase();
+  const mapId = await race.ensureMapByName(name);
+  if (mapId == null) return res.status(400).type("text/plain").send("bad map name");
+  const r = await race.blockMap(mapId, "crashed the server on load", `auto:loadfail→${req.session.username}`);
+  if (!r.ok) return res.status(404).type("text/plain").send("map not found");
+  await race.clearMapQuarantine(name, req.session.username);
+  invalidate("/game/blocked-maps");
+  res.redirect(303, `/admin/flags?done=${encodeURIComponent(`Blocked ${name} permanently and closed its open flags.`)}`);
 }));
 
 admin.get("/flags/all", requireAuth, wrap(async (req, res) => {
@@ -2345,7 +2486,11 @@ admin.post("/flags/map/:id/block", requireAuth, wrap(async (req, res) => {
   if (id == null) return res.status(400).type("text/plain").send("bad map id");
   const r = await race.blockMap(id, "blocked via admin flag review", req.session.username);
   if (!r.ok) return res.status(404).type("text/plain").send("map not found");
-  res.redirect(303, `/admin/flags?done=${encodeURIComponent("Blocked the map and closed its open flags. It will drop from rotation on the game servers' next restart.")}`);
+  // The blocked-maps feed is cached 30s under a MOUNT-relative key. This route
+  // never evicted it, so a freshly blocked map could still be handed to a game
+  // server for up to half a minute after the moderator acted.
+  invalidate("/game/blocked-maps");
+  res.redirect(303, `/admin/flags?done=${encodeURIComponent("Blocked the map and closed its open flags. It drops from the game servers' vote pool within ~30s, and from the rotation on their next restart.")}`);
 }));
 admin.post("/maps/:id/unblock", requireAuth, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;

@@ -231,7 +231,22 @@ export function sha256(s) {
 
 // Valid map-flag reasons. Single source of truth: the HTTP endpoint, the admin
 // CLI and the server-rendered admin page all validate against this list.
-export const FLAG_REASONS = ["broken", "offensive", "wrong_name", "duplicate", "other"];
+//
+// "loadfail" is machine-generated (a game box's crash guard reporting a map
+// that killed the server on load), not a player report. It has to be in this
+// list or the flag endpoint silently coerces it to "other" with a 200, and a
+// server-killing map becomes indistinguishable from a cosmetic complaint.
+export const FLAG_REASONS = ["broken", "offensive", "wrong_name", "duplicate", "other", "loadfail"];
+
+// Map-quarantine policy. Two failures of the same map, or one failure on each
+// of two DISTINCT servers, puts it on the blocked-maps feed. Thin evidence
+// expires after a week so a transient local fault (a half-written pk3) heals
+// itself; see recordMapLoadFailure.
+export const MAP_QUARANTINE_FAILS = Math.max(1, Number(process.env.RS_QUARANTINE_FAILS) || 2);
+export const MAP_QUARANTINE_EXPIRE_SECS = Math.max(
+  3600,
+  Number(process.env.RS_QUARANTINE_EXPIRE_SECS) || 7 * 24 * 3600
+);
 
 // Longest nick stored alongside a tournament entry (matches the HTTP layer's
 // MAX_NAME_LEN — these are display/diagnostic copies of a name, never the
@@ -3259,10 +3274,143 @@ class RaceDB {
   }
   // Just the (lowercased) map names, for the game servers' plain-text endpoint
   // that server/entrypoint.sh consumes when building g_maplist.
-  async blockedMapNames() {
-    return (await this.all("SELECT m.name FROM map_block b JOIN map m ON m.id = b.map_id ORDER BY m.name")).map(
-      (r) => String(r.name).toLowerCase()
+  async blockedMapNames(now = Math.floor(Date.now() / 1000)) {
+    // UNION of the moderator's blocks and the machine's active quarantine.
+    // Deliberately only here: the admin-facing blockedMaps() below stays
+    // map_block-only, so a machine quarantine never shows up in the moderator's
+    // blocked-maps table as though a human had put it there.
+    //
+    // This one query is the entire network-wide propagation. Both consumers are
+    // already deployed: server/entrypoint.sh subtracts this at boot (dropping
+    // the map from g_maplist, rs_idle_pool AND the boot map) and
+    // hrace/blockedmaps.as re-fetches every ~30s for the vote/rotation paths.
+    return (
+      await this.all(
+        `SELECT m.name FROM map_block b JOIN map m ON m.id = b.map_id
+         UNION
+         SELECT q.map_name FROM map_quarantine q
+          WHERE q.active AND (q.expires_at IS NULL OR q.expires_at > $1)
+         ORDER BY 1`,
+        [now]
+      )
+    ).map((r) => String(r.name).toLowerCase());
+  }
+
+  // ---------------------------- Map quarantine -----------------------------
+  // A map that fails to LOAD is reported here by the game boxes' crash guard.
+  // Policy lives in this one function so the endpoint stays dumb.
+  //
+  // Activates when either the same map has failed RS_QUARANTINE_FAILS times
+  // (default 2 — one failure could be a transient host condition), OR two
+  // DISTINCT servers have seen it fail. The second rule escalates immediately
+  // and on purpose: two nodes cannot both be holding the same locally-corrupt
+  // pk3, so that is the map, not the box.
+  //
+  // Returns { active, activatedNow, failCount, serverCount } so the caller can
+  // decide whether to file a moderator flag and evict the blocklist cache.
+  async recordMapLoadFailure({
+    mapName,
+    serverId = null,
+    detector = "crashguard",
+    note = null,
+    now = Math.floor(Date.now() / 1000),
+    failsToQuarantine = MAP_QUARANTINE_FAILS,
+    expireSecs = MAP_QUARANTINE_EXPIRE_SECS,
+  }) {
+    const name = String(mapName || "").toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return { ok: false, error: "invalid map name" };
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Evidence first. ON CONFLICT DO NOTHING so several reporters describing
+      // the same event at the same second collapse to one row.
+      await client.query(
+        `INSERT INTO map_load_failure (map_name, server_id, detected_at, detector, note)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (server_id, map_name, detected_at) DO NOTHING`,
+        [name, serverId, now, detector, note]
+      );
+      // server_count is recomputed from the evidence rather than incremented,
+      // so one node reporting ten times never looks like ten nodes.
+      const counts = (
+        await client.query(
+          `SELECT COUNT(*)::int AS fails, COUNT(DISTINCT server_id)::int AS servers
+             FROM map_load_failure WHERE map_name = $1`,
+          [name]
+        )
+      ).rows[0];
+      const failCount = counts.fails;
+      const serverCount = counts.servers;
+      const active = failCount >= failsToQuarantine || serverCount >= 2;
+      // Thin evidence expires so a one-off self-heals; once it is unambiguous
+      // (>= 3 failures) it stays until a human clears it.
+      const expiresAt = !active ? null : failCount >= 3 ? null : now + expireSecs;
+
+      const prev = (
+        await client.query("SELECT active FROM map_quarantine WHERE map_name = $1", [name])
+      ).rows[0];
+
+      await client.query(
+        `INSERT INTO map_quarantine
+           (map_name, fail_count, server_count, first_failed_at, last_failed_at,
+            last_server_id, last_note, active, expires_at, cleared_by, cleared_at)
+         VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, NULL, NULL)
+         ON CONFLICT (map_name) DO UPDATE SET
+           fail_count     = EXCLUDED.fail_count,
+           server_count   = EXCLUDED.server_count,
+           last_failed_at = EXCLUDED.last_failed_at,
+           last_server_id = EXCLUDED.last_server_id,
+           last_note      = EXCLUDED.last_note,
+           active         = EXCLUDED.active,
+           expires_at     = EXCLUDED.expires_at,
+           cleared_by     = NULL,
+           cleared_at     = NULL`,
+        [name, failCount, serverCount, now, serverId, note, active, expiresAt]
+      );
+      await client.query("COMMIT");
+      return {
+        ok: true,
+        active,
+        activatedNow: active && !(prev && prev.active),
+        failCount,
+        serverCount,
+        expiresAt,
+      };
+    } catch (e) {
+      try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // Quarantine rows for the admin panel, worst first. `effective` is what the
+  // game servers actually see right now (active AND unexpired), which is not
+  // the same as `active` once expires_at has passed.
+  async quarantinedMaps(now = Math.floor(Date.now() / 1000)) {
+    return (
+      await this.all(
+        `SELECT q.*, s.name AS server_name,
+                (q.active AND (q.expires_at IS NULL OR q.expires_at > $1)) AS effective
+           FROM map_quarantine q
+           LEFT JOIN server s ON s.id = q.last_server_id
+          ORDER BY q.active DESC, q.last_failed_at DESC`,
+        [now]
+      )
+    ).map((r) => ({ ...r, last_server_id: r.last_server_id == null ? null : num(r.last_server_id) }));
+  }
+
+  // Lift a quarantine. Deliberately keeps the map_load_failure evidence: the
+  // history is what tells a moderator this map has been cleared and came back.
+  async clearMapQuarantine(mapName, by, now = Math.floor(Date.now() / 1000)) {
+    const r = await this.pool.query(
+      `UPDATE map_quarantine
+          SET active = FALSE, expires_at = NULL, cleared_by = $2, cleared_at = $3
+        WHERE map_name = $1`,
+      [String(mapName || "").toLowerCase(), by || null, now]
     );
+    return r.rowCount;
   }
 
   // ======================= Offensive-name censoring =========================
