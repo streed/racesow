@@ -268,8 +268,8 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 // Hot read endpoints are Redis-cached (short TTL). /overview is the heaviest
 // aggregate and the most-hit page-load call, so it carries a wider window than
 // the per-map/per-player reads — but not by much: the homepage also carries the
-// two feeds people watch for their own run ("Recent PBs" and "Recent Finishes"),
-// so it is cached as a live feed, not as a summary.
+// "Recent PBs" feed people watch for their own run, so it is cached as a live
+// feed, not as a summary.
 api.get("/overview", cache(45, { edge: true }), wrap(async (_req, res) => res.json(await race.overview())));
 api.get("/servers", wrap(async (_req, res) => res.json({ servers: await race.servers() })));
 

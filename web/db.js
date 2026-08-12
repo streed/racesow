@@ -695,7 +695,6 @@ class RaceDB {
       this._censorNamed({ ...r, rank: num(r.rank), id: num(r.id), srRanked: srIsRanked(r.maps) }, num(r.id))
     );
     const recent = await this.recentRecords(8);
-    const recentFinishes = await this.recentFinishes({ limit: 10 });
     const lastUpdate = await this.one("SELECT value FROM config WHERE key='last_update'");
     return {
       lastUpdate: lastUpdate ? parseInt(lastUpdate.value, 10) : null,
@@ -703,7 +702,6 @@ class RaceDB {
       versions,
       hallOfFame,
       recent,
-      recentFinishes,
       servers: await this.servers(),
     };
   }
@@ -747,8 +745,8 @@ class RaceDB {
   // — those are `race`/recentRecords). Optionally scoped to one map or one
   // player (canonical id). Carries each run's checkpoint splits so the map/
   // player pages can show per-run split breakdowns, and `pb` marks the run that
-  // equals the player's current best on that map. Powers the recent-finishes
-  // feed and the per-map / per-player finish history.
+  // equals the player's current best on that map. Powers the per-map and
+  // per-player finish history.
   async recentFinishes({ limit = 12, mapId = null, playerId = null } = {}) {
     // Build the filters dynamically: the `$n IS NULL OR col = $n` form forces
     // the generic plan to cover both shapes, which keeps Postgres off the

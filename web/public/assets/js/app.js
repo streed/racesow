@@ -299,10 +299,6 @@ async function viewOverview() {
           <div class="muted" style="padding:8px 2px">No records set recently &mdash; a run only appears here when it beats the player's existing best on a map.</div>`}
         </div>
         <div class="panel" style="margin-bottom:20px">
-          <h3><span class="dot orange"></span> Recent Finishes</h3>
-          ${finishFeed(d.recentFinishes, { emptyMsg: "No finishes recorded yet — every completed run (not just personal bests) shows here." })}
-        </div>
-        <div class="panel" style="margin-bottom:20px">
           <h3><span class="dot"></span> Finishes by Version</h3>
           <div class="vbars">
             ${d.versions.map((v) => { const n = v.records != null ? v.records : v.races; return `
