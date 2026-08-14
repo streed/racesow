@@ -1112,3 +1112,105 @@ tr.tincomplete td { opacity: .5; }
   .tgrid { grid-template-columns: 1fr; }
   .tcode { font-size: 24px; letter-spacing: 2px; }
 }
+
+/* ---------- Stats: when people play ----------
+   Two colour jobs, kept apart on purpose. The heatmap is MAGNITUDE, so it is
+   one hue in six steps (--hm-0..5, empty included) and keeps that hue whatever
+   the region filter says. The split charts are IDENTITY, so regions get a fixed
+   categorical order (--reg-*) that never re-assigns when a region drops out.
+   The pair was validated for CVD separation against the panel surface; the
+   Unknown slot is deliberately the neutral "other" grey, and every value it
+   carries is also printed in the region table, which is the relief for a
+   low-chroma slot. */
+:root {
+  --reg-eu:    #ea5a10;
+  --reg-us:    #0fa5c4;
+  --reg-other: #676c7c;
+  --hm-0: rgba(255,255,255,.045);
+  --hm-1: rgba(255,106,26,.20);
+  --hm-2: rgba(255,106,26,.36);
+  --hm-3: rgba(255,106,26,.55);
+  --hm-4: rgba(255,106,26,.76);
+  --hm-5: #ff6a1a;
+}
+
+/* Window / zone / region / metric pickers. Segmented links (not buttons): each
+   state is a real URL, so a view can be shared and Back works. */
+.statbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 24px; }
+.statwin { font-family: var(--cond); text-transform: uppercase; letter-spacing: 1px; font-size: 11.5px; }
+.segbar { display: inline-flex; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 3px; gap: 3px; }
+.seg {
+  font-family: var(--cond); font-weight: 600; font-size: 13px; letter-spacing: .4px;
+  padding: 6px 12px; border-radius: 6px; color: var(--muted); cursor: pointer;
+  white-space: nowrap; transition: color .12s, background .12s;
+}
+.seg:hover { color: var(--text); background: var(--panel-2); }
+.seg.on { color: var(--bg); background: var(--orange); }
+.seg.on:hover { background: var(--orange-2); }
+
+.statpanel { padding: 0 0 4px; margin-bottom: 24px; }
+.statpanel > .statctl { display: flex; gap: 12px; flex-wrap: wrap; padding: 14px 18px 4px; }
+.statcap { color: var(--faint); font-size: 12.5px; line-height: 1.55; padding: 4px 18px 14px; }
+.statcap .mono { color: var(--muted); }
+/* A tile whose headline is a word or a clock time rather than a count. */
+.tile .num.stat-word { font-size: 26px; letter-spacing: .3px; }
+.tile-sub { color: var(--faint); font-size: 12px; margin-top: 5px; font-variant-numeric: tabular-nums; }
+
+/* Hour-of-week grid. 2px of surface between cells so adjacent fills never
+   touch and the step boundaries stay readable. */
+/* Capped: stretched to a full desktop panel the cells become 40px blocks, which
+   reads as a wall rather than a grid you scan. Below the min-width the grid
+   scrolls inside its own box rather than shrinking 168 cells and their day
+   labels into illegibility — the page itself never scrolls sideways. */
+.hmscroll { overflow-x: auto; }
+.hmap { display: block; width: 100%; min-width: 520px; max-width: 880px; padding: 4px 18px 6px; }
+.hmap .hmc { fill: var(--hm-0); transition: stroke .12s; stroke: transparent; stroke-width: 1; }
+.hmap .hmc.s1 { fill: var(--hm-1); }
+.hmap .hmc.s2 { fill: var(--hm-2); }
+.hmap .hmc.s3 { fill: var(--hm-3); }
+.hmap .hmc.s4 { fill: var(--hm-4); }
+.hmap .hmc.s5 { fill: var(--hm-5); }
+.hmap .hmc:hover { stroke: var(--text); }
+/* "Now" is a ring, never a fill: a marker that recoloured the cell would be
+   indistinguishable from a busy hour. */
+.hmap .hmc.now { stroke: var(--cyan); stroke-width: 1.5; }
+.hmax { fill: var(--faint); font-family: var(--cond); font-size: 11px; letter-spacing: .5px; }
+
+.hmlegend { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 10px 18px 0; font-size: 12px; }
+.hmkey { width: 14px; height: 14px; border-radius: 3px; background: var(--hm-0); display: inline-block; }
+.hmkey.s1 { background: var(--hm-1); } .hmkey.s2 { background: var(--hm-2); }
+.hmkey.s3 { background: var(--hm-3); } .hmkey.s4 { background: var(--hm-4); }
+.hmkey.s5 { background: var(--hm-5); }
+.hmkey.now { background: transparent; border: 1.5px solid var(--cyan); }
+.hmnow-key { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); margin-left: 8px; }
+
+/* Hour-of-day / day-of-week columns. */
+.stchart { display: block; width: 100%; padding: 4px 14px 8px; }
+.stchart .stbar { fill: var(--orange); transition: opacity .12s; }
+.stchart .stbar:hover { opacity: .78; }
+.stchart .stbar.r-EU { fill: var(--reg-eu); }
+.stchart .stbar.r-US { fill: var(--reg-us); }
+.stchart .stbar.r-Unknown { fill: var(--reg-other); }
+.stchart .stval { fill: var(--muted); font-family: var(--cond); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.stchart .stval.peak { fill: var(--text); font-weight: 700; }
+.stlegend { display: flex; gap: 14px; flex-wrap: wrap; padding: 12px 18px 0; font-size: 12.5px; color: var(--muted); }
+.stkey { display: inline-flex; align-items: center; gap: 6px; }
+.stkey .sw { width: 10px; height: 10px; border-radius: 2px; background: var(--orange); }
+.stkey .sw.r-EU { background: var(--reg-eu); }
+.stkey .sw.r-US { background: var(--reg-us); }
+.stkey .sw.r-Unknown { background: var(--reg-other); }
+
+/* Region table: the swatch repeats the chart's hue so the row and the bar are
+   the same entity, and the name beside it means identity is never colour alone. */
+.rdot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 8px; background: var(--muted); }
+.rdot.r-EU { background: var(--reg-eu); }
+.rdot.r-US { background: var(--reg-us); }
+.rdot.r-Unknown { background: var(--reg-other); }
+.rsrv { font-size: 11.5px; margin-top: 3px; }
+
+@media (max-width: 700px) {
+  .statbar { gap: 8px; }
+  .seg { padding: 6px 9px; font-size: 12px; }
+  .hmap { padding: 4px 8px 6px; }
+  .tile .num.stat-word { font-size: 22px; }
+}

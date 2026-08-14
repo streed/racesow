@@ -2412,6 +2412,444 @@ function viewColors() {
   });
 }
 
+/* ============================ WHEN PEOPLE PLAY ============================
+ * /stats — the servers' weekly rhythm: an hour-of-week heatmap plus hour-of-day
+ * and day-of-week breakdowns, each splittable by the region of the server a run
+ * was set on.
+ *
+ * The metric is completed runs (the finish log is the only activity history the
+ * DB keeps — nothing samples who is merely CONNECTED), which the page says out
+ * loud rather than implying it counts players online.
+ *
+ * Colour: the heatmap is magnitude, so it is one hue light->dark and keeps that
+ * hue whatever the region filter says — the title carries the filter. Region is
+ * identity, so the split charts use the fixed categorical order below; a region
+ * with no runs is dropped without shifting anyone else's hue. "Players" is
+ * never stacked: distinct people don't add up across regions (the API counts
+ * the all-regions total separately for exactly this reason).
+ */
+const DOW_SHORT = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DOW_LONG = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const STAT_WINDOWS = [
+  { days: 30, label: "30 days" },
+  { days: 90, label: "90 days" },
+  { days: 365, label: "12 months" },
+  { days: 0, label: "All time" },
+];
+// Cube cache keyed by what the API actually varies on (window + zone), so the
+// region and metric toggles — which are URL params, so they stay shareable and
+// survive Back — re-render from memory instead of refetching.
+const statsCube = new Map();
+
+function browserTz() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+// "Europe/Berlin" -> "Berlin"; the zone is shown next to a time, where the
+// continent adds width and no information.
+function tzShort(tz) {
+  const tail = String(tz).split("/").pop();
+  return tail.replace(/_/g, " ");
+}
+
+const hourLabel = (h) => String(h).padStart(2, "0") + ":00";
+const slotLabel = (dow, hour) => `${DOW_SHORT[dow]} ${hourLabel(hour)}`;
+
+// The viewer's current hour-of-week IN the displayed zone, so "now" can be
+// marked on the grid. Returns null if the zone isn't one Intl can format.
+function nowSlot(tz) {
+  try {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz,
+      weekday: "short",
+      hour: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date());
+    const wd = parts.find((p) => p.type === "weekday")?.value;
+    const hr = parts.find((p) => p.type === "hour")?.value;
+    const dow = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].indexOf(wd);
+    // "24" is how en-GB h23 spells midnight in some ICU builds.
+    const hour = parseInt(hr, 10) % 24;
+    return dow < 0 || Number.isNaN(hour) ? null : { dow, hour };
+  } catch {
+    return null;
+  }
+}
+
+async function viewStats(params) {
+  const days = STAT_WINDOWS.some((w) => String(w.days) === params.days) ? parseInt(params.days, 10) : 90;
+  // No ?tz= means "the zone this browser is in": the useful default for
+  // "when should I show up", and the response echoes back what the server
+  // actually used so a zone Postgres rejects is visible rather than silent.
+  const tz = params.tz || browserTz();
+  const metric = params.metric === "players" ? "players" : "runs";
+  const cubeKey = `${days}|${tz}`;
+
+  let hit = statsCube.get(cubeKey);
+  // Matched to the API's own cache TTL: toggling region/metric must not refetch,
+  // but a tab left open all afternoon must not keep redrawing this morning.
+  if (hit && Date.now() - hit.at > 300_000) hit = null;
+  if (!hit) {
+    loading();
+    hit = { at: Date.now(), d: await api("/stats/playtimes" + buildQuery({ days, tz })) };
+    statsCube.set(cubeKey, hit);
+  }
+  const d = hit.d;
+  const known = (d.regions || []).map((r) => r.key);
+  const region = known.includes(params.region) ? params.region : "ALL";
+  const state = { days, tz: params.tz || "", region, metric };
+  const link = (over) => "#/stats" + buildQuery({ ...state, ...over, tz: (over.tz ?? state.tz) || "" });
+
+  if (!d.total.runs) {
+    app.innerHTML = `
+      ${statsHeader(d, state)}
+      <div class="empty">No finishes recorded in this window — try a longer one.</div>`;
+    return;
+  }
+
+  const cells = statsIndex(d);
+  const at = (dow, hour) => cellVal(cells, region, dow, hour, metric);
+  const unit = metric === "players" ? "players" : "runs";
+
+  // Peaks are read off the CURRENT slice, so every headline matches the charts
+  // under it rather than describing the unfiltered whole. Day and hour figures
+  // are the API's own rollups (dow/hour = -1), never sums of the grid: distinct
+  // players don't add up across the cells of a day.
+  let peak = { dow: 0, hour: 0, v: -1 };
+  for (let dow = 0; dow < 7; dow++)
+    for (let hour = 0; hour < 24; hour++) {
+      const v = at(dow, hour);
+      if (v > peak.v) peak = { dow, hour, v };
+    }
+  const byDay = Array.from({ length: 7 }, (_, i) => at(i, -1));
+  const byHour = Array.from({ length: 24 }, (_, i) => at(-1, i));
+  const total = at(-1, -1);
+  const topDay = byDay.indexOf(Math.max(...byDay));
+  const topHour = byHour.indexOf(Math.max(...byHour));
+  // A share only means anything for runs, which partition the window. The same
+  // arithmetic on players would divide by a number nobody is counted in twice.
+  const pct = (n) => (total ? Math.round((n / total) * 100) : 0);
+  const ofTotal =
+    metric === "runs"
+      ? { day: `${pct(byDay[topDay])}% of the week's runs`, hour: `${pct(byHour[topHour])}% of runs, any day` }
+      : {
+          day: `${fmtNum(byDay[topDay])} different players`,
+          hour: `${fmtNum(byHour[topHour])} different players, any day`,
+        };
+  const weekendRuns = at(5, -1) + at(6, -1);
+
+  app.innerHTML = `
+    ${statsHeader(d, state)}
+
+    <div class="tiles">
+      ${statTile(slotLabel(peak.dow, peak.hour), "busiest hour of the week", `${fmtNum(peak.v)} ${unit}`, "accent")}
+      ${statTile(DOW_LONG[topDay], "busiest day", ofTotal.day)}
+      ${statTile(hourLabel(topHour), "busiest hour of the day", ofTotal.hour)}
+      ${
+        metric === "runs"
+          ? statTile(pct(weekendRuns) + "%", "falls on the weekend", "Saturday + Sunday")
+          : statTile(fmtNum(total), "players in this window", "counted once, however often they raced")
+      }
+    </div>
+
+    <div class="page-title" style="font-size:20px">THE WEEK <span class="accent">·</span> ${esc(
+      region === "ALL" ? "all servers" : regionLabel(d, region)
+    )}</div>
+    <div class="panel statpanel">
+      <div class="statctl">
+        <div class="segbar" role="group" aria-label="Region">
+          <a class="seg ${region === "ALL" ? "on" : ""}" data-nav="${link({ region: "" })}" href="${navHref(link({ region: "" }))}">All servers</a>
+          ${(d.regions || [])
+            .map(
+              (r) =>
+                `<a class="seg ${region === r.key ? "on" : ""}" data-nav="${link({ region: r.key })}" href="${navHref(link({ region: r.key }))}">${esc(r.label)}</a>`
+            )
+            .join("")}
+        </div>
+        <div class="segbar" role="group" aria-label="Metric">
+          <a class="seg ${metric === "runs" ? "on" : ""}" data-nav="${link({ metric: "runs" })}" href="${navHref(link({ metric: "runs" }))}">Runs</a>
+          <a class="seg ${metric === "players" ? "on" : ""}" data-nav="${link({ metric: "players" })}" href="${navHref(link({ metric: "players" }))}">Players</a>
+        </div>
+      </div>
+      ${statsHeatmap(cells, { region, metric, tz: d.tz, label: region === "ALL" ? "all servers" : regionLabel(d, region) })}
+      <div class="statcap">Each cell is one hour of the week in ${esc(tzShort(d.tz))} time${
+        metric === "players" ? ", counting how many different players finished a run in it" : ", counting finished runs"
+      }. Darker is busier.</div>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel statpanel">
+        <h3><span class="dot"></span>By hour of day</h3>
+        ${statsBars(d, cells, { metric, region, kind: "hour" })}
+      </div>
+      <div class="panel statpanel">
+        <h3><span class="dot teal"></span>By day of week</h3>
+        ${statsBars(d, cells, { metric, region, kind: "day" })}
+      </div>
+    </div>
+
+    ${statsRegionPanel(d, cells, metric)}`;
+}
+
+// Page title + the window/zone toolbar. Rendered on the empty state too, so a
+// window with no runs can still be switched away from.
+function statsHeader(d, state) {
+  const link = (over) => "#/stats" + buildQuery({ ...state, ...over, tz: (over.tz ?? state.tz) || "" });
+  const zones = [
+    { tz: "", label: "Your time" },
+    { tz: "UTC", label: "UTC" },
+    ...(d.regions || []).filter((r) => r.tz !== "UTC").map((r) => ({ tz: r.tz, label: tzShort(r.tz) })),
+  ];
+  const span =
+    d.first && d.last
+      ? `${fmtUtc(d.first, { time: false })} – ${fmtUtc(d.last, { time: false })}`
+      : "no runs in this window";
+  // A zone the API refused — one this browser knows but Postgres or the API's
+  // allow-list doesn't — has to be visible: the grid would otherwise quietly be
+  // UTC while the picker claims otherwise. Compared against what THIS page
+  // asked for, which also catches a hand-typed ?tz=.
+  const asked = state.tz || browserTz();
+  const fellBack = asked !== d.tz;
+  return `
+    <div class="page-title">WHEN PEOPLE <span class="accent">PLAY</span></div>
+    <div class="page-sub">
+      ${fmtNum(d.total.runs)} finished runs by ${fmtNum(d.total.players)} players · ${esc(span)} ·
+      times in <b>${esc(d.tz)}</b>${fellBack ? ` <span class="muted">(${esc(asked)} is not a zone this server knows)</span>` : ""}
+    </div>
+    <div class="statbar">
+      <div class="segbar" role="group" aria-label="Window">
+        ${STAT_WINDOWS.map(
+          (w) =>
+            `<a class="seg ${w.days === state.days ? "on" : ""}" data-nav="${link({ days: w.days })}" href="${navHref(link({ days: w.days }))}">${w.label}</a>`
+        ).join("")}
+      </div>
+      <div class="segbar" role="group" aria-label="Time zone">
+        ${zones
+          .map((z) => {
+            const on = (state.tz || "") === z.tz;
+            return `<a class="seg ${on ? "on" : ""}" data-nav="${link({ tz: z.tz })}" href="${navHref(link({ tz: z.tz }))}">${esc(z.label)}</a>`;
+          })
+          .join("")}
+      </div>
+    </div>`;
+}
+
+// A stat tile whose value is a word or a time, not a number to be formatted.
+function statTile(value, label, sub = "", variant = "") {
+  return `<div class="tile ${variant}">
+    <div class="num stat-word">${esc(value)}</div>
+    <div class="lbl">${esc(label)}</div>
+    ${sub ? `<div class="tile-sub">${esc(sub)}</div>` : ""}
+  </div>`;
+}
+
+function regionLabel(d, key) {
+  const r = (d.regions || []).find((x) => x.key === key);
+  return r ? r.label : key;
+}
+
+function statsIndex(d) {
+  const m = new Map();
+  for (const c of d.cells || []) m.set(`${c.region}|${c.dow}|${c.hour}`, c);
+  return m;
+}
+const cellVal = (cells, region, dow, hour, metric) => {
+  const c = cells.get(`${region}|${dow}|${hour}`);
+  return c ? c[metric] : 0;
+};
+
+/* ---- hour-of-week heatmap ----------------------------------------------- *
+ * 7 rows x 24 cells, one sequential hue in six steps (the empty step included),
+ * with the scale legend beside it — magnitude is the whole message, so nothing
+ * here encodes identity. The current hour is ringed rather than recoloured, so
+ * the "now" marker can't be mistaken for a value. */
+function statsHeatmap(cells, { region, metric, tz, label }) {
+  const W = 660, padL = 34, padR = 8, padT = 6, padB = 20, CH = 21;
+  const cw = (W - padL - padR) / 24;
+  const H = padT + 7 * CH + padB;
+  const n = (v) => v.toFixed(1);
+  let max = 0;
+  for (let dw = 0; dw < 7; dw++) for (let h = 0; h < 24; h++) max = Math.max(max, cellVal(cells, region, dw, h, metric));
+  // 5 filled steps: the value's share of the busiest cell, so the darkest step
+  // is always reached and a quiet week doesn't render as a blank grid.
+  const step = (v) => (v <= 0 ? 0 : Math.min(5, 1 + Math.floor((v / max) * 4.999)));
+  const now = nowSlot(tz);
+  const unit = metric === "players" ? "players" : "runs";
+
+  let rects = "";
+  for (let dw = 0; dw < 7; dw++) {
+    for (let h = 0; h < 24; h++) {
+      const v = cellVal(cells, region, dw, h, metric);
+      const isNow = now && now.dow === dw && now.hour === h;
+      rects += `<rect class="hmc s${step(v)}${isNow ? " now" : ""}" x="${n(padL + h * cw + 1.5)}" y="${n(padT + dw * CH + 1.5)}"
+        width="${n(cw - 3)}" height="${CH - 3}" rx="2"><title>${esc(
+        `${DOW_LONG[dw]} ${hourLabel(h)}–${hourLabel((h + 1) % 24)} · ${fmtNum(v)} ${unit}${isNow ? " · happening now" : ""}`
+      )}</title></rect>`;
+    }
+  }
+  const dayLabels = DOW_SHORT.map(
+    (d, i) => `<text class="hmax" x="${padL - 8}" y="${padT + i * CH + CH / 2}" text-anchor="end" dominant-baseline="middle">${d}</text>`
+  ).join("");
+  const hourLabels = [0, 3, 6, 9, 12, 15, 18, 21]
+    .map(
+      (h) => `<text class="hmax" x="${n(padL + h * cw + cw / 2)}" y="${H - 6}" text-anchor="middle">${String(h).padStart(2, "0")}</text>`
+    )
+    .join("");
+
+  const swatches = [0, 1, 2, 3, 4, 5]
+    .map((s) => `<span class="hmkey s${s}"></span>`)
+    .join("");
+  return `
+    <div class="hmlegend">
+      <span class="muted">quiet</span>${swatches}<span class="muted">busy · up to ${fmtNum(max)} ${unit}/hour</span>
+      ${now ? `<span class="hmnow-key"><span class="hmkey now"></span>now</span>` : ""}
+    </div>
+    <div class="hmscroll">
+      <svg class="hmap" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(
+        `${unit} by hour of the week on ${label}, busiest hour ${fmtNum(max)} ${unit}`
+      )}">
+        ${dayLabels}${rects}${hourLabels}
+      </svg>
+    </div>`;
+}
+
+/* ---- hour-of-day / day-of-week columns ----------------------------------- *
+ * Stacked by region when the metric is runs and no region is selected (runs
+ * partition cleanly); a single series otherwise, because distinct players
+ * counted per region do not sum to the distinct players overall. */
+function statsBars(d, cells, { metric, region, kind }) {
+  const slots = kind === "hour" ? 24 : 7;
+  const stack = metric === "runs" && region === "ALL" && (d.regions || []).length > 1;
+  const series = stack ? d.regions.map((r) => ({ key: r.key, label: r.label })) : [{ key: region, label: null }];
+  // The API's own rollup for the axis being collapsed (-1), so a "players" bar
+  // is the distinct players in that hour/day rather than a sum of cells that
+  // counts a regular several times over.
+  const at = (key, i) => (kind === "hour" ? cellVal(cells, key, -1, i, metric) : cellVal(cells, key, i, -1, metric));
+  const totals = Array.from({ length: slots }, (_, i) => series.reduce((a, s) => a + at(s.key, i), 0));
+  const max = Math.max(1, ...totals);
+  const peakIdx = totals.indexOf(Math.max(...totals));
+
+  const W = 500, H = kind === "hour" ? 180 : 170, padL = 30, padR = 10, padT = 22, padB = 22;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const slotW = plotW / slots, barW = Math.max(3, slotW - (kind === "hour" ? 3 : 10));
+  const base = H - padB;
+  const n = (v) => v.toFixed(1);
+  const unit = metric === "players" ? "players" : "runs";
+
+  let bars = "";
+  for (let i = 0; i < slots; i++) {
+    const x = padL + i * slotW + (slotW - barW) / 2;
+    let y = base;
+    series.forEach((s) => {
+      const v = at(s.key, i);
+      if (!v) return;
+      const h = (v / max) * plotH;
+      // 2px of surface between stacked segments: adjacent fills never touch.
+      const drawn = Math.max(1, h - (stack ? 2 : 0));
+      y -= h;
+      bars += `<rect class="stbar r-${esc(s.key)}" x="${n(x)}" y="${n(y)}" width="${n(barW)}" height="${n(drawn)}" rx="2"
+        ><title>${esc(
+          `${kind === "hour" ? hourLabel(i) : DOW_LONG[i]}${s.label ? " · " + s.label : ""} · ${fmtNum(v)} ${unit}`
+        )}</title></rect>`;
+    });
+  }
+
+  // Direct labels: every bar when there are 7, only the peak when there are 24
+  // (a number on each of 24 columns is noise, and they collide).
+  const labels = Array.from({ length: slots }, (_, i) => {
+    if (kind === "hour" && i !== peakIdx) return "";
+    if (!totals[i]) return "";
+    const x = padL + i * slotW + slotW / 2;
+    const y = base - (totals[i] / max) * plotH - 5;
+    return `<text class="stval${i === peakIdx ? " peak" : ""}" x="${n(x)}" y="${n(y)}" text-anchor="middle">${fmtNum(totals[i])}</text>`;
+  }).join("");
+
+  const ticks =
+    kind === "hour"
+      ? [0, 6, 12, 18, 23].map(
+          (i) => `<text class="hmax" x="${n(padL + i * slotW + slotW / 2)}" y="${H - 6}" text-anchor="middle">${String(i).padStart(2, "0")}</text>`
+        )
+      : DOW_SHORT.map(
+          (dn, i) => `<text class="hmax" x="${n(padL + i * slotW + slotW / 2)}" y="${H - 6}" text-anchor="middle">${dn}</text>`
+        );
+
+  const legend = stack
+    ? `<div class="stlegend">${series
+        .map((s) => `<span class="stkey"><span class="sw r-${esc(s.key)}"></span>${esc(s.label)}</span>`)
+        .join("")}</div>`
+    : "";
+
+  return `${legend}
+    <svg class="stchart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(
+      `${unit} by ${kind === "hour" ? "hour of day" : "day of week"}, peak ${fmtNum(totals[peakIdx])}`
+    )}">
+      <line class="srgrid" x1="${padL}" y1="${padT}" x2="${W - padR}" y2="${padT}"/>
+      <text class="hmax" x="${padL - 6}" y="${padT}" text-anchor="end" dominant-baseline="middle">${fmtNum(max)}</text>
+      ${bars}${labels}
+      <line class="srdaxis" x1="${padL}" y1="${base}" x2="${W - padR}" y2="${base}"/>
+      ${ticks.join("")}
+    </svg>`;
+}
+
+/* ---- the region breakdown ------------------------------------------------ */
+function statsRegionPanel(d, cells, metric) {
+  const regions = d.regions || [];
+  if (!regions.length) return "";
+  const totalRuns = regions.reduce((a, r) => a + r.runs, 0);
+  const rows = regions
+    .map((r) => {
+      let peak = { dow: 0, hour: 0, v: -1 };
+      for (let dw = 0; dw < 7; dw++)
+        for (let h = 0; h < 24; h++) {
+          const v = cellVal(cells, r.key, dw, h, metric);
+          if (v > peak.v) peak = { dow: dw, hour: h, v };
+        }
+      const byDay = Array.from({ length: 7 }, (_, i) => cellVal(cells, r.key, i, -1, metric));
+      const topDay = byDay.indexOf(Math.max(...byDay));
+      const localPeak = r.localHours.indexOf(Math.max(...r.localHours));
+      const share = totalRuns ? Math.round((r.runs / totalRuns) * 100) : 0;
+      return `<tr>
+        <td><span class="rdot r-${esc(r.key)}"></span>${esc(r.label)}
+          <div class="muted rsrv">${r.servers.length ? esc(r.servers.join(" · ")) : "no enrolled server"}</div></td>
+        <td class="num">${fmtNum(r.runs)}</td>
+        <td class="num">${share}%</td>
+        <td class="num">${fmtNum(r.players)}</td>
+        <td>${esc(DOW_LONG[topDay])}</td>
+        <td class="mono">${esc(slotLabel(peak.dow, peak.hour))}</td>
+        <td class="mono">${esc(hourLabel(localPeak))} <span class="muted">${esc(tzShort(r.tz))}</span></td>
+      </tr>`;
+    })
+    .join("");
+  return `
+    <div class="page-title" style="font-size:20px">BY <span class="accent">REGION</span></div>
+    <div class="panel statpanel">
+      <div class="table-wrap"><div class="tscroll">
+        <table class="data">
+          <thead><tr>
+            <th>Region</th><th class="num">Runs</th><th class="num">Share</th><th class="num">Players</th>
+            <th>Busiest day</th><th>Peak hour <span class="muted">(${esc(tzShort(d.tz))})</span></th>
+            <th>Peak hour <span class="muted">(region local)</span></th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div></div>
+      <div class="statcap">
+        A run counts towards the region of the server it was set on — derived from the server's address
+        (<span class="mono">eu.*</span> / <span class="mono">us.*</span>), not from where the player is.
+        Player counts are per region and are not added up: someone who races on both sides is one player in each.
+        ${
+          metric === "players"
+            ? "Busiest day and peak hour follow the metric you picked above (players)."
+            : "Busiest day and peak hour follow the metric you picked above (runs)."
+        }
+      </div>
+    </div>`;
+}
+
 /* ------------------------- achievements directory ------------------------ */
 // Every active achievement with rarity + recent earners. Hidden achievements
 // show as a masked card until somebody earns them.
@@ -2828,6 +3266,7 @@ async function router() {
     else if (path === "/players") await viewPlayers(params);
     else if (path === "/compare") await viewCompare(params);
     else if (path === "/achievements") await viewAchievements();
+    else if (path === "/stats") await viewStats(params);
     // Exact match first: "/tournaments" is the calendar, "/tournaments/<slug>"
     // one tournament. Both share a stem so setActiveNav's startsWith highlights
     // the header link on either.

@@ -10,7 +10,15 @@ import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { openDatabase, sha256, simplifyName, hashPassword, verifyPassword, FLAG_REASONS } from "./db.js";
+import {
+  openDatabase,
+  sha256,
+  simplifyName,
+  hashPassword,
+  verifyPassword,
+  FLAG_REASONS,
+  PLAYTIME_WINDOWS,
+} from "./db.js";
 import { createLivePoller, parseAddress } from "./live.js";
 import { createStreamRegistry } from "./streams.js";
 import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js";
@@ -244,6 +252,19 @@ function asInt(v) {
   return Number.isNaN(n) ? null : n;
 }
 
+// Every IANA zone this runtime knows, as the allow-list for ?tz= on the stats
+// page (the browser sends its own Intl zone name). Bounding it matters twice:
+// an unknown name makes Postgres raise inside AT TIME ZONE, and the zone is
+// part of a response cache key, so free-text would let a client mint unbounded
+// Redis entries. ~600 names, built once at boot.
+const IANA_ZONES = new Set((() => {
+  try {
+    return Intl.supportedValuesOf("timeZone");
+  } catch {
+    return ["UTC"]; // older runtime: only UTC is offered, everything else falls back to it
+  }
+})());
+
 // /api/maps/:id leaderboard page size. The map page requests limit=10000
 // ("everyone") and limit=1 (just map meta), so we can't hard-cap it low without
 // truncating real leaderboards. Instead the raw limit is snapped to a small set
@@ -291,6 +312,32 @@ api.get("/servers/:id", wrap(async (req, res) => {
     stream: streams.for(id),
   });
 }));
+
+// When the servers are busy: the finish log bucketed into a 7x24 hour-of-week
+// grid, split by server region (see db.playTimes). ?days picks the window and
+// ?tz the zone the buckets are cut in — both are snapped to a fixed set BEFORE
+// the cache key is built, so a client can't mint unbounded Redis keys by
+// walking either parameter. A 5-minute TTL is generous for a page whose
+// smallest bucket is an hour.
+const playTimesKey = (req) => {
+  const days = asInt(req.query.days);
+  const tz = req.query.tz;
+  return (
+    "/stats/playtimes?days=" +
+    (PLAYTIME_WINDOWS.includes(days) ? days : 90) +
+    "&tz=" +
+    (typeof tz === "string" && IANA_ZONES.has(tz) ? tz : "UTC")
+  );
+};
+api.get(
+  "/stats/playtimes",
+  cache(300, { edge: true, key: playTimesKey }),
+  wrap(async (req, res) => {
+    const days = asInt(req.query.days);
+    const tz = typeof req.query.tz === "string" && IANA_ZONES.has(req.query.tz) ? req.query.tz : "UTC";
+    res.json(await race.playTimes({ days: PLAYTIME_WINDOWS.includes(days) ? days : 90, tz }));
+  })
+);
 
 api.get("/maps", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.maps(req.query))));
 

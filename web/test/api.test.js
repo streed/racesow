@@ -843,3 +843,71 @@ test("game map-load: a trusted server quarantines a bad map into the blocked-map
   const f2 = await feed();
   assert.equal(f2.filter((n) => n === "mlmap1").length, 1, "feed must not duplicate");
 });
+
+test("/api/stats/playtimes buckets finishes by hour-of-week per region, in the asked-for zone", async () => {
+  // Two enrolled servers whose region is derived from the deploy naming
+  // convention (address first), plus a run with no server at all.
+  await dbQuery(`INSERT INTO server (name, status, created_at, address) VALUES
+    ('Racesow - Test EU', 'trusted', 1, 'eu.frankfurt.racesow.org:44400'),
+    ('Racesow - Test US', 'trusted', 1, 'us.east.racesow.org:44400')`);
+  const ids = await dbQuery(`SELECT id, address FROM server WHERE name LIKE 'Racesow - Test %' ORDER BY id`);
+  const euId = ids.rows.find((r) => r.address.startsWith("eu.")).id;
+  const usId = ids.rows.find((r) => r.address.startsWith("us.")).id;
+  const seed = await dbQuery(`SELECT (SELECT id FROM player ORDER BY id LIMIT 1) p,
+                                     (SELECT id FROM map ORDER BY id LIMIT 1) m`);
+  const { p, m } = seed.rows[0];
+
+  // Tuesday 2026-08-11, 23:30 UTC — which is Wednesday 01:30 in Berlin (CEST,
+  // UTC+2). The whole point of bucketing in Postgres rather than rotating a UTC
+  // grid client-side is that this run must move BOTH its hour and its weekday.
+  const ts = Math.floor(Date.UTC(2026, 7, 11, 23, 30, 0) / 1000);
+  const cell = (d, region, dow, hour, metric = "runs") =>
+    (d.cells.find((c) => c.region === region && c.dow === dow && c.hour === hour) || {})[metric] || 0;
+
+  // Measured as a delta: the finishes the earlier tests ingested land at "now",
+  // which could be any cell, and this must not care.
+  const before = await get("/stats/playtimes?days=90&tz=UTC");
+  await dbQuery(`INSERT INTO finish (player_id, map_id, version_id, time, server_id, created_at) VALUES
+    (${p}, ${m}, 1, 12345, ${euId}, ${ts}),
+    (${p}, ${m}, 1, 12346, ${euId}, ${ts}),
+    (${p}, ${m}, 1, 12347, ${euId}, ${ts}),
+    (${p}, ${m}, 1, 12348, ${usId}, ${ts}),
+    (${p}, ${m}, 1, 12349, ${usId}, ${ts}),
+    (${p}, ${m}, 1, 12350, NULL,   ${ts})`);
+
+  const utc = await get("/stats/playtimes?days=90&tz=UTC");
+  assert.equal(utc.tz, "UTC");
+  // Tuesday is dow 1 (the grid is Monday-first, not Postgres's Sunday-first).
+  assert.equal(cell(utc, "EU", 1, 23) - cell(before, "EU", 1, 23), 3);
+  assert.equal(cell(utc, "US", 1, 23) - cell(before, "US", 1, 23), 2);
+  assert.equal(cell(utc, "Unknown", 1, 23) - cell(before, "Unknown", 1, 23), 1, "a run with no server_id still counts");
+  assert.equal(cell(utc, "ALL", 1, 23) - cell(before, "ALL", 1, 23), 6, "the all-regions row is counted, not summed");
+  assert.equal(utc.total.runs - before.total.runs, 6);
+
+  const berlin = await get("/stats/playtimes?days=90&tz=Europe/Berlin");
+  assert.equal(berlin.tz, "Europe/Berlin");
+  assert.equal(cell(berlin, "ALL", 2, 1) - cell(before, "ALL", 2, 1), 6, "23:30 UTC on Tue is 01:30 Wed in CEST");
+  assert.equal(cell(berlin, "ALL", 1, 23), 0, "and it has left the UTC cell entirely");
+
+  // Regions come back in a fixed order with their servers named, so the page can
+  // say what "Europe" IS. Distinct players are per region and never summed.
+  const eu = berlin.regions.find((r) => r.key === "EU");
+  const us = berlin.regions.find((r) => r.key === "US");
+  assert.ok(berlin.regions.findIndex((r) => r.key === "EU") < berlin.regions.findIndex((r) => r.key === "US"));
+  assert.ok(eu.servers.includes("Racesow - Test EU"), "EU names its own boxes");
+  assert.ok(us.servers.includes("Racesow - Test US"));
+  assert.equal(eu.localHours.length, 24, "each region also reports its peak in its OWN zone");
+  assert.equal(us.tz, "America/New_York");
+
+  // Both parameters are snapped to an allow-list — this is what keeps the
+  // response cache key bounded, so it must not be a passthrough.
+  assert.equal((await get("/stats/playtimes?days=7")).days, 90, "an unlisted window falls back to 90 days");
+  assert.equal((await get("/stats/playtimes?days=0")).days, 0, "all-time is a real choice, not a falsy one");
+  assert.equal((await get("/stats/playtimes?tz=Mars/Olympus")).tz, "UTC", "an unknown zone falls back, it does not 500");
+  assert.equal((await get("/stats/playtimes?tz=" + encodeURIComponent("'; DROP TABLE finish; --"))).tz, "UTC");
+  assert.ok((await get("/stats/playtimes")).total.runs > 0, "the finish table survived that");
+
+  const shell = await fetch(`${base}/stats`, { redirect: "manual" });
+  assert.equal(shell.status, 200);
+  assert.match(await shell.text(), /<!doctype html>/i, "/stats is a client route served by the SPA shell");
+});

@@ -649,6 +649,29 @@ function toOffset(v) {
 // number (race ids are in the millions), so normalise at the edge.
 const num = (v) => (v == null ? null : Number(v));
 
+// ---- Server regions (see playTimes) -------------------------------------
+// Fixed order: it is the categorical colour order on the stats page, so a
+// region that goes quiet must not repaint the ones that are left. `tz` is the
+// zone that region's players are mostly in, used to report each region's peak
+// hour in its own local time.
+const REGIONS = [
+  { key: "EU", label: "Europe", tz: "Europe/Berlin" },
+  { key: "US", label: "North America", tz: "America/New_York" },
+  { key: "Unknown", label: "Unknown", tz: "UTC" },
+];
+// Derives the region of the server a run was set on. Address first (the deploy
+// convention is eu.frankfurt.racesow.org / us.east.racesow.org, one hostname
+// per box across both game ports), name second for a server enrolled before its
+// address was recorded, and Unknown for a run with no server_id at all — the
+// legacy shared-token rows and one-off demo imports.
+const REGION_SQL = `CASE
+  WHEN sv.address ILIKE 'eu.%' OR sv.name ILIKE '%EU %' OR sv.name ILIKE '%EU'  THEN 'EU'
+  WHEN sv.address ILIKE 'us.%' OR sv.name ILIKE '%US %' OR sv.name ILIKE '%US'  THEN 'US'
+  ELSE 'Unknown' END`;
+// Selectable windows, in days; 0 is all time. Also the API's allow-list, which
+// keeps the response cache key bounded.
+export const PLAYTIME_WINDOWS = [30, 90, 365, 0];
+
 class RaceDB {
   constructor(pool, caps) {
     this.pool = pool;
@@ -656,6 +679,8 @@ class RaceDB {
     this.versions = {};
     // Memoized perfect-run per map (recomputed when an ingest touches the map).
     this._perfectRunCache = new Map();
+    // IANA zone name -> does this Postgres know it (see timeZoneOk).
+    this._tzOk = new Map();
     // Offensive-name censoring config: word-list matcher (shared by player AND
     // map names) + per-player and per-map override maps, loaded from
     // censor_term/player_censor/map_censor and refreshed on a timer + admin edit.
@@ -2594,6 +2619,159 @@ class RaceDB {
         count,
       })),
     };
+  }
+
+  // ---- When people play: activity by hour-of-week, split by server region ----
+  //
+  // The finish log is the only activity signal the schema keeps: nothing samples
+  // concurrent population (the live poller is in-memory only, and run_tally
+  // holds counters, not per-attempt events). So "how busy is Tuesday 20:00" is
+  // "how many runs were COMPLETED in that hour", which undercounts anyone who
+  // was on the server without finishing a run. The page says so.
+  //
+  // Buckets are cut in a caller-chosen IANA zone via AT TIME ZONE, which applies
+  // each row's own UTC offset — DST included — instead of shifting an already
+  // aggregated UTC grid by a fixed number of hours (that smears an hour across
+  // the spring/autumn boundary and rolls the wrong runs into the next weekday).
+  //
+  // Region is derived, not stored: there is no region column anywhere. Servers
+  // are named/addressed by convention (eu.frankfurt…, us.east…, "Racesow - EU
+  // Central"), so the address prefix decides it and the name is the fallback for
+  // a server enrolled before its address was set. A new region only needs a
+  // branch here and a label in REGIONS.
+  async playTimes({ days = 90, tz = "UTC" } = {}) {
+    const winDays = PLAYTIME_WINDOWS.includes(days) ? days : 90;
+    const zone = (await this.timeZoneOk(tz)) ? tz : "UTC";
+    // days = 0 means "all time": every finish ever, including the backdated ones
+    // an imported demo can put years before the finish log itself existed.
+    const since = winDays ? Math.floor(Date.now() / 1000) - winDays * 86400 : 0;
+
+    // One pass, eight grouping sets: the hour-of-week grid, its day-of-week and
+    // hour-of-day rollups, and the totals — each both per-region and across all
+    // regions. Every rollup is COUNTED rather than summed from the grid because
+    // distinct PLAYERS do not add up in either direction: someone who raced on
+    // both boxes is one player, not two, and someone who raced at 18:00 and
+    // again at 21:00 is one player on Tuesday, not two. Runs happen to be safe
+    // to sum, but having one shape for both metrics keeps the page from being
+    // quietly right for one and wrong for the other.
+    //
+    // A rolled-up axis comes back as -1 ('ALL' for region), so a single sparse
+    // list carries the grid and every total the page needs.
+    const grid = await this.all(
+      `WITH src AS (
+         SELECT ${REGION_SQL} AS region,
+                pl.canonical_id AS player_id,
+                to_timestamp(f.created_at) AT TIME ZONE $2::text AS ts
+           FROM finish f
+           JOIN player pl ON pl.id = f.player_id
+           LEFT JOIN server sv ON sv.id = f.server_id
+          WHERE f.created_at >= $1
+       ), runs AS (
+         SELECT region, player_id,
+                (EXTRACT(ISODOW FROM ts)::int - 1) AS dow,
+                EXTRACT(HOUR FROM ts)::int         AS hour
+           FROM src
+       )
+       SELECT COALESCE(region, 'ALL')          AS region,
+              COALESCE(dow, -1)                AS dow,
+              COALESCE(hour, -1)               AS hour,
+              COUNT(*)::int                    AS runs,
+              COUNT(DISTINCT player_id)::int   AS players
+         FROM runs
+        GROUP BY GROUPING SETS (
+          (region, dow, hour), (dow, hour),
+          (region, dow),       (dow),
+          (region, hour),      (hour),
+          (region),            ()
+        )`,
+      [since, zone]
+    );
+
+    // Each region's own peak, in ITS OWN local time — the number that actually
+    // answers "when is the US server busy". Reading it off the grid above would
+    // report it in whatever zone the viewer happens to be in.
+    const local = await this.all(
+      `WITH runs AS (
+         SELECT ${REGION_SQL} AS region, f.created_at
+           FROM finish f
+           LEFT JOIN server sv ON sv.id = f.server_id
+          WHERE f.created_at >= $1
+       )
+       SELECT region,
+              EXTRACT(HOUR FROM to_timestamp(created_at) AT TIME ZONE
+                CASE region ${REGIONS.map((r) => `WHEN '${r.key}' THEN '${r.tz}'`).join(" ")} ELSE 'UTC' END
+              )::int AS hour,
+              COUNT(*)::int AS runs
+         FROM runs
+        GROUP BY 1, 2`,
+      [since]
+    );
+
+    // Only the window's edges — every count comes off the grouping sets above.
+    const span = await this.one(
+      `SELECT MIN(created_at)::bigint lo, MAX(created_at)::bigint hi
+         FROM finish WHERE created_at >= $1`,
+      [since]
+    );
+
+    // The (region) grouping set, plus its () rollup as 'ALL'.
+    const byRegion = new Map(grid.filter((r) => r.dow === -1 && r.hour === -1).map((r) => [r.region, r]));
+    const overall = byRegion.get("ALL") || { runs: 0, players: 0 };
+
+    // Named so the page can say which boxes a region IS, rather than leaving
+    // "Europe" to be taken on faith.
+    const hosts = new Map();
+    for (const s of await this.all(`SELECT ${REGION_SQL} AS region, sv.name FROM server sv ORDER BY sv.id`)) {
+      if (!hosts.has(s.region)) hosts.set(s.region, []);
+      hosts.get(s.region).push(s.name);
+    }
+
+    const localHours = new Map(); // region -> 24 counts in that region's own zone
+    for (const r of local) {
+      if (!localHours.has(r.region)) localHours.set(r.region, new Array(24).fill(0));
+      localHours.get(r.region)[r.hour] = r.runs;
+    }
+
+    return {
+      tz: zone,
+      tzRequested: tz,
+      days: winDays,
+      since: since || null,
+      first: num(span && span.lo),
+      last: num(span && span.hi),
+      total: { runs: overall.runs, players: overall.players },
+      // Only regions that actually raced, in the fixed REGIONS order so a hue
+      // never moves between renders (an empty region must not shift the others).
+      regions: REGIONS.filter((r) => byRegion.has(r.key)).map((r) => ({
+        key: r.key,
+        label: r.label,
+        tz: r.tz,
+        runs: byRegion.get(r.key).runs,
+        players: byRegion.get(r.key).players,
+        servers: hosts.get(r.key) || [],
+        localHours: localHours.get(r.key) || new Array(24).fill(0),
+      })),
+      // Sparse hour-of-week cube plus its rollups (dow/hour = -1), so the client
+      // can re-slice it — region filter, runs vs players, day and hour
+      // breakdowns — with no further requests and no unsound summing.
+      cells: grid.map((r) => ({ region: r.region, dow: r.dow, hour: r.hour, runs: r.runs, players: r.players })),
+    };
+  }
+
+  // True when Postgres knows this IANA zone name. AT TIME ZONE with an unknown
+  // zone raises 22023 mid-query, so it is checked once (and memoised) instead of
+  // letting a typo'd ?tz= 500 the page.
+  async timeZoneOk(name) {
+    if (!name || typeof name !== "string" || name.length > 64) return false;
+    if (this._tzOk.has(name)) return this._tzOk.get(name);
+    let ok = false;
+    try {
+      ok = !!(await this.one("SELECT 1 ok FROM pg_timezone_names WHERE name = $1", [name]));
+    } catch {
+      ok = false;
+    }
+    this._tzOk.set(name, ok);
+    return ok;
   }
 
   // The per-map contributions behind a player's Skill Rating: the SR_TOP_K
