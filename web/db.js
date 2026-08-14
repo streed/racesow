@@ -2758,6 +2758,48 @@ class RaceDB {
     };
   }
 
+  // ---- Sitemap: every content page worth crawling ------------------------
+  //
+  // Only pages a crawler can actually use: a map/player page server-renders its
+  // own OG tags (see server.js) and reads as a real document, so it belongs in
+  // the index. Deliberately absent: /compare (needs two ids — no canonical URL),
+  // /replay/* (a 3D viewer, nothing to index), /server/* (ops), and blocked maps
+  // (pulled from play, so their leaderboard is a dead end).
+  //
+  // `lastmod` is the last time the page's CONTENT could have changed — the map's
+  // most recent run, the player's most recent activity — not when the row was
+  // written. NULL where nothing has ever been played there; the caller omits the
+  // element rather than inventing a date, which is what the spec asks for.
+  // One shard at a time — a request for the handful of tournament rows must not
+  // also drag ~14k map and player rows out of the DB.
+  async sitemapUrls(shard) {
+    if (shard === "maps")
+      return (
+        await this.all(
+          `SELECT mi.map_id id, mi.last_played lastmod
+             FROM map_index mi
+            WHERE NOT EXISTS (SELECT 1 FROM map_block b WHERE b.map_id = mi.map_id)
+            ORDER BY mi.map_id`
+        )
+      ).map((r) => ({ id: num(r.id), lastmod: num(r.lastmod) }));
+
+    // standings is the ranked board: a canonical player with at least one PB.
+    // Players outside it have nothing on their profile worth indexing.
+    if (shard === "players")
+      return (
+        await this.all(`SELECT player_id id, last_active lastmod FROM standings ORDER BY player_id`)
+      ).map((r) => ({ id: num(r.id), lastmod: num(r.lastmod) }));
+
+    // Draft tournaments are admin-only and 404 publicly; cancelled ones keep
+    // their page (the calendar still links to them), so they stay crawlable.
+    return (
+      await this.all(
+        `SELECT slug, GREATEST(updated_at, finalized_at) lastmod
+           FROM tournament WHERE status <> 'draft' ORDER BY starts_at DESC`
+      )
+    ).map((r) => ({ slug: r.slug, lastmod: num(r.lastmod) }));
+  }
+
   // True when Postgres knows this IANA zone name. AT TIME ZONE with an unknown
   // zone raises 22023 mid-query, so it is checked once (and memoised) instead of
   // letting a typo'd ?tz= 500 the page.

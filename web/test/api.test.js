@@ -911,3 +911,58 @@ test("/api/stats/playtimes buckets finishes by hour-of-week per region, in the a
   assert.equal(shell.status, 200);
   assert.match(await shell.text(), /<!doctype html>/i, "/stats is a client route served by the SPA shell");
 });
+
+test("sitemap: an index plus per-shard urlsets covering pages, maps and players", async () => {
+  const get = async (p) => {
+    const r = await fetch(`${base}${p}`);
+    return { status: r.status, ct: r.headers.get("content-type"), body: await r.text() };
+  };
+
+  const idx = await get("/sitemap.xml");
+  assert.equal(idx.status, 200);
+  assert.match(idx.ct, /application\/xml/);
+  assert.match(idx.body, /^<\?xml version="1\.0" encoding="UTF-8"\?>/);
+  assert.match(idx.body, /<sitemapindex xmlns="http:\/\/www\.sitemaps\.org\/schemas\/sitemap\/0\.9">/);
+  for (const shard of ["pages", "maps", "players"])
+    assert.match(idx.body, new RegExp(`<loc>http://[^<]+/sitemap-${shard}\\.xml</loc>`), `index lists ${shard}`);
+
+  const pages = await get("/sitemap-pages.xml");
+  assert.equal(pages.status, 200);
+  // The new stats page has to be in here — that is the whole point of listing
+  // the client routes explicitly rather than hoping a crawler finds them.
+  for (const p of ["/", "/maps", "/players", "/stats", "/demo", "/achievements", "/tournaments", "/about"])
+    assert.match(pages.body, new RegExp(`<loc>http://[^<]+${p === "/" ? "/" : p}</loc>`), `${p} is listed`);
+  assert.equal(/<loc>/.test(pages.body) && !/<loc><\/loc>/.test(pages.body), true, "no empty locs");
+  // Routes with no canonical URL must NOT be advertised.
+  assert.ok(!/\/compare</.test(pages.body), "/compare needs params — not indexable");
+  assert.ok(!/\/replay\//.test(pages.body), "/replay is a viewer, not a document");
+
+  const maps = await get("/sitemap-maps.xml");
+  const mapIds = [...maps.body.matchAll(/<loc>http:\/\/[^<]+\/map\/(\d+)<\/loc>/g)].map((m) => +m[1]);
+  assert.ok(mapIds.length > 0, "maps shard is not empty");
+  const known = await dbQuery(`SELECT id FROM map ORDER BY id LIMIT 1`);
+  assert.ok(mapIds.includes(Number(known.rows[0].id)), "a real map is listed");
+
+  // A blocked map is pulled from play, so it must drop out of the sitemap.
+  await dbQuery(`INSERT INTO map (name) VALUES ('sitemap-blocked-map')`);
+  const blocked = Number((await dbQuery(`SELECT id FROM map WHERE name='sitemap-blocked-map'`)).rows[0].id);
+  await dbQuery(`INSERT INTO map_block (map_id, reason, blocked_at, blocked_by)
+                 VALUES (${blocked}, 'test', 1, 'test')`);
+  // The shard is cached for 6h, so assert against a freshly-built body: no Redis
+  // in tests means the handler re-runs, but keep the assertion honest either way.
+  const after = await get("/sitemap-maps.xml");
+  assert.ok(!new RegExp(`/map/${blocked}<`).test(after.body), "a blocked map is not advertised");
+
+  // lastmod, where present, is a W3C date — an invalid one invalidates the file.
+  for (const m of [...after.body.matchAll(/<lastmod>([^<]+)<\/lastmod>/g)].slice(0, 50))
+    assert.match(m[1], /^\d{4}-\d{2}-\d{2}$/, `bad lastmod ${m[1]}`);
+
+  const players = await get("/sitemap-players.xml");
+  assert.equal(players.status, 200);
+  assert.match(players.body, /<loc>http:\/\/[^<]+\/player\/\d+<\/loc>/);
+
+  const robots = await get("/robots.txt");
+  assert.equal(robots.status, 200);
+  assert.match(robots.body, /^User-agent: \*$/m);
+  assert.match(robots.body, /^Sitemap: http:\/\/[^\s]+\/sitemap\.xml$/m, "robots points at the index");
+});

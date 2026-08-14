@@ -4391,6 +4391,107 @@ app.get("/backup/racesow-db-latest.zip", backupLimiter, (_req, res) => {
   });
 });
 
+/* ------------------------------ sitemap ---------------------------------- *
+ * A sitemap INDEX plus three shards rather than one flat file. The protocol
+ * caps a single sitemap at 50,000 URLs, and the player shard alone already
+ * carries ~9k and grows with every new racer — sharding now costs a few lines
+ * and moves that cliff out of reach. Each shard is cached for 6h at the edge:
+ * these are three DB scans, and a crawler that re-fetches them hourly must not
+ * turn into load.
+ *
+ * The SPA fallback below only skips paths containing a dot, which is why these
+ * .xml routes must be (and are) declared BEFORE it — but they'd be shadowed by
+ * express.static too, so keep them here, above both. */
+const SITEMAP_SHARDS = ["pages", "maps", "players"];
+// Static client routes. /compare and /replay/* are omitted (no canonical URL
+// without params); /live is here but ranked low — it is a real page, though its
+// content is whatever is happening this second.
+const SITEMAP_PAGES = [
+  ["/", "1.0"],
+  ["/maps", "0.9"],
+  ["/players", "0.9"],
+  ["/stats", "0.8"],
+  ["/tournaments", "0.7"],
+  ["/demo", "0.7"],
+  ["/achievements", "0.7"],
+  ["/live", "0.5"],
+  ["/about", "0.4"],
+  ["/colors", "0.4"],
+];
+
+// Epoch seconds -> the W3C date the sitemap spec wants. Null/0 (never played,
+// never active) yields null so the caller can drop <lastmod> entirely: an
+// invented date is worse than none, since a crawler uses it to decide whether
+// re-fetching is worth it.
+const sitemapDate = (ts) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : null);
+
+const sitemapUrl = ({ loc, lastmod, priority }) =>
+  `<url><loc>${escAttr(loc)}</loc>` +
+  (lastmod ? `<lastmod>${lastmod}</lastmod>` : "") +
+  (priority ? `<priority>${priority}</priority>` : "") +
+  `</url>`;
+
+const sitemapDoc = (body) =>
+  `<?xml version="1.0" encoding="UTF-8"?>\n` +
+  `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${body}</urlset>\n`;
+
+const sendXml = (res, xml) => {
+  res.set("Content-Type", "application/xml; charset=utf-8");
+  res.send(xml);
+};
+
+app.get("/sitemap.xml", cache(21600, { edge: true }), wrap(async (req, res) => {
+  const origin = siteOrigin(req);
+  const today = new Date().toISOString().slice(0, 10);
+  sendXml(
+    res,
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
+      SITEMAP_SHARDS.map(
+        (s) => `<sitemap><loc>${escAttr(`${origin}/sitemap-${s}.xml`)}</loc><lastmod>${today}</lastmod></sitemap>`
+      ).join("") +
+      `</sitemapindex>\n`
+  );
+}));
+
+// One handler per shard, registered under its literal path: an Express param
+// pattern carrying a ".xml" suffix is exactly the kind of route that silently
+// stops matching, and there are only three of them.
+const sitemapShard = (shard) =>
+  wrap(async (req, res) => {
+    const origin = siteOrigin(req);
+    const rows = await race.sitemapUrls(shard);
+    let urls;
+    if (shard === "pages") {
+      urls = [
+        ...SITEMAP_PAGES.map(([p, priority]) => ({ loc: origin + p, priority })),
+        // Tournament pages ride with the static set: there are a handful, and
+        // they are the same kind of page — an editorial destination, not a row.
+        ...rows.map((t) => ({
+          loc: `${origin}/tournaments/${encodeURIComponent(t.slug)}`,
+          lastmod: sitemapDate(t.lastmod),
+          priority: "0.6",
+        })),
+      ];
+    } else {
+      const path = shard === "maps" ? "map" : "player";
+      urls = rows.map((r) => ({ loc: `${origin}/${path}/${r.id}`, lastmod: sitemapDate(r.lastmod) }));
+    }
+    sendXml(res, sitemapDoc(urls.map(sitemapUrl).join("")));
+  });
+for (const shard of SITEMAP_SHARDS) {
+  app.get(`/sitemap-${shard}.xml`, cache(21600, { edge: true }), sitemapShard(shard));
+}
+
+// Points crawlers at the sitemap. Cloudflare serves its own managed robots.txt
+// (the AI content-signal block) in front of this and appends it to whatever the
+// origin returns, so this file deliberately carries ONLY the sitemap directive
+// and a blanket allow — the crawler policy stays Cloudflare's to own, and is not
+// duplicated here where it would silently drift.
+app.get("/robots.txt", (req, res) => {
+  res.type("text/plain").send(`User-agent: *\nAllow: /\n\nSitemap: ${siteOrigin(req)}/sitemap.xml\n`);
+});
+
 app.get("/", (req, res) => sendShell(res, defaultShell(req)));
 
 // Static frontend. The 3D replay model/vendor assets are large and stable, so
