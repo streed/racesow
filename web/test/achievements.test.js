@@ -332,6 +332,105 @@ test("distance/strafes tallies + speed snapshots flow through ingest, profile, a
   assert.equal(sd.detail.value, 2100);
 });
 
+test("map-category rules count a player's PB catalogue per map class", async (t) => {
+  const race = await freshDb(t);
+  // Three map classes as the .bsp scanner records them. map_weapon is keyed by
+  // the LOWERCASED map name, which is what the rule joins on.
+  await ingest(race, "purestrafe", [finish("Cat", 30000)]);
+  await ingest(race, "iceworld", [finish("Cat", 31000)]);
+  await ingest(race, "rocketpit", [finish("Cat", 32000)]);
+  await ingest(race, "unscanned", [finish("Cat", 33000)]);
+  await race.pool.query(
+    `INSERT INTO map_weapon (name, weapons, is_strafe, slick_frac, slick_brushes) VALUES
+       ('purestrafe', '{}',        TRUE,  0.0,  0),
+       ('iceworld',   '{}',        TRUE,  0.40, 90),
+       ('rocketpit',  '{rl,pg}',   FALSE, 0.0,  0)`
+  );
+  // The rule reads `best` (the PB catalogue), which is a rebuilt aggregate.
+  await race.refreshAggregates();
+
+  const mk = (title, category, count) =>
+    makeAch(race, { title, kind: "map_category_finished", params: { category, count: String(count) }, window: "lifetime" });
+  await mk("Strafer", "strafe", 2); // purestrafe + iceworld (slick maps with no guns are still strafe maps)
+  await mk("Icer", "slick", 1); // iceworld only
+  await mk("Gunner", "weapon", 1); // rocketpit only
+  await mk("Rocketeer", "w:rl", 1); // rocketpit carries an rl
+  await mk("Laserist", "w:lg", 1); // nothing carries an lg
+  await mk("Overreach", "slick", 2); // only one slick map exists
+  assert.equal(await race.evaluateAchievements(null), 4);
+  const won = (await race.all(
+    `SELECT a.slug FROM player_achievement pa JOIN achievement a ON a.id = pa.achievement_id ORDER BY a.slug`
+  )).map((r) => r.slug);
+  assert.deepEqual(won, ["gunner", "icer", "rocketeer", "strafer"]);
+
+  // The unscanned map counts for no category, but still counts as a plain map.
+  await makeAch(race, { title: "Anymap", kind: "distinct_maps_finished", params: { count: "4" }, window: "lifetime" });
+  assert.equal(await race.evaluateAchievements(null), 1);
+
+  // Progress reports the raw catalogue size against the target, threshold off.
+  const cat = await race.one("SELECT id FROM player WHERE simplified = 'Cat'");
+  const { progress } = await race.playerAchievements(Number(cat.id));
+  const over = progress.find((p) => p.slug === "overreach");
+  assert.equal(over.target, 2);
+  assert.equal(over.value, 1);
+});
+
+test("global rank, launch speed and tries-to-PB kinds award off their own columns", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({
+    version: VER,
+    map: "launch",
+    source: "racelog",
+    records: [
+      // Ana finishes on her very first attempt, leaving the line hot.
+      { name: "Ana", login: "", time: 20000, checkpoints: [], start_speed: 950, max_speed: 2400 },
+      // Bo takes 40 tries and a standing start.
+      { name: "Bo", login: "", time: 25000, checkpoints: [], attempts: 40, start_speed: 320 },
+    ],
+  });
+  await race.refreshAggregates();
+
+  await makeAch(race, { title: "Flying Start", kind: "start_speed_run", params: { minUps: "900" }, window: "lifetime" });
+  await makeAch(race, { title: "First Try", kind: "pb_attempts", params: { maxAttempts: "1" }, window: "lifetime" });
+  await makeAch(race, { title: "Ranked", kind: "global_rank", params: { maxRank: "5" }, window: "lifetime" });
+  // Both players sit inside the top 5 of a two-player board; only Ana clears
+  // the speed and first-try gates.
+  assert.equal(await race.evaluateAchievements(null), 4);
+
+  const rows = await race.all(
+    `SELECT a.slug, p.name, pa.finish_id, pa.detail FROM player_achievement pa
+       JOIN achievement a ON a.id = pa.achievement_id
+       JOIN player p ON p.id = pa.player_id ORDER BY a.slug, p.name`
+  );
+  const bySlug = (s) => rows.filter((r) => r.slug === s);
+  assert.deepEqual(bySlug("flying-start").map((r) => r.name), ["Ana"]);
+  assert.equal(bySlug("flying-start")[0].detail.value, 950);
+  assert.ok(bySlug("flying-start")[0].finish_id != null, "launch-speed award records its finish");
+  assert.deepEqual(bySlug("first-try").map((r) => r.name), ["Ana"]);
+  assert.equal(bySlug("first-try")[0].detail.value, 1);
+  assert.deepEqual(bySlug("ranked").map((r) => r.name), ["Ana", "Bo"]);
+});
+
+test("new rule kinds validate their params like the rest of the catalogue", () => {
+  // The category select only accepts catalogue keys — never a raw string.
+  assert.ok(validateDefinition({ title: "x", kind: "map_category_finished", params: { category: "slick; DROP TABLE", count: "5" } }).error);
+  assert.ok(validateDefinition({ title: "x", kind: "map_category_finished", params: { category: "slick", count: "0" } }).error);
+  const ok = validateDefinition({
+    title: "Ice Breaker",
+    kind: "map_category_finished",
+    params: { category: "w:rl", count: "50" },
+    window: "lifetime",
+  });
+  assert.equal(ok.error, undefined);
+  assert.deepEqual(ok.value.rule, { kind: "map_category_finished", category: "w:rl", count: 50 });
+  assert.equal(targetOf(ok.value), 50);
+
+  // better:'low' kinds still need a positive bound.
+  assert.ok(validateDefinition({ title: "x", kind: "pb_attempts", params: { maxAttempts: "0" } }).error);
+  assert.ok(validateDefinition({ title: "x", kind: "global_rank", params: { maxRank: "nope" } }).error);
+  assert.ok(validateDefinition({ title: "x", kind: "start_speed_run", params: { minUps: "-5" } }).error);
+});
+
 test("deleting is blocked once earned; deactivation stops new awards but keeps old ones", async (t) => {
   const race = await freshDb(t);
   await ingest(race, "dl", [finish("Keeper", 30000)]);

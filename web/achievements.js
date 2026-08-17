@@ -24,6 +24,16 @@
 //               current PBs and the standings aggregate. standings is UNLOGGED
 //               and rebuilt after ingests, so kinds reading it reflect the
 //               last completed refresh — the daily sweep is the backstop.
+//   map_weapon  per-map .bsp scan (weapons carried, is_strafe, slick_frac).
+//               Keyed by the LOWERCASED map name, not map_id — every join is
+//               `w.name = lower(m.name)`. Unscanned maps (72 of ~4,780) simply
+//               don't match, so a category rule under-counts rather than
+//               guessing.
+//   race.attempts
+//               tries-to-PB, snapshotted only when a PB is set from a live
+//               racelog ingest; NULL for everything older. See pb_attempts.
+
+import { WEAPONS, SLICK_MIN_FRAC } from "./weapons.js";
 
 export const TIERS = ["bronze", "silver", "gold", "legend"];
 
@@ -94,6 +104,50 @@ const MOVEMENT_COLS = {
   distance: "Distance raced (game units)",
   strafes: "Strafes",
 };
+
+// Map categories a rule may count, and the map_weapon predicate each one means.
+// `where(p)` returns a boolean SQL fragment about the map aliased `m`; it takes
+// the Params collector because some categories carry a literal.
+//
+// These deliberately mirror the filters on /maps (db.js mapList) so a category
+// means ONE thing across the product: a player who filters the map list, races
+// what it lists and comes back expecting credit gets it.
+const MAP_CATEGORIES = {
+  strafe: {
+    label: "Strafe maps (no weapons)",
+    short: "strafe maps",
+    // Includes mapList's name fallback for the handful of maps the scanner
+    // hasn't classified. It disagrees with the scan on 6 of ~2,790 maps —
+    // matching what players can see is worth more than those 6.
+    where: () =>
+      `(EXISTS (SELECT 1 FROM map_weapon w WHERE w.name = lower(m.name) AND w.is_strafe)` +
+      ` OR m.name ILIKE '%strafe%')`,
+  },
+  slick: {
+    label: "Slick / ice maps",
+    short: "slick maps",
+    where: (p) =>
+      `EXISTS (SELECT 1 FROM map_weapon w WHERE w.name = lower(m.name)` +
+      ` AND w.slick_frac >= ${p.add(SLICK_MIN_FRAC)})`,
+  },
+  weapon: {
+    label: "Weapon maps (any weapon)",
+    short: "weapon maps",
+    // is_strafe is precisely "carries no weapon but the gunblade every player
+    // spawns with", so NOT is_strafe is "has a real weapon pickup".
+    where: () => `EXISTS (SELECT 1 FROM map_weapon w WHERE w.name = lower(m.name) AND NOT w.is_strafe)`,
+  },
+};
+for (const w of WEAPONS) {
+  MAP_CATEGORIES[`w:${w.code}`] = {
+    label: `${w.name} maps`,
+    short: `${w.name} maps`,
+    where: (p) =>
+      `EXISTS (SELECT 1 FROM map_weapon mw WHERE mw.name = lower(m.name)` +
+      ` AND ${p.add(w.code)} = ANY(mw.weapons))`,
+  };
+}
+const CATEGORY_OPTIONS = Object.entries(MAP_CATEGORIES).map(([value, c]) => ({ value, label: c.label }));
 
 // A standings-column threshold kind (skill_rating / world_records / podiums /
 // points differ only in column + labels). maxBound caps the admin-entered
@@ -324,6 +378,95 @@ export const RULE_KINDS = {
         FROM race r JOIN map m ON m.id = r.map_id JOIN player pl ON pl.id = r.player_id
         WHERE lower(m.name) = ${p.add(String(rule.map).toLowerCase())}${gate}${cidFilter(p, o)}
         ORDER BY ${CID}, r.time ASC`;
+    },
+  },
+
+  map_category_finished: {
+    label: "Distinct maps finished — by category",
+    help: "Finished N different maps of one category: strafe maps, slick/ice maps, weapon maps, or maps carrying one named weapon. Counts the player's ALL-TIME map catalog (their PBs), so runs predating the finish log count. A map can only score once the .bsp scanner has classified it.",
+    windows: ["lifetime"],
+    params: [
+      { key: "category", label: "Map category", type: "select", options: CATEGORY_OPTIONS },
+      { key: "count", label: "Map count", type: "int", min: 1, max: 100000 },
+    ],
+    format: "count",
+    better: "high",
+    target: (rule) => rule.count,
+    describe: (rule) =>
+      `${(MAP_CATEGORIES[rule.category] || {}).short || rule.category} finished ≥ ${rule.count}`,
+    sql(rule, _win, p, o) {
+      // Category is validated against MAP_CATEGORIES before a definition can be
+      // saved; the looked-up builder (never the raw value) reaches the SQL.
+      const cat = Object.prototype.hasOwnProperty.call(MAP_CATEGORIES, rule.category)
+        ? MAP_CATEGORIES[rule.category]
+        : MAP_CATEGORIES.strafe;
+      const having = o.progress ? "" : ` HAVING COUNT(*) >= ${p.add(rule.count)}`;
+      // best is already canonical-keyed (one row per map ever finished).
+      const who = o.progress
+        ? ` AND b.player_id = ${p.add(o.canonId)}`
+        : o.ids
+        ? ` AND b.player_id = ANY(${p.add(o.ids)})`
+        : "";
+      return `
+        SELECT b.player_id, COUNT(*)::int AS value, NULL::bigint AS finish_id
+        FROM best b JOIN map m ON m.id = b.map_id
+        WHERE ${cat.where(p)}${who}
+        GROUP BY 1${having}`;
+    },
+  },
+
+  global_rank: {
+    label: "Global leaderboard rank",
+    help: "Currently ranked at or above #N on the overall standings board. This is the network-wide position — “Leaderboard rank” above is per-map.",
+    windows: ["lifetime"],
+    params: [{ key: "maxRank", label: "Rank at or above (10 = top 10 overall)", type: "int", min: 1, max: 100000 }],
+    format: "rank",
+    better: "low",
+    target: (rule) => rule.maxRank,
+    describe: (rule) => `ranked top ${rule.maxRank} overall`,
+    sql(rule, _win, p, o) {
+      const gate = o.progress ? "" : ` AND s.rank <= ${p.add(rule.maxRank)}`;
+      return `
+        SELECT s.player_id, s.rank::int AS value, NULL::bigint AS finish_id
+        FROM standings s WHERE s.rank IS NOT NULL${gate}${standingsFilter(p, o)}`;
+    },
+  },
+
+  start_speed_run: {
+    label: "Launch speed — single run",
+    help: "Left the start line at N ups or more on a finished run. Recorded per finish by servers running the 2026-07-31 metrics update; earlier finishes don't count. Maps that enforce a prejump limit cap this, so high values come from prejump-friendly maps.",
+    windows: ["lifetime"],
+    params: [{ key: "minUps", label: "Minimum start speed (ups)", type: "int", min: 1, max: 100000 }],
+    format: "ups",
+    better: "high",
+    target: (rule) => rule.minUps,
+    describe: (rule) => `a run started at ${rule.minUps} ups`,
+    sql(rule, _win, p, o) {
+      const gate = o.progress ? "" : ` AND f.start_speed >= ${p.add(rule.minUps)}`;
+      return `
+        SELECT DISTINCT ON (${CID}) ${CID} AS player_id, f.start_speed AS value, f.id AS finish_id
+        FROM finish f JOIN player pl ON pl.id = f.player_id
+        WHERE f.start_speed IS NOT NULL${gate}${cidFilter(p, o)}
+        ORDER BY ${CID}, f.start_speed DESC`;
+    },
+  },
+
+  pb_attempts: {
+    label: "Personal best within N attempts",
+    help: "Holds a personal best set within N tries of that map — 1 means the very first run they ever made on it was the record. Captured only as a PB is set, and only from live server ingests, so older records read as unknown and never qualify. Beating that PB later rewrites the count upwards, so progress can move backwards; an award already earned is kept.",
+    windows: ["lifetime"],
+    params: [{ key: "maxAttempts", label: "Attempts at or below", type: "int", min: 1, max: 1000000 }],
+    format: "count",
+    better: "low",
+    target: (rule) => rule.maxAttempts,
+    describe: (rule) => `a PB set within ${rule.maxAttempts} attempt${rule.maxAttempts === 1 ? "" : "s"}`,
+    sql(rule, _win, p, o) {
+      const gate = o.progress ? "" : ` AND r.attempts <= ${p.add(rule.maxAttempts)}`;
+      return `
+        SELECT DISTINCT ON (${CID}) ${CID} AS player_id, r.attempts::int AS value, NULL::bigint AS finish_id
+        FROM race r JOIN player pl ON pl.id = r.player_id
+        WHERE r.attempts IS NOT NULL${gate}${cidFilter(p, o)}
+        ORDER BY ${CID}, r.attempts ASC`;
     },
   },
 
