@@ -503,7 +503,10 @@ test("/player/:id serves the SPA shell with player-specific OG tags", async () =
   assert.match(html, /<meta property="og:title" content="Nova — Racesow player stats">/);
   assert.match(html, /<meta property="og:type" content="profile">/);
   assert.match(html, /world record/); // stats line in og:description
-  assert.match(html, new RegExp(`<meta property="og:url" content="http://[^"]+/player/${id}">`));
+  // og:url is the slugged form, matching rel=canonical — a share and a crawl
+  // must agree on one address for the profile, not two.
+  assert.match(html, new RegExp(`<meta property="og:url" content="http://[^"]+/player/${id}-nova">`));
+  assert.match(html, new RegExp(`<link rel="canonical" href="http://[^"]+/player/${id}-nova">`));
   assert.match(html, new RegExp(`<meta property="og:image" content="http://[^"]+/og/player/${id}.png">`));
   assert.match(html, /<meta name="twitter:card" content="summary_large_image">/);
   assert.doesNotMatch(html, /\^1/); // colour codes never leak into tags
@@ -938,7 +941,7 @@ test("sitemap: an index plus per-shard urlsets covering pages, maps and players"
   assert.ok(!/\/replay\//.test(pages.body), "/replay is a viewer, not a document");
 
   const maps = await get("/sitemap-maps.xml");
-  const mapIds = [...maps.body.matchAll(/<loc>http:\/\/[^<]+\/map\/(\d+)<\/loc>/g)].map((m) => +m[1]);
+  const mapIds = [...maps.body.matchAll(/<loc>http:\/\/[^<]+\/map\/(\d+)(?:-[a-z0-9-]*)?<\/loc>/g)].map((m) => +m[1]);
   assert.ok(mapIds.length > 0, "maps shard is not empty");
   const known = await dbQuery(`SELECT id FROM map ORDER BY id LIMIT 1`);
   assert.ok(mapIds.includes(Number(known.rows[0].id)), "a real map is listed");
@@ -959,10 +962,58 @@ test("sitemap: an index plus per-shard urlsets covering pages, maps and players"
 
   const players = await get("/sitemap-players.xml");
   assert.equal(players.status, 200);
-  assert.match(players.body, /<loc>http:\/\/[^<]+\/player\/\d+<\/loc>/);
+  assert.match(players.body, /<loc>http:\/\/[^<]+\/player\/\d+(?:-[a-z0-9-]*)?<\/loc>/);
 
   const robots = await get("/robots.txt");
   assert.equal(robots.status, 200);
   assert.match(robots.body, /^User-agent: \*$/m);
   assert.match(robots.body, /^Sitemap: http:\/\/[^\s]+\/sitemap\.xml$/m, "robots points at the index");
+});
+
+test("sitemap URLs are descriptive: id-slug, censored, and the page canonicalises to them", async () => {
+  const body = async (p) => (await fetch(`${base}${p}`)).text();
+
+  // A map whose name needs slugging (case, spaces, punctuation) and a player
+  // whose name carries Warsow colour codes.
+  await dbQuery(`INSERT INTO map (name) VALUES ('KZ_Long Jumps!! v2')`);
+  const mapId = Number((await dbQuery(`SELECT id FROM map WHERE name='KZ_Long Jumps!! v2'`)).rows[0].id);
+  await dbQuery(`INSERT INTO map_index (map_id, name, records, finishes, players)
+                 VALUES (${mapId}, 'KZ_Long Jumps!! v2', 0, 0, 0)`);
+
+  const maps = await body("/sitemap-maps.xml");
+  assert.match(maps, new RegExp(`<loc>http://[^<]+/map/${mapId}-kz-long-jumps-v2</loc>`), "map slug is normalised");
+
+  // The slug is decoration; the id is what resolves. Both spellings must serve
+  // the page, and the wrong/missing slug must not 404 — a renamed map would
+  // otherwise break every link ever shared.
+  for (const p of [`/map/${mapId}`, `/map/${mapId}-kz-long-jumps-v2`, `/map/${mapId}-utterly-wrong`]) {
+    const r = await fetch(`${base}${p}`);
+    assert.equal(r.status, 200, `${p} must serve the page`);
+  }
+
+  // ...and every spelling points at ONE canonical, or the two forms compete.
+  const canon = `<link rel="canonical" href="http://[^"]+/map/${mapId}-kz-long-jumps-v2">`;
+  for (const p of [`/map/${mapId}`, `/map/${mapId}-utterly-wrong`])
+    assert.match(await body(p), new RegExp(canon), `${p} canonicalises to the slugged form`);
+  // The map shell also has to say what the map IS (it served the generic site
+  // title before this existed).
+  assert.match(await body(`/map/${mapId}`), /<meta property="og:title" content="KZ_Long Jumps!! v2 — Racesow map records">/);
+  // ...and a map that HAS a board describes it: the record, its holder (colour
+  // codes stripped), and the size of the field.
+  const seeded = (await get("/maps?q=testmap1")).rows[0];
+  const seededHtml = await body(`/map/${seeded.id}`);
+  assert.match(seededHtml, /<meta property="og:description" content="World record \d+[:.][^"]*by Nova · \d+ records? · \d+ players?">/);
+  assert.doesNotMatch(seededHtml, /\^\d/, "colour codes never leak into the map tags");
+
+  // Players: colour codes stripped, and the profile carries the same canonical.
+  const players = await body("/sitemap-players.xml");
+  const first = players.match(/<loc>http:\/\/[^<]+\/player\/(\d+)(?:-([a-z0-9-]*))?<\/loc>/);
+  assert.ok(first, "at least one player URL");
+  assert.ok(!/\^\d/.test(players), "no raw ^colour codes in any sitemap URL");
+  assert.ok(!/[A-Z ]/.test(first[2] || ""), "slug is lowercase and dash-separated");
+  assert.match(await body(`/player/${first[1]}`), /<link rel="canonical" href="http:\/\/[^"]+\/player\/\d+/);
+
+  // Query-state pages self-canonicalise so /stats?days=30&region=EU is one page.
+  assert.match(await body("/stats?days=30&region=EU&metric=players"), /<link rel="canonical" href="http:\/\/[^"]+\/stats">/);
+  assert.ok(!/rel="canonical"/.test(await body("/no-such-page")), "an unknown path gets no canonical");
 });

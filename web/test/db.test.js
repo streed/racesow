@@ -1364,3 +1364,48 @@ test("SR is unpublished until a player has finished SR_MIN_MAPS maps", async (t)
       );
   }
 });
+
+test("sitemapUrls: descriptive slugs, built from the CENSORED display name", async (t) => {
+  const race = await freshDb(t);
+
+  await race.ingest({
+    version: VER,
+    map: "KZ_Long Jumps!! v2",
+    source: "racelog",
+    records: [finish("^1Nova^7 Räcer", 12345), finish("slurword", 23456)],
+  });
+  await race.refreshAggregates();
+
+  const maps = await race.sitemapUrls("maps");
+  const m = maps.find((x) => x.slug.startsWith("kz-long"));
+  assert.ok(m, "the map is listed");
+  // Lowercased, punctuation collapsed to single dashes, no leading/trailing dash.
+  assert.equal(m.slug, "kz-long-jumps-v2");
+  assert.equal(typeof m.id, "number");
+
+  let players = await race.sitemapUrls("players");
+  const nova = players.find((p) => p.slug.includes("nova"));
+  assert.ok(nova, "the player is listed");
+  // ^colour codes stripped and the accent folded — a URL is ASCII here.
+  assert.equal(nova.slug, "nova-racer");
+
+  // Now censor the other name. The slug is published in a sitemap and lands in
+  // search results, so it must carry the MASK, never the word.
+  await race.all(
+    `INSERT INTO censor_term (term, mode, severity, active, added_at, added_by)
+     VALUES ('slurword', 'word', 'slur', true, 1, 'test')`
+  );
+  await race.loadCensorConfig();
+  players = await race.sitemapUrls("players");
+  assert.ok(
+    players.every((p) => !p.slug.includes("slurword")),
+    "a censored name must never reach a URL: " + JSON.stringify(players.map((p) => p.slug))
+  );
+
+  // A name with nothing slug-worthy left yields "" so the caller emits the bare
+  // id rather than a URL ending in a dangling dash.
+  await race.ingest({ version: VER, map: MAP, source: "racelog", records: [finish("^1!!! ^2***", 34567)] });
+  await race.refreshAggregates();
+  const symbols = (await race.sitemapUrls("players")).find((p) => p.slug === "");
+  assert.ok(symbols, "an all-symbol nick slugs to the empty string, not to '-'");
+});

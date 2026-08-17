@@ -18,6 +18,7 @@ import {
   verifyPassword,
   FLAG_REASONS,
   PLAYTIME_WINDOWS,
+  urlSlug,
 } from "./db.js";
 import { createLivePoller, parseAddress } from "./live.js";
 import { createStreamRegistry } from "./streams.js";
@@ -4107,6 +4108,17 @@ function sendShell(res, html) {
   res.type("html").send(html);
 }
 
+// Race time in ms -> the site's own display format ("1:23.456" / "9.870"), so a
+// shared map link reads exactly like the leaderboard it links to. Mirrors
+// fmtTime() in public/assets/js/app.js.
+function fmtRaceTime(ms) {
+  if (ms == null) return "—";
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const mss = String(ms % 1000).padStart(3, "0");
+  return m > 0 ? `${m}:${String(s).padStart(2, "0")}.${mss}` : `${s}.${mss}`;
+}
+
 const escAttr = (s) =>
   String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
@@ -4119,17 +4131,31 @@ function siteOrigin(req) {
   return `${proto}://${host}`;
 }
 
-function withOgTags(tags) {
-  const block = tags
-    .map(([prop, content]) => {
-      const attr = prop.startsWith("twitter:") ? "name" : "property";
-      return `<meta ${attr}="${escAttr(prop)}" content="${escAttr(content)}">`;
-    })
-    .join("\n  ");
+// `canonical`, when given, adds a rel=canonical alongside the OG block. It is
+// what makes the descriptive URLs safe: /map/412 and /map/412-cpm22 are the
+// same page (every router here parses the leading integer and ignores the
+// tail), so without this a crawler indexes both and splits their ranking. The
+// canonical always names the slugged form — the one the sitemap advertises.
+function withOgTags(tags, canonical = null) {
+  const block =
+    (canonical ? `<link rel="canonical" href="${escAttr(canonical)}">\n  ` : "") +
+    tags
+      .map(([prop, content]) => {
+        const attr = prop.startsWith("twitter:") ? "name" : "property";
+        return `<meta ${attr}="${escAttr(prop)}" content="${escAttr(content)}">`;
+      })
+      .join("\n  ");
   // The static shell carries default OG tags between the markers; swap them
   // for the page-specific set.
   return INDEX_HTML.replace(/<!-- og -->[\s\S]*?<!-- \/og -->/, `<!-- og -->\n  ${block}\n  <!-- /og -->`);
 }
+
+// The one place a descriptive URL is spelled: "/map/412-cpm22", or "/map/412"
+// when the name slugs to nothing (an all-symbol nick, or one the censor masked).
+// The sitemap, the canonical tag and any future internal link must all agree,
+// so they all come through here. The id stays FIRST and is what resolves the
+// page — the tail is decoration a rename can safely invalidate.
+const descriptiveUrl = (origin, kind, id, slug) => `${origin}/${kind}/${id}${slug ? `-${slug}` : ""}`;
 
 app.get("/player/:id", renderLimiter, wrap(async (req, res, next) => {
   const id = parseInt(req.params.id, 10);
@@ -4137,6 +4163,7 @@ app.get("/player/:id", renderLimiter, wrap(async (req, res, next) => {
   if (!d) return next(); // unknown player -> plain SPA shell (default tags)
   const origin = siteOrigin(req);
   const name = simplifyName(d.name);
+  const canonical = descriptiveUrl(origin, "player", d.id, urlSlug(name));
   const s = d.standing;
   const bits = [
     s.rank != null ? `Rank #${s.rank}` : null,
@@ -4154,7 +4181,7 @@ app.get("/player/:id", renderLimiter, wrap(async (req, res, next) => {
       ["og:type", "profile"],
       ["og:title", `${name} — Racesow player stats`],
       ["og:description", bits.join(" · ")],
-      ["og:url", `${origin}/player/${d.id}`],
+      ["og:url", canonical],
       ["og:image", image],
       ["og:image:width", "1200"],
       ["og:image:height", "630"],
@@ -4164,7 +4191,41 @@ app.get("/player/:id", renderLimiter, wrap(async (req, res, next) => {
       ["twitter:title", `${name} — Racesow player stats`],
       ["twitter:description", bits.join(" · ")],
       ["twitter:image", image],
-    ])
+    ], canonical)
+  );
+}));
+
+// Map pages had NO server-rendered shell: every /map/:id link shared anywhere
+// showed the generic site title, and there was nowhere to hang the canonical
+// that makes "/map/412-cpm22" and "/map/412" one page instead of two. Same
+// shape as the player shell above; the OG image stays the site logo (there is
+// no per-map card renderer, unlike /og/player/:id.png).
+app.get("/map/:id", renderLimiter, wrap(async (req, res, next) => {
+  const id = parseInt(req.params.id, 10);
+  const d = Number.isNaN(id) ? null : await race.mapSummary(id);
+  if (!d) return next(); // unknown map -> plain SPA shell (default tags)
+  const origin = siteOrigin(req);
+  const canonical = descriptiveUrl(origin, "map", d.id, urlSlug(d.name));
+  const wr = d.wr;
+  const bits = [
+    wr && wr.time != null ? `World record ${fmtRaceTime(wr.time)} by ${simplifyName(wr.name || "unknown")}` : "No world record yet",
+    `${(d.records || 0).toLocaleString("en-US")} record${d.records === 1 ? "" : "s"}`,
+    `${(d.players || 0).toLocaleString("en-US")} player${d.players === 1 ? "" : "s"}`,
+  ].filter(Boolean);
+  const title = `${d.name} — Racesow map records`;
+  sendShell(
+    res,
+    withOgTags([
+      ["og:site_name", "Racesow"],
+      ["og:type", "website"],
+      ["og:title", title],
+      ["og:description", bits.join(" · ")],
+      ["og:url", canonical],
+      ["og:image", `${origin}/assets/img/warsow-logo.png`],
+      ["twitter:card", "summary"],
+      ["twitter:title", title],
+      ["twitter:description", bits.join(" · ")],
+    ], canonical)
   );
 }));
 
@@ -4371,15 +4432,25 @@ app.get("/og/server/:id.png", renderLimiter, wrap(async (req, res) => {
 // Default tags with an absolute og:image (crawlers ignore relative URLs).
 function defaultShell(req) {
   const origin = siteOrigin(req);
-  return withOgTags([
-    ["og:site_name", "Racesow"],
-    ["og:type", "website"],
-    ["og:title", "Racesow · Warsow Race Records"],
-    ["og:description", "Live world records, maps and player rankings from Warsow race servers."],
-    ["og:url", origin + "/"],
-    ["og:image", `${origin}/assets/img/warsow-logo.png`],
-    ["twitter:card", "summary"],
-  ]);
+  // Self-canonical, but ONLY for a route we actually publish: those pages carry
+  // their whole state in the query string (/stats?days=30&region=EU&metric=…,
+  // /maps?sort=records&offset=120), which is one page in many hundreds of URL
+  // spellings. Unknown paths get no canonical — this handler also answers every
+  // typo and dead link, and pointing those at themselves would invite indexing
+  // a soft 404.
+  const known = SITEMAP_PAGES.some(([p]) => p === req.path);
+  return withOgTags(
+    [
+      ["og:site_name", "Racesow"],
+      ["og:type", "website"],
+      ["og:title", "Racesow · Warsow Race Records"],
+      ["og:description", "Live world records, maps and player rankings from Warsow race servers."],
+      ["og:url", origin + "/"],
+      ["og:image", `${origin}/assets/img/warsow-logo.png`],
+      ["twitter:card", "summary"],
+    ],
+    known ? origin + (req.path === "/" ? "/" : req.path) : null
+  );
 }
 
 // Public database backup download (the db-backup sidecar refreshes it weekly).
@@ -4474,8 +4545,14 @@ const sitemapShard = (shard) =>
         })),
       ];
     } else {
-      const path = shard === "maps" ? "map" : "player";
-      urls = rows.map((r) => ({ loc: `${origin}/${path}/${r.id}`, lastmod: sitemapDate(r.lastmod) }));
+      // Descriptive form ("/map/412-cpm22"): the id still resolves the page, the
+      // tail says what it is. Both the shell's rel=canonical and this agree, so
+      // the bare-id links the site itself emits consolidate onto these.
+      const kind = shard === "maps" ? "map" : "player";
+      urls = rows.map((r) => ({
+        loc: descriptiveUrl(origin, kind, r.id, r.slug),
+        lastmod: sitemapDate(r.lastmod),
+      }));
     }
     sendXml(res, sitemapDoc(urls.map(sitemapUrl).join("")));
   });

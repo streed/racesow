@@ -285,6 +285,26 @@ export function verifyPassword(password, stored) {
 export function simplifyName(name) {
   return String(name).replace(/\^[0-9]/g, "");
 }
+
+// A name -> the descriptive tail of a URL ("/map/412-cpm22"). ASCII-only and
+// lossy on purpose: the id before it is what actually resolves the page (every
+// router here parses the leading integer and stops at the dash), so this tail
+// only has to be readable and STABLE-ish, never reversible. Returns "" for a
+// name with nothing slug-worthy in it — an all-symbol nick, or one the censor
+// masked to ***** — and callers then emit the bare id rather than a dangling
+// dash. ALWAYS feed this a censored, colour-stripped name: a slug goes into a
+// public URL and a sitemap, where an unmasked name is far more durable than an
+// unmasked page.
+export function urlSlug(name) {
+  return String(name == null ? "" : name)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "") // drop combining accents: "Astrom", not "A-str-m"
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+/, "")
+    .slice(0, 48) // keep URLs sane; the id carries the meaning
+    .replace(/-+$/, ""); // never end on the dash a mid-word cut can leave
+}
 export function trimName(simplified) {
   return normToken(simplified);
 }
@@ -1928,6 +1948,37 @@ class RaceDB {
     };
   }
 
+  // Just enough about a map to title a shared link: name, size of the board,
+  // and who holds the record. Deliberately NOT mapDetail — that pulls a
+  // leaderboard, the recent-finish feed and the perfect-run computation, and
+  // the sitemap now advertises every one of ~4,500 map pages, so the shell a
+  // crawler hits has to stay cheap. Two queries, both by primary key.
+  async mapSummary(id) {
+    const map = await this.one("SELECT id, name FROM map WHERE id = $1", [id]);
+    if (!map) return null;
+    const idx = await this.one(
+      "SELECT records, players, wr_time, wr_pid FROM map_index WHERE map_id = $1",
+      [id]
+    );
+    let wr = null;
+    if (idx && idx.wr_time != null) {
+      const holder = idx.wr_pid != null
+        ? await this.one("SELECT name FROM player WHERE id = $1", [num(idx.wr_pid)])
+        : null;
+      wr = this._censorNamed(
+        { time: num(idx.wr_time), name: holder ? holder.name : null },
+        num(idx.wr_pid)
+      );
+    }
+    return {
+      id: num(map.id),
+      name: this._cnMap(map.name, num(map.id)),
+      records: idx ? num(idx.records) : 0,
+      players: idx ? num(idx.players) : 0,
+      wr,
+    };
+  }
+
   async mapDetail(id, { limit } = {}) {
     const map = await this.one("SELECT id, name FROM map WHERE id = $1", [id]);
     if (!map) return null;
@@ -2772,23 +2823,41 @@ class RaceDB {
   // element rather than inventing a date, which is what the spec asks for.
   // One shard at a time — a request for the handful of tournament rows must not
   // also drag ~14k map and player rows out of the DB.
+  // Each row carries a `slug` — the readable tail of its URL. It is built from
+  // the CENSORED display name (_cnMap / _cn, the same choke-points every other
+  // read goes through), because a slug is published in a sitemap and lands in
+  // search results, which outlive the page itself.
   async sitemapUrls(shard) {
     if (shard === "maps")
       return (
         await this.all(
-          `SELECT mi.map_id id, mi.last_played lastmod
+          `SELECT mi.map_id id, mi.name, mi.last_played lastmod
              FROM map_index mi
             WHERE NOT EXISTS (SELECT 1 FROM map_block b WHERE b.map_id = mi.map_id)
             ORDER BY mi.map_id`
         )
-      ).map((r) => ({ id: num(r.id), lastmod: num(r.lastmod) }));
+      ).map((r) => ({
+        id: num(r.id),
+        slug: urlSlug(this._cnMap(r.name, num(r.id))),
+        lastmod: num(r.lastmod),
+      }));
 
     // standings is the ranked board: a canonical player with at least one PB.
-    // Players outside it have nothing on their profile worth indexing.
+    // Players outside it have nothing on their profile worth indexing. The join
+    // is on the canonical id, so the slug is the name the profile actually
+    // displays rather than whichever alias happened to set a record.
     if (shard === "players")
       return (
-        await this.all(`SELECT player_id id, last_active lastmod FROM standings ORDER BY player_id`)
-      ).map((r) => ({ id: num(r.id), lastmod: num(r.lastmod) }));
+        await this.all(
+          `SELECT s.player_id id, p.name, s.last_active lastmod
+             FROM standings s JOIN player p ON p.id = s.player_id
+            ORDER BY s.player_id`
+        )
+      ).map((r) => ({
+        id: num(r.id),
+        slug: urlSlug(simplifyName(this._cn(r.name, num(r.id)))),
+        lastmod: num(r.lastmod),
+      }));
 
     // Draft tournaments are admin-only and 404 publicly; cancelled ones keep
     // their page (the calendar still links to them), so they stay crawlable.
