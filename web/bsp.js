@@ -12,6 +12,7 @@
 //   FBSP (qfusion, v1):    vertex 80 B, face 148 B
 import fs from "node:fs";
 import zlib from "node:zlib";
+import { isSafeMapName } from "./mapname.js";
 
 // --- .pk3 (zip) extraction ---------------------------------------------------
 // Find maps/<mapName>.bsp inside the archive via the central directory and
@@ -97,8 +98,8 @@ export function extractMapEntities(pk3Path) {
     const commentLen = buf.readUInt16LE(p + 32);
     const localOff = buf.readUInt32LE(p + 42);
     const fname = buf.toString("latin1", p + 46, p + 46 + nameLen).toLowerCase();
-    const m = fname.match(/^maps\/([a-z0-9_.-]+)\.bsp$/);
-    if (m) {
+    const m = fname.match(/^maps\/(.+)\.bsp$/);
+    if (m && isSafeMapName(m[1])) {
       // Same untrusted-offset guard as extractBsp: a corrupt central directory
       // must yield "" for this map, never a throw that aborts the whole scan.
       let bsp = null;
@@ -661,7 +662,7 @@ function pointInWindingXY(w, x, y) {
 // the common name==filename case) still work.
 export function loadMapGeometry(mapsDir, mapName, resolvePk3s = null) {
   const base = String(mapName || "").replace(/-reversed$/, "").toLowerCase();
-  if (!base || !/^[a-z0-9_.-]+$/.test(base)) return null;
+  if (!isSafeMapName(base)) return null;
   const candidates = [];
   if (resolvePk3s) {
     for (const f of resolvePk3s(base) || []) if (!candidates.includes(f)) candidates.push(f);

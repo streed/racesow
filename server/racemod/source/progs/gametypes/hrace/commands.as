@@ -54,8 +54,6 @@ bool Cmd_CallvoteValidate( Client@ client, const String &cmdString, const String
     {
         if ( levelTime - randmap_time > RANDMAP_DELAY_MAX )
         {
-            Cvar mapname( "mapname", "", 0 );
-            String current = mapname.string;
             // Everything after "randmap" is the filter: a name pattern as before,
             // or a strafe / slick / weapon filter (e.g. "strafe", "slick", "rl",
             // "rl pg", "rl slick") that GetMapsByFilter resolves against the
@@ -69,16 +67,23 @@ bool Cmd_CallvoteValidate( Client@ client, const String &cmdString, const String
                 pattern += ( pattern.length() == 0 ? "" : " " ) + tok;
             }
 
-            String[] maps = GetMapsByFilter( pattern, current );
-
-            if ( maps.length() == 0 )
-            {
-                client.printMessage( "No matching maps\n" );
+            // Draw through the CALLER'S OWN Player, not an independent roll
+            // here: randomMap() hands back the map a "/prerandmap <same filter>"
+            // preview already showed this player, and only draws a fresh one
+            // when there is no matching preview. Rolling here instead is what
+            // made the vote offer a different map than the preview promised.
+            // It applies the same current-map exclusion and prints its own
+            // "No matching maps".
+            Player@ player = RACE_GetPlayer( client );
+            if ( @player == null )   // caller gone: nothing to offer
                 return false;
-            }
 
-            randmap_matches = maps.length();
-            randmap = maps[randrange(randmap_matches)];
+            String pick = player.randomMap( pattern, false );
+            if ( pick == "" )
+                return false;
+
+            randmap_matches = player.randmapMatches;
+            randmap = pick;
         }
 
         if ( levelTime - randmap_time < RANDMAP_DELAY_MIN )

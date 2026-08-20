@@ -1214,3 +1214,54 @@ tr.tincomplete td { opacity: .5; }
   .hmap { padding: 4px 8px 6px; }
   .tile .num.stat-word { font-size: 22px; }
 }
+
+/* ---------- /blog — site updates ---------- */
+/* A reading column, not a data table: the rest of the site is dense tabular
+   stats, so the one page made of prose gets a measure that is actually
+   readable (~70ch) instead of the full 1180px grid. */
+.bloglist { display: grid; gap: 14px; max-width: 820px; }
+.blogcard { padding: 18px 20px; }
+.blogcard-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.blogcard-head time { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.blogcard h2 { font-family: var(--cond); font-size: 21px; font-weight: 700; margin: 0 0 8px; line-height: 1.25; }
+.blogcard h2 a { color: var(--text); }
+.blogcard h2 a:hover { color: var(--orange-2); }
+.blogteaser { color: var(--muted); margin: 0 0 10px; font-size: 14px; line-height: 1.6; }
+.blogmore { font-family: var(--cond); text-transform: uppercase; letter-spacing: .5px; font-size: 12px; color: var(--cyan); }
+.rsslink { color: var(--orange); margin-left: 6px; }
+
+/* One post. */
+.blogpost { padding: 22px 26px; max-width: 820px; }
+.blogtitle { font-family: var(--cond); font-style: italic; font-weight: 800; text-transform: uppercase;
+  letter-spacing: 1px; font-size: 27px; margin: 4px 0 16px; line-height: 1.15; }
+.blogbody { font-size: 15px; line-height: 1.7; color: var(--text); }
+.blogbody p { margin: 0 0 14px; }
+.blogbody h3 { font-family: var(--cond); text-transform: uppercase; letter-spacing: .6px;
+  font-size: 16px; color: var(--orange-2); margin: 24px 0 8px; }
+.blogbody h4, .blogbody h5 { font-family: var(--cond); font-size: 14px; color: var(--text); margin: 18px 0 6px; }
+.blogbody ul, .blogbody ol { margin: 0 0 14px; padding-left: 22px; }
+.blogbody li { margin: 4px 0; }
+.blogbody a { color: var(--cyan); }
+.blogbody a:hover { text-decoration: underline; }
+.blogbody code { font-family: var(--mono); font-size: 13px; background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+.blogbody pre { background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 14px; overflow-x: auto; margin: 0 0 14px; }
+.blogbody pre code { border: 0; background: none; padding: 0; }
+.blogbody blockquote { margin: 0 0 14px; padding: 4px 0 4px 14px;
+  border-left: 3px solid var(--line-2); color: var(--muted); }
+.blogbody hr { border: 0; border-top: 1px solid var(--line); margin: 20px 0; }
+.blogbody img { max-width: 100%; }
+
+/* Category pills reuse .pill; one accent per category so the list scans. */
+.pill.blogtag.maps    { color: var(--green); border-color: rgba(169,242,106,.4); background: rgba(169,242,106,.08); }
+.pill.blogtag.update  { color: var(--cyan); border-color: rgba(34,211,238,.4); background: rgba(34,211,238,.08); }
+.pill.blogtag.servers { color: var(--orange); border-color: rgba(255,106,26,.45); background: rgba(255,106,26,.08); }
+.pill.blogtag.event   { color: var(--gold); border-color: rgba(255,210,74,.4); background: rgba(255,210,74,.08); }
+
+/* Prev/next. The empty <span> placeholders keep the surviving link pinned to
+   its own side when a post has only one neighbour. */
+.blognavrow { display: flex; justify-content: space-between; gap: 12px; max-width: 820px; margin: 14px 0 0; }
+.blognav { font-family: var(--cond); font-size: 13px; color: var(--muted);
+  max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.blognav:hover { color: var(--orange-2); }

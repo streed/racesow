@@ -10,7 +10,7 @@
 //   docker compose --profile seed run --rm seed-topscores
 import fs from "node:fs";
 import path from "node:path";
-import { openDatabase } from "./db.js";
+import { openDatabase, isSafeMapName } from "./db.js";
 
 const DATABASE_URL =
   process.env.DATABASE_URL || "postgres://racesow:racesow@127.0.0.1:5432/racesow";
@@ -87,7 +87,7 @@ const race = await openDatabase(DATABASE_URL);
 
 const maps = (
   await race.all("SELECT DISTINCT m.id, m.name FROM map m JOIN race r ON r.map_id = m.id ORDER BY m.name")
-).filter((m) => /^[a-z0-9][a-z0-9_.-]*$/i.test(m.name)); // path-safe names only
+).filter((m) => isSafeMapName(String(m.name).toLowerCase())); // path-safe names only
 
 fs.mkdirSync(OUT_DIR, { recursive: true });
 

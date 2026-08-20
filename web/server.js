@@ -19,12 +19,26 @@ import {
   FLAG_REASONS,
   PLAYTIME_WINDOWS,
   urlSlug,
+  isSafeMapName,
 } from "./db.js";
 import { createLivePoller, parseAddress } from "./live.js";
 import { createStreamRegistry } from "./streams.js";
 import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js";
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
 import { cache, invalidate } from "./cache.js";
+import {
+  BLOG_TAGS,
+  isBlogTag,
+  blogTagLabel,
+  slugify,
+  isValidSlug,
+  renderBody,
+  sanitizeText,
+  teaserFor,
+  MAX_TITLE,
+  MAX_SUMMARY,
+  MAX_BODY,
+} from "./blog.js";
 import { RULE_KINDS, WINDOWS, TIERS, validateDefinition, describeRule } from "./achievements.js";
 import {
   SCORINGS,
@@ -462,6 +476,55 @@ api.post(
   })
 );
 
+
+/* ------------------------------- blog ------------------------------------ *
+ * Short site-update posts. Two reads: the paginated list (teasers only) and one
+ * post (rendered). Both are public and cacheable; drafts are excluded at the DB
+ * layer, never by filtering here.
+ *
+ * The list deliberately does NOT ship each post's body — a "what's new" index
+ * that carried ten full posts would be the heaviest JSON on the site for a page
+ * that only renders teasers. teaserFor() derives the teaser server-side so the
+ * client never needs the body to render the list. */
+api.get("/blog", cache(120, { edge: true }), wrap(async (req, res) => {
+  const d = await race.blogList({ limit: req.query.limit || 10, offset: req.query.offset });
+  res.json({
+    total: d.total,
+    limit: d.limit,
+    offset: d.offset,
+    posts: d.rows.map((r) => ({
+      slug: r.slug,
+      title: r.title,
+      teaser: teaserFor(r),
+      tag: r.tag,
+      tagLabel: blogTagLabel(r.tag),
+      publishedAt: r.publishedAt,
+    })),
+  });
+}));
+
+api.get("/blog/:slug", cache(120, { edge: true }), wrap(async (req, res) => {
+  const post = await race.blogBySlug(req.params.slug);
+  if (!post) return res.status(404).json({ error: "no such post" });
+  const { prev, next } = await race.blogNeighbours(post.publishedAt, post.id);
+  res.json({
+    slug: post.slug,
+    title: post.title,
+    teaser: teaserFor(post),
+    tag: post.tag,
+    tagLabel: blogTagLabel(post.tag),
+    // Pre-rendered: the markdown-lite renderer is the security boundary, so it
+    // stays on the server. The client inserts this as HTML and must never be
+    // handed the raw source to render itself.
+    html: renderBody(post.body),
+    publishedAt: post.publishedAt,
+    updatedAt: post.updatedAt,
+    author: post.author,
+    prev,
+    next,
+  });
+}));
+
 api.get("/players", cache(60, { edge: true }), wrap(async (req, res) => res.json(await race.players(req.query))));
 
 // Profiles list the player's own recent finishes — same "did my run land?"
@@ -754,7 +817,7 @@ const playerRecCacheKey = (map, name) =>
   `/api/game/player-record?map=${String(map || "").toLowerCase()}&name=${String(name || "").slice(0, 64)}`;
 api.get("/game/player-record", cache(60, { key: (req) => playerRecCacheKey(req.query.map, req.query.name) }), wrap(async (req, res) => {
   const { map, name } = req.query;
-  if (typeof map !== "string" || !/^[a-z0-9][a-z0-9_.-]*$/.test(map.toLowerCase()))
+  if (typeof map !== "string" || !isSafeMapName(map.toLowerCase()))
     return res.status(404).type("text/plain").send("// unknown map\n");
   if (typeof name !== "string" || name.length === 0 || name.length > 64 || /[\x00-\x1f\x7f]/.test(name))
     return res.status(404).type("text/plain").send("// bad name\n");
@@ -772,7 +835,7 @@ api.get("/game/player-record", cache(60, { key: (req) => playerRecCacheKey(req.q
 // is trivial. A 404 = unknown/invalid map or bad name.
 api.get("/game/saved-start", wrap(async (req, res) => {
   const { map, name } = req.query;
-  if (typeof map !== "string" || !/^[a-z0-9][a-z0-9_.-]*$/.test(map.toLowerCase()))
+  if (typeof map !== "string" || !isSafeMapName(map.toLowerCase()))
     return res.status(404).type("text/plain").send("// unknown map\n");
   if (typeof name !== "string" || name.length === 0 || name.length > 64 || /[\x00-\x1f\x7f]/.test(name))
     return res.status(404).type("text/plain").send("// bad name\n");
@@ -1924,7 +1987,7 @@ api.post(
   wrap(async (req, res) => {
     const body = req.body || {};
     const mapName = typeof body.map === "string" ? body.map.slice(0, MAX_MAP_LEN).toLowerCase() : "";
-    if (!mapName || !/^[a-z0-9][a-z0-9_.-]*$/.test(mapName))
+    if (!isSafeMapName(mapName))
       return res.status(400).json({ error: "map required" });
     const note = (typeof body.note === "string" ? body.note.trim().slice(0, FLAG_NOTE_MAX) : "") || null;
     const detector = typeof body.detector === "string" ? body.detector.slice(0, 32) : "crashguard";
@@ -1991,7 +2054,7 @@ api.post(
   wrap(async (req, res) => {
     const body = req.body || {};
     const mapName = typeof body.map === "string" ? body.map.slice(0, MAX_MAP_LEN).toLowerCase() : "";
-    if (!mapName || !/^[a-z0-9][a-z0-9_.-]*$/.test(mapName)) return res.status(400).json({ error: "map required" });
+    if (!isSafeMapName(mapName)) return res.status(400).json({ error: "map required" });
     const name = typeof body.name === "string" ? body.name.slice(0, MAX_NAME_LEN) : "";
     if (!name) return res.status(400).json({ error: "name required" });
     const login = typeof body.login === "string" ? body.login.slice(0, MAX_NAME_LEN) : "";
@@ -2413,7 +2476,7 @@ admin.get("/flags", requireAuth, wrap(async (req, res) => {
     ${quarSection}
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
-      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a> · <a href="/admin/tournaments">tournaments</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a>` : ""} · <a href="/admin/account">account</a></p>
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a> · <a href="/admin/tournaments">tournaments</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a> · <a href="/admin/blog">blog</a>` : ""} · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
 }));
 
@@ -2887,6 +2950,245 @@ admin.post("/announcements", requireAdmin, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   await race.setSetting("announcements", sanitizeAnnouncements(req.body && req.body.text), req.session.username);
   res.redirect(303, "/admin/announcements?ok=1");
+}));
+
+// --- Blog / site updates (admin only) ---------------------------------------
+// Short "what's new" posts: new map batches, feature launches, server changes.
+// Admin-only rather than moderator: unlike a map block, a post is site-wide
+// published content that goes out to the RSS feed the moment it lands.
+//
+// The body is markdown-lite, rendered by web/blog.js at READ time (never here,
+// and never stored as HTML) — see that module for why the renderer is the
+// security boundary.
+
+// A post id from the URL, or null when it is not an integer — parseInt("abc")
+// is NaN, and handing that to pg is a 500 rather than the 404 it should be.
+function blogIdParam(req) {
+  const id = Number(req.params.id);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+// Parse the publish controls into a published_at value: null (draft), an
+// explicit backdate, or "now". Returns undefined when the typed date is
+// unparseable, so the caller can reject rather than silently publishing at the
+// epoch — a post dated 1970 sorts to the bottom of the feed forever.
+function parsePublishAt(body, existing) {
+  if (!body || !body.publish) return null;
+  const raw = String(body.published_at || "").trim();
+  if (!raw) return existing || Math.floor(Date.now() / 1000);
+  // <input type="datetime-local"> has no zone; the site's dates are all UTC.
+  const ms = Date.parse(/(Z|[+-]\d\d:?\d\d)$/.test(raw) ? raw : raw + "Z");
+  if (Number.isNaN(ms)) return undefined;
+  return Math.floor(ms / 1000);
+}
+
+// The <input type="datetime-local"> value for an epoch (UTC, minute precision).
+const dtLocal = (ts) => (ts ? new Date(ts * 1000).toISOString().slice(0, 16) : "");
+
+// The list + post caches are keyed per query string, so a paginated list has
+// more spellings than we can enumerate. Drop the two that carry the vast
+// majority of traffic (the first page and the post itself) and let the 120s TTL
+// retire the rest — a deep list page being one edit stale is not worth tracking
+// every key. The api router is mounted at /api, so these keys are the
+// MOUNT-RELATIVE paths.
+function invalidateBlog(slug) {
+  invalidate("/blog");
+  invalidate("/blog?limit=10");
+  if (slug) invalidate("/blog/" + slug);
+  invalidate("/blog.xml"); // app-level route: full path
+}
+
+function blogFormHtml(req, { post = null, error = "" } = {}) {
+  const isNew = !post;
+  const val = (v) => escHtml(v == null ? "" : String(v));
+  const tagOpts = BLOG_TAGS.map(
+    (t) => `<option value="${escHtml(t.value)}" ${post && post.tag === t.value ? "selected" : ""}>${escHtml(t.label)}</option>`
+  ).join("");
+  const err = error ? `<div class="msg err">${escHtml(error)}</div>` : "";
+  return `${err}
+    <form class="card" method="post" action="${isNew ? "/admin/blog/new" : `/admin/blog/${post.id}`}" style="max-width:760px">
+      <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+      <label for="title">Title</label>
+      <input id="title" name="title" maxlength="${MAX_TITLE}" required value="${post ? val(post.title) : ""}">
+      ${isNew
+        ? `<label for="slug">URL slug <span style="color:#8f857a">(optional — derived from the title)</span></label>
+           <input id="slug" name="slug" maxlength="80" placeholder="373-new-maps" value="">
+           <p class="sub" style="margin:4px 0 0">Permanent: the post URL is <span style="font-family:monospace">/blog/&lt;slug&gt;</span> and it is never rewritten by a later re-title.</p>`
+        : `<label>URL slug</label>
+           <input value="${val(post.slug)}" disabled>
+           <p class="sub" style="margin:4px 0 0">Fixed once published — <a href="/blog/${encodeURIComponent(post.slug)}" target="_blank" rel="noopener">view ↗</a></p>`}
+      <label for="tag">Category</label>
+      <select id="tag" name="tag">${tagOpts}</select>
+      <label for="summary">Teaser <span style="color:#8f857a">(optional — the first lines of the body are used if blank)</span></label>
+      <textarea id="summary" name="summary" rows="2" maxlength="${MAX_SUMMARY}">${post ? val(post.summary) : ""}</textarea>
+      <label for="body">Body <span style="color:#8f857a">(markdown-lite: ## heading, - list, **bold**, *italic*, \`code\`, [text](url), &gt; quote)</span></label>
+      <textarea id="body" name="body" rows="16" maxlength="${MAX_BODY}"
+        style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace">${post ? val(post.body) : ""}</textarea>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:14px">
+        <input type="checkbox" name="publish" style="width:auto" ${!post || post.publishedAt ? "checked" : ""}>
+        Published <span style="color:#8f857a">(unchecked = draft, not served anywhere)</span>
+      </label>
+      <label for="published_at">Publish date <span style="color:#8f857a">(UTC — leave as-is to keep, blank to stamp now)</span></label>
+      <input id="published_at" name="published_at" type="datetime-local" value="${post ? dtLocal(post.publishedAt) : ""}">
+      <div class="actions"><button class="primary" type="submit">${isNew ? "Create post" : "Save"}</button>
+        <a class="btn" href="/admin/blog">Cancel</a></div>
+    </form>`;
+}
+
+admin.get("/blog", requireAdmin, wrap(async (req, res) => {
+  const { rows } = await race.blogList({ limit: 50, drafts: true });
+  const done = req.query.ok ? `<div class="msg ok">Saved.</div>` : "";
+  const body = rows.length
+    ? `<table><tr><th>Post</th><th>Category</th><th>Status</th><th>Date</th><th></th></tr>
+       ${rows.map((r) => `<tr>
+         <td><a href="/admin/blog/${r.id}">${escHtml(r.title)}</a>
+             <div class="meta">/blog/${escHtml(r.slug)}</div></td>
+         <td>${escHtml(blogTagLabel(r.tag))}</td>
+         <td>${r.publishedAt ? `<span class="st-resolved">published</span>` : `<span class="st-open">draft</span>`}</td>
+         <td>${r.publishedAt ? fmtWhen(r.publishedAt) : "—"}</td>
+         <td>
+           <form class="inline" method="post" action="/admin/blog/${r.id}/publish">
+             <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+             <button type="submit">${r.publishedAt ? "unpublish" : "publish"}</button>
+           </form>
+         </td></tr>`).join("")}</table>`
+    : `<div class="empty">No posts yet.</div>`;
+  sendAdmin(res, "Blog", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Site updates</h1>
+    <p class="sub">Short posts telling players what changed · public at
+      <a href="/blog" target="_blank" rel="noopener">/blog ↗</a> ·
+      feed at <span style="font-family:monospace">/blog.xml</span> ·
+      drafts are invisible until published</p>
+    ${done}
+    <div class="actions" style="margin-bottom:14px"><a class="btn" href="/admin/blog/new">New post</a></div>
+    ${body}`, req.session);
+}));
+
+admin.get("/blog/new", requireAdmin, wrap(async (req, res) => {
+  sendAdmin(res, "New post", `<div class="crumbs"><a href="/admin/blog">← blog</a></div>
+    <h1>New post</h1>${blogFormHtml(req)}`, req.session);
+}));
+
+admin.post("/blog/new", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const b = req.body || {};
+  const title = sanitizeText(b.title, MAX_TITLE).trim();
+  if (!title) {
+    return sendAdmin(res, "New post", `<div class="crumbs"><a href="/admin/blog">← blog</a></div>
+      <h1>New post</h1>${blogFormHtml(req, { error: "A title is required." })}`, req.session);
+  }
+  // An explicit slug is honoured when it is already in canonical form; anything
+  // else is derived from the title. The dated fallback covers a title with no
+  // slug-able characters at all (all symbols, or non-Latin script).
+  const typed = sanitizeText(b.slug, 80).trim().toLowerCase();
+  const slug =
+    (typed && isValidSlug(typed) && typed) ||
+    slugify(title) ||
+    "update-" + new Date().toISOString().slice(0, 10);
+  const publishedAt = parsePublishAt(b, null);
+  if (publishedAt === undefined) {
+    return sendAdmin(res, "New post", `<div class="crumbs"><a href="/admin/blog">← blog</a></div>
+      <h1>New post</h1>${blogFormHtml(req, { error: "Could not read that publish date." })}`, req.session);
+  }
+  const id = await race.blogCreate({
+    slug,
+    title,
+    summary: sanitizeText(b.summary, MAX_SUMMARY).trim(),
+    body: sanitizeText(b.body, MAX_BODY),
+    tag: isBlogTag(b.tag) ? b.tag : "update",
+    publishedAt,
+    author: req.session.username,
+  });
+  if (id == null) {
+    return sendAdmin(res, "New post", `<div class="crumbs"><a href="/admin/blog">← blog</a></div>
+      <h1>New post</h1>${blogFormHtml(req, { error: `The slug "${slug}" is already taken — give the post a different title or slug.` })}`, req.session);
+  }
+  invalidateBlog(slug);
+  res.redirect(303, `/admin/blog/${id}?ok=1`);
+}));
+
+admin.get("/blog/:id", requireAdmin, wrap(async (req, res) => {
+  const post = await race.blogById(blogIdParam(req));
+  if (!post) return res.status(404).type("text/plain").send("not found");
+  const done = req.query.ok ? `<div class="msg ok">Saved.</div>` : "";
+  // Preview of what is SAVED (not of the textarea): the renderer runs on the
+  // server, so an accurate preview is a round-trip by definition. It doubles as
+  // a check that the stored body renders the way the author meant.
+  const preview = post.body.trim()
+    ? `<h2>Preview</h2><div class="card blogprev">${renderBody(post.body)}</div>`
+    : "";
+  sendAdmin(res, "Edit post", `<div class="crumbs"><a href="/admin/blog">← blog</a></div>
+    <style>
+      .blogprev h3{font-size:16px;margin:14px 0 6px;color:#e9c9a8}
+      .blogprev h4{font-size:14px;margin:12px 0 6px;color:#e9c9a8}
+      .blogprev code{background:#12100e;border:1px solid #2c2823;border-radius:4px;padding:1px 5px;font-size:13px}
+      .blogprev pre{background:#0c0b09;border:1px solid #2c2823;border-radius:8px;padding:10px 12px;overflow:auto}
+      .blogprev pre code{border:0;background:none;padding:0}
+      .blogprev blockquote{margin:10px 0;padding:2px 0 2px 12px;border-left:3px solid #3a352d;color:#cdbfae}
+    </style>
+    <h1>${escHtml(post.title)}</h1>
+    <p class="sub">${post.publishedAt ? `published ${fmtWhen(post.publishedAt)}` : "draft"}${post.author ? ` · by ${escHtml(post.author)}` : ""} · last edited ${fmtWhen(post.updatedAt)}</p>
+    ${done}${blogFormHtml(req, { post })}
+    ${preview}
+    <form class="card" method="post" action="/admin/blog/${post.id}/delete"
+          onsubmit="return confirm('Delete this post? Any link already shared will 404.')">
+      <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+      <h2 style="margin-top:0">Delete</h2>
+      <p class="sub">Removes the post for good. Unpublish instead if you only want it out of sight.</p>
+      <div class="actions"><button class="danger" type="submit">Delete post</button></div>
+    </form>`, req.session);
+}));
+
+admin.post("/blog/:id", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const post = await race.blogById(blogIdParam(req));
+  if (!post) return res.status(404).type("text/plain").send("not found");
+  const b = req.body || {};
+  const title = sanitizeText(b.title, MAX_TITLE).trim();
+  const publishedAt = parsePublishAt(b, post.publishedAt);
+  if (!title || publishedAt === undefined) {
+    return sendAdmin(res, "Edit post", `<div class="crumbs"><a href="/admin/blog">← blog</a></div>
+      <h1>Edit post</h1>${blogFormHtml(req, {
+        post,
+        error: title ? "Could not read that publish date." : "A title is required.",
+      })}`, req.session);
+  }
+  await race.blogUpdate(post.id, {
+    title,
+    summary: sanitizeText(b.summary, MAX_SUMMARY).trim(),
+    body: sanitizeText(b.body, MAX_BODY),
+    tag: isBlogTag(b.tag) ? b.tag : "update",
+    publishedAt,
+  });
+  invalidateBlog(post.slug);
+  res.redirect(303, `/admin/blog/${post.id}?ok=1`);
+}));
+
+admin.post("/blog/:id/publish", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const post = await race.blogById(blogIdParam(req));
+  if (!post) return res.status(404).type("text/plain").send("not found");
+  // published_at IS the draft flag, so unpublishing necessarily drops the date
+  // and re-publishing stamps now. To restore a post to its old slot in the feed
+  // (pulled to fix a typo, say), set the date explicitly on the edit form.
+  await race.blogUpdate(post.id, {
+    title: post.title,
+    summary: post.summary,
+    body: post.body,
+    tag: post.tag,
+    publishedAt: post.publishedAt ? null : Math.floor(Date.now() / 1000),
+  });
+  invalidateBlog(post.slug);
+  res.redirect(303, "/admin/blog?ok=1");
+}));
+
+admin.post("/blog/:id/delete", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const post = await race.blogById(blogIdParam(req));
+  if (!post) return res.status(404).type("text/plain").send("not found");
+  await race.blogDelete(post.id);
+  invalidateBlog(post.slug);
+  res.redirect(303, "/admin/blog?ok=1");
 }));
 
 // --- Achievements (admin + moderator) ---
@@ -4229,6 +4531,33 @@ app.get("/map/:id", renderLimiter, wrap(async (req, res, next) => {
   );
 }));
 
+// A shared update post. Same shape as the map/player shells: these links get
+// posted to Discord, so the card must carry the post's own title and teaser
+// rather than the generic site tags. The slug IS the canonical id here (no
+// numeric prefix), so there is no descriptiveUrl() dance.
+app.get("/blog/:slug", renderLimiter, wrap(async (req, res, next) => {
+  const post = await race.blogBySlug(req.params.slug);
+  if (!post) return next(); // unknown/draft post -> plain SPA shell (404 view)
+  const origin = siteOrigin(req);
+  const canonical = `${origin}/blog/${encodeURIComponent(post.slug)}`;
+  const teaser = teaserFor(post);
+  sendShell(
+    res,
+    withOgTags([
+      ["og:site_name", "Racesow"],
+      ["og:type", "article"],
+      ["og:title", `${post.title} — Racesow`],
+      ["og:description", teaser],
+      ["og:url", canonical],
+      ["og:image", `${origin}/assets/img/warsow-logo.png`],
+      ["article:published_time", new Date((post.publishedAt || 0) * 1000).toISOString()],
+      ["twitter:card", "summary"],
+      ["twitter:title", `${post.title} — Racesow`],
+      ["twitter:description", teaser],
+    ], canonical)
+  );
+}));
+
 // The stats card behind og:image — rendered per player, cached a few minutes.
 app.get("/og/player/:id.png", renderLimiter, wrap(async (req, res) => {
   const id = parseInt(req.params.id, 10);
@@ -4482,6 +4811,7 @@ const SITEMAP_PAGES = [
   ["/maps", "0.9"],
   ["/players", "0.9"],
   ["/stats", "0.8"],
+  ["/blog", "0.8"],
   ["/tournaments", "0.7"],
   ["/demo", "0.7"],
   ["/achievements", "0.7"],
@@ -4510,6 +4840,54 @@ const sendXml = (res, xml) => {
   res.set("Content-Type", "application/xml; charset=utf-8");
   res.send(xml);
 };
+
+/* -------------------------------- feed ----------------------------------- *
+ * RSS 2.0 for the update posts. The point of the blog is that people find out
+ * about new maps without checking the site, so it needs a feed a reader can
+ * subscribe to. Registered here with the other .xml routes, above express.static
+ * and the SPA fallback (the fallback passes on any path with a dot, but static
+ * would still shadow it).
+ *
+ * <description> carries the plain teaser and <content:encoded> the rendered
+ * post. The renderer already escaped every "<" and ">" the author typed, so the
+ * CDATA section cannot be closed from inside — the split below is belt-and-
+ * braces in case that ever stops being true. */
+const cdata = (html) => `<![CDATA[${String(html).replace(/]]>/g, "]]]]><![CDATA[>")}]]>`;
+
+app.get("/blog.xml", cache(600, { edge: true }), wrap(async (req, res) => {
+  const origin = siteOrigin(req);
+  const { rows } = await race.blogList({ limit: 20 });
+  const items = rows
+    .map((r) => {
+      const url = `${origin}/blog/${encodeURIComponent(r.slug)}`;
+      return (
+        `<item>` +
+        `<title>${escAttr(r.title)}</title>` +
+        `<link>${escAttr(url)}</link>` +
+        `<guid isPermaLink="true">${escAttr(url)}</guid>` +
+        `<category>${escAttr(blogTagLabel(r.tag))}</category>` +
+        `<pubDate>${new Date((r.publishedAt || 0) * 1000).toUTCString()}</pubDate>` +
+        `<description>${escAttr(teaserFor(r))}</description>` +
+        `<content:encoded>${cdata(renderBody(r.body))}</content:encoded>` +
+        `</item>`
+      );
+    })
+    .join("");
+  sendXml(
+    res,
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+      `<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/" ` +
+      `xmlns:atom="http://www.w3.org/2005/Atom">` +
+      `<channel>` +
+      `<title>Racesow — updates</title>` +
+      `<link>${escAttr(origin + "/blog")}</link>` +
+      `<atom:link href="${escAttr(origin + "/blog.xml")}" rel="self" type="application/rss+xml"/>` +
+      `<description>New maps, site changes and server news from Racesow.</description>` +
+      `<language>en</language>` +
+      items +
+      `</channel></rss>\n`
+  );
+}));
 
 app.get("/sitemap.xml", cache(21600, { edge: true }), wrap(async (req, res) => {
   const origin = siteOrigin(req);
@@ -4541,6 +4919,13 @@ const sitemapShard = (shard) =>
         ...rows.map((t) => ({
           loc: `${origin}/tournaments/${encodeURIComponent(t.slug)}`,
           lastmod: sitemapDate(t.lastmod),
+          priority: "0.6",
+        })),
+        // Update posts ride here for the same reason tournaments do: a handful
+        // of editorial pages, not rows of a growing table.
+        ...(await race.blogSitemap()).map((b) => ({
+          loc: `${origin}/blog/${encodeURIComponent(b.slug)}`,
+          lastmod: sitemapDate(b.lastmod),
           priority: "0.6",
         })),
       ];

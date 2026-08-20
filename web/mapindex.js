@@ -18,6 +18,7 @@
 // falls through to a good one).
 import fs from "node:fs";
 import path from "node:path";
+import { isSafeMapName } from "./mapname.js";
 
 const CD_SIG = 0x02014b50; // central directory file header
 const EOCD_SIG = 0x06054b50; // end of central directory
@@ -71,8 +72,8 @@ export function listBspNames(pk3Path) {
       const commentLen = cd.readUInt16LE(p + 32);
       if (p + 46 + nameLen > cd.length) break;
       const fname = cd.toString("latin1", p + 46, p + 46 + nameLen).toLowerCase();
-      const m = fname.match(/^maps\/([a-z0-9_.-]+)\.bsp$/);
-      if (m) names.push(m[1]);
+      const m = fname.match(/^maps\/(.+)\.bsp$/);
+      if (m && isSafeMapName(m[1])) names.push(m[1]);
       p += 46 + nameLen + extraLen + commentLen;
     }
     return names;

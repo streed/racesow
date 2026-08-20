@@ -556,3 +556,147 @@ test("moderator tier: flags + map-block + restart allowed; admin-only surface is
   assert.match(admServers, /action="\/admin\/maintenance"/, "admin sees the maintenance form");
   assert.match(admServers, /action="\/admin\/broadcast"/, "admin sees the broadcast form");
 });
+
+// --- Blog / site updates ---------------------------------------------------
+// The public read paths are covered in blog.test.js; what matters here is the
+// admin flow around them: the tier gate, CSRF, slug derivation, and the fact
+// that "publish" is the single control deciding whether the world sees a post.
+
+async function blogPage(pathname) {
+  const r = await fetch(`${base}${pathname}`, { headers: { cookie: await adminCookie() } });
+  const html = await r.text();
+  return { status: r.status, html, csrf: html.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1] };
+}
+
+async function blogPost(pathname, fields, csrf) {
+  return fetch(`${base}${pathname}`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie: await adminCookie(), "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ _csrf: csrf, ...fields }),
+  });
+}
+
+test("blog: a post is created with a derived slug and is public only once published", async () => {
+  const form = await blogPage("/admin/blog/new");
+  assert.equal(form.status, 200);
+
+  // Created as a DRAFT (publish unchecked -> the field is simply absent, which
+  // is how an HTML checkbox says "off").
+  const created = await blogPost("/admin/blog/new", {
+    title: "373 New Maps!",
+    tag: "maps",
+    summary: "",
+    body: "We added **373** maps.\n\n- surf\n- slick",
+  }, form.csrf);
+  assert.equal(created.status, 303);
+
+  const row = (await db.query("SELECT * FROM blog_post")).rows[0];
+  assert.equal(row.slug, "373-new-maps", "slug derived from the title");
+  assert.equal(row.tag, "maps");
+  assert.equal(row.published_at, null, "unchecked publish => draft");
+  assert.equal(row.author, ADMIN_USER);
+
+  // A draft is invisible everywhere public.
+  assert.equal((await fetch(`${base}/api/blog/373-new-maps`)).status, 404);
+  assert.equal((await (await fetch(`${base}/api/blog`)).json()).total, 0);
+
+  // Publish it from the list, then it appears.
+  const list = await blogPage("/admin/blog");
+  assert.match(list.html, /373 New Maps!/);
+  const pub = await blogPost(`/admin/blog/${row.id}/publish`, {}, list.csrf);
+  assert.equal(pub.status, 303);
+
+  const now = await (await fetch(`${base}/api/blog/373-new-maps`)).json();
+  assert.equal(now.title, "373 New Maps!");
+  assert.match(now.html, /<strong>373<\/strong>/);
+  // The teaser falls back to the body when no summary was given.
+  assert.match(now.teaser, /373/);
+});
+
+test("blog: a duplicate slug is reported, not thrown, and never clobbers the original", async () => {
+  const form = await blogPage("/admin/blog/new");
+  const dup = await blogPost("/admin/blog/new", {
+    title: "373 New Maps!", tag: "update", summary: "", body: "different body",
+  }, form.csrf);
+  // Re-renders the form with an error rather than redirecting or 500ing.
+  assert.equal(dup.status, 200);
+  assert.match(await dup.text(), /already taken/i);
+
+  const rows = (await db.query("SELECT body FROM blog_post WHERE slug = '373-new-maps'")).rows;
+  assert.equal(rows.length, 1);
+  assert.match(rows[0].body, /We added/, "the original post is untouched");
+});
+
+test("blog: editing keeps the slug and can pull a post back to draft", async () => {
+  const id = (await db.query("SELECT id FROM blog_post WHERE slug='373-new-maps'")).rows[0].id;
+  const page = await blogPage(`/admin/blog/${id}`);
+  assert.equal(page.status, 200);
+  assert.match(page.html, /Preview/, "the saved body is previewed as rendered");
+
+  // Save with publish unchecked -> back to draft, slug unchanged.
+  const saved = await blogPost(`/admin/blog/${id}`, {
+    title: "373 new maps (edited)", tag: "maps", summary: "Now with a teaser.", body: "edited body",
+  }, page.csrf);
+  assert.equal(saved.status, 303);
+
+  const row = (await db.query("SELECT * FROM blog_post WHERE id=$1", [id])).rows[0];
+  assert.equal(row.slug, "373-new-maps", "the slug is not rewritten by a re-title");
+  assert.equal(row.title, "373 new maps (edited)");
+  assert.equal(row.published_at, null);
+  assert.equal((await fetch(`${base}/api/blog/373-new-maps`)).status, 404);
+});
+
+test("blog: a bad publish date is refused instead of stamping the epoch", async () => {
+  const id = (await db.query("SELECT id FROM blog_post WHERE slug='373-new-maps'")).rows[0].id;
+  const page = await blogPage(`/admin/blog/${id}`);
+  const r = await blogPost(`/admin/blog/${id}`, {
+    title: "T", tag: "maps", summary: "", body: "b", publish: "on", published_at: "not-a-date",
+  }, page.csrf);
+  assert.equal(r.status, 200);
+  assert.match(await r.text(), /publish date/i);
+  const row = (await db.query("SELECT published_at FROM blog_post WHERE id=$1", [id])).rows[0];
+  assert.equal(row.published_at, null, "still a draft, not published at 1970");
+});
+
+test("blog: an explicit backdate is honoured", async () => {
+  const id = (await db.query("SELECT id FROM blog_post WHERE slug='373-new-maps'")).rows[0].id;
+  const page = await blogPage(`/admin/blog/${id}`);
+  const r = await blogPost(`/admin/blog/${id}`, {
+    title: "T", tag: "maps", summary: "", body: "b", publish: "on", published_at: "2026-08-12T09:30",
+  }, page.csrf);
+  assert.equal(r.status, 303);
+  const row = (await db.query("SELECT published_at FROM blog_post WHERE id=$1", [id])).rows[0];
+  // The form has no timezone; the site reads it as UTC.
+  assert.equal(Number(row.published_at), Math.floor(Date.parse("2026-08-12T09:30:00Z") / 1000));
+});
+
+test("blog: writes need CSRF and an admin session", async () => {
+  const id = (await db.query("SELECT id FROM blog_post WHERE slug='373-new-maps'")).rows[0].id;
+
+  // No CSRF token.
+  const noCsrf = await fetch(`${base}/admin/blog/${id}/publish`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie: await adminCookie(), "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({}),
+  });
+  assert.equal(noCsrf.status, 403);
+
+  // No session at all -> bounced to the login page, not served.
+  const anon = await fetch(`${base}/admin/blog`, { redirect: "manual" });
+  assert.ok([302, 303].includes(anon.status), `expected a redirect, got ${anon.status}`);
+});
+
+test("blog: a non-numeric post id is a 404, not a 500", async () => {
+  const r = await fetch(`${base}/admin/blog/not-an-id`, { headers: { cookie: await adminCookie() } });
+  assert.equal(r.status, 404);
+});
+
+test("blog: delete removes the post", async () => {
+  const id = (await db.query("SELECT id FROM blog_post WHERE slug='373-new-maps'")).rows[0].id;
+  const page = await blogPage(`/admin/blog/${id}`);
+  const r = await blogPost(`/admin/blog/${id}/delete`, {}, page.csrf);
+  assert.equal(r.status, 303);
+  assert.equal((await db.query("SELECT id FROM blog_post")).rows.length, 0);
+});

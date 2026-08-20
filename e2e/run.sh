@@ -158,6 +158,42 @@ fi
 [ ! -e "${TMP}/wsw/racemod/topscores/race/nosuchmap.txt" ] \
     || { echo "FAIL: file written for an unknown map" >&2; exit 1; }
 
+# Map names are not all [a-z0-9._-]. The pool carries un-dead!020_3,
+# gu3#5-stickupkids, 4^3, 3ont-p900`archi and 18 more. Their finishes have always
+# been ingested (the report path never charset-guarded), but every READ path used
+# to refuse them, so those maps had a full leaderboard on the site and an empty
+# in-game `top`. Two distinct traps live here, so both directions are exercised:
+# the API's isSafeMapName / the native's rsMapNameOk must accept the name, and
+# the native must percent-encode it into the query string — an unencoded '#'
+# makes curl send "?map=gu3" and treat the rest as a fragment.
+step "phase C: punctuation map names round-trip (ingest -> API -> topscores file)"
+"${TMP}/harness" "${BASE}/api/ingest" "${TOKEN}" "${VERSION}" <<'EOF'
+un-dead!020_3	^1No^7va		20132	5000,12000
+gu3#5-stickupkids	^4Wa^5ve		31000	9000
+EOF
+
+for m in 'un-dead!020_3' 'gu3#5-stickupkids'; do
+    WARSOW_DIR="${TMP}/wsw" FS_GAME="racemod" \
+        "${TMP}/topfetch" "${BASE}/api/game/topscores" "" "${m}" 10 \
+        || { echo "FAIL: fetch refused/failed for '${m}'" >&2; exit 1; }
+    f="${TMP}/wsw/racemod/topscores/race/${m}.txt"
+    # The file is named with the RAW map name (that is the name the gametype's
+    # own loader/writer uses); only the URL copy is encoded.
+    head -1 "${f}" | grep -qx "//${m} top scores" \
+        || { echo "FAIL: bad header for '${m}'" >&2; cat "${f}" >&2; exit 1; }
+done
+grep -qF '"20132" "^1No^7va" "2" "5000" "12000" ' "${TMP}/wsw/racemod/topscores/race/un-dead!020_3.txt" \
+    || { echo "FAIL: record missing from the '!' map board" >&2; exit 1; }
+grep -qF '"31000" "^4Wa^5ve" "1" "9000" ' "${TMP}/wsw/racemod/topscores/race/gu3#5-stickupkids.txt" \
+    || { echo "FAIL: record missing from the '#' map board (unencoded fragment?)" >&2; exit 1; }
+
+step "phase C: a traversing map name is still refused before any request"
+rc=0
+WARSOW_DIR="${TMP}/wsw" FS_GAME="racemod" \
+    "${TMP}/topfetch" "${BASE}/api/game/topscores" "" '../../etc/passwd' 3 || rc=$?
+[ "${rc}" = "1" ] \
+    || { echo "FAIL: traversing name was not refused outright (rc=${rc})" >&2; exit 1; }
+
 step "phase C: GET retry — fetch starts against a DOWN server, must recover"
 kill "${SERVER_PID}"
 wait "${SERVER_PID}" 2>/dev/null || true

@@ -59,6 +59,7 @@ import {
   monthlyName,
   monthlyDescription,
 } from "./tournaments.js";
+import { isSafeMapName } from "./mapname.js";
 
 // Async (thread-pool) compression for the request/ingest paths — the sync
 // variants block the event loop for the duration of an 8MB trajectory.
@@ -350,6 +351,27 @@ export function identKey(name) {
 // nick falls back to a sentinel. `_login` is kept only for call-site parity.
 export function canonKey(simplified, _login) {
   return identKey(simplified) || "?empty?";
+}
+
+// Map-name safety lives in its own module so the .bsp/.pk3 readers can share
+// it without importing the Postgres client; re-exported here because every
+// existing caller reaches for it through db.js.
+export { isSafeMapName, MAX_MAP_NAME } from "./mapname.js";
+
+// blog_post row -> the shape every caller sees: epoch ints as Numbers (pg hands
+// BIGINT back as a string) and a null published_at meaning "draft".
+function blogRow(r) {
+  return {
+    id: num(r.id),
+    slug: r.slug,
+    title: r.title,
+    summary: r.summary || "",
+    body: r.body || "",
+    tag: r.tag || "update",
+    publishedAt: r.published_at == null ? null : num(r.published_at),
+    updatedAt: num(r.updated_at),
+    author: r.author || null,
+  };
 }
 
 // Escape LIKE/ILIKE metacharacters in user-supplied search text so "50%" or
@@ -1065,7 +1087,7 @@ class RaceDB {
   // Returns null for a name that fails the charset check — never a partial row.
   async ensureMapByName(name) {
     const n = String(name || "").toLowerCase();
-    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(n)) return null;
+    if (!isSafeMapName(n)) return null;
     const row = await this.one(
       `INSERT INTO map (name) VALUES ($1)
        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
@@ -1088,7 +1110,7 @@ class RaceDB {
   // load-bearing: the game swaps this straight into its local records file.
   async gameTopscoresText(mapName) {
     const name = String(mapName || "").toLowerCase();
-    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
+    if (!isSafeMapName(name)) return null;
     const map = await this.one("SELECT id FROM map WHERE name = $1", [name]);
     if (!map) return null;
 
@@ -1154,7 +1176,7 @@ class RaceDB {
   // name a record was set under.
   async gameRanksText(mapName) {
     const name = String(mapName || "").toLowerCase();
-    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
+    if (!isSafeMapName(name)) return null;
     const map = await this.one("SELECT id FROM map WHERE name = $1", [name]);
     if (!map) return null;
 
@@ -1259,7 +1281,7 @@ class RaceDB {
   // body, so an empty body reads as "none").
   async gamePlayerRecordText(mapName, playerName) {
     const name = String(mapName || "").toLowerCase();
-    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
+    if (!isSafeMapName(name)) return null;
     const map = await this.one("SELECT id FROM map WHERE name = $1", [name]);
     if (!map) return null;
     // identKey() is the JS twin of the game's removeColorTokens().tolower() AND
@@ -1346,7 +1368,7 @@ class RaceDB {
   // leaves them at the map default). null (unknown/invalid map) => 404 upstream.
   async savedStartText(mapName, playerName) {
     const name = String(mapName || "").toLowerCase();
-    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
+    if (!isSafeMapName(name)) return null;
     const map = await this.one("SELECT id FROM map WHERE name = $1", [name]);
     if (!map) return null;
     const clean = simplifyName(playerName).toLowerCase();
@@ -1726,7 +1748,7 @@ class RaceDB {
   //   then one line per frame: x y z pitch yaw roll vx vy vz
   async gameGhostText(mapName) {
     const name = String(mapName || "").toLowerCase();
-    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return null;
+    if (!isSafeMapName(name)) return null;
     const map = await this.one("SELECT id FROM map WHERE name = $1", [name]);
     if (!map) return null;
     const buf = await this.ghostGzip(num(map.id));
@@ -2811,6 +2833,114 @@ class RaceDB {
 
   // ---- Sitemap: every content page worth crawling ------------------------
   //
+  // --- Site update posts (the /blog "what's new" feed) -----------------------
+  // Read paths take an explicit `drafts` flag rather than defaulting to "show
+  // everything": the public API and the admin area call the same methods, and a
+  // draft leaking into the public list is the one failure mode that matters
+  // here. The flag is a boolean the caller sets, never anything derived from
+  // request input.
+
+  // One page of posts, newest first. `drafts: true` (admin) also returns
+  // unpublished rows, which sort to the top since they have no date yet.
+  async blogList({ limit = 10, offset = 0, drafts = false } = {}) {
+    const lim = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 50);
+    const off = Math.max(parseInt(offset, 10) || 0, 0);
+    const where = drafts ? "" : "WHERE published_at IS NOT NULL";
+    const totalRow = await this.one(`SELECT COUNT(*) n FROM blog_post ${where}`);
+    const rows = await this.all(
+      `SELECT id, slug, title, summary, body, tag, published_at, updated_at, author
+         FROM blog_post ${where}
+        ORDER BY published_at IS NULL DESC, published_at DESC, id DESC
+        LIMIT $1 OFFSET $2`,
+      [lim, off]
+    );
+    return { total: num(totalRow.n), limit: lim, offset: off, rows: rows.map(blogRow) };
+  }
+
+  async blogBySlug(slug, { drafts = false } = {}) {
+    const r = await this.one(
+      `SELECT id, slug, title, summary, body, tag, published_at, updated_at, author
+         FROM blog_post WHERE slug = $1 ${drafts ? "" : "AND published_at IS NOT NULL"}`,
+      [String(slug || "")]
+    );
+    return r ? blogRow(r) : null;
+  }
+
+  async blogById(id) {
+    if (id == null) return null; // caller passed an unparseable :id -> 404, not a query
+    const r = await this.one(
+      `SELECT id, slug, title, summary, body, tag, published_at, updated_at, author
+         FROM blog_post WHERE id = $1`,
+      [id]
+    );
+    return r ? blogRow(r) : null;
+  }
+
+  // The neighbours of a post in publish order, for the prev/next links on a post
+  // page. Drafts are never neighbours — they have no place in the reading order.
+  async blogNeighbours(publishedAt, id) {
+    const at = num(publishedAt);
+    const [prev, next] = await Promise.all([
+      this.one(
+        `SELECT slug, title FROM blog_post
+          WHERE published_at IS NOT NULL AND (published_at, id) < ($1, $2)
+          ORDER BY published_at DESC, id DESC LIMIT 1`,
+        [at, id]
+      ),
+      this.one(
+        `SELECT slug, title FROM blog_post
+          WHERE published_at IS NOT NULL AND (published_at, id) > ($1, $2)
+          ORDER BY published_at ASC, id ASC LIMIT 1`,
+        [at, id]
+      ),
+    ]);
+    return {
+      prev: prev ? { slug: prev.slug, title: prev.title } : null,
+      next: next ? { slug: next.slug, title: next.title } : null,
+    };
+  }
+
+  // Returns null when the slug is already taken, so the caller can report it
+  // instead of the insert throwing a constraint error up the stack.
+  async blogCreate({ slug, title, summary = "", body = "", tag = "update", publishedAt = null, author = null },
+                   now = Math.floor(Date.now() / 1000)) {
+    const r = await this.one(
+      `INSERT INTO blog_post (slug, title, summary, body, tag, published_at, created_at, updated_at, author)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
+       ON CONFLICT (slug) DO NOTHING RETURNING id`,
+      [slug, title, summary, body, tag, publishedAt, now, author]
+    );
+    return r ? num(r.id) : null;
+  }
+
+  // Edits content only. The slug is deliberately NOT updatable: it is the
+  // published identity of the post, and rewriting it silently breaks every link
+  // already shared. publishedAt is passed through as given (null = back to draft).
+  async blogUpdate(id, { title, summary, body, tag, publishedAt },
+                   now = Math.floor(Date.now() / 1000)) {
+    await this.pool.query(
+      `UPDATE blog_post
+          SET title = $2, summary = $3, body = $4, tag = $5, published_at = $6, updated_at = $7
+        WHERE id = $1`,
+      [id, title, summary, body, tag, publishedAt, now]
+    );
+  }
+
+  async blogDelete(id) {
+    await this.pool.query("DELETE FROM blog_post WHERE id = $1", [id]);
+  }
+
+  // Published posts for the sitemap: slug + the last time the text changed.
+  async blogSitemap() {
+    return (
+      await this.all(
+        `SELECT slug, GREATEST(published_at, updated_at) lastmod
+           FROM blog_post WHERE published_at IS NOT NULL
+          ORDER BY published_at DESC, id DESC`
+      )
+    ).map((r) => ({ slug: r.slug, lastmod: num(r.lastmod) }));
+  }
+
   // Only pages a crawler can actually use: a map/player page server-renders its
   // own OG tags (see server.js) and reads as a real document, so it belongs in
   // the index. Deliberately absent: /compare (needs two ids — no canonical URL),
@@ -3624,7 +3754,7 @@ class RaceDB {
     expireSecs = MAP_QUARANTINE_EXPIRE_SECS,
   }) {
     const name = String(mapName || "").toLowerCase();
-    if (!/^[a-z0-9][a-z0-9_.-]*$/.test(name)) return { ok: false, error: "invalid map name" };
+    if (!isSafeMapName(name)) return { ok: false, error: "invalid map name" };
 
     const client = await this.pool.connect();
     try {

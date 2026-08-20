@@ -283,11 +283,12 @@ size_t collectBody( void *data, size_t size, size_t nmemb, void *userp )
 	return n;
 }
 
-// RFC3986 percent-encode for a query-string value. The map-name fetches never
-// needed this (map names are [a-z0-9._-]), but a player nick can carry spaces,
-// '&', '#' or UTF-8 bytes that would corrupt "?map=..&name=<nick>" — and curl
-// does NOT auto-encode CURLOPT_URL. Hand-rolled + ASCII so it survives the
-// POSIX-locale build; encodes everything except the RFC3986 unreserved set.
+// RFC3986 percent-encode for a query-string value. Player nicks need it (spaces,
+// '&', '#', UTF-8 bytes would all corrupt "?map=..&name=<nick>"), and so do map
+// names: the pool really does contain gu3#5-stickupkids, whose unencoded '#'
+// turns the rest of the URL into a fragment the server never sees. curl does NOT
+// auto-encode CURLOPT_URL. Hand-rolled + ASCII so it survives the POSIX-locale
+// build; encodes everything except the RFC3986 unreserved set.
 std::string urlEncode( const std::string &s )
 {
 	static const char hex[] = "0123456789ABCDEF";
@@ -305,6 +306,54 @@ std::string urlEncode( const std::string &s )
 		}
 	}
 	return out;
+}
+
+// Longest map name we accept. The longest real one is 47 characters and the
+// reverse boards ask for "<name>-reversed" (+9), so this is headroom.
+static const size_t RS_MAP_NAME_MAX = 64;
+
+// Punctuation a map name may contain after its first character. The twin of
+// isSafeMapName in web/mapname.js (the stats API); keep the two in step.
+//
+// The rule used to stop at "_.-", which refused every fetch for the 22 real maps
+// whose names carry a '!', '#', '^' or '`' - un-dead!020_3, gu3#5-stickupkids,
+// 4^3, 3ont-p900`archi and friends. Their finishes were still reported and
+// stored (the report path never had this guard), so those maps had a full
+// leaderboard on the web and an empty `top` in game.
+//
+// It stays an allowlist rather than "anything printable" because the name is
+// spliced into a console command ("map <name>"), a cfg line, a shell variable in
+// entrypoint.sh/crashguard.sh, a file name under topscores/race/, and the
+// double-quoted token format of the payload itself. So ';', '$', '&', quotes,
+// the directory separators, '%' and the glob characters stay out for good. What
+// is left is inert in all of those, and every caller percent-encodes the name
+// into the query string on top of that.
+static const char RS_MAP_NAME_PUNCT[] = "_.-!#^`~+=@()[],";
+
+// Is this map name safe to put in a URL and to use as a file name?
+bool rsMapNameOk( const char *mapname )
+{
+	if( !mapname || !mapname[0] )
+		return false;
+	// A leading '.' or '-' is what turns a name into "../.." or into something a
+	// command line reads as an option: the first character is always alphanumeric.
+	char first = mapname[0];
+	if( !( ( first >= 'a' && first <= 'z' ) || ( first >= '0' && first <= '9' ) ) )
+		return false;
+
+	size_t n = 0;
+	for( const char *p = mapname; *p; p++, n++ ) {
+		if( n >= RS_MAP_NAME_MAX )
+			return false;
+		char c = *p;
+		if( ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) )
+			continue;
+		if( strchr( RS_MAP_NAME_PUNCT, c ) == NULL )
+			return false;
+		if( c == '.' && p[1] == '.' )
+			return false; // belt and braces: no directory escape
+	}
+	return true;
 }
 
 // -1 = transport error (retryable), otherwise the HTTP status.
@@ -1504,16 +1553,10 @@ void RS_ApiFetchTop( const char *url, const char *token, const char *mapname )
 	if( !url || !url[0] || !mapname || !mapname[0] )
 		return;
 
-	// The map name becomes a file name — accept the same character set the
-	// stats API allows and refuse anything else outright.
-	for( const char *p = mapname; *p; p++ ) {
-		char c = *p;
-		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
-			c == '_' || c == '.' || c == '-';
-		if( !ok ) {
-			fprintf( stderr, "rs_api: refusing top-scores fetch for unsafe map name\n" );
-			return;
-		}
+	// The map name becomes a file name AND a query value (see rsMapNameOk).
+	if( !rsMapNameOk( mapname ) ) {
+		fprintf( stderr, "rs_api: refusing top-scores fetch for unsafe map name\n" );
+		return;
 	}
 
 	const char *base = getenv( "WARSOW_DIR" );
@@ -1523,7 +1566,9 @@ void RS_ApiFetchTop( const char *url, const char *token, const char *mapname )
 	if( !fsgame || !fsgame[0] )
 		fsgame = "racemod";
 
-	std::string full = std::string( url ) + "?map=" + mapname;
+	// URL copy percent-encoded; the on-disk copy stays raw so it matches the
+	// file name the gametype's own loader/writer uses (hrace/recordtime.as).
+	std::string full = std::string( url ) + "?map=" + urlEncode( mapname );
 	std::string path = std::string( base ) + "/" + fsgame + "/topscores/race/" + mapname + ".txt";
 
 	ApiState *s = ensureStarted();
@@ -1693,17 +1738,12 @@ void RS_ApiFetchGhost( const char *url, const char *token, const char *mapname )
 {
 	if( !url || !url[0] || !mapname || !mapname[0] )
 		return;
-	for( const char *p = mapname; *p; p++ ) {
-		char c = *p;
-		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
-			c == '_' || c == '.' || c == '-';
-		if( !ok ) {
-			fprintf( stderr, "rs_api: refusing ghost fetch for unsafe map name\n" );
-			return;
-		}
+	if( !rsMapNameOk( mapname ) ) {
+		fprintf( stderr, "rs_api: refusing ghost fetch for unsafe map name\n" );
+		return;
 	}
 
-	std::string full = std::string( url ) + "?map=" + mapname;
+	std::string full = std::string( url ) + "?map=" + urlEncode( mapname );
 	ApiState *s = ensureStarted();
 	unsigned gen = s->fetchGhostGen.fetch_add( 1 ) + 1;
 	{
@@ -2212,19 +2252,13 @@ void RS_ApiFetchRanks( const char *url, const char *token, const char *mapname )
 	if( !url || !url[0] || !mapname || !mapname[0] )
 		return;
 
-	// The map name rides in the query string - accept the same character set the
-	// stats API allows and refuse anything else outright.
-	for( const char *p = mapname; *p; p++ ) {
-		char c = *p;
-		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
-			c == '_' || c == '.' || c == '-';
-		if( !ok ) {
-			fprintf( stderr, "rs_api: refusing ranks fetch for unsafe map name\n" );
-			return;
-		}
+	// The map name rides in the query string, percent-encoded (see rsMapNameOk).
+	if( !rsMapNameOk( mapname ) ) {
+		fprintf( stderr, "rs_api: refusing ranks fetch for unsafe map name\n" );
+		return;
 	}
 
-	std::string full = std::string( url ) + "?map=" + mapname;
+	std::string full = std::string( url ) + "?map=" + urlEncode( mapname );
 	ApiState *s = ensureStarted();
 	unsigned gen = s->fetchRanksGen.fetch_add( 1 ) + 1;
 	{
@@ -2305,20 +2339,14 @@ void RS_ApiFetchPlayerRecord( const char *url, const char *token, const char *ma
 	if( playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
 		return;
 
-	// The map name rides in the query string - accept the same character set the
-	// stats API allows and refuse anything else outright. (The name is encoded
-	// instead of charset-guarded.)
-	for( const char *p = mapname; *p; p++ ) {
-		char c = *p;
-		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
-			c == '_' || c == '.' || c == '-';
-		if( !ok ) {
-			fprintf( stderr, "rs_api: refusing player-record fetch for unsafe map name\n" );
-			return;
-		}
+	// Both the map name and the player nick ride in the query string; both are
+	// percent-encoded below, and the map name is guarded too (rsMapNameOk).
+	if( !rsMapNameOk( mapname ) ) {
+		fprintf( stderr, "rs_api: refusing player-record fetch for unsafe map name\n" );
+		return;
 	}
 
-	std::string full = std::string( url ) + "?map=" + mapname + "&name=" + urlEncode( cleanName );
+	std::string full = std::string( url ) + "?map=" + urlEncode( mapname ) + "&name=" + urlEncode( cleanName );
 	ApiState *s = ensureStarted();
 	// Bump the slot's generation (supersedes any in-flight fetch), THEN clear any
 	// stale result still sitting in the slot. This matters because slots are
@@ -2403,19 +2431,14 @@ void RS_ApiFetchSavedStart( const char *url, const char *token, const char *mapn
 	if( playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
 		return;
 
-	// Map name rides in the query string - same charset guard as the other map
-	// fetches; the player name is percent-encoded instead.
-	for( const char *p = mapname; *p; p++ ) {
-		char c = *p;
-		bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) ||
-			c == '_' || c == '.' || c == '-';
-		if( !ok ) {
-			fprintf( stderr, "rs_api: refusing saved-start fetch for unsafe map name\n" );
-			return;
-		}
+	// Map name rides in the query string - same guard as the other map fetches;
+	// both it and the player name are percent-encoded below.
+	if( !rsMapNameOk( mapname ) ) {
+		fprintf( stderr, "rs_api: refusing saved-start fetch for unsafe map name\n" );
+		return;
 	}
 
-	std::string full = std::string( url ) + "?map=" + mapname + "&name=" + urlEncode( cleanName );
+	std::string full = std::string( url ) + "?map=" + urlEncode( mapname ) + "&name=" + urlEncode( cleanName );
 	ApiState *s = ensureStarted();
 	// gen first, result second (see RS_ApiFetchPlayerRecord): slots are reused
 	// across players, so clear any stale result the previous occupant left behind.

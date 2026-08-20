@@ -1662,11 +1662,18 @@ class Player
         if ( pattern == "*" )
             pattern = "";
 
-        if ( !pre && this.randmap != "" && this.randmapPattern == pattern )
-            return this.randmap;
-
         Cvar mapname( "mapname", "", 0 );
         String current = mapname.string;
+
+        // A vote (pre=false) reuses the "/prerandmap" preview whenever it asks
+        // for the same filter, so the vote offers exactly the map the caller
+        // was just shown. Only a fresh "/prerandmap" re-rolls it. The current
+        // map is excluded here too: the preview cannot normally outlive its map
+        // (the VM is rebuilt per level), but a vote to reload the map we are
+        // already on is never what the caller previewed.
+        if ( !pre && this.randmap != "" && this.randmapPattern == pattern
+             && this.randmap != current )
+            return this.randmap;
 
         String[] maps = GetMapsByFilter( pattern, current );
 

@@ -3246,6 +3246,88 @@ function trophiesCard(list) {
     </div>`;
 }
 
+/* ------------------------------ /blog ------------------------------------ *
+ * Site updates: what changed and when. The list renders teasers the API derives
+ * server-side (it never ships post bodies), and a post's HTML is rendered by
+ * the server's markdown-lite renderer — the client only inserts it.
+ *
+ * That insertion is the one innerHTML on this page that is not built from esc()
+ * output, which is exactly why the rendering lives on the server: web/blog.js
+ * escapes the author's text before re-introducing its own fixed tag vocabulary,
+ * so `html` here can never contain markup an author typed. */
+
+// "20 Aug 2026" — posts are dated, not relative: "3d ago" is useless on a
+// changelog you are reading to find out when something shipped.
+function blogDate(ts) {
+  if (!ts) return "";
+  return new Date(ts * 1000).toLocaleDateString("en-GB", {
+    day: "numeric", month: "short", year: "numeric", timeZone: "UTC",
+  });
+}
+
+const blogTagPill = (post) =>
+  `<span class="pill blogtag ${esc(post.tag || "update")}">${esc(post.tagLabel || "Update")}</span>`;
+
+async function viewBlog(params) {
+  loading();
+  const state = { offset: Math.max(0, parseInt(params.offset, 10) || 0) };
+  const d = await api("/blog" + buildQuery({ limit: 10, offset: state.offset || "" }));
+  const posts = d.posts || [];
+  const list = posts.length
+    ? posts
+        .map(
+          (p) => `<article class="panel blogcard">
+            <div class="blogcard-head">
+              ${blogTagPill(p)}
+              <time datetime="${esc(new Date((p.publishedAt || 0) * 1000).toISOString())}">${esc(blogDate(p.publishedAt))}</time>
+            </div>
+            <h2><a data-nav="#/blog/${encodeURIComponent(p.slug)}" href="/blog/${encodeURIComponent(p.slug)}">${esc(p.title)}</a></h2>
+            <p class="blogteaser">${esc(p.teaser)}</p>
+            <a class="blogmore" data-nav="#/blog/${encodeURIComponent(p.slug)}" href="/blog/${encodeURIComponent(p.slug)}">Read more →</a>
+          </article>`
+        )
+        .join("")
+    : `<div class="empty">No updates posted yet.</div>`;
+
+  app.innerHTML = `
+    <div class="page-title"><span class="accent">SITE</span> UPDATES</div>
+    <p class="page-sub">New maps, site changes and server news.
+      <a href="/blog.xml" class="rsslink" target="_blank" rel="noopener">RSS feed</a></p>
+    <div class="bloglist">${list}</div>
+    ${pager(state, { offset: d.offset, limit: d.limit, total: d.total }, "#/blog")}`;
+}
+
+async function viewBlogPost(slug) {
+  loading();
+  let d;
+  try {
+    d = await api("/blog/" + encodeURIComponent(slug));
+  } catch (e) {
+    // A draft, a deleted post, or a typo'd link: say so on the page rather than
+    // dropping the reader into the generic error view.
+    app.innerHTML = `<div class="crumbs"><a data-nav="#/blog">Updates</a></div>
+      <div class="empty">That update doesn't exist (any more).<br>
+        <small><a data-nav="#/blog">See all updates</a></small></div>`;
+    return;
+  }
+  const nav = [
+    d.prev ? `<a class="blognav prev" data-nav="#/blog/${encodeURIComponent(d.prev.slug)}" href="/blog/${encodeURIComponent(d.prev.slug)}">← ${esc(d.prev.title)}</a>` : `<span></span>`,
+    d.next ? `<a class="blognav next" data-nav="#/blog/${encodeURIComponent(d.next.slug)}" href="/blog/${encodeURIComponent(d.next.slug)}">${esc(d.next.title)} →</a>` : `<span></span>`,
+  ].join("");
+
+  app.innerHTML = `
+    <div class="crumbs"><a data-nav="#/blog">Updates</a> / ${esc(d.title)}</div>
+    <article class="panel blogpost">
+      <div class="blogcard-head">
+        ${blogTagPill(d)}
+        <time datetime="${esc(new Date((d.publishedAt || 0) * 1000).toISOString())}">${esc(blogDate(d.publishedAt))}</time>
+      </div>
+      <h1 class="blogtitle">${esc(d.title)}</h1>
+      <div class="blogbody">${d.html || ""}</div>
+    </article>
+    <div class="blognavrow">${nav}</div>`;
+}
+
 async function router() {
   stopLiveRefresh();
   stopReplay();
@@ -3267,6 +3349,10 @@ async function router() {
     else if (path === "/compare") await viewCompare(params);
     else if (path === "/achievements") await viewAchievements();
     else if (path === "/stats") await viewStats(params);
+    // Exact match first, same as /tournaments: "/blog" is the index,
+    // "/blog/<slug>" one post.
+    else if (path === "/blog") await viewBlog(params);
+    else if (path.startsWith("/blog/")) await viewBlogPost(decodeURIComponent(path.slice(6)));
     // Exact match first: "/tournaments" is the calendar, "/tournaments/<slug>"
     // one tournament. Both share a stem so setActiveNav's startsWith highlights
     // the header link on either.

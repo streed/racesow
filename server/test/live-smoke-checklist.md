@@ -89,8 +89,10 @@ finishing.
 | B9 | `position recall interval` → `position recall interval auto` (after a finish) → `position recall delay` / `delay 10` | Prints, sets; `auto` errors "You haven't finished yet." with no finish |
 | B10 | `mark` → move → `mark` again | Dummy model at your spot, only you see it; re-mark moves it |
 | B11 | `prerandmap *` and `prerandmap <pattern>` | Prints chosen map + its top-scores table + match count; re-rolls each call |
+| B11b | `prerandmap <pattern>` then `callvote randmap <same pattern>` | The vote offers the map the preview just showed (same pick, same match count); a different pattern, another player, or a fresh `prerandmap` re-rolls |
 | B12 | `lastrecs` (after setting a record, then `rcon map` to another map) | Cross-map recent-records table with "(previously …)" |
 | B13 | `top coldrun` (from another map) | That map's board without loading it; `top` alone unchanged |
+| B13b | `rcon map un-dead!020_3`, then `top` (also try `gu3#5-stickupkids`) | A full board, matching racesow.org/map/4059. These names carry a `!` / `#`; both the API gate and the fetch native used to refuse them, so an empty board here means the web layer or the engine did not get the fix |
 | B14 | `noclip` as a spectator; `noclip` while dead; `noclip` while playing outside practice | Joins + enters practice + noclips in place; auto-enters practicemode; "Can't use noclip in overtime." during overtime |
 | B15 | In noclip: hold ATTACK+SPECIAL aiming at a wall, then at water | Glide toward the aimed surface, stopping just short; water surfaces now valid targets (MASK_WATER) |
 | B16 | `position save` in prerace while dead / under a low ceiling | "You can only save your position while alive." / "…where you cannot stand up." |

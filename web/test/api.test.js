@@ -423,6 +423,52 @@ test("/api/game/topscores serves the EXACT topscores file format the gametype pa
   assert.equal((await fetch(`${base}/api/game/topscores`)).status, 404);
 });
 
+test("game payloads serve maps whose names carry punctuation (the in-game `top` gap)", async () => {
+  // 22 real maps are named with a '!', '#', '^' or '`' — un-dead!020_3,
+  // gu3#5-stickupkids, 4^3, 3ont-p900`archi. Their finishes have always been
+  // ingested (/api/ingest never charset-checked the map), but every game READ
+  // path refused the name, so racesow.org/map/4059 showed 85 records while the
+  // in-game `top` on that very map was empty. Every payload the gametype pulls
+  // per map is covered here, because they shared the one rejecting predicate.
+  for (const map of ["un-dead!020_3", "gu3#5-stickupkids", "4^3", "3ont-p900`archi"]) {
+    assert.deepEqual(
+      (await ingest(gameBody({ map, name: "^1No^7va", time: 20132, cps: [5000] }))).json,
+      { inserted: 1, improved: 0, unchanged: 0 },
+      `ingest accepted ${map}`
+    );
+    const q = encodeURIComponent(map);
+    const top = await fetch(`${base}/api/game/topscores?map=${q}`);
+    assert.equal(top.status, 200, `topscores for ${map}`);
+    const lines = (await top.text()).split("\n");
+    assert.equal(lines[0], `//${map} top scores`);
+    // Name pinned loosely: which nick variant represents the canonical group is
+    // decided by earlier tests in this file, and is not what this test is about.
+    assert.match(lines[2], /^"20132" ".+" "1" "5000" $/);
+
+    const ranks = await fetch(`${base}/api/game/ranks?map=${q}`);
+    assert.equal(ranks.status, 200, `ranks for ${map}`);
+    assert.match(await ranks.text(), /^\/\/ranks 1\n1 .+\n/);
+
+    const rec = await fetch(`${base}/api/game/player-record?map=${q}&name=nova`);
+    assert.equal(rec.status, 200, `player-record for ${map}`);
+    assert.match(await rec.text(), /^\/\/playerrec 1 1 /);
+
+    const start = await fetch(`${base}/api/game/saved-start?map=${q}&name=nova`);
+    assert.equal(start.status, 200, `saved-start for ${map}`);
+    assert.equal(await start.text(), "//starts\n");
+  }
+
+  // Still refused: characters that would end the engine console command the map
+  // name is spliced into, or escape the topscores/race/ directory it names.
+  for (const bad of ["semi;colon", "dollar$var", "a b", "-lead", "../../etc/passwd"]) {
+    assert.equal(
+      (await fetch(`${base}/api/game/topscores?map=${encodeURIComponent(bad)}`)).status,
+      404,
+      `topscores must refuse ${bad}`
+    );
+  }
+});
+
 test("/api/game/player-record serves one player's PB (rank + splits) the gametype seeds on join", async () => {
   // testmap1 was populated by the ingest test above: Nova 48000 (rank 1), Wave 49000.
   const r = await fetch(`${base}/api/game/player-record?map=testmap1&name=nova`);
