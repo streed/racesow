@@ -39,6 +39,13 @@ x-mirror-common: &mirror-common
     MAP_ROTATION: "0"
     MIRROR_PORT: "44450"
     MIRROR_SECRET: "mirror-test-local-only"
+    # Which game each mesh tag runs. The idle-follow rule (maprotate.as) only
+    # ever follows a peer it can prove runs this same engine, and it reads that
+    # from this table (or, in production, from the -ws / -wf tag suffix, which
+    # the A/B/C test tags don't carry). Without it these three nodes look like
+    # three unknown games to each other and never follow anything.
+    HOP_SERVERS: "A;Mirror Test A;warsow;localhost:44403|B;Mirror Test B;warsow;localhost:44401|C;Mirror Test C;warsow;localhost:44402"
+    HOP_GAME: "warsow"
     # test-only; lets scripts drive a node's console (e.g. addbot on B)
     RCON_PASSWORD: "mirrortest"
     # log received events + roster summaries to the console (rs_mirror(as):

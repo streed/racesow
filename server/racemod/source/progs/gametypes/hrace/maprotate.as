@@ -1,4 +1,10 @@
-// Idle map rotation.
+// What an unattended server does with its map.
+//
+// Two jobs, in priority order. If anybody is playing on another server in the
+// mesh, an empty box joins THEIR map (see "Following the busy server" below) so
+// the network converges on one map instead of four. If the mesh is quiet, the
+// box cycles through the rotation on its own rather than sitting on one map
+// forever — which is the original job of this module, described next.
 //
 // The race gametype runs with g_timelimit 0, so match.timeLimitHit() is never
 // true and GT_ThinkRules never advances the match past PLAYTIME. That means the
@@ -130,19 +136,380 @@ String RACE_PickIdleMap()
     return installed[randrange( installed.length() )];
 }
 
-// Called every frame from GT_ThinkRules. Tracks how long the server has been
-// empty and rotates once the idle threshold is crossed.
+///*****************************************************************
+/// Following the busy server
+///*****************************************************************
+//
+// Four servers, and most of the time only one of them has anybody on it. Left
+// alone the other three each wander through their own random rotation, so a
+// player who joins an empty box lands on a map nobody else is playing — and the
+// mesh, which otherwise works hard to present itself as one big server (shared
+// chat, mirrored ghosts, /who, /hop), feels like four unrelated ones. So an
+// EMPTY server follows the busy one: whoever has people on it decides the map,
+// the idle boxes mirror it, and the network sits on one map ready for whoever
+// shows up next.
+//
+// The rules, in order:
+//   - a server with anybody on it NEVER follows. Its own players own its map and
+//     change it the normal way (callvote / randmap / meshvote sync); a box with
+//     people on it is never dragged around by a busier one. Two occupied servers
+//     therefore just keep their own maps, each voting for itself.
+//   - an empty server follows the same-game peer with the most people on it,
+//     ties broken by tag. That is a pure function of mesh state, so every idle
+//     box in the mesh picks the same target without negotiating anything.
+//   - only once that target has held steady for rs_idle_follow_seconds, so a
+//     player passing through — or a peer that is itself mid-rotation — doesn't
+//     cost us a map load. Script globals reset on map load, which makes the same
+//     debounce a rate limit: at most one follow-switch per delay plus load.
+//   - while ANYONE is on the mesh the random idle rotation is suppressed, even
+//     when we can't follow (already on their map, not installed here, blocked).
+//     Otherwise we would rotate off the shared map and then follow right back.
+//
+// Cross-game is excluded on purpose. Warsow and Warfork share one mesh but not
+// one engine, and a map the other engine loads happily can take this one down —
+// Warfork's fatal GClip_SetBrushModel wedged three servers that way (see the
+// rs_idle_pool notes above). A same-game peer with the map LOADED and people on
+// it is the strongest evidence available that the map is safe here; that, plus
+// installed and not blocked, is the whole gate — and since crashguard reports a
+// map that kills a server and the API quarantines it into that same blocklist,
+// a map that gets past all three stops being followable shortly afterwards.
+
+// Follow the busy server at all; 0 leaves only the random idle rotation.
+// CVAR_ARCHIVE so a box can opt out without a rebuild.
+Cvar rs_idle_follow( "rs_idle_follow", "1", CVAR_ARCHIVE );
+
+// How long (seconds) the busiest peer must sit on one map before an empty
+// server spends a map load to join it.
+Cvar rs_idle_follow_seconds( "rs_idle_follow_seconds", "45", CVAR_ARCHIVE );
+
+// How long a peer counts as occupied after we last saw a player on it. This has
+// to comfortably outlast a peer's own map change: while a peer loads it stops
+// publishing entirely and the C side drops its roster rows, so without the
+// memory an idle box would read the mesh as empty for a minute and wander off
+// on a random rotation at the exact moment the players are about to reappear.
+const uint IDLE_FOLLOW_GRACE = 120000;
+
+// How often the whole follow decision is made. Its inputs move at the mesh
+// publish rate and every switch it can make is behind a multi-second debounce,
+// so once a second is plenty — and it keeps the roster fold, the peer-registry
+// walk and the string work off the frame path, which matters because
+// GT_ThinkRules calls in here ~60 times a second.
+const uint IDLE_FOLLOW_TICK = 1000;
+
+// Per-peer occupancy memory: parallel arrays, at most one entry per peer.
+String[] followPeerTag;
+uint[] followPeerSeen;  // realTime we last saw a human on that peer
+int[] followPeerCount;  // humans in that sighting
+uint followNextTick = 0;
+
+// Last tick's answer to "is anyone playing anywhere on the mesh?", so the
+// between-tick frames can hold the random rotation back without redoing the
+// work. At most one second stale, against a rotation measured in minutes.
+bool followMeshBusy = false;
+
+// The target currently serving out its debounce.
+String followTargetTag = "";
+String followTargetMap = "";
+uint followTargetSince = 0;
+bool followTargetHere = false; // is followTargetMap installed on this box?
+bool followWarnedGame = false; // "can't tell which game this box is" said once
+
+// Fold the mirrored roster into "how many people are on each peer" and remember
+// it. Every row in mirrorPlayers is a real human on another server: the mesh
+// publishes neither fake clients (WR ghost, mirror bots) nor the TV camera, so
+// this is the same population RACE_AnyHumanPresent counts locally. Spectators
+// count — somebody sitting in spectate on a map is still somebody to join.
+void RACE_FollowObserve()
+{
+    // This tick's headcount per peer tag.
+    String[] tags;
+    int[] counts;
+    for ( uint i = 0; i < mirrorPlayers.length(); i++ )
+    {
+        String tag = mirrorPlayers[i].server;
+        if ( tag.length() == 0 )
+            continue;
+        bool found = false;
+        for ( uint j = 0; j < tags.length(); j++ )
+        {
+            if ( tags[j] != tag )
+                continue;
+            counts[j] = counts[j] + 1;
+            found = true;
+            break;
+        }
+        if ( !found )
+        {
+            tags.insertLast( tag );
+            counts.insertLast( 1 );
+        }
+    }
+
+    for ( uint i = 0; i < tags.length(); i++ )
+    {
+        int at = -1;
+        for ( uint j = 0; j < followPeerTag.length(); j++ )
+        {
+            if ( followPeerTag[j] == tags[i] )
+            {
+                at = int( j );
+                break;
+            }
+        }
+        if ( at < 0 )
+        {
+            followPeerTag.insertLast( tags[i] );
+            followPeerSeen.insertLast( realTime );
+            followPeerCount.insertLast( counts[i] );
+        }
+        else
+        {
+            followPeerSeen[at] = realTime;
+            followPeerCount[at] = counts[i];
+        }
+    }
+
+    // Forget peers nobody has been seen on for a while. This is what eventually
+    // releases an idle box back to its random rotation once the mesh empties.
+    for ( uint i = 0; i < followPeerTag.length(); )
+    {
+        if ( realTime - followPeerSeen[i] > IDLE_FOLLOW_GRACE )
+        {
+            followPeerTag.removeAt( i );
+            followPeerSeen.removeAt( i );
+            followPeerCount.removeAt( i );
+        }
+        else
+        {
+            i++;
+        }
+    }
+}
+
+// Remembered headcount for a peer, for the follow log line. This is the last
+// sighting, not a live count: a peer that empties keeps its old number until the
+// grace drops it, which at worst points idle boxes at a just-vacated map for a
+// couple of minutes before they re-target. 0 once forgotten.
+int followPeerCountOf( const String &in tag )
+{
+    for ( uint i = 0; i < followPeerTag.length(); i++ )
+    {
+        if ( followPeerTag[i] == tag )
+            return followPeerCount[i];
+    }
+    return 0;
+}
+
+// "warsow" / "warfork" for a mesh tag: from the rs_hop_servers table serverhop.as
+// already parses (tag;name;game;addr), else from the -ws / -wf suffix the tags
+// themselves carry. "" when neither says.
+String RACE_FollowGameOf( const String &in tag )
+{
+    String want = tag.removeColorTokens().tolower();
+    if ( want.length() == 0 )
+        return "";
+
+    RACE_HopParse();
+    for ( uint i = 0; i < hopTag.length(); i++ )
+    {
+        if ( hopTag[i].removeColorTokens().tolower() == want )
+            return hopGame[i].removeColorTokens().tolower();
+    }
+
+    if ( want.length() > 3 )
+    {
+        String suffix = want.substr( want.length() - 3, 3 );
+        if ( suffix == "-ws" )
+            return "warsow";
+        if ( suffix == "-wf" )
+            return "warfork";
+    }
+    return "";
+}
+
+// This box's own game, from rs_hop_game (set by both entrypoints) or its tag.
+String RACE_FollowOurGame()
+{
+    String mine = rsHopGame.string.removeColorTokens().tolower();
+    if ( mine.length() == 0 )
+        mine = RACE_FollowGameOf( rsMirrorTag.string );
+    return mine;
+}
+
+// Does that peer run the same game as this box? Unknown on either side is a NO:
+// following is only ever worth it when we can prove the peer proved the map on
+// this engine. A box that can't answer for itself says so once per map load and
+// then just never follows, rather than quietly gambling on a Warfork map.
+bool RACE_FollowSameGame( const String &in tag )
+{
+    String mine = RACE_FollowOurGame();
+    if ( mine.length() == 0 )
+    {
+        if ( !followWarnedGame )
+        {
+            followWarnedGame = true;
+            G_Print( "Idle follow: neither rs_hop_game nor the rs_mirror_tag suffix says which game this box runs; not following any peer.\n" );
+        }
+        return false;
+    }
+    return mine == RACE_FollowGameOf( tag );
+}
+
+// The peer we should be mirroring: the same-game one with the most people on it,
+// ties broken by tag so that every idle server in the mesh lands on the same
+// answer without exchanging a single packet about it. "" when the mesh is quiet.
+String RACE_FollowBestPeer()
+{
+    String best = "";
+    int bestCount = 0;
+    for ( uint i = 0; i < followPeerTag.length(); i++ )
+    {
+        int count = followPeerCount[i];
+        if ( count <= 0 )
+            continue;
+        if ( !RACE_FollowSameGame( followPeerTag[i] ) )
+            continue;
+        // RACE_MeshVoteIdLess: String has no opCmp, and the tie-break has to be
+        // deterministic across boxes or two idle servers pick different targets.
+        if ( best.length() == 0 || count > bestCount
+                || ( count == bestCount && RACE_MeshVoteIdLess( followPeerTag[i], best ) ) )
+        {
+            best = followPeerTag[i];
+            bestCount = count;
+        }
+    }
+    return best;
+}
+
+// The map a peer is on right now, from the live peer registry (which carries
+// keepalive state, so it is current even for a peer whose players we are only
+// remembering). "" when that peer isn't being heard at all — which is exactly
+// what a peer mid-map-load looks like.
+String RACE_FollowPeerMap( const String &in tag )
+{
+    String want = tag.removeColorTokens().tolower();
+    int pc = RS_MirrorPeerCount();
+    for ( int i = 0; i < pc; i++ )
+    {
+        String ptag = RS_MirrorPeerTag( i );
+        if ( ptag.removeColorTokens().tolower() != want )
+            continue;
+        String pmap = RS_MirrorPeerMap( i );
+        return pmap.removeColorTokens().tolower();
+    }
+    return "";
+}
+
+// Once a second: refresh what we know about the other servers and, if this one
+// is empty, join whichever of them the players are on. Everything the follow
+// rule needs is recomputed here and the verdict cached in followMeshBusy, so the
+// other ~60 calls a second this gets are free.
+void RACE_FollowThink()
+{
+    if ( realTime < followNextTick )
+        return;
+    followNextTick = realTime + IDLE_FOLLOW_TICK;
+
+    RACE_FollowObserve();
+
+    if ( RACE_AnyHumanPresent() )
+    {
+        // Somebody is here, so this box follows nobody: its own players own its
+        // map. Drop the debounce with it, so a box that briefly had someone on
+        // it starts the countdown over rather than switching the instant they
+        // disconnect. followMeshBusy is irrelevant while we are occupied (the
+        // caller returns before reading it) — false is just the honest value
+        // for "not currently following anything".
+        followTargetTag = "";
+        followTargetMap = "";
+        followTargetSince = 0;
+        followMeshBusy = false;
+        return;
+    }
+
+    followMeshBusy = RACE_FollowBusyPeer();
+}
+
+// Follow the busy server, and report whether the mesh has people on it at all.
+//
+// Returns TRUE whenever somebody is playing somewhere on the mesh, whether or
+// not that ended in a map change here — the caller uses it to hold the random
+// idle rotation back. Returns false only when the mesh is genuinely quiet, which
+// is when wandering off to a random map is the right thing to do.
+bool RACE_FollowBusyPeer()
+{
+    if ( rs_idle_follow.integer <= 0 )
+        return false;
+    if ( !RACE_MirrorEnabled() )
+        return false;
+
+    // A passed mesh vote is already taking us somewhere; leave it alone (and
+    // hold the rotation, since a vote means people are on the mesh).
+    if ( mvSwitching )
+        return true;
+
+    String tag = RACE_FollowBestPeer();
+    if ( tag.length() == 0 )
+    {
+        followTargetTag = "";
+        followTargetMap = "";
+        followTargetSince = 0;
+        return false; // nobody anywhere: back to the random rotation
+    }
+
+    String map = RACE_FollowPeerMap( tag );
+    if ( map.length() == 0 )
+        return true; // heard its players but not its keepalive: it is loading, wait
+
+    if ( tag != followTargetTag || map != followTargetMap )
+    {
+        // New target (or the one we were watching moved): restart the debounce
+        // and price the map once, since RACE_MapExists walks every installed pk3.
+        followTargetTag = tag;
+        followTargetMap = map;
+        followTargetSince = ( realTime == 0 ) ? 1 : realTime;
+        followTargetHere = RACE_MapExists( map );
+        if ( !followTargetHere )
+            G_Print( "Idle follow: [" + tag + "] is playing " + map + ", which is not installed here; staying put.\n" );
+        return true;
+    }
+
+    Cvar mapnameCvar( "mapname", "", 0 );
+    if ( map == mapnameCvar.string.removeColorTokens().tolower() )
+        return true; // already where the players are
+
+    // Not installed, or blocked here since we last looked (the blocklist is
+    // refreshed live): hold this map rather than rotating away from the mesh.
+    if ( !followTargetHere || RACE_IsMapBlocked( map ) )
+        return true;
+
+    int seconds = rs_idle_follow_seconds.integer;
+    if ( seconds < 0 )
+        seconds = 0;
+    if ( realTime - followTargetSince < uint( seconds ) * 1000 )
+        return true;
+
+    randmap_passed = map;                     // the same proven randmap change path
+    G_Print( "Idle follow: nobody here and " + followPeerCountOf( tag ) + " player(s) on ["
+            + tag + "], switching to their map " + map + "\n" );
+    match.launchState( MATCH_STATE_POSTMATCH );
+    return true;
+}
+
+// Called every frame from GT_ThinkRules. Decides what an unattended server does
+// with its map: join the players on another server if the mesh has any, and
+// otherwise cycle to a fresh map once the idle threshold is crossed.
 void RACE_IdleRotateThink()
 {
-    int minutes = rs_idle_rotate_minutes.integer;
-    if ( minutes <= 0 )
-        return; // feature disabled
-
-    // Only rotate from live play, never during the scoreboard window or the
-    // pending change we just launched (launchState below moves the state out of
-    // PLAYTIME, which also stops this from re-firing before the map swaps).
+    // Only act from live play, never during the scoreboard window or a pending
+    // change we already launched (launchState moves the state out of PLAYTIME,
+    // which is also what stops either path re-firing before the map swaps).
     if ( match.getState() != MATCH_STATE_PLAYTIME )
         return;
+
+    // Follow the busy server (once a second, whatever our own state: the peer
+    // memory has to already be warm at the moment our last player leaves).
+    RACE_FollowThink();
 
     if ( RACE_AnyHumanPresent() )
     {
@@ -153,6 +520,17 @@ void RACE_IdleRotateThink()
         raceIdleSince = 0;
         return;
     }
+
+    // Nobody here, but somebody is playing elsewhere on the mesh: hold this map.
+    // That covers the follow having already put us on their map, and equally the
+    // cases where we couldn't follow at all (map not installed here, blocked) —
+    // rotating away from the busy map is precisely what this is meant to stop.
+    if ( followMeshBusy )
+        return;
+
+    int minutes = rs_idle_rotate_minutes.integer;
+    if ( minutes <= 0 )
+        return; // random rotation disabled
 
     // First empty frame: start the clock. levelTime can be 0 on the very first
     // frame, so use 1 as the "started" sentinel (0 means "not tracking").

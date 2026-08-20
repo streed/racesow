@@ -745,10 +745,12 @@ void GT_ThinkRules()
         }
     }
 
-    // Rotate to a fresh pool map when the box has sat empty (no real players)
-    // for rs_idle_rotate_minutes. Without this an idle server never leaves its
-    // current map: g_timelimit is 0, so nothing ever ends the match to let the
-    // engine's g_maprotation/g_maplist rotation fire (maprotate.as).
+    // Decide what an empty box does with its map (maprotate.as): join the map
+    // whichever mesh server currently has players on it, or, when the mesh is
+    // quiet, rotate to a fresh pool map after rs_idle_rotate_minutes. Without
+    // this an idle server never leaves its current map at all: g_timelimit is 0,
+    // so nothing ever ends the match to let the engine's g_maprotation/g_maplist
+    // rotation fire.
     RACE_IdleRotateThink();
 
     // set all clients race stats
