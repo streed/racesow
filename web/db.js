@@ -1095,6 +1095,39 @@ class RaceDB {
     );
     return row ? num(row.id) : null;
   }
+  // Bulk twin of ensureMapByName for cataloguing the INSTALLED pool: mint a row
+  // for every map that ships in a pk3 on the server, so a map is findable on the
+  // site before anyone has raced it (map_index is built FROM map with LEFT
+  // JOINs, so a fresh row simply reads as 0 records / no WR).
+  //
+  // ensureMapByName's warning applies and is answered here: minting a row makes
+  // the name publicly listable, so the caller must have decided the name is
+  // trustworthy. The one supported caller (seed-map-catalog.js) takes names from
+  // maps/<name>.bsp inside the pk3s in the server's own maps directory - the
+  // exact source the engine builds its own vote pool from. A name that is good
+  // enough to appear in `callvote map` is good enough to appear on /maps.
+  //
+  // One statement rather than a round trip per name: the pool is ~5,000 maps.
+  // Returns the names actually created, so a caller can report the delta instead
+  // of guessing it.
+  async ensureMapsByName(names) {
+    const clean = [
+      ...new Set(
+        (names || [])
+          .map((n) => String(n == null ? "" : n).toLowerCase())
+          .filter((n) => isSafeMapName(n))
+      ),
+    ];
+    if (!clean.length) return { considered: 0, created: [] };
+    const rows = await this.all(
+      `INSERT INTO map (name) SELECT unnest($1::text[])
+       ON CONFLICT (name) DO NOTHING
+       RETURNING name`,
+      [clean]
+    );
+    return { considered: clean.length, created: rows.map((r) => r.name) };
+  }
+
   // Real (un-censored) map name for a map id. Used by the /map/:id/padpork
   // redirect so an offensive map name resolves to its external page WITHOUT the
   // name ever reaching the client.
