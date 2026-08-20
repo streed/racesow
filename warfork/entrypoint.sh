@@ -167,30 +167,32 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     echo "set g_gametype \"${G_GAMETYPE}\""
     echo "set g_maprotation \"${MAP_ROTATION}\""
     [ -n "${MAPLIST}" ]            && echo "set g_maplist \"${MAPLIST}\""
-    # Idle map rotation (hrace/maprotate.as) reads this private copy of the
-    # rotation list rather than g_maplist — an AngelScript Cvar handle on that
-    # engine-owned cvar would re-register it with an empty default and wipe it.
+    # Idle map rotation (hrace/maprotate.as) deliberately does NOT read MAPLIST:
+    # an empty server cycles every installed, non-blocked map — the same pool a
+    # `callvote randmap *` already offers here — because MAPLIST is capped at the
+    # engine's 1024-char command buffer (~90 names) and pinning the cycle to it
+    # left the rest of the mirror reachable only by a human vote.
     #
-    # This line is NOT optional on Warfork. RACE_PickIdleMap fails open when the
-    # cvar is empty: it falls back to GetMapsByFilter, i.e. EVERY installed map.
-    # Warfork mounts the whole ~4,250-pk3 mirror, and a chunk of those maps are
-    # unloadable on this engine — rotating onto one raises
+    # This is the riskier half of that change on WARFORK specifically. A chunk of
+    # the ~4,250-pk3 mirror is unloadable on this engine: rotating onto one raises
     # "GClip_SetBrushModel: NULL model in 'trigger_multiple'", which reaches
-    # Com_Error(ERR_DROP) -> SV_ShutdownGame: the game module is unloaded, every
-    # client dropped, and the UDP socket CLOSED (NET_CloseSocket, sv_init.c).
-    # The process itself keeps running -- SV_Frame then early-returns past its
-    # only NET_Sleep, so it spins one core at 100% answering nothing. The
-    # container never exits, so nothing restarts it. That wedged EU Warfork on
-    # 2026-08-06 and again on 2026-08-08 (38h), and US Warfork on 2026-08-09
-    # (12h, on aryshok_mew).
+    # Com_Error(ERR_DROP) -> SV_ShutdownGame — game module unloaded, every client
+    # dropped, UDP socket CLOSED (NET_CloseSocket, sv_init.c). The process keeps
+    # running, SV_Frame early-returns past its only NET_Sleep, and it spins one
+    # core answering nothing. That wedged EU Warfork on 2026-08-06 and again on
+    # 2026-08-08 (38h), and US Warfork on 2026-08-09 (12h, aryshok_mew).
     #
-    # Warsow is immune to this PARTICULAR map defect at the ENGINE level, not
-    # because of this cvar: racemod_2.1 already patched that call site to print,
-    # unlink and return instead of G_Error (see wsw game/g_clip.cpp). Warfork
-    # still runs upstream's fatal version, which is why all three wedges were
-    # Warfork. Confining rotation to the vetted mappool (below) reduces the
-    # exposure; it does not remove it.
-    [ -n "${MAPLIST}" ]            && echo "set rs_idle_pool \"${MAPLIST}\""
+    # Warsow is immune to this PARTICULAR defect at the ENGINE level, not by
+    # config: racemod_2.1 patched that call site to print, unlink and return
+    # instead of G_Error (wsw game/g_clip.cpp). Warfork still runs upstream's
+    # fatal version. What makes the full pool acceptable here now is the recovery
+    # built since: gamehealth.sh bounces a wedged-but-"Up" engine, the crash guard
+    # names the map from its SpawnServer breadcrumb and reports it, and the API
+    # quarantines it into the same blocklist this rotation filters on — so a bad
+    # map costs one bounce on an EMPTY server and then removes itself network-wide.
+    # Set rs_idle_pool by hand on the box to confine rotation if that ever stops
+    # keeping up.
+    #
     # Arm the engine's own map-load recovery on a RACE map. SV_Frame's
     # `!svs.initialized` branch calls SV_CheckDefaultMap() -> `map
     # $sv_defaultmap`, which is exactly the state the teardown above leaves

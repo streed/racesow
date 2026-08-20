@@ -326,13 +326,14 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     echo "set g_gametype \"${G_GAMETYPE}\""
     echo "set g_maprotation \"${MAP_ROTATION}\""
     echo "set g_maplist \"${MAPLIST}\""
-    # Idle map rotation (hrace/maprotate.as) reads this custom copy of the
-    # rotation list so an empty server can cycle every rs_idle_rotate_minutes.
-    # It deliberately does NOT read g_maplist: putting an AngelScript Cvar handle
-    # on that engine-owned cvar re-registers it with an empty default and wipes
-    # the value (which nothing re-sets), breaking the engine's own rotation and
-    # the vote pool. A private cvar like this is safe (same pattern as rs_api_*).
-    echo "set rs_idle_pool \"${MAPLIST}\""
+    # Idle map rotation (hrace/maprotate.as) is deliberately NOT confined to
+    # MAPLIST: an empty server cycles every installed, non-blocked map, the same
+    # pool `callvote randmap *` offers. MAPLIST is capped at the engine's
+    # 1024-char command buffer (~90 names), so pinning the cycle to it meant an
+    # unattended box rotated a sliver of the mirror forever. The module's
+    # rs_idle_pool cvar still confines rotation when set; nothing sets it here,
+    # and it is the lever to reach for if bad maps ever need excluding faster
+    # than the central blocklist/quarantine can retire them.
     # Engine-level map-load recovery, aimed at a race map. When a map fails to
     # load the engine raises Com_Error(ERR_DROP), which tears the server down
     # (game module unloaded, UDP socket closed, svs.initialized=false) and

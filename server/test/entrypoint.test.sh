@@ -153,4 +153,12 @@ else
     echo "SKIP: case 6 needs zip"
 fi
 
+# --- Case 7: the idle map cycle is never confined to g_maplist ---------------
+# hrace/maprotate.as rotates an empty server over EVERY installed, non-blocked
+# map. It honours rs_idle_pool as an operator override, so the entrypoint must
+# not set that cvar: writing it would silently pin the cycle back to MAPLIST,
+# which the engine's 1024-char command buffer truncates to ~90 names.
+grep -q 'rs_idle_pool' "${CFG}"  && fail "rs_idle_pool must not be generated (it re-confines the idle map cycle)"
+grep -q 'rs_idle_pool' "${CFG2}" && fail "rs_idle_pool must not be generated (plain case)"
+
 echo "OK: entrypoint contract tests passed"

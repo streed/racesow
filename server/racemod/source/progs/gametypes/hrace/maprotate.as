@@ -17,22 +17,34 @@
 // state walks straight to WAITEXIT where GT_MatchStateFinished runs the chosen
 // `map`.
 //
-// Where the map comes from: rs_idle_pool, a space-separated copy of the
-// mappool.txt rotation that entrypoint.sh sets alongside g_maplist. We read that
-// private cvar rather than g_maplist itself because putting an AngelScript Cvar
-// handle on the engine-owned g_maplist re-registers it with an empty default and
-// wipes the value (nothing re-sets it, unlike `mapname`), which would break the
-// engine's own rotation and the vote pool. A private cvar is safe, same pattern
-// as rs_api_*. Fail-open: an unset pool (old env.cfg) falls back to any installed
-// map so the box still rotates; 0 minutes disables the feature entirely.
+// Where the map comes from: every installed map, minus the moderator blocklist
+// and the machine quarantine, minus the map we are already on — the exact same
+// enumeration `callvote randmap *` offers (GetMapsByFilter). The cycle and the
+// vote therefore see one identical pool, so a map that can be voted for can also
+// come up on its own, and a map a moderator blocks disappears from both within
+// one blocklist refresh. 0 minutes disables the feature entirely.
+//
+// It used to be confined to rs_idle_pool, a copy of the curated mappool.txt
+// rotation, which the engine's 1024-char command buffer caps at ~90 names — so
+// an unattended box cycled a sliver of the ~4,600 installed maps and every other
+// map was reachable only by a human voting for it. That cvar survives as an
+// operator override (see below) but nothing sets it any more.
 
 // Minutes with an empty server before it rotates; 0 disables. CVAR_ARCHIVE so it
 // can be tuned or muted per box without a rebuild (the .as recompiles at server
 // boot, not at Docker build time).
 Cvar rs_idle_rotate_minutes( "rs_idle_rotate_minutes", "10", CVAR_ARCHIVE );
 
-// The rotation list (space-separated map names), set by entrypoint.sh as a copy
-// of g_maplist. Read through a GLOBAL handle like every other module's cvars.
+// Optional operator override: a space-separated list of map names to confine
+// rotation to. Deliberately UNSET by default (no entrypoint writes it) — empty
+// means "every installed map", which is the point of this module. It exists as
+// a rescue lever: Warfork still runs upstream's fatal GClip_SetBrushModel, so a
+// map with a NULL brush model there is Com_Error(ERR_DROP) -> SV_ShutdownGame ->
+// a spinning process with a closed socket. That is now caught (gamehealth.sh
+// bounces the wedge, crashguard reports the map and the API quarantines it into
+// the blocklist), but if a bad batch of maps ever lands faster than the
+// quarantine retires them, setting this on the box confines rotation without a
+// rebuild. Read through a GLOBAL handle like every other module's cvars.
 Cvar rsIdlePool( "rs_idle_pool", "", 0 );
 
 // levelTime (ms) when the server was first seen empty this map; 0 = not tracking
@@ -70,38 +82,49 @@ bool RACE_AnyHumanPresent()
     return false;
 }
 
-// Pick a map to rotate to: a random rs_idle_pool entry that is neither the
-// current map nor moderator-blocked. Falls back to any installed map (the
-// proven-safe randmap enumeration) when the pool cvar is unset, so the box still
-// rotates. Returns "" only when truly nothing is available.
+// Pick a map to rotate to: a random installed map that is neither the current
+// one nor blocked. GetMapsByFilter does the whole job — it walks the engine's
+// map list, drops the <ignore> map and drops anything on the live blocklist
+// (moderator blocks UNION machine quarantine, refreshed ~30s by blockedmaps.as),
+// which is the same filtering every vote path gets. An empty pattern matches
+// every name; it is not a weapon filter (RACE_ClassifyFilter needs at least one
+// token), so this takes the plain name-pattern branch.
+//
+// When rs_idle_pool is set the candidates come from that list instead, still
+// minus the current map and still minus the blocklist.
+//
+// Returns "" only when nothing at all is available — a box with one installed
+// map, or an override pool whose every entry is blocked.
 String RACE_PickIdleMap()
 {
     Cvar mapnameCvar( "mapname", "", 0 );
-    String current = mapnameCvar.string.removeColorTokens().tolower();
+    String current = mapnameCvar.string;
 
     String list = rsIdlePool.string;
-    String[] pool;
-    for ( int i = 0; ; i++ )
+    if ( list.length() > 0 )
     {
-        String m = list.getToken( i );
-        if ( m.length() == 0 )
-            break;
-        String clean = m.removeColorTokens().tolower();
-        if ( clean == current )
-            continue;
-        if ( RACE_IsMapBlocked( clean ) )
-            continue;
-        pool.insertLast( m );
+        String currentClean = current.removeColorTokens().tolower();
+        String[] pool;
+        for ( int i = 0; ; i++ )
+        {
+            String m = list.getToken( i );
+            if ( m.length() == 0 )
+                break;
+            String clean = m.removeColorTokens().tolower();
+            if ( clean == currentClean )
+                continue;
+            if ( RACE_IsMapBlocked( clean ) )
+                continue;
+            pool.insertLast( m );
+        }
+        if ( pool.length() > 0 )
+            return pool[randrange( pool.length() )];
+        // Every entry blocked or filtered out: fall through to the full list
+        // rather than stopping the cycle dead.
     }
 
-    if ( pool.length() > 0 )
-        return pool[randrange( pool.length() )];
-
-    // Pool cvar unset (old env.cfg) or every entry filtered out: fall back to any
-    // installed, non-current, non-blocked map so an empty box still rotates.
     String pattern = "";
-    String cur2 = mapnameCvar.string;
-    String[] installed = GetMapsByFilter( pattern, cur2 );
+    String[] installed = GetMapsByFilter( pattern, current );
     if ( installed.length() == 0 )
         return "";
     return installed[randrange( installed.length() )];
