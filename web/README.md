@@ -49,6 +49,10 @@ docker compose up -d --build
 | `BACKUP_DIR`    | `/data/backups`                                  | where the `db-backup` sidecar publishes the [public backup](#public-database-backup) this server serves |
 | `HEATMAP_DIR`   | `/data/heatmaps`                                 | where the `heatmaps` sidecar renders per-map [top-down heatmaps](#map-heatmaps) this server serves |
 | `GHOST_DIR`     | `./ghosts` (`/data/ghosts` in Docker)            | per-(map, player) ghost trajectory files; also the source the heatmap generator reads |
+| `MAPPACK_DIR`   | `/mappack` (`./server/maps` mounted read-only)   | the game servers' `.pk3` mirror, served as [map downloads](#map-downloads). Absent → no download offered |
+| `MAPPACK_INDEX` | `/data/mappack-index.json`                       | persisted CRC/map-name index for the above (one JSON file; the packs are never copied) |
+| `MAPPACK_REFRESH_MS` | `21600000` (6h)                             | how often the mirror is re-scanned for new/changed packs |
+| `MAPPACK_MAX_STREAMS` | `4`                                        | concurrent full-pack streams before new ones get a 503 + `Retry-After` |
 | `ADMIN_COOKIE_INSECURE` | *(unset)*                                | Set to `1` to drop the `Secure` flag on the admin session cookie for plain-HTTP local dev. Never set in production (the edge terminates TLS, so `req.secure` already adds `Secure`). |
 
 ## Schema migrations
@@ -107,6 +111,7 @@ All responses are JSON. List endpoints accept `q`, `sort`, `order`
 | `GET /api/game/topscores?map=` | A map's top-50 in the exact topscores file format the game reads. |
 | `GET /api/health`        | Liveness check.                                                  |
 | `GET /api/backup`        | Metadata for the latest [public database backup](#public-database-backup): filename, size, sha256, generated time, row counts, include/exclude lists. 404 until the first backup exists. |
+| `GET /api/mappack`       | [Map download](#map-downloads) availability: `{ready, building, packs, maps, bytes, pack_bytes, etag, updated_at, download_url}`. Never errors — `ready:false` while the mirror is being indexed or when it is not mounted. |
 | `POST /api/maps/:id/flag`| Public "flag this map for review". Body `{reason, note?}` where `reason` ∈ `broken`, `offensive`, `wrong_name`, `duplicate`, `other`. Anonymous, tightly rate-limited, and deduped per reporter (a salted hash of the IP, never stored raw); a repeat report returns `{ok:true, duplicate:true}`. Reviewed in the [admin area](#map-flags--admin-area). |
 | `GET /api/maps/blocked` | Maps a moderator has blocked from play (JSON `{maps:[{id,name,reason,blockedAt,blockedBy}]}`). |
 | `GET /api/game/blocked-maps` | Same, as plain text (one lowercased map name per line) — `server/entrypoint.sh` GETs this to drop blocked maps from `g_maplist` (vote pool + cycle). |
@@ -264,6 +269,45 @@ name-censor tables) and tournament entry codes (`tournament_entrant`). Mesh keys
 and `INGEST_TOKEN` live in env/config and are never in the database. See
 [`../backup/README.md`](../backup/README.md) for restore steps.
 
+## Map downloads
+
+The maps themselves, for players who would rather not wait on the in-game
+downloader:
+
+| URL | Purpose |
+| --- | --- |
+| `GET /download/racesow-maps.zip` | every `.pk3` the servers hand out, as one archive (~13 GB) |
+| `GET /download/map/<map>` | just the pack carrying `<map>` (a few MB; `.pk3` suffix optional) |
+| `GET /api/mappack` | size, pack/map counts and readiness of the above |
+
+Both are streamed straight out of `MAPPACK_DIR` — the same `server/maps`
+directory the game containers load their packs from, mounted read-only. Nothing
+is duplicated on disk and there is no build step: `mappack.js` writes the zip
+per request with method 0 (STORE), since a `.pk3` is already a compressed zip.
+
+Consequences worth knowing:
+
+- **The length is exact and the download resumes.** Because the archive is a
+  pure concatenation of headers + untouched pack bytes, its total size is known
+  before the first byte goes out, and any byte offset maps back to a known place
+  in a known pack. So the response carries a real `Content-Length`, `Range`/
+  `If-Range` work, and `curl -C -`, wget or a download manager can resume a
+  13 GB transfer that died at 80%. ZIP64 is used automatically past 4 GB.
+- **It is indexed in the background.** Method 0 still needs each entry's CRC-32,
+  so the mirror is read once at startup and the result persisted to
+  `MAPPACK_INDEX`. Until that finishes, downloads answer `503` + `Retry-After`
+  and `/api/mappack` reports `ready:false`; later boots are a stat pass, and a
+  new batch of maps only costs a hash of the new packs.
+- **A pack is not a map.** Pack filenames and map names often differ and one
+  pack can carry several maps, so `/download/map/<map>` resolves the name
+  through the index and sends the pack (named as itself, since renaming it would
+  break the client's pure check). A `<map>-reversed` route downloads the forward
+  map's pack. Maps that ship with the base game are not in the mirror, so their
+  map pages simply show no download link.
+- **Bandwidth is the scarce resource.** `MAPPACK_MAX_STREAMS` bounds concurrent
+  full-pack streams in the app; the production nginx adds a per-IP connection
+  cap and a request budget on `/download/` (see `deploy/nginx/racesow.conf`).
+
 ## Map heatmaps
 
 A nightly, top-down "where people have been" density image per map, shown on the
@@ -309,4 +353,6 @@ docker compose run --rm heatmaps node heatmap.js 42       # just map id 42
 - `seed-topscores.js` — write the game server's topscores files from the DB.
 - `heatmap.js` — nightly [map heatmap](#map-heatmaps) generator + self-scheduling
   sidecar (dependency-free PNG encoder; pure rendering path).
+- `mappack.js` — [map downloads](#map-downloads): background CRC/map-name index
+  of the pack mirror, the streamed ZIP64 layout, Range serving, per-map lookup.
 - `public/` — the frontend (`index.html`, `assets/css`, `assets/js`).

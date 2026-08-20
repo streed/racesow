@@ -55,6 +55,12 @@ services:
       GHOST_DIR: "/data/ghosts"
       BACKUP_DIR: "/data/backups"
       HEATMAP_DIR: "/data/heatmaps"
+      # Map-pack downloads — must match `web` exactly (rolling-deploy.sh env
+      # parity). Both replicas serve ranged requests for the same 13 GB archive,
+      # and nginx round-robins a resumed download between them, so they must
+      # index the same directory and share the same persisted index.
+      MAPPACK_DIR: "/mappack"
+      MAPPACK_INDEX: "/data/mappack-index.json"
       # Sentry — MUST match the base `web` service in docker-compose.yml exactly
       # (same ${...} defaults → identical resolved values): rolling-deploy.sh
       # fails the parity preflight on any env drift between web and web2.
@@ -67,6 +73,9 @@ services:
       # Same read-only replay-mesh mount as `web` — without it this replica
       # 404s every /maps/<map>.glb the viewer requests.
       - ./web/public/maps:/app/public/maps:ro
+      # Same read-only map mirror as `web` — without it this replica reports the
+      # map pack as unavailable on half of all requests.
+      - ./server/maps:/mappack:ro
     ports:
       - "127.0.0.1:8081:8080"
     healthcheck:

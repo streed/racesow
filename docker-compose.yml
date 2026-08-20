@@ -150,6 +150,16 @@ services:
       # (served at /api/maps/:id/heatmap.png). Also under ./data, shared by both
       # web replicas; the sidecar writes, the web only reads.
       HEATMAP_DIR: "/data/heatmaps"
+      # The map mirror, mounted read-only below: the same ./server/maps the game
+      # containers load their packs from, so the downloadable pack is the exact
+      # set the servers hand out and costs no second copy on disk. web/mappack.js
+      # streams it as one zip (/download/racesow-maps.zip) and serves single
+      # packs (/download/map/<map>). Unset/absent → no download is offered.
+      MAPPACK_DIR: "/mappack"
+      # Persisted CRC index for the above (one JSON file, not the packs). On
+      # /data so a restart does not re-read the whole mirror and so both
+      # replicas share one hashing pass.
+      MAPPACK_INDEX: "/data/mappack-index.json"
       # Sentry error + performance reporting (web/instrument.mjs). Empty DSN =
       # disabled/no-op. Keep these in exact lockstep with the web2 replica in
       # docker-compose.override.yml (rolling-deploy.sh fails on env drift).
@@ -166,6 +176,10 @@ services:
       # --dir server/maps web/public/maps) and mounted READ-ONLY, so adding maps
       # needs no image rebuild and the multi-hundred-MB glbs are never baked in.
       - ./web/public/maps:/app/public/maps:ro
+      # The game servers' map packs (~13 GB), READ-ONLY, for the map downloads
+      # (MAPPACK_DIR above). Same host directory server/docker-compose.yml
+      # mounts into the game containers as /warsow/maps_extra.
+      - ./server/maps:/mappack:ro
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 30s

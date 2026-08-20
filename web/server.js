@@ -22,6 +22,7 @@ import {
   isSafeMapName,
 } from "./db.js";
 import { createLivePoller, parseAddress } from "./live.js";
+import { createMapPack } from "./mappack.js";
 import { createStreamRegistry } from "./streams.js";
 import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js";
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
@@ -79,6 +80,14 @@ const PUBLIC_HOST = PUBLIC_ORIGIN ? new URL(PUBLIC_ORIGIN).host : "";
 const BACKUP_DIR = process.env.BACKUP_DIR || "/data/backups";
 const BACKUP_LATEST_ZIP = path.join(BACKUP_DIR, "racesow-db-latest.zip");
 const BACKUP_LATEST_META = path.join(BACKUP_DIR, "racesow-db-latest.json");
+
+// Full map pack: the ~13 GB of .pk3 packs the game servers hand out, streamed
+// as one zip at /download/racesow-maps.zip (and per map at /download/map/<map>).
+// MAPPACK_DIR is the same server/maps directory the game containers mount, so
+// there is no second copy of the mirror; web/mappack.js explains the layout.
+// An unset/absent directory degrades to "no download offered" — the API
+// reports not-ready and the About panel stays hidden.
+const MAPPACK_DIR = process.env.MAPPACK_DIR || "/mappack";
 
 // Top-down map heatmaps, generated nightly by the heatmaps sidecar (see
 // web/heatmap.js + docker-compose.yml) into HEATMAP_DIR under the shared ./data
@@ -165,6 +174,11 @@ const live = createLivePoller(race);
 // Live video streams: maps enrolled servers -> their HLS playback URL (from the
 // STREAM_URLS env), refined by optional encoder heartbeats. See streams.js.
 const streams = createStreamRegistry();
+
+// Downloadable map packs (web/mappack.js): the whole mirror as one streamed zip
+// plus a single .pk3 per map. Indexing CRCs the mirror once in the background
+// (persisted to /data), so this is started after listen() rather than awaited.
+const mappack = createMapPack({ dir: MAPPACK_DIR });
 
 const app = express();
 app.disable("x-powered-by");
@@ -253,6 +267,15 @@ const loginLimiter = rateLimiter({ windowMs: 60_000, max: 10, key: (req) => "log
 // fronts it) — generous enough for a browser plus a resumed/parallel download
 // manager, tight enough that it can't be used as a bandwidth amplifier.
 const backupLimiter = rateLimiter({ windowMs: 60_000, max: 20, key: (req) => "backup:" + (req.ip || "?") });
+// Map-pack downloads. Throughput is NOT what this bounds — a single request can
+// be 13 GB, so bandwidth is controlled by mappack.js's concurrent-stream cap and
+// nginx's per-IP connection cap. This only stops request churn, and so it is
+// deliberately loose: a download manager opens a dozen ranged connections, and a
+// tool that reads the archive's central directory (any zip reader pointed at the
+// URL) issues dozens of small ranged reads before it fetches anything. A tight
+// budget here would 429 exactly those legitimate clients.
+const mapPackLimiter = rateLimiter({ windowMs: 60_000, max: 120, key: (req) => "mappack:" + (req.ip || "?") });
+const singleMapLimiter = rateLimiter({ windowMs: 60_000, max: 60, key: (req) => "mapfile:" + (req.ip || "?") });
 
 app.use((req, _res, next) => {
   if (req.path.startsWith("/api/")) console.log(`${req.method} ${req.originalUrl}`);
@@ -401,6 +424,9 @@ api.get("/maps/:id", cache(30, { edge: true, key: (req) => `${req.path}?limit=${
   const detail = await race.mapDetail(id, { limit: mapDetailLimit(req.query.limit) });
   if (!detail) return res.status(404).json({ error: "map not found" });
   detail.heatmap = heatmapMeta(id);
+  // The .pk3 this map lives in, for the map page's download button. A reverse
+  // map resolves to its forward map's pack (no pk3 is named "<map>-reversed").
+  detail.download = mappack.packFor(detail.name);
   res.json(detail);
 }));
 
@@ -1078,6 +1104,11 @@ api.get("/backup", wrap(async (_req, res) => {
   }
   res.json(meta);
 }));
+
+// Full map pack availability: size, pack count, and where to download it. Never
+// an error — a box without the map mirror mounted, or one still hashing it,
+// reports ready:false and the frontend simply omits the panel.
+api.get("/mappack", (_req, res) => res.json(mappack.status()));
 
 // --- Aggregate refresh (debounced, with a max-wait so a continuous ingest
 // stream from many servers can't starve the rebuild indefinitely). ----------
@@ -4791,6 +4822,17 @@ app.get("/backup/racesow-db-latest.zip", backupLimiter, (_req, res) => {
   });
 });
 
+// The full map pack: every .pk3 the game servers serve, as one streamed zip.
+// GET and HEAD (Express routes HEAD here too) with Range/If-Range support, so
+// a 13 GB transfer that dies at 80% resumes instead of starting over. See
+// web/mappack.js for why it is built per request rather than kept on disk.
+app.get("/download/racesow-maps.zip", mapPackLimiter, (req, res) => mappack.handle(req, res));
+
+// One map's pack. `:name` is a map name (with or without a .pk3 suffix), which
+// is resolved through the index to the pack that actually carries the bsp —
+// pack filenames and map names often differ, and one pack can hold several maps.
+app.get("/download/map/:name", singleMapLimiter, (req, res) => mappack.handleMap(req, res));
+
 /* ------------------------------ sitemap ---------------------------------- *
  * A sitemap INDEX plus three shards rather than one flat file. The protocol
  * caps a single sitemap at 50,000 URLs, and the player shard alone already
@@ -5029,6 +5071,10 @@ const server = app.listen(PORT, async () => {
     console.error("boot status check failed (continuing):", e?.message ?? e);
   }
   if (!shuttingDown) live.start(); // a signal may land during the await above
+  // Index the map mirror in the background (a first pass CRCs ~13 GB; the
+  // result is persisted, so later boots are a stat pass). Downloads 503 until
+  // it lands rather than blocking the boot.
+  if (!shuttingDown) mappack.start();
   // Maintenance mode: load persisted state and keep it (and the re-broadcast
   // timer) reconciled from the DB so both web replicas agree.
   await refreshMaintenance();
@@ -5053,6 +5099,7 @@ async function shutdown(signal) {
   // pool refuses to drain.
   setTimeout(() => process.exit(1), 8000).unref();
   live.stop();
+  mappack.stop();
   stopMaintTimer();
   clearInterval(maintRefreshTimer);
   clearInterval(tournamentSweepTimer);

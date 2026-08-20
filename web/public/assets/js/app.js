@@ -894,7 +894,7 @@ async function viewMaps(params) {
 
   app.innerHTML = `
     <div class="page-title"><span class="accent">MAPS</span> DATABASE</div>
-    <p class="page-sub">Browse every race map, sorted and searchable. Click a map for its full leaderboard and world-record splits.</p>
+    <p class="page-sub">Browse every race map, sorted and searchable. Click a map for its full leaderboard and world-record splits — each map page has a download link for its <span class="mono">.pk3</span>, or <a data-nav="#/about" href="/about">grab the whole pool in one zip</a>.</p>
     <div class="toolbar">
       <input class="filter" id="mfilter" placeholder="Filter maps by name…" value="${esc(state.q)}">
       <select class="filter version" id="mweapon" title="Filter by weapon or strafe">
@@ -1141,7 +1141,7 @@ async function viewMap(id) {
     <div class="page-title">${mapNameHtml(d.name)}</div>
     ${isReversedMap(d.name) ? `<p class="page-sub reverse-note">Reverse route of <b>${esc(baseMapName(d.name))}</b> — start at the finish line, run the checkpoints backward to the start. Separate leaderboard from the normal map. <a data-nav="#/about">How reverse mode works ↗</a></p>` : ""}
     <p class="page-sub">${fmtNum(d.records != null ? d.records : d.races)} ranked times · ${fmtNum(d.finishes != null ? d.finishes : d.races)} finishes · ${fmtNum(d.players)} players on the board
-      · <a class="extlink" href="/map/${d.id}/padpork" target="_blank" rel="noopener external">padpork.org ↗</a></p>
+      · <a class="extlink" href="/map/${d.id}/padpork" target="_blank" rel="noopener external">padpork.org ↗</a>${mapDownloadLink(d)}</p>
 
     <div class="map-hero">
       <div class="map-hero-main">
@@ -2073,6 +2073,15 @@ async function viewAbout() {
         </div>
       </div>
 
+      <div class="panel" id="map-download">
+        <h3><span class="dot teal"></span> Download every map</h3>
+        <div class="about-body">
+          <p>Your client downloads maps one at a time as you join them, which is fine on a fast line and painful on a slow one. This is the same set in a single archive: every custom <span class="mono">.pk3</span> the servers hand out, so you can browse the whole pool offline and never wait on a download mid-session again.</p>
+          <div id="map-download-meta" class="db-meta muted">Checking the map mirror…</div>
+          <p class="muted about-fineprint">Extract the <span class="mono">.pk3</span> files (no subfolder) into the mod directory your client already downloads maps into — <span class="mono">racemod/</span> on Warsow, <span class="mono">racesow/</span> on Warfork. The archive is stored, not compressed (a pk3 is already a zip), and the download resumes: if it drops at 80%, <span class="mono">curl -C -</span>, wget or any download manager picks it back up. Just want one map? Every map page has its own download link.</p>
+        </div>
+      </div>
+
       <div class="panel" id="db-download">
         <h3><span class="dot"></span> Download the database</h3>
         <div class="about-body">
@@ -2160,6 +2169,52 @@ async function viewAbout() {
       box.textContent = "The public snapshot is being generated — check back shortly.";
     }
   })();
+
+  // Full map pack. Deliberately separate from the DB block above: either can be
+  // absent (a box without the map mirror mounted reports ready:false) without
+  // taking the other's panel down with it.
+  (async () => {
+    const box = document.getElementById("map-download-meta");
+    const panel = document.getElementById("map-download");
+    if (!box) return;
+    try {
+      const m = await api("/mappack");
+      if (!m.ready) {
+        // Still hashing the mirror after a deploy — say so rather than
+        // offering a link that would 503.
+        box.textContent = m.building
+          ? "The map archive is being indexed right now — check back in a few minutes."
+          : "The full map archive isn't available on this server.";
+        return;
+      }
+      box.classList.remove("muted");
+      const updated = m.updated_at ? new Date(m.updated_at * 1000) : null;
+      box.innerHTML = `
+        <a class="btn db-dl-btn" href="${esc(m.download_url)}" download rel="noopener">⬇ Download every map (${esc(fmtBytes(m.bytes))} zip)</a>
+        <div class="db-stats">
+          <span>${fmtNum(m.packs)} packs</span>
+          <span>${fmtNum(m.maps)} maps</span>
+          ${updated ? `<span title="${esc(updated.toISOString())}">Newest pack ${esc(updated.toISOString().slice(0, 10))}</span>` : ""}
+        </div>`;
+    } catch (e) {
+      if (panel) panel.hidden = true;
+    }
+  })();
+}
+
+// The map's own .pk3, when the server mirror has it. The file is the PACK, not
+// the map: pack and map names often differ and one pack can carry several maps,
+// so the tooltip names the file and says what else comes with it. Stock maps
+// that ship with the game are not in the mirror (the servers never hand those
+// out), so those simply get no link — see web/mappack.js.
+function mapDownloadLink(d) {
+  const dl = d.download;
+  if (!dl || !dl.url) return "";
+  const others = (dl.maps || []).filter((m) => m !== String(d.name || "").toLowerCase().replace(/-reversed$/, ""));
+  const tip =
+    `${dl.filename} — drop it into your racemod/ folder (racesow/ on Warfork)` +
+    (others.length ? `. Also contains: ${others.join(", ")}` : "");
+  return ` · <a class="extlink map-dl" href="${esc(dl.url)}" download rel="noopener" title="${esc(tip)}">⬇ Download map (${esc(fmtBytes(dl.bytes))})</a>`;
 }
 
 /* --------------------------- shared widgets ------------------------------ */
@@ -2305,7 +2360,9 @@ document.addEventListener("click", (e) => {
     // a download (demo/DB export) or a click off-site to a different origin.
     const href = link.getAttribute("href") || "";
     if (link.hasAttribute("download")) {
-      track("Download demo", { url: href });
+      // /download/... is a map pack (one map or the whole pool); everything
+      // else that carries `download` is a demo or the DB export.
+      track(href.startsWith("/download/") ? "Download maps" : "Download demo", { url: href });
     } else if (/^https?:\/\//i.test(href)) {
       try {
         const u = new URL(href, location.origin);
