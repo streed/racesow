@@ -154,9 +154,11 @@ String RACE_PickIdleMap()
 //     change it the normal way (callvote / randmap / meshvote sync); a box with
 //     people on it is never dragged around by a busier one. Two occupied servers
 //     therefore just keep their own maps, each voting for itself.
-//   - an empty server follows the same-game peer with the most people on it,
-//     ties broken by tag. That is a pure function of mesh state, so every idle
-//     box in the mesh picks the same target without negotiating anything.
+//   - an empty server follows the peer with the most people on it, whichever
+//     game that peer runs, ties broken by tag. That is a pure function of mesh
+//     state, so every idle box in the mesh picks the same target without
+//     negotiating anything — which is what makes all four converge on one map
+//     rather than one pair per game.
 //   - only once that target has held steady for rs_idle_follow_seconds, so a
 //     player passing through — or a peer that is itself mid-rotation — doesn't
 //     cost us a map load. Script globals reset on map load, which makes the same
@@ -165,14 +167,27 @@ String RACE_PickIdleMap()
 //     when we can't follow (already on their map, not installed here, blocked).
 //     Otherwise we would rotate off the shared map and then follow right back.
 //
-// Cross-game is excluded on purpose. Warsow and Warfork share one mesh but not
-// one engine, and a map the other engine loads happily can take this one down —
-// Warfork's fatal GClip_SetBrushModel wedged three servers that way (see the
-// rs_idle_pool notes above). A same-game peer with the map LOADED and people on
-// it is the strongest evidence available that the map is safe here; that, plus
-// installed and not blocked, is the whole gate — and since crashguard reports a
-// map that kills a server and the API quarantines it into that same blocklist,
-// a map that gets past all three stops being followable shortly afterwards.
+// Cross-game follow is ON. It used to be excluded: Warsow and Warfork share one
+// mesh but not one engine, and a map the other engine loads happily can take
+// this one down — Warfork's fatal GClip_SetBrushModel wedged three servers that
+// way (see the rs_idle_pool notes above). But that gate was doing no work. The
+// random idle rotation below already draws from EVERY installed map with no
+// evidence about any of them, so refusing to follow a map that a sibling server
+// has LOADED and that people are actually racing on was never buying safety —
+// it is strictly better evidence than the rotation's own coin flip. What it cost
+// was the whole point of the mesh: with a player on a Warsow box, the two
+// Warfork boxes ignored them and wandered off through their own rotations, so
+// "four servers acting like one" only ever held within a game.
+//
+// The gate that does the real work is unchanged and applies to every peer: the
+// map must be INSTALLED here and not blocked. Both boxes mount the same map
+// mirror, so in practice that only ever excludes the base game's own maps, whose
+// names differ per engine (wrace1 vs wfrace1) — and those aside, a map that does
+// kill a server now costs one bounce on an empty box before crashguard reports
+// it and the API quarantines it out of this same blocklist network-wide.
+//
+// rs_idle_follow_crossgame 0 restores the same-game-only behaviour on a box
+// without a rebuild, if a Warfork-fatal map ever proves that wrong.
 
 // Follow the busy server at all; 0 leaves only the random idle rotation.
 // CVAR_ARCHIVE so a box can opt out without a rebuild.
@@ -181,6 +196,12 @@ Cvar rs_idle_follow( "rs_idle_follow", "1", CVAR_ARCHIVE );
 // How long (seconds) the busiest peer must sit on one map before an empty
 // server spends a map load to join it.
 Cvar rs_idle_follow_seconds( "rs_idle_follow_seconds", "45", CVAR_ARCHIVE );
+
+// Follow peers running the OTHER game too (Warsow <-> Warfork). 1 = the whole
+// mesh converges on whoever has players; 0 = the old same-game-only rule. The
+// installed-here and not-blocked gates apply either way. CVAR_ARCHIVE so it is
+// a per-box lever rather than a rebuild.
+Cvar rs_idle_follow_crossgame( "rs_idle_follow_crossgame", "1", CVAR_ARCHIVE );
 
 // How long a peer counts as occupied after we last saw a player on it. This has
 // to comfortably outlast a peer's own map change: while a peer loads it stops
@@ -336,28 +357,34 @@ String RACE_FollowOurGame()
     return mine;
 }
 
-// Does that peer run the same game as this box? Unknown on either side is a NO:
-// following is only ever worth it when we can prove the peer proved the map on
-// this engine. A box that can't answer for itself says so once per map load and
-// then just never follows, rather than quietly gambling on a Warfork map.
-bool RACE_FollowSameGame( const String &in tag )
+// May this box follow that peer at all? Yes for every peer by default — see the
+// cross-game note at the top. Only when rs_idle_follow_crossgame is 0 does this
+// narrow to peers running the same game, and then an unknown game on either side
+// is a NO: under that setting following is only worth it when we can show the
+// peer proved the map on THIS engine. A box that cannot answer for itself says
+// so once per map load and then follows nobody, rather than quietly widening the
+// rule the operator just turned off.
+bool RACE_FollowEligible( const String &in tag )
 {
+    if ( rs_idle_follow_crossgame.integer > 0 )
+        return true;
+
     String mine = RACE_FollowOurGame();
     if ( mine.length() == 0 )
     {
         if ( !followWarnedGame )
         {
             followWarnedGame = true;
-            G_Print( "Idle follow: neither rs_hop_game nor the rs_mirror_tag suffix says which game this box runs; not following any peer.\n" );
+            G_Print( "Idle follow: rs_idle_follow_crossgame is 0 and neither rs_hop_game nor the rs_mirror_tag suffix says which game this box runs; not following any peer.\n" );
         }
         return false;
     }
     return mine == RACE_FollowGameOf( tag );
 }
 
-// The peer we should be mirroring: the same-game one with the most people on it,
-// ties broken by tag so that every idle server in the mesh lands on the same
-// answer without exchanging a single packet about it. "" when the mesh is quiet.
+// The peer we should be mirroring: the one with the most people on it, ties
+// broken by tag so that every idle server in the mesh lands on the same answer
+// without exchanging a single packet about it. "" when the mesh is quiet.
 String RACE_FollowBestPeer()
 {
     String best = "";
@@ -367,7 +394,7 @@ String RACE_FollowBestPeer()
         int count = followPeerCount[i];
         if ( count <= 0 )
             continue;
-        if ( !RACE_FollowSameGame( followPeerTag[i] ) )
+        if ( !RACE_FollowEligible( followPeerTag[i] ) )
             continue;
         // RACE_MeshVoteIdLess: String has no opCmp, and the tie-break has to be
         // deterministic across boxes or two idle servers pick different targets.

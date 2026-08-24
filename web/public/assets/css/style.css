@@ -552,6 +552,13 @@ footer.site .foot-right .bmc-btn-text { font-size: 12px !important; }
   font-family: var(--cond); font-style: italic; text-transform: uppercase;
   letter-spacing: .5px; font-size: 12px; color: var(--teal);
 }
+/* A peer that is on THIS card's map right now — the same servers named in the
+   "racing together" row above. They stay in the list (the chip count is the
+   mesh size and must not move) and are tinted instead. */
+.mesh-peer.on-map {
+  border-color: rgba(78,205,196,.45);
+  background: rgba(78,205,196,.10);
+}
 .mesh-map { font-family: var(--mono); font-size: 11px; color: var(--cyan); }
 .mesh-num { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 /* one-time explainer under the LIVE header, only shown when a mesh is live */

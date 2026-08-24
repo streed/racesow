@@ -1620,17 +1620,23 @@ function meshSameMap(peerMap, myMap) {
 // Cross-server mesh line(s) for a live card. The meaningful state is "a linked
 // server is on the SAME map right now": those players appear in-game as
 // translucent ghosts you race alongside. Peers sharing this card's map (and
-// actually populated) get a highlighted "racing together" row; the rest are
-// shown as a compact "linked" list so it's obvious the servers are joined
-// without re-dumping each sibling card's full state.
+// actually populated) also get a highlighted "racing together" row above the
+// list.
+//
+// The list itself is EVERY peer, always. It used to omit the ones promoted into
+// the "racing together" row, which made the mesh look like it had lost a server
+// at the exact moment it was working best: with a player on EU-WS and US-WS
+// followed onto their map, US East's card listed two linked servers out of
+// three, and the only place the third appeared was the sentence above it. The
+// count of chips is what people read as "how many servers are in the mesh", so
+// it has to stay the same whatever the servers happen to be playing.
 function renderMesh(s) {
   if (!s.mesh || !s.mesh.length) return "";
   const here = [];
-  const linked = [];
   for (const p of s.mesh) {
     if (p.players > 0 && meshSameMap(p.map, s.map)) here.push(p);
-    else linked.push(p);
   }
+  const isHere = (p) => here.includes(p);
   const rows = [];
   if (here.length) {
     const ghosts = here.reduce((n, p) => n + p.players, 0);
@@ -1641,20 +1647,18 @@ function renderMesh(s) {
         <span class="mesh-txt">Racing together on <b>${esc(s.map || "this map")}</b> · <b>+${ghosts}</b> ghost${ghosts === 1 ? "" : "s"} from ${who}</span>
       </div>`);
   }
-  if (linked.length) {
-    const chips = linked.map((p) => `
-        <span class="mesh-peer" title="${esc(p.tag)}${p.map ? ` is on ${esc(p.map)}` : ""} · ${p.players} player${p.players === 1 ? "" : "s"}">
-          <span class="mesh-tag">${esc(p.tag)}</span>
-          ${p.map ? `<span class="mesh-map">▸ ${esc(p.map)}</span>` : ""}
-          ${p.players > 0 ? `<span class="mesh-num">${fmtNum(p.players)}</span>` : ""}
-        </span>`).join("");
-    rows.push(`<div class="mesh-row"
-        title="These servers are joined into one race mesh. Whenever two are on the same map, their players race together as cross-server ghosts.">
-        <span class="mesh-ico">⇄</span>
-        <span class="mesh-lbl">Linked</span>
-        ${chips}
-      </div>`);
-  }
+  const chips = s.mesh.map((p) => `
+      <span class="mesh-peer${isHere(p) ? " on-map" : ""}" title="${esc(p.tag)}${p.map ? ` is on ${esc(p.map)}` : ""} · ${p.players} player${p.players === 1 ? "" : "s"}${isHere(p) ? " · same map as this server" : ""}">
+        <span class="mesh-tag">${esc(p.tag)}</span>
+        ${p.map ? `<span class="mesh-map">▸ ${esc(p.map)}</span>` : ""}
+        ${p.players > 0 ? `<span class="mesh-num">${fmtNum(p.players)}</span>` : ""}
+      </span>`).join("");
+  rows.push(`<div class="mesh-row"
+      title="These ${s.mesh.length} servers are joined into one race mesh. Whenever two are on the same map, their players race together as cross-server ghosts.">
+      <span class="mesh-ico">⇄</span>
+      <span class="mesh-lbl">Linked</span>
+      ${chips}
+    </div>`);
   return `<div class="live-mesh">${rows.join("")}</div>`;
 }
 
