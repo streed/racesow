@@ -12,11 +12,15 @@
 // refresh interval instead of at the next restart. meshvote's explicit
 // single-map path checks RACE_IsMapBlocked directly.
 //
+// RACE_IsMapBlocked also answers true for the base game's own non-race maps,
+// which are never playable here for reasons that have nothing to do with a
+// moderator — see RACE_IsStockNonRaceMap below.
+//
 // Fail-open by design: if rs_api_blocked_url is empty or the API is
-// unreachable, RACE_IsMapBlocked returns false and nothing is filtered — a
-// network blip must never freeze map voting, and the restart-time filter in
-// entrypoint.sh stays the durable backstop. The list is only ever replaced by a
-// fresh successful fetch, never cleared by a failure.
+// unreachable, RACE_IsMapBlocked returns false for the moderator half and
+// nothing there is filtered — a network blip must never freeze map voting, and
+// the restart-time filter in entrypoint.sh stays the durable backstop. The list
+// is only ever replaced by a fresh successful fetch, never cleared by a failure.
 
 Cvar rsApiBlockedUrl( "rs_api_blocked_url", "", 0 );
 
@@ -26,10 +30,99 @@ const uint API_BLOCKED_REFRESH_MS = 30 * 1000;
 uint apiBlockedLastFetch = 0;
 String[] raceBlockedMaps; // lowercased, colour-stripped map names currently blocked
 
-// True if <mapName> is on the live blocklist. Case-insensitive; colour tokens
-// stripped. Fail-open: an empty / unfetched / unconfigured list yields false.
+// --- Base-game maps that are not race maps -----------------------------------
+//
+// Every selection path enumerates the ENGINE's map list (ML_GetMapByNum), which
+// is every installed .bsp — so since the idle cycle was widened from the curated
+// mappool to "every installed map" (maprotate.as, 2026-08-20) the maps that ship
+// with Warsow/Warfork themselves have been in the draw alongside the ~4,600 race
+// maps. Two problems, one of them fatal:
+//
+//   - wtutorial1 (Warsow) and wftutorial1 (Warfork) each ship a
+//     progs/maps/<name>.as whose MAP_Gametype() hook returns "tutorial". The
+//     engine honours it, switches g_gametype and reloads the gametype — which
+//     unloads THIS script. Nothing of ours runs after that: no idle rotation to
+//     move off the map, and no mirror publish, so the box silently drops out of
+//     the mesh and stays there until a human restarts it. US Warfork drew
+//     wftutorial1 on 2026-08-21 and sat out of the mesh for three days.
+//   - the rest (wdm*/wfdm*, ctf, bomb, duel arenas, and `ui`, which is a menu
+//     backdrop rather than a level) have no start/finish triggers at all, so
+//     drawing one parks an idle server on ten minutes of nothing raceable. Both
+//     boxes did this several times a day.
+//
+// wrace1/wfrace1 are the stock RACE maps and deliberately stay in the pool —
+// wrace1 has real records. The list is explicit rather than a "w*"-prefix rule
+// so a community map can never be excluded by an accident of naming; these names
+// come from the shipped basewsw/basewf pk3s and only move when the game itself
+// does. Unlike the moderator list this rule is local, permanent and never
+// fail-open: it needs no fetch, so it holds on a server with no INGEST_URL.
+//
+// The engine's own built-in `callvote map` does not come through here (it never
+// consulted the blocklist either), so gamehealth.sh carries the matching
+// recovery half: it reads the gametype back out of getinfo and bounces an engine
+// that is no longer running ours.
+
+// Parsed once per script load (script globals reset on every map), then reused
+// for the whole pool walk — ~4,600 lookups per rotation or wildcard vote.
+String[] raceStockNonRaceMaps;
+
+// True if <mapName> is one of the base game's own non-race maps. Case
+// insensitive, colour tokens stripped — same contract as RACE_IsMapBlocked,
+// which folds this in.
+//
+// The names live in a local built by concatenation rather than a const global:
+// Warsow's AngelScript (2.29) is the stricter of the two engines this same
+// source has to compile under, and a plain local expression is the form both
+// accept without question (see server/test/boot-test.sh on why "it built" says
+// nothing about whether it compiles).
+bool RACE_IsStockNonRaceMap( const String &in mapName )
+{
+    if ( raceStockNonRaceMaps.length() == 0 )
+    {
+        String list = "ui "
+            + "wamphi1 wbomb1 wbomb2 wbomb3 wbomb4 wbomb5 wbomb6 wca1 "
+            + "wctf1 wctf2 wctf3 wctf4 wctf6 wda1 wda2 wda3 wda4 wda5 "
+            + "wdm1 wdm2 wdm4 wdm5 wdm6 wdm7 wdm9 wdm10 wdm11 wdm12 wdm13 "
+            + "wdm14 wdm15 wdm16 wdm17 wdm18 wdm19 wtutorial1 "
+            + "wfamphi1 wfbomb1 wfbomb2 wfbomb3 wfbomb4 wfbomb5 wfbomb6 "
+            + "wfca1 wfca2 wfctf1 wfctf2 wfctf3 wfctf4 wfctf5 wfctf6 "
+            + "wfda1 wfda2 wfda3 wfda4 wfda5 "
+            + "wfdm1 wfdm2 wfdm3 wfdm4 wfdm5 wfdm6 wfdm7 wfdm8 wfdm9 wfdm10 "
+            + "wfdm11 wfdm12 wfdm13 wfdm14 wfdm15 wfdm16 wfdm17 wfdm18 "
+            + "wfdm19 wfdm20 wftutorial1";
+        for ( int i = 0; ; i++ )
+        {
+            String tok = list.getToken( i );
+            if ( tok.length() == 0 )
+                break;
+            raceStockNonRaceMaps.insertLast( tok );
+        }
+    }
+
+    String key = mapName.removeColorTokens().tolower();
+    for ( uint i = 0; i < raceStockNonRaceMaps.length(); i++ )
+    {
+        if ( raceStockNonRaceMaps[i] == key )
+            return true;
+    }
+    return false;
+}
+
+// True if <mapName> may not be played here: on the live moderator blocklist, or
+// one of the base game's own non-race maps (see RACE_IsStockNonRaceMap above —
+// that half is local and permanent, never fail-open). Case-insensitive; colour
+// tokens stripped. Folding both into this one predicate is deliberate: every
+// path that asks "may this map be selected" — the pool walks in utils.as, the
+// idle rotation and the follow-the-busy-server target in maprotate.as, and
+// meshvote's three explicit single-map gates — already funnels through here, and
+// each of them wants the same answer for both reasons.
+//
+// Fail-open on the moderator half only: an empty / unfetched / unconfigured list
+// blocks nothing.
 bool RACE_IsMapBlocked( const String &in mapName )
 {
+    if ( RACE_IsStockNonRaceMap( mapName ) )
+        return true;
     if ( raceBlockedMaps.length() == 0 )
         return false;
     String key = mapName.removeColorTokens().tolower();
@@ -39,6 +132,17 @@ bool RACE_IsMapBlocked( const String &in mapName )
             return true;
     }
     return false;
+}
+
+// Why a map RACE_IsMapBlocked refused is unavailable, as one line of
+// player-facing text. The two halves want different words: a moderator block is
+// a decision that can be reversed ("right now"), while a base-game non-race map
+// is simply not the kind of map this server plays and never will be.
+String RACE_MapBlockedReason( const String &in mapName )
+{
+    if ( RACE_IsStockNonRaceMap( mapName ) )
+        return "Map '" + mapName + "' ships with the base game and is not a race map.\n";
+    return "Map '" + mapName + "' is blocked and can't be voted right now.\n";
 }
 
 // Rebuild raceBlockedMaps from the fetched payload. getToken() splits on any

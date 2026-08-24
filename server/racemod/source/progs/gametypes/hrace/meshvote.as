@@ -351,7 +351,7 @@ bool Cmd_MeshVoteSync( Client@ client, const String &in argsString )
     }
     if ( RACE_IsMapBlocked( targetMap ) )
     {
-        client.printMessage( "Map '" + targetMap + "' is blocked and can't be voted right now.\n" );
+        client.printMessage( RACE_MapBlockedReason( targetMap ) );
         return true;
     }
 
@@ -465,12 +465,13 @@ bool Cmd_MeshVote( Client@ client, const String &cmdString, const String &argsSt
             client.printMessage( "Map '" + map + "' is not installed on this server.\n" );
             return true;
         }
-        // Blocked by a moderator in the web admin (live list from blockedmaps.as).
-        // The wildcard branch above is already filtered via GetMapsByPattern; this
+        // Not playable here: a moderator block from the web admin, or a
+        // base-game non-race map (both live behind RACE_IsMapBlocked). The
+        // wildcard branch above is already filtered via GetMapsByPattern; this
         // guards the explicit single-map case.
         if ( RACE_IsMapBlocked( map ) )
         {
-            client.printMessage( "Map '" + map + "' is blocked and can't be voted right now.\n" );
+            client.printMessage( RACE_MapBlockedReason( map ) );
             return true;
         }
     }
