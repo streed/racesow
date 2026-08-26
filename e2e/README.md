@@ -11,8 +11,10 @@ server image). CI runs both on every push/PR (`.github/workflows/ci.yml` and
 |---|---|---|
 | Web DB semantics + HTTP API | `cd web && npm test` | fast |
 | env → `env.cfg` → launch args | `sh server/test/entrypoint.test.sh` | fast |
-| Reporting natives → live web API (both directions, retry queue) | `sh e2e/run.sh` | fast |
+| Reporting natives → live web API (both directions, retry queue, `/top <map>` per-player boards) | `sh e2e/run.sh` | fast |
 | Mesh wire parser vs. hostile datagrams (ASan/UBSan) | `sh e2e/mirror_fuzz_run.sh` | fast |
+| Mesh input gates: what the parser *accepts* (coord range, name vs. chat sanitising) | `g++ -std=c++11 -o /tmp/t e2e/mirror_sanitize_test.cpp -pthread && /tmp/t` | fast |
+| API queue: what is evicted when it is full (a finish must never be the first thing dropped) | `g++ -std=c++11 -o /tmp/t e2e/api_queue_test.cpp -lcurl -pthread && /tmp/t` | fast |
 | WR-demo filename: engine C vs. `.as`, byte-for-byte | `node --test server/test/demoname.test.mjs` | fast |
 | **hrace gametype compiles at boot + a real client connects** | `sh e2e/gameserver_smoke.sh` | heavy |
 | **Website + DB + game together, game→web over HTTP** | `sh e2e/fullstack_run.sh` | heavy |
@@ -52,5 +54,14 @@ existing `warsow-race:2.1.2` (how CI invokes them after the shared build step).
 
 `mirror_wire_check.py` (fake mesh player / wire poker), `mesh_regression.py`
 (headless RSM1 protocol suite against the live 3-node mesh), and the harness
-sources (`report_harness.cpp`, `topfetch_harness.cpp`, `mirror_*`) used by the
-scripts above.
+sources (`report_harness.cpp`, `topfetch_harness.cpp`, `maptop_harness.cpp`,
+`mirror_*`) used by the scripts above. `maptop_harness` queues several
+`<map>:<slot>` pairs before polling any of them, which is how phase C2 shows
+that two players asking about two different maps get two different boards.
+
+`api_queue_test.cpp` and `mirror_sanitize_test.cpp` are unity builds: they
+`#include` the engine-patch `.cpp` rather than linking it, because the logic
+they pin (`makeRoomLocked`, `processStateLine`, `sanitizeName`) lives in an
+anonymous namespace and is deliberately not part of the native ABI. Neither
+opens a socket or starts a thread, so both run in milliseconds with no
+fixtures.

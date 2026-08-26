@@ -50,6 +50,7 @@ enum RequestType {
 	REQ_GET_MAPWEAPONS, // per-map weapon inventory -> stored in memory (RS_ApiPollMapWeapons)
 	REQ_GET_LASTMAPS,   // recently-played maps -> stored in memory (RS_ApiPollLastMaps)
 	REQ_GET_PLAYERREC,  // one player's PB on the current map -> stored per-slot (RS_ApiPollPlayerRecord)
+	REQ_GET_MAPTOP,     // ANOTHER map's top board, asked for by one player -> per-slot (RS_ApiPollMapTop)
 	REQ_GET_SAVEDSTART, // one player's saved start(s) on the current map -> per-slot (RS_ApiPollSavedStart)
 	REQ_GET_AWARDS,     // one player's fresh "achievement unlocked" rows -> per-slot (RS_ApiPollAwards)
 	REQ_GET_TOURNEY,    // current/next tournament + its map pool -> in memory (RS_ApiPollTourney)
@@ -192,6 +193,23 @@ struct ApiState {
 	std::mutex playerRecMutex;
 	std::string playerRecText[RS_PLAYERREC_MAX];
 
+	// Per-player "/top <map>" fetch handshake — the same PER-PLAYER shape as the
+	// player-record slots above, and for the same reason: two players can ask
+	// about two different maps at once, so the payload cannot live in one shared
+	// slot. Keyed by playerNum, guarded by mapTopMutex, superseded by a per-slot
+	// gen, result read-and-cleared by RS_ApiPollMapTop(i).
+	//
+	// Deliberately NOT the REQ_GET_TOPSCORES path: that one is the CURRENT map's
+	// board, it lands in a file the gametype's normal loader re-reads, and its
+	// single shared fetchGen/fetchResult also drives the pending-record announce
+	// verification. Routing an arbitrary map's board through it would let one
+	// player's "/top othermap" satisfy a record announcement about the map
+	// everyone is actually racing. This payload never touches a file at all.
+	std::atomic<unsigned> fetchMapTopGen[RS_PLAYERREC_MAX];
+	std::atomic<int> fetchMapTopResult[RS_PLAYERREC_MAX];
+	std::mutex mapTopMutex;
+	std::string mapTopText[RS_PLAYERREC_MAX];
+
 	// Per-player saved-START fetch handshake — identical PER-PLAYER shape to the
 	// player-record slots above (keyed by playerNum, one payload per slot behind
 	// savedStartMutex, a per-slot gen to supersede an in-flight re-join fetch,
@@ -248,6 +266,8 @@ struct ApiState {
 		for( int i = 0; i < RS_PLAYERREC_MAX; i++ ) {
 			fetchPlayerRecGen[i].store( 0 );
 			fetchPlayerRecResult[i].store( 0 );
+			fetchMapTopGen[i].store( 0 );
+			fetchMapTopResult[i].store( 0 );
 			fetchSavedStartGen[i].store( 0 );
 			fetchSavedStartResult[i].store( 0 );
 			fetchAwardsGen[i].store( 0 );
@@ -466,8 +486,7 @@ std::string spoolPath()
 }
 
 // Append one undeliverable report (worker or script thread; O_APPEND keeps
-// concurrent line appends whole at these sizes). Fetches pass through here
-// from the shared eviction paths — their empty body makes this a no-op.
+// concurrent line appends whole at these sizes).
 //
 // The TYPE check is not redundant with the empty-body check: REQ_POST_TJOIN is
 // the first non-report POST that carries a body, and spooling it would replay a
@@ -476,6 +495,11 @@ std::string spoolPath()
 // is a live, repeatable player action; the right answer to a dropped one is for
 // the player to type the command again, never for the server to remember it
 // across a restart.
+//
+// Callers select a REQ_POST_REPORT before calling (makeRoomLocked's ladder, and
+// the shutdown drain's report branch), so the guard should never fire — it is
+// the backstop that made the old queue-full path merely lose a tournament join
+// instead of replaying one, and it stays for the next caller who forgets.
 void spoolReport( const ApiRequest &req )
 {
 	if( req.type != REQ_POST_REPORT )
@@ -532,6 +556,60 @@ std::vector<ApiRequest> loadSpool()
 		fprintf( stderr, "rs_api: re-queued %zu spooled report(s), skipped %zu\n",
 			out.size(), skipped );
 	return out;
+}
+
+// Make room for one more request when the queue is at QUEUE_MAX. Caller holds
+// s->mutex.
+//
+// The eviction order is a strict preference ladder over what a dropped request
+// actually costs:
+//
+//  1. Any FETCH. Every fetch — top scores, ghost, blocklist, MOTD, ranks,
+//     map weapons, last maps, per-player record / saved start / awards,
+//     tournament — is reissued on its own refresh interval or on the next
+//     join, so losing one costs at most that interval. This is why the test is
+//     "not a POST" rather than a list of GET types: this used to be thirteen
+//     hand-maintained allowlists, one per RS_ApiFetch* entry point, each
+//     naming only the types that existed when it was written. RS_ApiFetchTop's
+//     still named exactly two, so a queue holding a MOTD or ranks fetch looked
+//     "all reports" to it and it spooled a finish instead of dropping a fetch
+//     it could have reissued 30 seconds later.
+//  2. The oldest REPORT, to the on-disk spool, where the next boot redelivers
+//     it. A finish happens once, so it is never simply dropped.
+//  3. Only if the queue is nothing but tournament joins: the oldest of those.
+//     A join cannot be spooled (replaying a sign-up on the next boot would
+//     answer a slot whose occupant has long since left — see ApiState) and its
+//     player is waiting on the reply, so it outranks a report here and is
+//     dropped only when there is no other candidate at all. The gametype times
+//     a pending join out, and the player can type the command again.
+//
+// Note step 2 scans for a REPORT rather than taking queue.front(): the front
+// could be a tournament join, which spoolReport() correctly refuses to write —
+// so the old "spool the front, then pop it" pair silently discarded that join,
+// exactly the outcome the ladder above exists to avoid.
+void makeRoomLocked( ApiState *s )
+{
+	if( s->queue.size() < QUEUE_MAX )
+		return;
+
+	for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+		if( it->type != REQ_POST_REPORT && it->type != REQ_POST_TJOIN ) {
+			s->queue.erase( it );
+			return;
+		}
+	}
+
+	for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
+		if( it->type == REQ_POST_REPORT ) {
+			fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
+			spoolReport( *it );
+			s->queue.erase( it );
+			return;
+		}
+	}
+
+	fprintf( stderr, "rs_api: queue full of tournament joins, dropping the oldest\n" );
+	s->queue.pop_front();
 }
 
 // -1 = transport error (retryable), otherwise the HTTP status.
@@ -1105,6 +1183,58 @@ void workerMain( ApiState *s )
 				continue;
 			}
 			// transient: fall through to the requeue below
+		} else if( req.type == REQ_GET_MAPTOP ) {
+			// One player's "/top <map>", keyed by req.slot — same per-slot
+			// handshake as REQ_GET_PLAYERREC below. A fetch queued once shutdown
+			// is under way is worthless: nobody will ever poll it.
+			if( req.slot < 0 || req.slot >= ApiState::RS_PLAYERREC_MAX )
+				continue;
+			if( s->stop.load() )
+				continue;
+			std::string payload;
+			status = doGet( req, payload );
+			bool current = req.gen == s->fetchMapTopGen[req.slot].load();
+			if( status >= 200 && status < 300 ) {
+				if( !current )
+					continue; // superseded (the slot asked again, or its player left)
+				// A topscores payload always opens with its "//<map> top scores"
+				// header, so anything else is a captive portal / proxy error page
+				// answering 200 and must never be tokenised into 0ms "records".
+				// An EMPTY body is the API's "no records for this map" and is a
+				// legitimate answer, not a failure — pass it through as a good
+				// payload so the gametype can say so rather than time out.
+				if( !payload.empty() && payload.compare( 0, 2, "//" ) != 0 ) {
+					fprintf( stderr, "rs_api: rejecting non-topscores payload from %s\n",
+						req.url.c_str() );
+					s->fetchMapTopResult[req.slot].store( -1 );
+					continue;
+				}
+				{
+					std::lock_guard<std::mutex> lock( s->mapTopMutex );
+					s->mapTopText[req.slot].swap( payload );
+				}
+				// One-shot fetch: always signal 1 on a good body, never dedup on
+				// "unchanged". A player who types the same "/top <map>" twice is
+				// owed an answer both times, and the script clears its per-player
+				// pending flag only on a non-zero poll — suppressing the signal
+				// would strand that flag and the command would never reply.
+				s->fetchMapTopResult[req.slot].store( 1 );
+				continue;
+			}
+			if( !current )
+				continue; // superseded - do not burn retries on a stale fetch
+			bool permanent = status >= 400 && status < 500;
+			req.attempts++;
+			if( permanent || req.attempts >= MAX_ATTEMPTS ) {
+				// 404 is the expected "no central records for this map yet"; the
+				// gametype turns -1 into "no records found", so it is not logged.
+				if( status != 404 )
+					fprintf( stderr, "rs_api: map-top fetch failed for good, status %ld: %s\n",
+						status, req.url.c_str() );
+				s->fetchMapTopResult[req.slot].store( -1 );
+				continue;
+			}
+			// transient: fall through to the requeue below
 		} else if( req.type == REQ_GET_PLAYERREC ) {
 			// Per-player PB fetch, keyed by req.slot. A fetch queued once
 			// shutdown is under way is worthless: nobody will ever poll it.
@@ -1339,37 +1469,14 @@ __attribute__(( destructor )) void rsApiShutdown()
 
 } // namespace
 
-// Enqueue any fire-and-forget POST (shared by all the report natives). When
-// the queue is full, evict a fetch first — fetches are fully reproducible on
-// the next refresh interval — and only then the oldest report, which goes to
-// the on-disk spool instead of being silently dropped.
-//
-// REQ_POST_TJOIN is deliberately NOT evictable here. It looks like a fetch to a
-// "anything that isn't a report" test, but it is neither reproducible nor
-// spoolable: a player is sitting at their console waiting for its reply, and
-// dropping it silently would leave their slot pending with nothing ever to
-// answer it. (The gametype times a pending join out as a backstop, but it
-// should not have to.)
+// Enqueue any fire-and-forget POST (shared by all the report natives).
+// makeRoomLocked decides what gives way when the queue is full.
 static void rsQueuePost( const char *url, const char *token, std::string &&body )
 {
 	ApiState *s = ensureStarted();
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type != REQ_POST_REPORT && it->type != REQ_POST_TJOIN ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
 			REQ_POST_REPORT, "", 0, 0 } );
 	}
@@ -1575,25 +1682,7 @@ void RS_ApiFetchTop( const char *url, const char *token, const char *mapname )
 	unsigned gen = s->fetchGen.fetch_add( 1 ) + 1;
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// Prefer evicting another fetch (fully reproducible next interval)
-			// over a race report (a finish is reported exactly once).
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
 			REQ_GET_TOPSCORES, std::move( path ), gen, 0 } );
 	}
@@ -1748,24 +1837,7 @@ void RS_ApiFetchGhost( const char *url, const char *token, const char *mapname )
 	unsigned gen = s->fetchGhostGen.fetch_add( 1 ) + 1;
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// evict another fetch (reproducible) before a one-shot race report
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
 			REQ_GET_GHOST, "", gen, 0 } );
 	}
@@ -1874,25 +1946,7 @@ void RS_ApiFetchBlocked( const char *url, const char *token )
 	unsigned gen = s->fetchBlockedGen.fetch_add( 1 ) + 1;
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// evict another fetch (fully reproducible next interval) before a
-			// one-shot race report
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
 			REQ_GET_BLOCKED, "", gen, 0 } );
 	}
@@ -1945,27 +1999,7 @@ void RS_ApiFetchMapWeapons( const char *url, const char *token )
 	unsigned gen = s->fetchMapWeaponsGen.fetch_add( 1 ) + 1;
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// evict another fetch (fully reproducible next interval) before a
-			// one-shot race report
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_MAPWEAPONS || it->type == REQ_GET_RANKS ||
-					it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE || it->type == REQ_GET_BLOCKED ||
-					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
 			REQ_GET_MAPWEAPONS, "", gen, 0 } );
 	}
@@ -2017,28 +2051,7 @@ void RS_ApiFetchLastMaps( const char *url, const char *token )
 	unsigned gen = s->fetchLastMapsGen.fetch_add( 1 ) + 1;
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// evict another fetch (fully reproducible next interval) before a
-			// one-shot race report
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_LASTMAPS || it->type == REQ_GET_MAPWEAPONS ||
-					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
-					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
-					it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
 			REQ_GET_LASTMAPS, "", gen, 0 } );
 	}
@@ -2091,26 +2104,7 @@ void RS_ApiFetchMotd( const char *url, const char *token )
 	unsigned gen = s->fetchMotdGen.fetch_add( 1 ) + 1;
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// evict another fetch (fully reproducible next interval) before a
-			// one-shot race report
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE || it->type == REQ_GET_BLOCKED ||
-					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
 			REQ_GET_MOTD, "", gen, 0 } );
 	}
@@ -2175,26 +2169,7 @@ void RS_ApiFetchAnnounce( const char *url, const char *token )
 	unsigned gen = s->fetchAnnounceGen.fetch_add( 1 ) + 1;
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// evict another fetch (fully reproducible next interval) before a
-			// one-shot race report
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE || it->type == REQ_GET_BLOCKED ||
-					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
 			REQ_GET_ANNOUNCE, "", gen, 0 } );
 	}
@@ -2263,27 +2238,7 @@ void RS_ApiFetchRanks( const char *url, const char *token, const char *mapname )
 	unsigned gen = s->fetchRanksGen.fetch_add( 1 ) + 1;
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// evict another fetch (fully reproducible next interval) before a
-			// one-shot race report
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
-					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
-					it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
 			REQ_GET_RANKS, "", gen, 0 } );
 	}
@@ -2360,27 +2315,7 @@ void RS_ApiFetchPlayerRecord( const char *url, const char *token, const char *ma
 	s->fetchPlayerRecResult[playerNum].store( 0 );
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// evict another fetch (fully reproducible on the next join) before a
-			// one-shot race report
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_PLAYERREC || it->type == REQ_GET_RANKS ||
-					it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE || it->type == REQ_GET_BLOCKED ||
-					it->type == REQ_GET_GHOST || it->type == REQ_GET_TOPSCORES ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
 			REQ_GET_PLAYERREC, "", gen, playerNum } );
 	}
@@ -2411,6 +2346,85 @@ const char *RS_PlayerRecordText( int playerNum )
 	return buf.c_str();
 }
 
+
+/*
+ * RS_ApiFetchMapTop / RS_ApiPollMapTop / RS_MapTopText
+ *
+ * Fetch ANOTHER map's top board on behalf of ONE player — the in-game
+ * "/top <map>" — from <url> (the public /api/game/topscores endpoint;
+ * ?map=<mapname> is appended), keyed by playerNum into a per-slot buffer.
+ * RS_ApiPollMapTop(i) returns 1 when that player's board has landed (read it
+ * with RS_MapTopText(i) and tokenise it — the payload is byte-identical to a
+ * topscores file, so the gametype's own parser handles it), -1 when the fetch
+ * failed for good, 0 while it is still in flight.
+ *
+ * This exists instead of pointing RS_ApiFetchTop at an arbitrary map because
+ * that native is the CURRENT map's board: it writes a file the level loader
+ * re-reads, and its single shared fetchGen/fetchResult also gates the pending
+ * record announce. See the fetchMapTopGen comment in ApiState.
+ *
+ * The board is held in memory and never written to disk: these are maps this
+ * server is not playing, and a player-typed command should not be able to
+ * create files under topscores/race/.
+ *
+ * No-op when url is empty (a server with no central API keeps reading its local
+ * topscores files, which is the only board it has).
+ */
+void RS_ApiFetchMapTop( const char *url, const char *token, const char *mapname, int playerNum )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] )
+		return;
+	if( playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return;
+
+	// The map name here comes from a PLAYER, not from the level: guard it before
+	// it becomes a query value (the gametype checks too — this is the backstop
+	// every other native-facing map name already gets).
+	if( !rsMapNameOk( mapname ) ) {
+		fprintf( stderr, "rs_api: refusing map-top fetch for unsafe map name\n" );
+		return;
+	}
+
+	std::string full = std::string( url ) + "?map=" + urlEncode( mapname );
+	ApiState *s = ensureStarted();
+	// Bump the generation first, THEN clear any stale result — the same
+	// load-bearing order as RS_ApiFetchPlayerRecord, and for the same reason:
+	// slots are reused, so a previous occupant's completed-but-unpolled result
+	// must not be read by whoever holds the slot next.
+	unsigned gen = s->fetchMapTopGen[playerNum].fetch_add( 1 ) + 1;
+	s->fetchMapTopResult[playerNum].store( 0 );
+	{
+		std::lock_guard<std::mutex> lock( s->mutex );
+		makeRoomLocked( s );
+		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
+			REQ_GET_MAPTOP, "", gen, playerNum } );
+	}
+	s->cv.notify_one();
+}
+
+int RS_ApiPollMapTop( int playerNum )
+{
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX )
+		return 0;
+	return s->fetchMapTopResult[playerNum].exchange( 0 );
+}
+
+// Copy out the last-fetched board for a slot. Called from the script thread
+// after a poll of 1; the AngelScript wrapper copies the static buffer
+// immediately (no reentrancy on the single script thread).
+const char *RS_MapTopText( int playerNum )
+{
+	static std::string buf;
+	ApiState *s = g_state;
+	if( !s || playerNum < 0 || playerNum >= ApiState::RS_PLAYERREC_MAX ) {
+		buf.clear();
+		return buf.c_str();
+	}
+	std::lock_guard<std::mutex> lock( s->mapTopMutex );
+	buf = s->mapTopText[playerNum];
+	return buf.c_str();
+}
 
 /*
  * RS_ApiFetchSavedStart / RS_ApiPollSavedStart / RS_SavedStartText
@@ -2446,24 +2460,7 @@ void RS_ApiFetchSavedStart( const char *url, const char *token, const char *mapn
 	s->fetchSavedStartResult[playerNum].store( 0 );
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_SAVEDSTART || it->type == REQ_GET_PLAYERREC ||
-					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
-					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
-					it->type == REQ_GET_TOPSCORES ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
 			REQ_GET_SAVEDSTART, "", gen, playerNum } );
 	}
@@ -2525,25 +2522,7 @@ void RS_ApiFetchAwards( const char *url, const char *token, const char *cleanNam
 	s->fetchAwardsResult[playerNum].store( 0 );
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_AWARDS || it->type == REQ_GET_SAVEDSTART ||
-					it->type == REQ_GET_PLAYERREC ||
-					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
-					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
-					it->type == REQ_GET_TOPSCORES ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ std::move( full ), token ? token : "", "", 0,
 			REQ_GET_AWARDS, "", gen, playerNum } );
 	}
@@ -2620,29 +2599,7 @@ void RS_ApiFetchTourney( const char *url, const char *token )
 	unsigned gen = s->fetchTourneyGen.fetch_add( 1 ) + 1;
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			// evict another fetch (fully reproducible next interval) before a
-			// one-shot race report
-			bool evicted = false;
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_TOURNEY || it->type == REQ_GET_LASTMAPS ||
-					it->type == REQ_GET_MAPWEAPONS ||
-					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
-					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
-					it->type == REQ_GET_TOPSCORES || it->type == REQ_GET_PLAYERREC ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				// No fetch to evict: the whole queue is reports. Spool the
-				// oldest instead of silently losing a finish.
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ url, token ? token : "", "", 0,
 			REQ_GET_TOURNEY, "", gen, 0 } );
 	}
@@ -2713,28 +2670,7 @@ void RS_ApiTourneyJoin( const char *url, const char *token, const char *code,
 	s->fetchTJoinResult[playerNum].store( 0 );
 	{
 		std::lock_guard<std::mutex> lock( s->mutex );
-		if( s->queue.size() >= QUEUE_MAX ) {
-			bool evicted = false;
-			// Evict only REPRODUCIBLE fetches — never another player's join,
-			// which has somebody waiting on its reply, and never a race report.
-			for( std::deque<ApiRequest>::iterator it = s->queue.begin(); it != s->queue.end(); ++it ) {
-				if( it->type == REQ_GET_TOURNEY ||
-					it->type == REQ_GET_AWARDS || it->type == REQ_GET_SAVEDSTART ||
-					it->type == REQ_GET_PLAYERREC ||
-					it->type == REQ_GET_RANKS || it->type == REQ_GET_MOTD || it->type == REQ_GET_ANNOUNCE ||
-					it->type == REQ_GET_BLOCKED || it->type == REQ_GET_GHOST ||
-					it->type == REQ_GET_TOPSCORES ) {
-					s->queue.erase( it );
-					evicted = true;
-					break;
-				}
-			}
-			if( !evicted ) {
-				fprintf( stderr, "rs_api: queue full, spooling oldest report\n" );
-				spoolReport( s->queue.front() );
-				s->queue.pop_front();
-			}
-		}
+		makeRoomLocked( s );
 		s->queue.push_back( ApiRequest{ url, token ? token : "", std::move( body ), 0,
 			REQ_POST_TJOIN, "", gen, playerNum } );
 	}

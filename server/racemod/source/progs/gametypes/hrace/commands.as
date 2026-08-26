@@ -472,10 +472,12 @@ bool Cmd_PreRandmap( Client@ client, const String &cmdString, const String &args
     if ( result == "" )
         return false;
 
-    client.printMessage( S_COLOR_YELLOW + "Showing top for " + S_COLOR_WHITE + result + "\n" );
-    RACE_ShowMapTop( client, result.tolower() );
-
+    // Which map was drawn, THEN its board. The board now comes from the central
+    // API and so arrives a moment later, on a subsequent frame — printing the
+    // "Chosen map" line first keeps the two in a sensible order instead of
+    // wrapping it around a gap.
     client.printMessage( S_COLOR_YELLOW + "Chosen map: " + S_COLOR_WHITE + result + S_COLOR_YELLOW + " (out of " + S_COLOR_WHITE + player.randmapMatches + S_COLOR_YELLOW + " matches)\n" );
+    RACE_ShowMapTop( client, result.tolower() );
     return true;
 }
 
@@ -506,12 +508,18 @@ bool Cmd_CPs( Client@ client, const String &cmdString, const String &argsString,
 // (e.g. a self-hosted stats site); defaults to the historical livesow address.
 Cvar race_toplists( "race_toplists", "http://livesow.net/race", CVAR_ARCHIVE );
 
-// Print another map's stored top board (read from its topscores file) without
-// loading it. Shared by "/top <map>" and "/prerandmap".
-void RACE_ShowMapTop( Client@ client, const String &in mapName )
+// Print another map's top board to one player. Shared by "/top <map>" and
+// "/prerandmap"; the RECORDS are supplied by the caller, which is what decides
+// where they came from — see RACE_ShowMapTop.
+//
+// A handle rather than "const RecordTime[] &in": RecordTime's accessors are not
+// declared const, so a const array reference could not call isFinished() or
+// getFinishTime() on its elements. RecordTime[]@ is the form RACE_Records
+// already returns and indexes, so it is known to compile on both engines — and
+// this file only finds that out at server boot.
+void RACE_RenderMapTop( Client@ client, const String &in mapName, RecordTime[]@ records )
 {
-    RecordTime[] records = RACE_ReadTopScoresFile( mapName );
-    if ( records.length() == 0 || !records[ 0 ].isFinished() )
+    if ( @records == null || records.length() == 0 || !records[ 0 ].isFinished() )
     {
         client.printMessage( S_COLOR_RED + "No records found for map \"" + mapName + "\".\n" );
         return;
@@ -542,11 +550,45 @@ void RACE_ShowMapTop( Client@ client, const String &in mapName )
         client.printMessage( maptable.getRow( i ) + "\n" );
 }
 
+// Show another map's board without loading that map.
+//
+// The central database is the source of truth for records — it holds every
+// server's finishes, while this server's topscores/race/<map>.txt holds only
+// what THIS box has seen, and for a map it has not hosted lately that file is
+// usually absent entirely. So the API is asked first (asynchronously, since the
+// game frame must never block on the network) and the local file is the
+// fallback for a server with no central API configured, which is the only board
+// such a server has. RACE_ApiMapTopRequest returns false when it cannot take
+// the request, and then the answer comes from disk exactly as before.
+//
+// The map name reaches a URL and, on the fallback path, a FILE NAME, and via
+// "/top <map>" it is typed by a player — so it is gated here, on the one
+// chokepoint both paths pass through, with the same allowlist the natives
+// apply. /prerandmap gets the gate too: its names come from the engine's own
+// map list, and all 4,257 installed packs satisfy the allowlist, so nothing
+// real is refused. Refusing early also beats the generic "no records" a
+// nonsense name would otherwise produce.
+void RACE_ShowMapTop( Client@ client, const String &in mapName )
+{
+    if ( !RACE_MapNameOk( mapName ) )
+    {
+        client.printMessage( S_COLOR_RED + "That is not a valid map name.\n" );
+        return;
+    }
+
+    if ( RACE_ApiMapTopRequest( client, mapName ) )
+        return; // answered asynchronously by RACE_ApiMapTopThink
+
+    RecordTime[] local = RACE_ReadTopScoresFile( mapName );
+    RACE_RenderMapTop( client, mapName, @local );
+}
+
 bool Cmd_Top( Client@ client, const String &cmdString, const String &argsString, int argc )
 {
-    // "/top <map>": inspect another map's stored board without loading it. The
-    // records are read straight from that map's topscores file into a scratch
-    // array, so the live level board and HUD are untouched.
+    // "/top <map>": inspect another map's board without loading it. The records
+    // are fetched from the central API (or, with no API configured, read from
+    // that map's topscores file) into a scratch array, so the live level board
+    // and HUD are untouched either way.
     String mapName = argsString.getToken( 0 );
     if ( mapName != "" )
     {

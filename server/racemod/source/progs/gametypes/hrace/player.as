@@ -142,6 +142,18 @@ class Player
     bool awardsSeeded;
     int awardsHighWater;
     uint nextAwardsPoll;
+    // "/top <map>" against the central board (hrace/apitop.as): the API is the
+    // source of truth for records, so the command asks it rather than reading
+    // this server's own topscores file. pendingMapTopFetch gates the per-slot
+    // poll and a second command while the first is travelling; mapTopName is the
+    // map the in-flight request is about (the reply carries no map, and the
+    // player needs to be told which board they are looking at); mapTopDeadline
+    // (levelTime ms) is the backstop for a request nothing ever answers, and
+    // mapTopNext paces repeats so the command cannot be used to hammer the API.
+    bool pendingMapTopFetch;
+    String mapTopName;
+    uint mapTopDeadline;
+    uint mapTopNext;
     // Tournament entry redeem (hrace/tournament.as): "/tournament <code>" fires
     // one per-slot POST whose REPLY is printed back to the player, so exactly
     // one may be in flight at a time — pendingTourneyJoin gates both the poll
@@ -408,6 +420,10 @@ class Player
         this.awardsSeeded = false;
         this.awardsHighWater = 0;
         this.nextAwardsPoll = 0;
+        this.pendingMapTopFetch = false;
+        this.mapTopName = "";
+        this.mapTopDeadline = 0;
+        this.mapTopNext = 0;
         this.pendingTourneyJoin = false;
         this.tourneyJoinDeadline = 0;
         this.tourneyNoticeAt = 0;

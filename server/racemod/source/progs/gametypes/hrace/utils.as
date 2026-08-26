@@ -42,6 +42,47 @@ uint RACE_LocateFrom( const String &in str, const String &in token, uint start )
     return start + str.substr( start ).locate( token, 0 );
 }
 
+// Characters a map name may contain. The AngelScript twin of rsMapNameOk in
+// server/enginepatches/g_rs_api.cpp (and of isSafeMapName in web/mapname.js);
+// keep all three in step.
+//
+// Why the base gametype needs its own copy: "/top <map>" takes a map name
+// straight from a player and hands it to
+// G_LoadFile( "topscores/race/" + name + ".txt" ). Every path that reaches the
+// natives is guarded by rsMapNameOk before the name becomes a URL or a file
+// name — this one went to the engine's filesystem layer with nothing in front
+// of it, trusting the engine to sanitise. It very likely does; that is not a
+// reason for the one caller taking arbitrary player input to be the only one
+// with no check of its own.
+//
+// The allowlist keeps the punctuation real maps use ("un-dead!020_3", "4^3",
+// "gu3#5-stickupkids") and leaves out everything with meaning to a shell, a cfg
+// line, a console command or a path: ';' '$' '&' quotes, the separators, '%'
+// and the glob characters.
+const String RACE_MAPNAME_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789_.-!#^`~+=@()[],";
+const String RACE_MAPNAME_FIRST = "abcdefghijklmnopqrstuvwxyz0123456789";
+const uint RACE_MAPNAME_MAX = 64; // longest real name is 47, +9 for "-reversed"
+
+bool RACE_MapNameOk( const String &in name )
+{
+    String lower = name.tolower();
+    if ( lower.length() == 0 || lower.length() > RACE_MAPNAME_MAX )
+        return false;
+    // A leading '.' or '-' is what turns a name into "../.." or into something a
+    // command line reads as an option: the first character is always alphanumeric.
+    if ( RACE_MAPNAME_FIRST.locate( lower.substr( 0, 1 ), 0 ) >= RACE_MAPNAME_FIRST.length() )
+        return false;
+    // Belt and braces: no directory escape even though '/' is not in the set.
+    if ( lower.locate( "..", 0 ) < lower.length() )
+        return false;
+    for ( uint i = 0; i < lower.length(); i++ )
+    {
+        if ( RACE_MAPNAME_CHARS.locate( lower.substr( i, 1 ), 0 ) >= RACE_MAPNAME_CHARS.length() )
+            return false;
+    }
+    return true;
+}
+
 String[] GetMapsByPattern( String@ pattern, String@ ignore = null )
 {
     String[] maps;
@@ -57,14 +98,18 @@ String[] GetMapsByPattern( String@ pattern, String@ ignore = null )
         @map = ML_GetMapByNum( i++ );
         if ( @map == null )
             break;
-        String clean_map = map.removeColorTokens().tolower();
         if ( @ignore != null && map == ignore )
             continue;
+        String clean_map = map.removeColorTokens().tolower();
         // Drop maps a moderator has blocked in the web admin (fetched live by
         // blockedmaps.as). Fail-open: unfetched/unconfigured => nothing blocked.
         // This filters every selection path that funnels through here: randmap,
         // meshvote wildcards, prerandmap and the /maps listing.
-        if ( RACE_IsMapBlocked( clean_map ) )
+        //
+        // The *Clean entry point, not RACE_IsMapBlocked: clean_map is already
+        // colour-stripped and lowercased, and the name-taking form would redo
+        // that twice more for each of the ~4,600 maps this loop visits.
+        if ( RACE_IsMapBlockedClean( clean_map ) )
             continue;
         if ( PatternMatch( clean_map, pattern, Wildcard_Yes ) )
         {
@@ -98,7 +143,7 @@ String[] GetMapsByFilter( String@ arg, String@ ignore = null )
         if ( @ignore != null && map == ignore )
             continue;
         String clean_map = map.removeColorTokens().tolower();
-        if ( RACE_IsMapBlocked( clean_map ) )
+        if ( RACE_IsMapBlockedClean( clean_map ) ) // already clean — see GetMapsByPattern
             continue;
         if ( RACE_MapMatchesFilter( clean_map ) )
             maps.insertLast( map );

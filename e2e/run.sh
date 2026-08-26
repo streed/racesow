@@ -187,6 +187,63 @@ grep -qF '"20132" "^1No^7va" "2" "5000" "12000" ' "${TMP}/wsw/racemod/topscores/
 grep -qF '"31000" "^4Wa^5ve" "1" "9000" ' "${TMP}/wsw/racemod/topscores/race/gu3#5-stickupkids.txt" \
     || { echo "FAIL: record missing from the '#' map board (unencoded fragment?)" >&2; exit 1; }
 
+# --- Phase C2: "/top <map>" — ANOTHER map's board, to one player -------------
+# The in-game "/top <map>" used to read this server's own topscores file, which
+# holds only what THIS box has seen — so a map it had not hosted lately answered
+# "No records found" while the website showed a full board. It now asks the
+# central API through its own per-player native (RS_ApiFetchMapTop), which keeps
+# the board in memory and hands it to the asking player.
+step "phase C2: compiling map-top harness (real g_rs_api.cpp)"
+g++ -std=c++11 -Wall -Wextra -o "${TMP}/maptop" \
+    "${HERE}/maptop_harness.cpp" \
+    "${ROOT}/server/enginepatches/g_rs_api.cpp" \
+    -lcurl -lpthread
+
+step "phase C2: two players ask about two different maps at once"
+# Both requests are queued before either is polled. A shared buffer (the reason
+# this is not just RS_ApiFetchTop with a different argument) would show up as one
+# board answering both slots.
+mkdir -p "${TMP}/wsw2/racemod/topscores/race"
+WARSOW_DIR="${TMP}/wsw2" FS_GAME="racemod" \
+    "${TMP}/maptop" "${BASE}/api/game/topscores" "" 10 \
+    'testrace:3' 'un-dead!020_3:7' > "${TMP}/maptop.out" \
+    || { echo "FAIL: concurrent map-top fetches did not both land" >&2; cat "${TMP}/maptop.out" >&2; exit 1; }
+sed 's/^/   /' "${TMP}/maptop.out"
+
+# Slot 3 must hold testrace's board and slot 7 the '!' map's — not each other's.
+awk '/^=== 3 testrace ok$/{f=1;next} /^=== /{f=0} f' "${TMP}/maptop.out" > "${TMP}/slot3.txt"
+awk '/^=== 7 un-dead!020_3 ok$/{f=1;next} /^=== /{f=0} f' "${TMP}/maptop.out" > "${TMP}/slot7.txt"
+head -1 "${TMP}/slot3.txt" | grep -qx "//testrace top scores" \
+    || { echo "FAIL: slot 3 did not get testrace's board" >&2; cat "${TMP}/slot3.txt" >&2; exit 1; }
+head -1 "${TMP}/slot7.txt" | grep -qx "//un-dead!020_3 top scores" \
+    || { echo "FAIL: slot 7 did not get the '!' map's board (slots clobbered?)" >&2; cat "${TMP}/slot7.txt" >&2; exit 1; }
+# Same loader format the gametype's own parser (RACE_ParseTopScores) reads.
+grep -qF '"47000" "^4Wa^5ve" "2" "9500" "27000" ' "${TMP}/slot3.txt" \
+    || { echo "FAIL: WR line missing from the map-top payload" >&2; cat "${TMP}/slot3.txt" >&2; exit 1; }
+grep -qF '"20132" "^1No^7va" "2" "5000" "12000" ' "${TMP}/slot7.txt" \
+    || { echo "FAIL: record missing from the '!' map's map-top payload" >&2; cat "${TMP}/slot7.txt" >&2; exit 1; }
+
+step "phase C2: the board is served from memory — no file is written"
+# A player-typed command must not be able to create files under topscores/race/.
+found="$(find "${TMP}/wsw2/racemod/topscores/race" -type f | wc -l)"
+[ "${found}" = "0" ] \
+    || { echo "FAIL: map-top wrote ${found} file(s) under topscores/race" >&2; \
+         find "${TMP}/wsw2/racemod/topscores/race" -type f >&2; exit 1; }
+
+step "phase C2: an unknown map fails the poll (the gametype says 'no records')"
+rc=0
+WARSOW_DIR="${TMP}/wsw2" FS_GAME="racemod" \
+    "${TMP}/maptop" "${BASE}/api/game/topscores" "" 10 'nosuchmap:1' >/dev/null || rc=$?
+[ "${rc}" = "2" ] \
+    || { echo "FAIL: unknown map did not fail for good (rc=${rc})" >&2; exit 1; }
+
+step "phase C2: a traversing map name is refused before any request"
+rc=0
+WARSOW_DIR="${TMP}/wsw2" FS_GAME="racemod" \
+    "${TMP}/maptop" "${BASE}/api/game/topscores" "" 3 '../../etc/passwd:2' >/dev/null || rc=$?
+[ "${rc}" = "1" ] \
+    || { echo "FAIL: traversing name was not refused outright (rc=${rc})" >&2; exit 1; }
+
 step "phase C: a traversing map name is still refused before any request"
 rc=0
 WARSOW_DIR="${TMP}/wsw" FS_GAME="racemod" \

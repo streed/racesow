@@ -258,16 +258,23 @@ void RACE_LoadTopScores( bool reversed = false )
     }
 }
 
-// Read topscores/race/<mapName>.txt into a fresh array (best-first, as stored
-// in the file) WITHOUT touching the live levelRecords board or the HUD. Used by
-// "/top <map>" to inspect another map's records without loading that map. This
-// mirrors the parsing in RACE_LoadTopScores above, but targets an arbitrary map
-// and returns the records instead of inserting them into the level board.
-RecordTime[] RACE_ReadTopScoresFile( const String &in mapName )
+// Parse a topscores payload into a fresh array (best-first, as stored) WITHOUT
+// touching the live levelRecords board or the HUD. Used to show a map OTHER than
+// the one loaded. This mirrors the parsing in RACE_LoadTopScores above, but
+// targets arbitrary text and returns the records instead of inserting them into
+// the level board.
+//
+// Text, not a file path, because the same bytes arrive two ways: from the
+// central API (RS_MapTopText, the authoritative board) and from this server's
+// own topscores/race/<map>.txt (the fallback when no API is configured). The
+// wire format and the on-disk format are byte-identical — the API payload IS
+// what RS_ApiFetchTop writes to that file — so one parser serves both. The
+// leading "//<map> top scores" header line costs nothing either way:
+// getToken() skips // comments.
+RecordTime[] RACE_ParseTopScores( const String &in topScores )
 {
     RecordTime[] list;
 
-    String topScores = G_LoadFile( "topscores/race/" + mapName.tolower() + ".txt" );
     if ( topScores.length() == 0 )
         return list;
 
@@ -331,6 +338,13 @@ RecordTime[] RACE_ReadTopScoresFile( const String &in mapName )
     }
 
     return list;
+}
+
+// The local-file half of the above: this server's own cached board for <mapName>.
+// Only the source of the bytes differs.
+RecordTime[] RACE_ReadTopScoresFile( const String &in mapName )
+{
+    return RACE_ParseTopScores( G_LoadFile( "topscores/race/" + mapName.tolower() + ".txt" ) );
 }
 
 void RACE_UpdateHUDTopScores()

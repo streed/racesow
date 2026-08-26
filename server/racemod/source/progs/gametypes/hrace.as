@@ -67,12 +67,31 @@ Cvar rs_tv_pov( "rs_tv_pov", "", CVAR_SERVERINFO );
 // TEAM_SPECTATOR guard below makes this inert there. Set 0 to require a manual
 // join.
 Cvar rs_autojoin( "rs_autojoin", "1", 0 );
+// Cleaned form of rs_tv_name, memoised against the raw cvar value it was
+// derived from. RACE_IsTvClient is asked per client per FRAME — the TV
+// auto-director loop and RACE_AnyHumanPresent both walk every slot every frame,
+// and the mirror publish walks them again at 10Hz — and it used to rebuild the
+// wanted name from the cvar on every one of those calls: two throwaway Strings
+// for a value that changes when an admin edits a cvar, i.e. essentially never.
+// The raw string is the cache key rather than a "dirty" flag so a live
+// "set rs_tv_name ..." still takes effect on the very next call.
+String raceTvNameRaw = "";
+String raceTvNameClean = "";
 bool RACE_IsTvClient( Client@ client )
 {
     if ( @client is null )
         return false;
-    String want = rs_tv_name.string.removeColorTokens().tolower();
-    return want.length() > 0 && client.name.removeColorTokens().tolower() == want;
+    String raw = rs_tv_name.string;
+    if ( raw.length() == 0 )
+        return false; // no camera configured: nothing can be it
+    if ( raw != raceTvNameRaw )
+    {
+        raceTvNameRaw = raw;
+        raceTvNameClean = raw.removeColorTokens().tolower();
+    }
+    if ( raceTvNameClean.length() == 0 )
+        return false; // a name of nothing but colour tokens matches nobody
+    return client.name.removeColorTokens().tolower() == raceTvNameClean;
 }
 
 // the player has finished the race. This entity times his automatic respawning
@@ -260,7 +279,15 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
     else if ( cmdString == "tourneyvote" || cmdString == "tvote" )
         return Cmd_TourneyVote( client, cmdString, argsString, argc );
 
-    G_PrintMsg( null, "unknown: " + cmdString + "\n" );
+    // Answer the client who typed it, not the whole server: G_PrintMsg with a
+    // null entity BROADCASTS, so an unrecognised command printed its name to
+    // everyone connected. Only a gametype-registered command reaches GT_Command,
+    // so this is a "we registered a command and forgot to dispatch it" notice —
+    // it belongs to the one person seeing the dead command, and the server
+    // console keeps the record for whoever has to add the missing branch.
+    if ( @client != null )
+        client.printMessage( S_COLOR_RED + "Unknown command: " + cmdString + "\n" );
+    G_Print( "hrace: unhandled registered command '" + cmdString + "'\n" );
 
     return false;
 }
@@ -650,6 +677,11 @@ void GT_ThinkRules()
     // live top scores from the central API (no-op when rs_api_top_url is
     // empty); also before the early-return so records stay current postmatch
     RACE_ApiTopThink();
+
+    // replies to "/top <map>" (no-op when rs_api_top_url is empty, and when
+    // nobody is waiting): the central DB is the source of truth for records, so
+    // the command asks it and this prints the board when it lands (apitop.as)
+    RACE_ApiMapTopThink();
 
     // live map blocklist from the central admin (no-op when rs_api_blocked_url
     // is empty); keeps the vote pool current so a map blocked in the web admin

@@ -67,6 +67,17 @@ int RS_MirrorBotAdd( const char *name, const char *clan, int r, int g, int b, bo
 
 	edict_t *ent = &game.edicts[entNum];
 	int playerNum = entNum - 1;
+	// Every other function here bounds playerNum against RS_MAX_BOT_SLOTS; this
+	// one is where the slot number first arrives, so it has to as well. The
+	// engine's client numbering has never exceeded the cap, but a slot outside
+	// it would be an out-of-bounds WRITE rather than a missed lookup — and a
+	// connected bot we could never find again to drop. Refuse it and hand the
+	// slot straight back.
+	if( playerNum < 0 || playerNum >= RS_MAX_BOT_SLOTS ) {
+		fprintf( stderr, "rs_mirror: refusing bot slot %d (cap %d)\n", playerNum, RS_MAX_BOT_SLOTS );
+		trap_DropClient( ent, DROP_TYPE_GENERAL, NULL );
+		return -1;
+	}
 	rs_mirrorBotSlot[playerNum] = true;
 	// Fresh slot: not the WR ghost until RS_MirrorBotUpdate says so, and a bot
 	// never opts out of seeing the ghost (these are the per-client visibility

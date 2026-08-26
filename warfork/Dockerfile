@@ -99,6 +99,7 @@ RUN cd source \
     && grep -q 'asFunc_RS_ApiFetchRanks'  game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchAnnounce' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchPlayerRecord' game/g_ascript.cpp \
+    && grep -q 'asFunc_RS_ApiFetchMapTop' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchSavedStart' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiSaveStart' game/g_ascript.cpp \
     && grep -q 'asFunc_RS_ApiFetchAwards' game/g_ascript.cpp \

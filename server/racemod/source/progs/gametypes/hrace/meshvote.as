@@ -95,6 +95,15 @@ bool RACE_MapExists( const String &in name )
         const String@ m = ML_GetMapByNum( i++ );
         if ( @m == null )
             break;
+        // Length first: this walks every installed .bsp — ~4,600 of them — and
+        // tolower() builds a throwaway String for each one it is called on. A
+        // length mismatch rules a name out with an integer compare and no
+        // allocation, which is almost all of them. Sound because the comparison
+        // below already assumes an installed map name carries no colour tokens
+        // (it lowercases m but does not strip it), and tolower() never changes
+        // length.
+        if ( m.length() != want.length() )
+            continue;
         if ( m.tolower() == want )
             return true;
     }

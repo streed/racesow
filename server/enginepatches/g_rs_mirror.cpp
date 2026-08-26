@@ -89,9 +89,30 @@ constexpr size_t IN_EVENTQ_MAX = 64;
 constexpr size_t OUT_EVENTQ_MAX = 32;
 constexpr size_t EVENT_DEDUP_WINDOW = 128;
 constexpr size_t RESEND_MAX = 32;
-constexpr size_t NAME_MAX = 64;
 constexpr size_t TEXT_MAX = 256;
-constexpr size_t TAG_MAX = 16;
+
+// The two sizes below are also spelled into sscanf field widths, which are
+// string literals — so the number lives in a macro and both the constant and
+// the width are derived from it. A width must be one below the buffer size
+// (it excludes the NUL); getting that wrong by editing one of two copies is a
+// stack overflow, so there is deliberately only one copy.
+#define RS_NAME_MAX_N 64
+#define RS_TAG_MAX_N 16
+#define RS_STR2( x ) #x
+#define RS_STR( x ) RS_STR2( x )
+#define RS_SCAN_NAME_W RS_STR( RS_NAME_MAX_N )
+#define RS_SCAN_TAG_W RS_STR( RS_TAG_MAX_N )
+constexpr size_t NAME_MAX = RS_NAME_MAX_N;
+constexpr size_t TAG_MAX = RS_TAG_MAX_N;
+
+// Largest magnitude accepted for a mirrored position / angle / velocity
+// component. isfinite() alone is not enough: a peer sending 1e30 would drive
+// ent->s.origin through GClip_LinkEntity and the snapshot coord quantisation,
+// where float->int of an out-of-range value is undefined behaviour. A Quake
+// world is +/-131072 units and no legal velocity approaches that, so this is
+// several orders of magnitude of headroom and still far inside int range. Same
+// posture as parseGhostPayload's +/-1e9 guard in g_rs_api.cpp.
+constexpr float COORD_ABS_MAX = 1.0e6f;
 
 // ---------------------------------------------------------------------------
 // Minimal SHA-256 + HMAC (vendored so the module gains no new dependencies).
@@ -280,8 +301,11 @@ std::string sanitizeToken( const char *s, size_t maxlen )
 	return out;
 }
 
-// Free-text fields (names, chat): kill the protocol delimiters, keep the rest
-// (including Warsow ^-color codes).
+// Free-text fields (chat, and the base pass for names): kill the protocol
+// delimiters, keep the rest — including Warsow ^-colour codes and UTF-8, which
+// is why this is a blocklist and not an allowlist. Quotes, backslashes and
+// semicolons stay: chat is printed with G_PrintMsg, never executed, and players
+// type all three. DEL is dropped as unprintable.
 std::string sanitizeField( const char *s, size_t maxlen )
 {
 	std::string out;
@@ -289,8 +313,30 @@ std::string sanitizeField( const char *s, size_t maxlen )
 		unsigned char c = (unsigned char)*p;
 		if( c == '\t' || c == '\r' || c == '\n' )
 			out += ' ';
-		else if( c >= 0x20 || c >= 0x80 )
+		else if( c >= 0x20 && c != 0x7f )
 			out += (char)c;
+	}
+	return out;
+}
+
+// A player NAME: sanitizeField, plus the three characters an info string is
+// built out of.
+//
+// A mirrored name is handed to Info_SetValueForKey( userinfo, "name", ... ) in
+// g_rs_mirrorbots.cpp before trap_FakeClientConnect. '\\' and '"' are the info
+// string's own delimiters and ';' is banned there by inheritance from Quake's
+// command separator, so qfusion refuses to set a value containing any of them —
+// a peer whose player was called >"< produced a bot with NO name key at all,
+// rather than a bot with that name. The engine holds real local names to exactly
+// this rule on connect, so nothing a genuine player can be called is lost.
+//
+// Names only: chat never becomes an info value, and players type all three.
+std::string sanitizeName( const char *s, size_t maxlen )
+{
+	std::string out = sanitizeField( s, maxlen );
+	for( size_t i = 0; i < out.size(); i++ ) {
+		if( out[i] == '\\' || out[i] == '"' || out[i] == ';' )
+			out[i] = ' ';
 	}
 	return out;
 }
@@ -708,10 +754,11 @@ void processStateLine( MirrorState *s, const std::string &tag, uint32_t seq, con
 	}
 	// %f parses "nan"/"inf"; reject non-finite coords so they never reach the
 	// ghost origin/velocity, the snapshot formatter, or the /watch trace math.
+	// Finite is not sufficient on its own — see COORD_ABS_MAX.
 	for( int i = 0; i < 9; i++ )
-		if( !std::isfinite( f[i] ) )
+		if( !std::isfinite( f[i] ) || f[i] < -COORD_ABS_MAX || f[i] > COORD_ABS_MAX )
 			return;
-	std::string name = sanitizeField( line + off, NAME_MAX );
+	std::string name = sanitizeName( line + off, NAME_MAX );
 	if( name.empty() )
 		return;
 
@@ -779,7 +826,7 @@ void processEventLine( MirrorState *s, PeerRt &rt, const std::string &tag, const
 		default: return;
 	}
 	ev.tag = tag;
-	ev.name = sanitizeField( std::string( nameStart, tab2 - nameStart ).c_str(), NAME_MAX );
+	ev.name = sanitizeName( std::string( nameStart, tab2 - nameStart ).c_str(), NAME_MAX );
 	ev.text = sanitizeField( tab2 + 1, TEXT_MAX );
 	if( ev.name.empty() )
 		return;
@@ -837,7 +884,8 @@ void processDatagram( MirrorState *s, const char *buf, size_t n, const sockaddr_
 	char type = 0;
 	char tagBuf[TAG_MAX + 1] = { 0 };
 	char mapBuf[NAME_MAX + 1] = { 0 };
-	if( sscanf( canon.c_str(), "%lld %u %c %16s %64s", &ts, &seq, &type, tagBuf, mapBuf ) != 5 ) {
+	if( sscanf( canon.c_str(), "%lld %u %c %" RS_SCAN_TAG_W "s %" RS_SCAN_NAME_W "s",
+			&ts, &seq, &type, tagBuf, mapBuf ) != 5 ) {
 		noteDrop( s );
 		return;
 	}
@@ -1065,7 +1113,7 @@ void RS_MirrorPlayer( const char *name, const float *origin, const float *angles
 	MirrorState *s = g_mirror;
 	if( !s || s->buildCount >= MAX_PLAYERS_PER_TAG )
 		return;
-	std::string cleanName = sanitizeField( name, NAME_MAX );
+	std::string cleanName = sanitizeName( name, NAME_MAX );
 	if( cleanName.empty() )
 		return;
 	if( score < 0 )
@@ -1105,7 +1153,7 @@ void RS_MirrorEvent( const char *kind, const char *name, const char *text )
 		return;
 	OutEvent ev;
 	ev.kind = k;
-	ev.name = sanitizeField( name, NAME_MAX );
+	ev.name = sanitizeName( name, NAME_MAX );
 	ev.text = sanitizeField( text, TEXT_MAX );
 	if( ev.name.empty() )
 		return;

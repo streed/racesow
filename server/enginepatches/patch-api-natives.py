@@ -571,6 +571,59 @@ PLAYERREC_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, PLAYERREC_ENTRY, "asGlobFuncs playerrecord entry")
 
+# --- 1k2. "/top <map>": pull ANOTHER map's board for ONE player ----------------
+# Adds RS_ApiFetchMapTop / RS_ApiPollMapTop / RS_MapTopText (impl in
+# g_rs_api.cpp). PER PLAYER, the same shape as the player-record trio, because
+# two players can ask about two different maps at once.
+#
+# NOT RS_ApiFetchTop with a different argument: that native is the CURRENT map's
+# board — it writes topscores/race/<map>.txt for the level loader to re-read, and
+# its single shared fetchGen/fetchResult also gates the pending record announce,
+# so an arbitrary map's payload landing there could satisfy an announcement about
+# the map everyone is racing. This one keeps the board in memory and hands it
+# straight to the asking player (hrace/apitop.as). Anchors re-emitted so they
+# stay unique. The Dockerfile asserts on "asFunc_RS_ApiFetchMapTop".
+MAPTOP_WRAPPER = (
+    "// racesow-docker: \"/top <map>\" - GETs the central /api/game/topscores text\n"
+    "// for an arbitrary map into a per-player slot; the gametype polls\n"
+    "// RS_ApiPollMapTop(playerNum) and reads RS_MapTopText(playerNum), then\n"
+    "// tokenises it with its own topscores parser (the payload is byte-identical\n"
+    "// to a topscores file) and prints the board to that one player.\n"
+    "void RS_ApiFetchMapTop( const char *url, const char *token, const char *mapname,\n"
+    "\tint playerNum );\n"
+    "int RS_ApiPollMapTop( int playerNum );\n"
+    "const char *RS_MapTopText( int playerNum );\n"
+    "\n"
+    "static void asFunc_RS_ApiFetchMapTop( asstring_t *url, asstring_t *token,\n"
+    "\tasstring_t *mapname, int playerNum )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !mapname || !mapname->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiFetchMapTop( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tmapname->buffer, playerNum );\n"
+    "}\n"
+    "\n"
+    "static int asFunc_RS_ApiPollMapTop( int playerNum ) { return RS_ApiPollMapTop( playerNum ); }\n"
+    "\n"
+    "static asstring_t *asFunc_RS_MapTopText( int playerNum )\n"
+    "{\n"
+    "\tconst char *s = RS_MapTopText( playerNum );\n"
+    "\treturn angelExport->asStringFactoryBuffer( s, strlen( s ) );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, MAPTOP_WRAPPER, "asFunc maptop wrapper")
+
+MAPTOP_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiFetchMapTop( const String &in url, const String &in token, "
+    "const String &in map, int playerNum )\", "
+    "asFUNCTION(asFunc_RS_ApiFetchMapTop), NULL },\n"
+    "\t{ \"int RS_ApiPollMapTop( int playerNum )\", asFUNCTION(asFunc_RS_ApiPollMapTop), NULL },\n"
+    "\t{ \"const String @RS_MapTopText( int playerNum )\", asFUNCTION(asFunc_RS_MapTopText), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, MAPTOP_ENTRY, "asGlobFuncs maptop entry")
+
 # --- 1l. per-player saved START on join: pull ONE player's saved start(s) ------
 # Adds RS_ApiFetchSavedStart / RS_ApiPollSavedStart / RS_SavedStartText (impl in
 # g_rs_api.cpp). PER PLAYER (playerNum-keyed per-slot result), the same shape as

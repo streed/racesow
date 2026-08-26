@@ -45,6 +45,16 @@ jobs:
         run: sh e2e/run.sh
       - name: mesh parser fuzz (ASan + UBSan)
         run: sh e2e/mirror_fuzz_run.sh
+      - name: API queue eviction ladder
+        run: |
+          g++ -std=c++11 -Wall -Wextra -Wno-unused-parameter \
+              -o /tmp/api_queue_test e2e/api_queue_test.cpp -lcurl -pthread
+          /tmp/api_queue_test
+      - name: mesh input gates (coord range, name vs chat sanitising)
+        run: |
+          g++ -std=c++11 -Wall -Wextra -Wno-unused-parameter \
+              -o /tmp/mirror_sanitize_test e2e/mirror_sanitize_test.cpp -pthread
+          /tmp/mirror_sanitize_test
       - name: WR-demo filename port equivalence
         run: node --test server/test/demoname.test.mjs
       - name: demo metadata parser (client-demo attribution)

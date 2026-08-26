@@ -76,6 +76,7 @@ RUN python3 /tmp/patch-api-natives.py \
     && grep -q "asFunc_RS_ApiFetchMapWeapons" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchLastMaps" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchPlayerRecord" game/g_ascript.cpp \
+    && grep -q "asFunc_RS_ApiFetchMapTop" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchSavedStart" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiSaveStart" game/g_ascript.cpp \
     && grep -q "asFunc_RS_ApiFetchAwards" game/g_ascript.cpp \

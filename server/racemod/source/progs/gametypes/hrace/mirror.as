@@ -23,6 +23,18 @@ Cvar rsMirrorSecret( "rs_mirror_secret", "", 0 );
 Cvar rsMirrorPort( "rs_mirror_port", "44450", 0 );
 Cvar rsMirrorPeers( "rs_mirror_peers", "", 0 );
 Cvar rsMirrorMaxGhosts( "rs_mirror_maxghosts", "32", 0 );
+// How many client slots are held back from the mesh, i.e. how many players this
+// box always has room for no matter how busy its peers are.
+//
+// A mirror bot is a real fake client out of the same fixed client array a human
+// connects into, and rs_mirror_maxghosts defaults to 32 against an
+// sv_maxclients of 16 — so a busy mesh (three peers, up to 32 published players
+// each) could fill every slot on a quiet box and answer a human's connect with
+// "server is full". The mesh is meant to make an empty server feel populated,
+// not to keep people out of it, so the bot ceiling is additionally capped at
+// maxClients minus this reserve. Set it to 0 to restore the old behaviour of
+// letting puppets take the whole server.
+Cvar rsMirrorReserveSlots( "rs_mirror_reserve_slots", "4", 0 );
 // 1 = log received events and a periodic roster/ghost summary to the server
 // console; pairs with the C side's "rs_mirror: stats" line for headless
 // verification that the mesh broadcast is flowing
@@ -785,6 +797,27 @@ void RACE_MirrorRemoveBot( MirrorPlayer@ rp )
     }
 }
 
+// Bot ceiling for this pass: rs_mirror_maxghosts, but never so many that mesh
+// puppets could occupy every client slot (see rs_mirror_reserve_slots). Capping
+// the TOTAL at maxClients - reserve is what guarantees the reserve: bots can
+// then never hold more than that many slots, so at least `reserve` are always
+// reachable by a connecting human.
+int RACE_MirrorBotCeiling()
+{
+    int reserve = rsMirrorReserveSlots.integer;
+    if ( reserve < 0 )
+        reserve = 0;
+    int cap = maxClients - reserve;
+    if ( cap < 0 )
+        cap = 0;
+    int maxBots = rsMirrorMaxGhosts.integer;
+    if ( maxBots < 0 )
+        maxBots = 0;
+    if ( maxBots > cap )
+        maxBots = cap;
+    return maxBots;
+}
+
 // Each frame: keep a real fake-client ("mirror bot") in sync for every remote
 // player on OUR map. The bot occupies a client slot, so it appears on the
 // scoreboard, is chaseable with the normal spectator controls, and its view
@@ -793,7 +826,7 @@ void RACE_MirrorRemoveBot( MirrorPlayer@ rp )
 void RACE_MirrorUpdateBots()
 {
     int botCount = 0;
-    int maxBots = rsMirrorMaxGhosts.integer;
+    int maxBots = RACE_MirrorBotCeiling();
 
     for ( uint i = 0; i < mirrorPlayers.length(); i++ )
     {

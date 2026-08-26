@@ -67,6 +67,20 @@ const uint API_TOURNEY_REFRESH_MS = 60 * 1000;
 // timeout here is always a request that genuinely went missing (evicted from a
 // full queue, dropped at shutdown, or no-opped) rather than one still travelling.
 const uint TOURNEY_JOIN_TIMEOUT_MS = 20000;
+
+// Minimum gap between one player's tournament sign-up attempts.
+//
+// An entry code is a shared secret ("RS9K-4MTB"), and every "/tournament <code>"
+// is a POST the SERVER makes under its own ingest token — so without a gate here
+// a player could walk the code space at command rate through a trusted proxy.
+// pendingTourneyJoin alone is not that gate: it clears the moment the reply
+// lands, which on a healthy link is well under a second. The web side rate-limits
+// per server token, which makes guessing slow but also means a guesser eats the
+// budget that carries finish reports — so the throttle belongs here too, per
+// player, the same shape as "/flag"'s cooldown.
+const uint TOURNEY_JOIN_COOLDOWN_MS = 5000;
+uint[] raceTourneyJoinLast( maxClients );
+
 // Most pool maps printed in one go. Every row is a separate reliable command,
 // and a 64-map pool would be 64 of them in a single frame — well past what
 // anything else in this mod emits at once (Cmd_Maplist pages at 30). The tail
@@ -720,6 +734,19 @@ bool Cmd_Tournament( Client@ client, const String &cmdString, const String &args
         client.printMessage( S_COLOR_YELLOW + "Still checking your last tournament request - hold on.\n" );
         return true;
     }
+
+    // Per-player throttle on sign-up attempts (see TOURNEY_JOIN_COOLDOWN_MS).
+    // Below the pending check, so someone whose request is still in flight gets
+    // the more specific message; above every path that reaches
+    // RACE_TriggerTourneyJoin, so both "join" and a raw entry code are covered.
+    int pn = client.playerNum;
+    if ( raceTourneyJoinLast[pn] != 0
+            && levelTime - raceTourneyJoinLast[pn] < TOURNEY_JOIN_COOLDOWN_MS )
+    {
+        client.printMessage( S_COLOR_YELLOW + "Hold on a moment before trying another entry code.\n" );
+        return true;
+    }
+    raceTourneyJoinLast[pn] = levelTime == 0 ? 1 : levelTime;
 
     if ( arg.tolower() == "join" )
     {

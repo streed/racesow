@@ -69,13 +69,32 @@ String[] raceStockNonRaceMaps;
 // True if <mapName> is one of the base game's own non-race maps. Case
 // insensitive, colour tokens stripped — same contract as RACE_IsMapBlocked,
 // which folds this in.
+bool RACE_IsStockNonRaceMap( const String &in mapName )
+{
+    return RACE_IsStockNonRaceMapClean( mapName.removeColorTokens().tolower() );
+}
+
+// The body of RACE_IsStockNonRaceMap, for a key the caller has ALREADY colour-
+// stripped and lowercased.
 //
 // The names live in a local built by concatenation rather than a const global:
 // Warsow's AngelScript (2.29) is the stricter of the two engines this same
 // source has to compile under, and a plain local expression is the form both
 // accept without question (see server/test/boot-test.sh on why "it built" says
 // nothing about whether it compiles).
-bool RACE_IsStockNonRaceMap( const String &in mapName )
+//
+// Both halves of the blocked predicate used to clean their own argument, so
+// asking "may this map be selected" cost FOUR String allocations per map — two
+// here and two in RACE_IsMapBlocked — on top of the one the pool walk in
+// utils.as had already done to build clean_map. Across the ~4,600-map
+// enumeration that every randmap / meshvote / prerandmap / "/maps" page and
+// every idle rotation performs, that is ~18,000 throwaway Strings built on the
+// game thread, three quarters of them re-deriving a value the caller was
+// holding. The walks now pass their clean_map straight through to the *Clean
+// entry points; the name-taking wrappers stay for the single-map callers
+// (meshvote's explicit gates, the follow target) where one clean is the honest
+// cost.
+bool RACE_IsStockNonRaceMapClean( const String &in key )
 {
     if ( raceStockNonRaceMaps.length() == 0 )
     {
@@ -99,7 +118,6 @@ bool RACE_IsStockNonRaceMap( const String &in mapName )
         }
     }
 
-    String key = mapName.removeColorTokens().tolower();
     for ( uint i = 0; i < raceStockNonRaceMaps.length(); i++ )
     {
         if ( raceStockNonRaceMaps[i] == key )
@@ -121,11 +139,16 @@ bool RACE_IsStockNonRaceMap( const String &in mapName )
 // blocks nothing.
 bool RACE_IsMapBlocked( const String &in mapName )
 {
-    if ( RACE_IsStockNonRaceMap( mapName ) )
+    return RACE_IsMapBlockedClean( mapName.removeColorTokens().tolower() );
+}
+
+// RACE_IsMapBlocked for a key the caller has ALREADY colour-stripped and
+// lowercased — the form the pool walks in utils.as use, since they build that
+// key anyway. See RACE_IsStockNonRaceMapClean for why this pair exists.
+bool RACE_IsMapBlockedClean( const String &in key )
+{
+    if ( RACE_IsStockNonRaceMapClean( key ) )
         return true;
-    if ( raceBlockedMaps.length() == 0 )
-        return false;
-    String key = mapName.removeColorTokens().tolower();
     for ( uint i = 0; i < raceBlockedMaps.length(); i++ )
     {
         if ( raceBlockedMaps[i] == key )

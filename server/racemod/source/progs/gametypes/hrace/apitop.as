@@ -200,3 +200,153 @@ void RACE_ApiTopThink()
         }
     }
 }
+
+///*****************************************************************
+/// "/top <map>" against the central board
+///*****************************************************************
+//
+// The map-wide fetch above keeps THIS map's board current. This half answers
+// "/top <othermap>" and "/prerandmap", where the local topscores file is the
+// wrong place to look: it holds only what this box has seen, and for a map it
+// has not hosted lately there is usually no file at all — so the command
+// answered "No records found" for maps with a full leaderboard on the website.
+// The central DB has every server's finishes, so that is what gets asked.
+//
+// Its own native (RS_ApiFetchMapTop), not RS_ApiFetchTop with a different
+// argument: that one writes the level's topscores file and shares the single
+// fetch generation that gates the pending record announce, so an arbitrary
+// map's payload landing there could satisfy an announcement about the map
+// everyone is actually racing. This one is per-player and stays in memory.
+
+// How long a player waits before the request is written off. The native retries
+// a transient failure up to MAX_ATTEMPTS with a 2s pause between, so this has to
+// outlast that; past it the player is told, and may ask again.
+const uint MAPTOP_TIMEOUT_MS = 12000;
+// Minimum gap between one player's "/top <map>" requests. The endpoint is cached
+// server-side and this is a cheap read, so this is about not letting one player
+// turn a chat-speed command into a request flood, not about protecting the DB.
+const uint MAPTOP_COOLDOWN_MS = 2000;
+
+// Ask the central API for <mapName>'s board on <client>'s behalf.
+//
+// Returns true when the request has been taken and the player will be answered
+// by RACE_ApiMapTopThink; false when this server cannot serve it from the API
+// at all, which is the caller's cue to fall back to the local file. Note the
+// asymmetry: a player-facing REFUSAL (already waiting, on cooldown) also returns
+// true, because the player has been told what is happening and must not then get
+// a second, stale answer off the disk.
+bool RACE_ApiMapTopRequest( Client@ client, const String &in mapName )
+{
+    if ( rsApiTopUrl.string.length() == 0 )
+        return false; // no central API on this server: the local file is all there is
+    if ( @client == null )
+        return false;
+
+    Player@ player = RACE_GetPlayer( client );
+    if ( player is null )
+        return false;
+
+    if ( player.pendingMapTopFetch )
+    {
+        client.printMessage( S_COLOR_YELLOW + "Still looking up " + S_COLOR_WHITE
+                + player.mapTopName + S_COLOR_YELLOW + " - hold on.\n" );
+        return true;
+    }
+    if ( player.mapTopNext != 0 && levelTime < player.mapTopNext )
+    {
+        client.printMessage( S_COLOR_YELLOW + "Hold on a moment before looking up another map.\n" );
+        return true;
+    }
+
+    player.pendingMapTopFetch = true;
+    player.mapTopName = mapName.tolower();
+    // levelTime can be 0 on the very first frame, so 1 is the "armed" sentinel
+    // (0 means "no deadline"), the same idiom as tourneyJoinDeadline.
+    player.mapTopDeadline = levelTime + MAPTOP_TIMEOUT_MS;
+    if ( player.mapTopDeadline == 0 )
+        player.mapTopDeadline = 1;
+    player.mapTopNext = levelTime + MAPTOP_COOLDOWN_MS;
+    if ( player.mapTopNext == 0 )
+        player.mapTopNext = 1;
+
+    // empty token: /api/game/topscores is public (same as the map-wide fetch
+    // above), so the ingest write-credential has no business riding along.
+    raceMapTopPending++;
+    RS_ApiFetchMapTop( rsApiTopUrl.string, "", player.mapTopName, client.playerNum );
+    client.printMessage( S_COLOR_WHITE + "Looking up " + S_COLOR_YELLOW + player.mapTopName
+            + S_COLOR_WHITE + "...\n" );
+    return true;
+}
+
+// How many players are waiting on a board right now. A HINT, not a tally to be
+// kept exactly right: the think below recomputes it from the players it finds
+// each pass, so a slot whose flag was cleared behind its back — a disconnect, or
+// Player.clear() on a rejoin — cannot leave it stuck high. All it has to be is
+// zero when nobody is waiting, which is almost always, and that is what makes
+// the per-frame cost of this feature a single integer compare.
+int raceMapTopPending = 0;
+
+// Poll for landed "/top <map>" boards and print them. Called from GT_ThinkRules;
+// a no-op when nobody is waiting or the feature is off.
+//
+// Walks every client slot rather than a team, because a SPECTATOR may type
+// "/top <map>" just as readily as a racer — unlike the join-time fetches, which
+// only concern people who are playing.
+void RACE_ApiMapTopThink()
+{
+    if ( raceMapTopPending <= 0 )
+        return;
+    if ( rsApiTopUrl.string.length() == 0 )
+        return;
+
+    int stillPending = 0;
+    for ( int i = 0; i < maxClients; i++ )
+    {
+        Client@ client = G_GetClient( i );
+        if ( @client == null || client.state() < CS_SPAWNED )
+            continue;
+        Player@ player = RACE_GetPlayer( client );
+        if ( player is null || !player.pendingMapTopFetch )
+            continue;
+
+        int result = RS_ApiPollMapTop( i );
+        if ( result == 1 )
+        {
+            player.pendingMapTopFetch = false;
+            // An empty body is the API's "this map has no records", which
+            // RACE_RenderMapTop already words correctly for an empty array.
+            RecordTime[] central = RACE_ParseTopScores( RS_MapTopText( i ) );
+            RACE_RenderMapTop( client, player.mapTopName, @central );
+            continue;
+        }
+        if ( result == -1 )
+        {
+            player.pendingMapTopFetch = false;
+            // Failed for good — most often a 404, i.e. the central DB has never
+            // seen a finish on this map. Fall back to whatever this server has
+            // cached locally rather than answering with nothing: on a box that
+            // has hosted the map, that file is a real (if partial) board.
+            RecordTime[] local = RACE_ReadTopScoresFile( player.mapTopName );
+            if ( local.length() > 0 && local[ 0 ].isFinished() )
+            {
+                client.printMessage( S_COLOR_YELLOW
+                        + "(central records unavailable - showing this server's own)\n" );
+            }
+            RACE_RenderMapTop( client, player.mapTopName, @local );
+            continue;
+        }
+
+        // Still in flight. The deadline is the backstop for a request nothing
+        // ever answers (evicted from a full queue, dropped at shutdown, or
+        // no-opped by the native): without it the player could never ask again.
+        if ( player.mapTopDeadline != 0 && levelTime >= player.mapTopDeadline )
+        {
+            player.pendingMapTopFetch = false;
+            client.printMessage( S_COLOR_RED + "Timed out looking up "
+                    + player.mapTopName + " - try again.\n" );
+            continue;
+        }
+        stillPending++;
+    }
+    raceMapTopPending = stillPending;
+}
