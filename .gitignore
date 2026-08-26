@@ -58,3 +58,7 @@ web/public/maps/*.glb
 temp/
 
 .env.production
+
+# Python bytecode (tools/mapfix)
+__pycache__/
+*.pyc
