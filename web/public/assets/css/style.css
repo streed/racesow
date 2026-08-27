@@ -45,6 +45,43 @@ body {
 }
 a { color: inherit; text-decoration: none; }
 
+/* ==========================================================================
+   Interaction affordances
+   --------------------------------------------------------------------------
+   Every clickable thing gets the hand cursor from this one block. A lot of the
+   site's controls are <span>/<div>/<td> wired up through the delegated
+   [data-nav] / [data-copy] handlers in app.js rather than real <button>s, and
+   those inherit the text I-beam over their label — which reads "select me",
+   not "click me" (the live page's WATCH badge was the worst offender). Listing
+   the interaction hooks here means a new badge is affordant the moment it
+   carries one, instead of each needing to remember its own cursor rule.
+
+   Deliberately NOT in the list: text/search inputs and <textarea> (the I-beam
+   is correct there) and bare <label> (clicking a label for a text field hands
+   you a caret, so the arrow is honest).
+   ========================================================================== */
+a[href],
+button,
+summary,
+select,
+[role="button"], [role="tab"], [role="link"], [role="option"], [role="switch"],
+[data-nav], [data-copy], [data-cmp-pick], [data-code],
+.clickable, .btn,
+input[type="button"], input[type="submit"], input[type="reset"],
+input[type="checkbox"], input[type="radio"], input[type="range"],
+input[type="file"], input[type="color"] {
+  cursor: pointer;
+}
+
+/* Switched off must not read as actionable, however it is switched off: a real
+   :disabled control, or an aria/class flag on a <span> that never could be. */
+:disabled,
+[aria-disabled="true"],
+.clickable.disabled,
+.btn.disabled {
+  cursor: not-allowed;
+}
+
 /* Diagonal "speed" streaks used as decorative separators. */
 .streaks {
   height: 3px;
@@ -67,6 +104,7 @@ header.site {
 }
 .brand { display: flex; align-items: center; gap: 12px; cursor: pointer; }
 .brand img { width: 34px; height: 34px; filter: drop-shadow(0 2px 6px rgba(255,106,26,.5)); }
+.brand:hover .wordmark { color: var(--orange-2); }
 .brand .wordmark {
   font-family: var(--cond);
   font-style: italic; font-weight: 800; letter-spacing: .5px;
@@ -863,6 +901,7 @@ a.replay-badge { text-decoration: none; }
   font: 700 11px/1 var(--cond); letter-spacing: .1em; vertical-align: middle;
 }
 .watch-badge .livedot { width: 7px; height: 7px; background: #fff; }
+.watch-badge:hover { background: var(--orange-2); }
 .srv-connect { padding: 10px 12px 4px; color: var(--muted); font-size: 13px; }
 .connect-copy {
   border: 1px solid var(--line-2); background: var(--panel-2); color: var(--text);
@@ -890,6 +929,7 @@ a.replay-badge { text-decoration: none; }
 .cmp-slot:first-child .cmp-slot-head { color: var(--cyan); }
 .cmp-slot:last-child .cmp-slot-head { color: var(--orange-2); }
 .cmp-picked { font-family: var(--cond); font-weight: 800; font-style: italic; font-size: 22px; margin-bottom: 10px; cursor: pointer; }
+.cmp-picked[data-nav]:hover { color: var(--orange-2); }
 .cmp-picked.empty { color: var(--faint); font-style: normal; font-weight: 600; font-size: 15px; cursor: default; }
 .cmp-search { margin-left: 0; width: 100%; }
 .cmp-search input { padding-left: 12px; }

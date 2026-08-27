@@ -2303,6 +2303,12 @@ h2{font-size:16px;margin:26px 0 10px;color:#e9c9a8}
 .actions{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap}
 form.inline{display:inline}
 button,.btn{font:inherit;cursor:pointer;border-radius:7px;border:1px solid #3a352d;background:#2a2620;color:#eee;padding:7px 13px}
+/* Affordance: the admin builds controls out of more than <button> — checkbox
+   labels are clickable strips, and <select>/<summary> read as inert without
+   the hand. :has() covers the wrapping label; the bare input covers the box
+   itself (and any browser without :has()). */
+select,summary,input[type=checkbox],input[type=radio],input[type=file],label:has(input[type=checkbox]),label:has(input[type=radio]){cursor:pointer}
+input:disabled,select:disabled,textarea:disabled{cursor:not-allowed}
 button.primary{background:#ff6a1a;border-color:#ff6a1a;color:#1a1206;font-weight:600}
 button.ok{border-color:#3a6b3a;color:#bfe6bf}
 button.warn{border-color:#6b5a2a;color:#e6d6a0}
