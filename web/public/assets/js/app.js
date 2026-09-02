@@ -1966,6 +1966,18 @@ const ABOUT_CMDS = [
     ],
   },
   {
+    title: "Duels — 1v1",
+    note:
+      "Challenge someone to a head-to-head on the map you're both already on. From the moment they accept, every finish either of you records counts: your fastest one is your time, the faster time leads, and the lead changes hands as often as you can beat each other. The duel ends when the map changes, when someone forfeits, or when one of you leaves and doesn't come back within five minutes — and the faster time then wins. Only the two of you ever see a duel's messages; nobody else on the server is shown the score. The result and your win-loss record go on both of your profiles here.",
+    rows: [
+      ["/duel <player>", "Challenge a player on this server to a 1v1 on the current map. The name matches on any part of it with colour codes ignored, so /duel tud finds tudduf. They have 60 seconds to answer."],
+      ["/duel", "With no name: show your live duel score, or list the challenges waiting for you."],
+      ["/accept [name]", "Accept a duel challenge. The name is only needed when more than one person has challenged you."],
+      ["/decline [name]", "Turn down a challenge."],
+      ["/forfeit", "Concede the duel you're in. A forfeit is a loss however fast you were — that's what makes it a concession rather than a way to bank a lead and walk away."],
+    ],
+  },
+  {
     title: "Cross-server mesh",
     note: "The servers above are linked. On the same map you'll see players from the other server as translucent ghosts, and their chat arrives with a [TAG] prefix.",
     rows: [
@@ -2005,6 +2017,8 @@ const ABOUT_FAQ = [
     "Yes. Open any map and look for a <b>▶ replay</b> badge to watch the ghost right in your browser, or <b>⬇ demo</b> to download it. To play a demo back in Warsow, drop the file in your <span class=\"mono\">racemod/demos</span> folder and run <span class=\"mono\">demo &lt;file&gt;</span> in the console."],
   ["How is the ranking worked out?",
     "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: on each map it measures how close your time is to the world record, weighted by how many players you beat, and your rating is the average across <b>50 map slots</b> on a 0–1000 scale, filled by your strongest maps. Everyone is measured on the same 50, so a deep catalog and a short one are compared like for like — but that also means all 50 count: a slow run inside them pulls the number down, and it's worth going back to improve your weakest. Any slot you haven't filled yet sits at the starting rating, so a short catalog climbs as you race more maps. Because every run is measured against the current world record, your SR can also drift down even when you haven't raced. If someone lowers a record on one of your best maps, you sit a little further from the top. Only contested maps count (you and at least two other players with a time on it). Any profile's Skill Rating card has a <b>“Which maps make up this rating?”</b> dropdown that lists exactly which maps went into the number, in order, and a <b>“where you stand”</b> chart underneath that plots every ranked player's rating so you can see which percentile yours falls in. World records and podium finishes are tracked separately on your profile."],
+  ["How do duels work?",
+    "A duel is a 1v1 on the map you're both standing on. Type <span class=\"mono\">/duel &lt;player&gt;</span> to challenge someone — the name matches on any part of it with colour codes ignored, so <span class=\"mono\">/duel tud</span> finds <span class=\"mono\">tudduf</span> — and they have 60 seconds to <span class=\"mono\">/accept</span> or <span class=\"mono\">/decline</span>. Once it's on, <b>every finish either of you records on that map counts</b>: your fastest is your time, and whoever is faster leads. Beat your own best and you might take the lead; the server tells you both, and nobody else. It ends on whichever comes first — the map changes, someone types <span class=\"mono\">/forfeit</span> (a loss however fast they were), or one of you leaves and doesn't return within five minutes. The faster time wins at that moment. Practice runs never count, and neither do runs in the other direction: a duel is fixed to the direction it was accepted in, because <span class=\"mono\">/reverse</span> is a separate leaderboard. If neither of you ever finishes, nothing is recorded. Everything else lands on both your profiles as a win-loss record and the recent match-ups. Type <span class=\"mono\">/duel</span> on its own at any time for the live score."],
   ["A map is broken or shouldn't be here — what do I do?",
     "Flag it for review. In-game, type <span class=\"mono\">/flag</span> while you're on the map (add a reason if you like, e.g. <span class=\"mono\">/flag broken</span>). Or open the map on this site and hit <b>⚑ Flag this map for review</b>. Moderators check flagged maps and can pull a bad one from the vote pool and map cycle."],
 ];
