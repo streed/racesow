@@ -11,6 +11,21 @@ services:
       REDIS_URL: "redis://redis:6379"
       # Live HLS stream per enrolled server id (web/streams.js). Public URLs.
       STREAM_URLS: "1=https://racesow.org/hls/eu/index.m3u8,2=https://racesow.org/hls/us/index.m3u8"
+      # Arms the automatic Monthly Cup generator (web/server.js sweepTournaments).
+      # Deliberately an env var and not a site_setting row: site_setting is dumped
+      # WHOLESALE into the public backup, so a stored flag would ship publicly and
+      # leave any restored mirror with an ARMED generator quietly creating
+      # tournaments. Must be identical on web and web2 (rolling-deploy.sh env
+      # parity); unsetting it here and rolling the web layer is the emergency stop.
+      #
+      # Committed ON so a new instance runs the cup by default, rather than the
+      # flag surviving only as hand-applied drift on the one box that happened to
+      # get it. The corollary is worth stating plainly: whoever RUNS THIS FILE is
+      # armed, so a clone of this repo schedules its own editions. That is still
+      # narrower than the site_setting route this avoids — restoring the public
+      # database alone arms nothing, because the flag lives here and not in the
+      # dump — but it is no longer "only production is armed".
+      MONTHLY_CUP: "1"
     ports: !override
       - "127.0.0.1:8080:8080"
 
@@ -50,6 +65,21 @@ services:
       # Shares the same Redis as the base web replica (see docker-compose.yml).
       REDIS_URL: "redis://redis:6379"
       STREAM_URLS: "1=https://racesow.org/hls/eu/index.m3u8,2=https://racesow.org/hls/us/index.m3u8"
+      # Arms the automatic Monthly Cup generator (web/server.js sweepTournaments).
+      # Deliberately an env var and not a site_setting row: site_setting is dumped
+      # WHOLESALE into the public backup, so a stored flag would ship publicly and
+      # leave any restored mirror with an ARMED generator quietly creating
+      # tournaments. Must be identical on web and web2 (rolling-deploy.sh env
+      # parity); unsetting it here and rolling the web layer is the emergency stop.
+      #
+      # Committed ON so a new instance runs the cup by default, rather than the
+      # flag surviving only as hand-applied drift on the one box that happened to
+      # get it. The corollary is worth stating plainly: whoever RUNS THIS FILE is
+      # armed, so a clone of this repo schedules its own editions. That is still
+      # narrower than the site_setting route this avoids — restoring the public
+      # database alone arms nothing, because the flag lives here and not in the
+      # dump — but it is no longer "only production is armed".
+      MONTHLY_CUP: "1"
       INGEST_TOKEN: "${INGEST_TOKEN:-}"
       DEMO_BASE_URL: "${DEMO_BASE_URL:-}"
       GHOST_DIR: "/data/ghosts"
