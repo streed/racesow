@@ -278,6 +278,14 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_TourneyMaps( client, cmdString, argsString, argc );
     else if ( cmdString == "tourneyvote" || cmdString == "tvote" )
         return Cmd_TourneyVote( client, cmdString, argsString, argc );
+    else if ( cmdString == "duel" )
+        return Cmd_Duel( client, cmdString, argsString, argc );
+    else if ( cmdString == "accept" )
+        return Cmd_DuelAccept( client, cmdString, argsString, argc );
+    else if ( cmdString == "decline" )
+        return Cmd_DuelDecline( client, cmdString, argsString, argc );
+    else if ( cmdString == "forfeit" )
+        return Cmd_DuelForfeit( client, cmdString, argsString, argc );
 
     // Answer the client who typed it, not the whole server: G_PrintMsg with a
     // null entity BROADCASTS, so an unrecognised command printed its name to
@@ -735,6 +743,12 @@ void GT_ThinkRules()
     // typed "/tournament <code>" (tournament.as)
     RACE_ApiTourneyJoinThink();
 
+    // 1v1 duels: presence, the reconnect grace period, and challenge expiry
+    // (duel.as). Before the early-return so a duellist who drops while the
+    // scoreboard is up still runs down their grace instead of the clock
+    // stopping until the next map.
+    RACE_DuelThink();
+
     // in-game WR ghost racer (no-op unless rs_wr_ghost + its URL are set); also
     // before the early-return so the ghost keeps looping while the scoreboard
     // is up
@@ -1093,6 +1107,9 @@ bool GT_MatchStateFinished( int incomingMatchState )
         RACE_UpdatePosValues();
         // script globals reset on map change: report uncounted race starts now
         RACE_FlushAllAttempts();
+        // ...and settle every live duel on this map's times, for the same
+        // reason: the duel state is script globals that are about to be gone.
+        RACE_DuelMapEnded();
 
         G_CmdExecute("set g_inactivity_maxtime 90\n");
         G_CmdExecute("set g_disable_vote_remove 1\n");
@@ -1189,6 +1206,11 @@ void GT_Shutdown()
     // changes). The native's worker drains the queued POST during library
     // shutdown, one delivery attempt per report.
     RACE_FlushAllAttempts();
+
+    // Backstop for a server stopped MID-MAP: the WAITEXIT sweep above only runs
+    // on a map change, and a duel left unconcluded is one that never reaches
+    // either profile. A no-op after WAITEXIT has already settled them.
+    RACE_DuelMapEnded();
 
     RACE_MirrorShutdown();
     RACE_GhostShutdown();
@@ -1470,6 +1492,10 @@ void GT_InitGametype()
     G_RegisterCommand( "tmaps" );
     G_RegisterCommand( "tourneyvote" );
     G_RegisterCommand( "tvote" );
+    G_RegisterCommand( "duel" );
+    G_RegisterCommand( "accept" );
+    G_RegisterCommand( "decline" );
+    G_RegisterCommand( "forfeit" );
 
     RACE_MirrorInit(); // registers "who" and "watch"
     RACE_GhostInit();

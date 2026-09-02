@@ -2667,6 +2667,12 @@ class Player
         {
             RACE_LogFinish( this );
 
+            // Score this finish against a live duel, if this player is in one
+            // (duel.as). After the report, so the central DB sees the run
+            // before the match-up that cites it; only genuine finishes reach
+            // here, which is exactly what a duel should count.
+            RACE_DuelFinish( this, finishTime );
+
             bool newPersonalBest = !this.best_recordTime.isFinished() || finishTime < this.best_recordTime.getFinishTime();
             if ( newPersonalBest )
             {

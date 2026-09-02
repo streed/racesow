@@ -434,6 +434,10 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # (default 600, archived; below 60 = rotation off).
         echo "set rs_api_tourney_url \"${INGEST_URL%/api/ingest}/api/game/tournament\""
         echo "set rs_api_tourney_join_url \"${INGEST_URL%/api/ingest}/api/game/tournament/join\""
+        # Concluded 1v1 duels (hrace/duel.as): one POST when a duel ends, so
+        # the match-up and its result show on both players' profiles. Empty url
+        # = duels still work in-game, they are just never recorded.
+        echo "set rs_api_duel_url \"${INGEST_URL%/api/ingest}/api/game/duel\""
     fi
     # Cross-server player mirroring: the gametype reads these and drives the
     # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.

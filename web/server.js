@@ -17,6 +17,7 @@ import {
   hashPassword,
   verifyPassword,
   FLAG_REASONS,
+  DUEL_REASONS,
   PLAYTIME_WINDOWS,
   urlSlug,
   isSafeMapName,
@@ -1986,6 +1987,100 @@ api.post(
         `${r.duplicate ? " [dup]" : ""}${mapCreated ? " [new map]" : ""}`
     );
     res.json({ ok: true, duplicate: !!r.duplicate, mapCreated });
+  })
+);
+
+// In-game "/duel" result target: a game server reports one CONCLUDED 1v1 duel
+// on behalf of the two players who raced it (hrace/duel.as -> RS_ApiReportDuel).
+//
+// Server-token authed and keyed by NAMES, like /game/flag and /ingest: the game
+// has no idea what a player id is here. Both nicks are resolved (and created if
+// new) exactly the way an ingested finish resolves its racer, so a duel between
+// two first-time players still lands.
+//
+// The reported WINNER is taken as given rather than recomputed from the two
+// times. That is deliberate: a forfeit is a loss however fast the forfeiter
+// was, and only the game knows a forfeit happened. What IS checked is that the
+// verdict is one of the three the game can send.
+//
+// Only a TRUSTED, enrolled server may mint a map row (same bar and same reason
+// as /game/flag): a duel is the one place a map name arrives attached to no
+// finish, and a map row is publicly listable the moment it exists.
+api.post(
+  "/game/duel",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  express.json({ limit: "8kb" }),
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const mapName = typeof body.map === "string" ? body.map.slice(0, MAX_MAP_LEN).toLowerCase() : "";
+    if (!mapName) return res.status(400).json({ error: "map required" });
+
+    const side = (v) => {
+      if (!v || typeof v !== "object") return null;
+      const name = typeof v.player === "string" ? v.player.slice(0, MAX_NAME_LEN) : "";
+      if (!name.trim()) return null;
+      const time = Number.isFinite(Number(v.time)) && Number(v.time) > 0 ? Math.floor(Number(v.time)) : null;
+      return {
+        name,
+        login: typeof v.login === "string" ? v.login.slice(0, MAX_NAME_LEN) : "",
+        time,
+        finishes: Math.max(0, Math.floor(Number(v.finishes) || 0)),
+      };
+    };
+    const a = side(body.a);
+    const b = side(body.b);
+    if (!a || !b) return res.status(400).json({ error: "two players required" });
+
+    // Neither of them finished: the game already declines to report these, so
+    // one arriving here is a bug or a forgery. Either way there is no result.
+    if (a.time == null && b.time == null) return res.status(400).json({ error: "no finishes" });
+
+    const winner = body.winner === "a" || body.winner === "b" ? body.winner : "draw";
+    const reason = DUEL_REASONS.includes(body.reason) ? body.reason : "map_change";
+    const version = typeof body.version === "string" ? body.version.slice(0, 64) : "";
+    const duration = Math.max(0, Math.floor(Number(body.duration) || 0));
+
+    // Mirrors /game/flag: an untrusted or quarantined box may report duels on
+    // maps the site already knows, but may not bring new map rows into being.
+    const known = await race.mapIdByName(mapName);
+    if (known == null && !req.ingest.trusted) return res.status(404).json({ error: "unknown map" });
+
+    let r;
+    try {
+      r = await race.recordDuel({
+        version,
+        map: mapName,
+        a,
+        b,
+        winner,
+        reason,
+        duration,
+        serverId: req.ingest.serverId,
+      });
+    } catch (e) {
+      console.error("duel ingest failed:", e);
+      return res.status(500).json({ error: "ingest failed" });
+    }
+    if (!r.ok) return res.status(400).json({ error: r.error || "bad duel" });
+
+    // No cache eviction here, unlike the ingest path. /players/:id is cached
+    // for 30s and its key carries the profile's sort/page/version query, so
+    // there is no single key to delete — and unlike a new world record, a duel
+    // result nobody is watching for is fine to appear half a minute later.
+
+    recordEvent(
+      req.ingest.serverId,
+      `duel ${simplifyName(a.name)} vs ${simplifyName(b.name)} on ${mapName} from ${req.ingest.serverName}` +
+        ` (${winner}, ${reason})${r.mapCreated ? " [new map]" : ""}`
+    );
+    res.json({ ok: true, id: r.id, mapCreated: !!r.mapCreated });
   })
 );
 

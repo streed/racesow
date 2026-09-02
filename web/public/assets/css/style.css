@@ -1152,6 +1152,59 @@ tr.tincomplete td { opacity: .5; }
 .trophy-item.p1 { border-color: rgba(255,210,74,.5); }
 .trophy-item.p2 { border-color: rgba(207,214,230,.4); }
 .trophy-item.p3 { border-color: rgba(214,139,82,.45); }
+/* ---------- Duels: 1v1 match-ups raced in game ----------
+   Three states with three jobs, so they are coloured by OUTCOME and nothing
+   else: green won, red lost, gold drew. The verdict word carries the colour on
+   its own (never colour alone — the word IS the label), and the left border is
+   the same signal repeated for anyone scanning the column rather than reading
+   it. Everything else in the row stays neutral so a wall of duels does not
+   read as a wall of alerts. */
+.duels { padding: 12px 14px; margin-bottom: 24px; }
+.duel-record {
+  display: flex; align-items: baseline; gap: 6px;
+  font-family: var(--cond); font-weight: 800; font-size: 26px; letter-spacing: .5px;
+  padding: 2px 2px 12px; border-bottom: 1px solid var(--line); margin-bottom: 6px;
+}
+.duel-record .dr-w { color: var(--green); }
+.duel-record .dr-x { color: #ff5a5a; }
+.duel-record .dr-d { color: var(--gold); }
+.duel-record .dr-sep { color: var(--faint); font-weight: 600; }
+.duel-record .dr-l { font-size: 12px; margin-left: 2px; opacity: .75; }
+
+.duel-row {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 9px 4px 9px 10px; border-left: 3px solid var(--line-2);
+  border-bottom: 1px solid var(--line);
+}
+.duel-row:last-of-type { border-bottom: 0; }
+.duel-row.win  { border-left-color: var(--green); }
+.duel-row.loss { border-left-color: #ff5a5a; }
+.duel-row.draw { border-left-color: var(--gold); }
+.duel-verdict {
+  flex: 0 0 auto; min-width: 46px;
+  font-family: var(--cond); font-weight: 800; font-size: 13px; letter-spacing: .8px;
+  padding-top: 2px;
+}
+.duel-row.win  .duel-verdict { color: var(--green); }
+.duel-row.loss .duel-verdict { color: #ff5a5a; }
+.duel-row.draw .duel-verdict { color: var(--gold); }
+.duel-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.duel-vs { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; font-size: 14px; }
+.duel-vs .duel-t { font-family: var(--mono); font-size: 12.5px; }
+.duel-vs .duel-x { color: var(--faint); font-style: italic; padding: 0 2px; }
+.duel-opp { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--line-2); }
+.duel-opp:hover { border-bottom-color: var(--orange); }
+.duel-notime { color: var(--faint); font-style: italic; font-size: 12.5px; }
+.duel-sub { font-size: 11.5px; }
+.duel-sub a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--line-2); }
+.duel-sub a:hover { border-bottom-color: var(--orange); }
+.duel-more { font-size: 11.5px; padding: 9px 4px 2px; }
+
+@media (max-width: 560px) {
+  .duel-row { gap: 8px; padding-left: 8px; }
+  .duel-verdict { min-width: 40px; font-size: 12px; }
+}
+
 /* Podium medal inside a standings table cell. */
 .data .trophy { font-size: 14px; }
 

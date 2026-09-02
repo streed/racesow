@@ -239,6 +239,12 @@ export function sha256(s) {
 // server-killing map becomes indistinguishable from a cosmetic complaint.
 export const FLAG_REASONS = ["broken", "offensive", "wrong_name", "duplicate", "other", "loadfail"];
 
+// How a 1v1 duel ended (hrace/duel.as). An unrecognised value is coerced to
+// map_change rather than rejected: the reason is colour on a result that is
+// otherwise complete, and a game server running a newer duel.as than this web
+// build should still get its match-up recorded.
+export const DUEL_REASONS = ["map_change", "disconnect", "forfeit"];
+
 // Map-quarantine policy. Two failures of the same map, or one failure on each
 // of two DISTINCT servers, puts it on the blocked-maps feed. Thin evidence
 // expires after a week so a transient local fault (a half-written pk3) heals
@@ -2648,6 +2654,10 @@ class RaceDB {
       // rarest thing on a profile and almost always an empty array, so a lazy
       // endpoint would cost a round trip to render nothing.
       trophies: await this.playerTrophies(canonId),
+      // Duels ride the payload for the same reason as trophies: most profiles
+      // have none, so a lazy endpoint would buy a round trip to render nothing.
+      // The card shows the last few; the record counts them all.
+      duels: await this.playerDuels(canonId, { limit: 6 }),
       recentFinishes: await this.recentFinishes({ limit: 5, playerId: canonId }),
       versions,
       records: { total, limit: lim, offset: off, rows: records },
@@ -5341,6 +5351,231 @@ class RaceDB {
       endsAt: num(r.ends_at),
       awardedAt: num(r.awarded_at),
     }));
+  }
+
+  // --------------------------------------------------------------------------
+  // 1v1 duels ---------------------------------------------------------------
+  // A duel is agreed, raced and decided entirely inside one game server on one
+  // map (hrace/duel.as); this side only ever sees the finished result, POSTed
+  // once when it concludes. So there is no "live duel" state here to keep in
+  // step with a server, and nothing to reconcile if a box disappears mid-duel:
+  // an unreported duel simply never happened as far as the site is concerned.
+
+  // Store one concluded duel. Both nicks are resolved (and created if new) the
+  // same way an ingested finish resolves its racer, then reduced to their
+  // canonical representative so the row survives an alias rebuild and shows on
+  // whichever profile the group currently answers to.
+  //
+  // `winner` is the game's verdict ("a" | "b" | anything else = draw) rather
+  // than something recomputed from the two times, because a forfeit is a loss
+  // however fast the forfeiter was.
+  //
+  // Returns { ok, id, mapCreated } — ok:false with a reason for a map name the
+  // charset gate refuses or a pair that resolves to one and the same player.
+  async recordDuel({
+    version = "",
+    map,
+    a,
+    b,
+    winner = "draw",
+    reason = "map_change",
+    duration = 0,
+    serverId = null,
+    createdAt = null,
+  }) {
+    const mapName = String(map || "").toLowerCase();
+    if (!isSafeMapName(mapName)) return { ok: false, error: "invalid map name" };
+    if (!a || !b || !String(a.name || "") || !String(b.name || "")) return { ok: false, error: "two players required" };
+
+    const at = createdAt != null ? Math.floor(Number(createdAt)) : Math.floor(Date.now() / 1000);
+    // A duel neither player finished is not reported by the game, but clamp
+    // anyway: 0 and negatives mean "no time", and NULL is how that is stored.
+    const msOrNull = (v) => {
+      const n = Math.floor(Number(v));
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+    const countOf = (v) => {
+      const n = Math.floor(Number(v));
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    };
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const q1 = async (sql, params) => (await client.query(sql, params)).rows[0];
+
+      const mapExisting = await q1("SELECT id FROM map WHERE name = $1", [mapName]);
+      const mapRow = await q1(
+        `INSERT INTO map (name) VALUES ($1)
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+        [mapName]
+      );
+
+      let versionId = null;
+      if (String(version || "")) {
+        const vRow = await q1(
+          `INSERT INTO version (name) VALUES ($1)
+           ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+          [String(version)]
+        );
+        versionId = num(vRow.id);
+      }
+
+      // Canonical representative for each side, like the replay path.
+      const canonOf = async (rec) => {
+        const rawId = await this._resolvePlayer(client, { name: rec.name, login: String(rec.login || "") });
+        const c = (await client.query("SELECT canonical_id FROM player WHERE id = $1", [rawId])).rows[0];
+        return c && c.canonical_id != null ? num(c.canonical_id) : rawId;
+      };
+      const idA = await canonOf(a);
+      const idB = await canonOf(b);
+
+      // Both nicks are aliases of ONE person: whatever happened in game, this
+      // is not a match-up, and storing it would put a player against themselves
+      // on their own profile.
+      if (idA === idB) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: "both names resolve to the same player" };
+      }
+
+      let winnerId = null;
+      if (winner === "a") winnerId = idA;
+      else if (winner === "b") winnerId = idB;
+
+      const row = await q1(
+        `INSERT INTO duel (map_id, player_a, player_b, time_a, time_b, finishes_a, finishes_b,
+                           winner_id, reason, duration, version_id, server_id, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+        [
+          num(mapRow.id),
+          idA,
+          idB,
+          msOrNull(a.time),
+          msOrNull(b.time),
+          countOf(a.finishes),
+          countOf(b.finishes),
+          winnerId,
+          DUEL_REASONS.includes(reason) ? reason : "map_change",
+          countOf(duration),
+          versionId,
+          serverId == null ? null : num(serverId),
+          at,
+        ]
+      );
+
+      await client.query("COMMIT");
+      return { ok: true, id: num(row.id), mapCreated: !mapExisting };
+    } catch (e) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* connection may be dead */
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // This player's duels, newest first, plus their overall record.
+  //
+  // Every row is rewritten from the stored a/b pair into "you vs them", so the
+  // caller never has to work out which side of the pair the player was on. Ids
+  // are matched through the alias group in BOTH directions (the same shape as
+  // playerTournamentEntry) so a canonical rebuild that picks a new
+  // representative does not hide a player's own history from them.
+  async playerDuels(id, { limit = 10 } = {}) {
+    let canonId = id;
+    const c = await this.one("SELECT canonical_id FROM player WHERE id = $1", [id]);
+    if (c && c.canonical_id != null) canonId = num(c.canonical_id);
+    const lim = Math.min(50, Math.max(1, Math.floor(Number(limit) || 10)));
+
+    // The set of player ids that ARE this person, expanded once and reused by
+    // both queries below — a duel row stores whichever representative was
+    // current when it was written.
+    const groupSql = `SELECT DISTINCT COALESCE(pl.canonical_id, pl.id) FROM player pl
+       WHERE COALESCE(pl.canonical_id, pl.id) = $1`;
+
+    const rows = await this.all(
+      `SELECT d.id, d.time_a, d.time_b, d.finishes_a, d.finishes_b, d.winner_id,
+              d.reason, d.duration, d.created_at,
+              d.player_a, d.player_b,
+              m.id AS map_id, m.name AS map_name,
+              pa.name AS name_a, pb.name AS name_b,
+              COALESCE(pa.canonical_id, pa.id) AS canon_a,
+              COALESCE(pb.canonical_id, pb.id) AS canon_b
+       FROM duel d
+       JOIN map m ON m.id = d.map_id
+       JOIN player pa ON pa.id = d.player_a
+       JOIN player pb ON pb.id = d.player_b
+       WHERE COALESCE(pa.canonical_id, pa.id) IN (${groupSql})
+          OR COALESCE(pb.canonical_id, pb.id) IN (${groupSql})
+       ORDER BY d.created_at DESC, d.id DESC
+       LIMIT $2`,
+      [canonId, lim]
+    );
+
+    let wins = 0;
+    let losses = 0;
+    let draws = 0;
+    const duels = rows.map((r) => {
+      const youAreA = num(r.canon_a) === canonId;
+      const you = {
+        id: youAreA ? num(r.canon_a) : num(r.canon_b),
+        name: youAreA ? r.name_a : r.name_b,
+        time: youAreA ? (r.time_a == null ? null : num(r.time_a)) : r.time_b == null ? null : num(r.time_b),
+        finishes: num(youAreA ? r.finishes_a : r.finishes_b) || 0,
+      };
+      const them = {
+        id: youAreA ? num(r.canon_b) : num(r.canon_a),
+        name: youAreA ? r.name_b : r.name_a,
+        time: youAreA ? (r.time_b == null ? null : num(r.time_b)) : r.time_a == null ? null : num(r.time_a),
+        finishes: num(youAreA ? r.finishes_b : r.finishes_a) || 0,
+      };
+      const winnerId = r.winner_id == null ? null : num(r.winner_id);
+      const result = winnerId == null ? "draw" : winnerId === you.id ? "win" : "loss";
+      if (result === "win") wins++;
+      else if (result === "loss") losses++;
+      else draws++;
+
+      this._censorNamed(you, you.id);
+      this._censorNamed(them, them.id);
+      return {
+        id: num(r.id),
+        mapId: num(r.map_id),
+        mapName: this._cnMap(r.map_name, num(r.map_id)),
+        you,
+        them,
+        result,
+        reason: r.reason,
+        duration: num(r.duration) || 0,
+        at: num(r.created_at),
+      };
+    });
+
+    // The headline record counts EVERY duel this player has ever finished, not
+    // just the page above — a profile that says "3-1" when the player has
+    // duelled forty times would be quietly wrong.
+    const totals = await this.one(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE COALESCE(w.canonical_id, w.id) = $1)::int AS wins,
+              COUNT(*) FILTER (WHERE d.winner_id IS NULL)::int AS draws
+       FROM duel d
+       JOIN player pa ON pa.id = d.player_a
+       JOIN player pb ON pb.id = d.player_b
+       LEFT JOIN player w ON w.id = d.winner_id
+       WHERE COALESCE(pa.canonical_id, pa.id) IN (${groupSql})
+          OR COALESCE(pb.canonical_id, pb.id) IN (${groupSql})`,
+      [canonId]
+    );
+    const total = totals ? num(totals.total) : 0;
+    const totalWins = totals ? num(totals.wins) : 0;
+    const totalDraws = totals ? num(totals.draws) : 0;
+
+    return {
+      record: { played: total, wins: totalWins, losses: total - totalWins - totalDraws, draws: totalDraws },
+      duels,
+    };
   }
 
   // Freeze one tournament: snapshot its standings and mint trophies.

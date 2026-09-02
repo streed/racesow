@@ -42,6 +42,7 @@ hrace/playerrecord.as;
 hrace/savedstarts.as;
 hrace/awards.as;
 hrace/tournament.as;
+hrace/duel.as;
 hrace/demos.as;
 hrace/ghostbot.as;
 hrace/mirror.as;

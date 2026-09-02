@@ -726,6 +726,104 @@ test("/api/game/saved-start round-trips /savestart via /api/ingest/saved-start (
   assert.match(after, /\nreverse /, "reverse start survives");
 });
 
+// POST /api/game/duel — the exact JSON the RS_ApiReportDuel native emits when a
+// 1v1 duel concludes (hrace/duel.as RACE_DuelReport).
+test("game duel: a concluded match-up is stored and lands on both profiles", async () => {
+  const post = async (body, token = TOKEN) => {
+    const r = await fetch(`${base}/api/game/duel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    return { status: r.status, json: await r.json().catch(() => ({})) };
+  };
+
+  // The map has to exist for a shared-token report (only a trusted enrolled
+  // server may mint one), so race a finish onto it first.
+  await fetch(`${base}/api/ingest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+    body: JSON.stringify({
+      version: "wsw 2.1",
+      map: "duelmap",
+      source: "racelog",
+      records: [{ name: "duelwinner", login: "", time: 50000, checkpoints: [] }],
+    }),
+  });
+
+  const body = {
+    version: "wsw 2.1",
+    map: "duelmap",
+    a: { player: "^2duelwinner", login: "", time: 34109, finishes: 12 },
+    b: { player: "duelloser", login: "", time: 34812, finishes: 9 },
+    winner: "a",
+    reason: "map_change",
+    duration: 842,
+  };
+
+  assert.equal((await post(body, "wrong-token")).status, 401, "bad token rejected");
+
+  const ok = await post(body);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.ok, true);
+
+  // Both sides read it back, each from their own point of view.
+  const idOf = async (nick) =>
+    Number(
+      (await dbQuery(`SELECT COALESCE(canonical_id, id) AS id FROM player WHERE simplified = '${nick}' LIMIT 1`))
+        .rows[0].id
+    );
+  const winnerId = await idOf("duelwinner");
+  const loserId = await idOf("duelloser");
+
+  const win = await (await fetch(`${base}/api/players/${winnerId}`)).json();
+  assert.equal(win.duels.record.wins, 1);
+  assert.equal(win.duels.record.losses, 0);
+  assert.equal(win.duels.duels[0].result, "win");
+  assert.equal(win.duels.duels[0].you.time, 34109);
+  assert.equal(win.duels.duels[0].mapName, "duelmap");
+
+  const lose = await (await fetch(`${base}/api/players/${loserId}`)).json();
+  assert.equal(lose.duels.record.losses, 1);
+  assert.equal(lose.duels.duels[0].result, "loss");
+  assert.equal(lose.duels.duels[0].them.time, 34109);
+});
+
+test("game duel: malformed reports are refused without touching the table", async () => {
+  const post = async (body) => {
+    const r = await fetch(`${base}/api/game/duel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify(body),
+    });
+    return r.status;
+  };
+  const count = async () => Number((await dbQuery("SELECT COUNT(*) c FROM duel")).rows[0].c);
+  const before = await count();
+
+  const good = {
+    map: "duelmap",
+    a: { player: "x", login: "", time: 1000, finishes: 1 },
+    b: { player: "y", login: "", time: 2000, finishes: 1 },
+    winner: "a",
+    reason: "map_change",
+  };
+
+  assert.equal(await post({ ...good, map: "" }), 400, "no map");
+  assert.equal(await post({ ...good, b: undefined }), 400, "one player");
+  assert.equal(await post({ ...good, a: { player: "   ", time: 1000 } }), 400, "blank name");
+  // Neither player finished: the game never sends this, so it is a bug or a forgery.
+  assert.equal(
+    await post({ ...good, a: { player: "x", time: 0, finishes: 0 }, b: { player: "y", time: 0, finishes: 0 } }),
+    400,
+    "no finishes"
+  );
+  // An unknown map from the shared (non-enrolled) token cannot mint a row.
+  assert.equal(await post({ ...good, map: "never-seen-duelmap" }), 404, "unknown map");
+
+  assert.equal(await count(), before, "nothing was stored");
+});
+
 // POST /api/game/flag on a map with no `map` row.
 //
 // A map that crashes the server on load can never have produced a finish, so it

@@ -1375,6 +1375,8 @@ async function viewPlayer(id, params) {
 
     ${achievementsCard(d.achievements)}
 
+    ${duelsCard(d.duels)}
+
     ${d.recentFinishes && d.recentFinishes.length ? `
     <div class="page-title" style="font-size:20px">RECENT FINISHES <span class="accent">·</span> last 5</div>
     <div class="panel" style="margin-bottom:24px">${finishFeed(d.recentFinishes, { showMap: true, showPlayer: false })}</div>` : ""}
@@ -3284,6 +3286,51 @@ function wireTournamentJoin(slug) {
 /* Profile trophy shelf. Rides the main profile payload (trophies are rare and
  * usually an empty array, so a lazy endpoint would cost a round trip to render
  * nothing) and renders nothing at all when there are none. */
+/* ---- duels: 1v1 match-ups raced in game ("/duel <player>") ----------------
+ * Each row is one CONCLUDED duel, already rewritten server-side into "you vs
+ * them" so this never has to work out which side of the stored pair the profile
+ * belongs to. The headline record counts every duel the player has finished;
+ * the rows are the most recent handful.
+ *
+ * A duel where somebody never finished the map is normal, not missing data —
+ * "no time" is the honest rendering and a loss against any finish at all. */
+function duelsCard(d) {
+  if (!d || !d.record || !d.record.played) return "";
+  const rec = d.record;
+  const rows = d.duels || [];
+  const verdict = { win: "WON", loss: "LOST", draw: "DREW" };
+  const why = { map_change: "map change", disconnect: "opponent left", forfeit: "forfeit" };
+  const t = (ms) => (ms == null ? '<span class="duel-notime">no time</span>' : `<span class="time">${fmtTime(ms)}</span>`);
+
+  return `
+    <div class="page-title" style="font-size:20px">DUELS <span class="accent">·</span> ${fmtNum(rec.played)}</div>
+    <div class="panel duels">
+      <div class="duel-record" title="Every 1v1 duel this player has finished">
+        <span class="dr-w">${fmtNum(rec.wins)}<span class="dr-l">W</span></span>
+        <span class="dr-sep">–</span>
+        <span class="dr-x">${fmtNum(rec.losses)}<span class="dr-l">L</span></span>
+        ${rec.draws ? `<span class="dr-sep">–</span><span class="dr-d">${fmtNum(rec.draws)}<span class="dr-l">D</span></span>` : ""}
+      </div>
+      ${rows
+        .map(
+          (x) => `<div class="duel-row ${esc(x.result)}">
+            <span class="duel-verdict">${verdict[x.result] || "DREW"}</span>
+            <span class="duel-body">
+              <span class="duel-vs">${wname(x.you.name)}<span class="duel-t">${t(x.you.time)}</span>
+                <span class="duel-x">vs</span>
+                <a class="duel-opp" data-nav="#/player/${x.them.id}" href="/player/${x.them.id}">${wname(x.them.name)}</a><span class="duel-t">${t(x.them.time)}</span></span>
+              <span class="duel-sub muted">on <a data-nav="#/map/${x.mapId}" href="/map/${x.mapId}">${mapNameHtml(x.mapName)}</a>
+                · ${fmtNum(x.you.finishes + x.them.finishes)} run${x.you.finishes + x.them.finishes === 1 ? "" : "s"}
+                · ${esc(why[x.reason] || "ended")}
+                · ${esc(fmtAgo(x.at))}</span>
+            </span>
+          </div>`
+        )
+        .join("")}
+      ${rec.played > rows.length ? `<div class="duel-more muted">Showing the last ${fmtNum(rows.length)} of ${fmtNum(rec.played)}.</div>` : ""}
+    </div>`;
+}
+
 function trophiesCard(list) {
   const t = list || [];
   if (!t.length) return "";

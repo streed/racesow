@@ -244,6 +244,9 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # rs_tourney_announce_interval seconds (default 600, archived).
         echo "set rs_api_tourney_url \"${base}/api/game/tournament\""
         echo "set rs_api_tourney_join_url \"${base}/api/game/tournament/join\""
+        # Concluded 1v1 duels (hrace/duel.as): one POST when a duel ends, so
+        # the match-up and its result show on both players' profiles.
+        echo "set rs_api_duel_url \"${base}/api/game/duel\""
     fi
     # Cross-server (cross-GAME) player mesh. Empty peers/tag = off. Uses the same
     # RS_Mirror* natives + wire protocol as the Warsow servers, so a Warfork node

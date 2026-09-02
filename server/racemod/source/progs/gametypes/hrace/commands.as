@@ -789,6 +789,15 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/copystart <player>" );
         cmdlist.addCell( "Start where another player on the server starts (this session only)." );
 
+        cmdlist.addCell( "/duel <player>" );
+        cmdlist.addCell( "Challenge someone to a 1v1 on this map - fastest time wins. /help duel" );
+
+        cmdlist.addCell( "/accept /decline" );
+        cmdlist.addCell( "Answer a duel challenge someone sent you." );
+
+        cmdlist.addCell( "/forfeit" );
+        cmdlist.addCell( "Concede the duel you are in." );
+
         // Optional layers add their own rows here. A base build adds none, so a
         // server without the racesow.org overlay does not advertise commands
         // that would answer "unknown command".
@@ -1024,6 +1033,19 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         client.printMessage( S_COLOR_WHITE + "  unfinishable, offensive, or a duplicate. Reason is optional (e.g. broken, offensive," + "\n" );
         client.printMessage( S_COLOR_WHITE + "  wrong_name, duplicate). Your name is attached automatically. Moderators can pull a" + "\n" );
         client.printMessage( S_COLOR_WHITE + "  bad map from the vote pool and cycle." + "\n" );
+    }
+    else if ( command == "duel" || command == "accept" || command == "decline" || command == "forfeit" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/duel <player>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Challenges another player on this server to a 1v1 on the map you are both on. The name is" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  matched on any part of it with colour codes ignored, so /duel tud finds tudduf." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  They have 60 seconds to /accept or /decline. With no argument, /duel shows your score." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Once it is on, every finish you record on this map counts: your fastest one is your time," + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  and whoever is faster leads. Practice runs and runs in the other direction do not count." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- The duel ends when the map changes, when someone types /forfeit (which is a loss), or when" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  one of you leaves and does not come back within five minutes. The faster time then wins," + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  and the result goes on both of your profiles at " + race_toplists.string + "." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Only the two of you ever see a duel's messages." + "\n" );
     }
     else
     {

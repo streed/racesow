@@ -1641,6 +1641,77 @@ void RS_ApiFlag( const char *url, const char *token, const char *mapname,
 }
 
 /*
+ * RS_ApiReportDuel
+ *
+ * Queue a concluded 1v1 duel (hrace/duel.as) for POSTing to <url> (the central
+ * /api/game/duel). Two players, the map they duelled on, each one's best time
+ * in milliseconds and how many counted finishes they put in, plus who won and
+ * why it ended.
+ *
+ * timeA/timeB of 0 means "never finished" and is sent as JSON null rather than
+ * a zero: a duel where one player never got round the map is a real result, and
+ * a 0 there would read as an impossibly fast run to everything downstream.
+ *
+ * <winner> is decided by the GAME, not recomputed from the times here or at the
+ * far end, because a forfeit is a loss no matter who was faster — the times
+ * alone cannot express that. <reason> is map_change|disconnect|forfeit.
+ *
+ * Fire-and-forget, same posture as the finish and flag reports: nothing reads
+ * the reply, and a dropped duel is a duel missing from two profiles rather than
+ * anything the players can act on. No-op when url, mapname or either name is
+ * empty.
+ */
+void RS_ApiReportDuel( const char *url, const char *token, const char *version,
+	const char *mapname,
+	const char *nameA, const char *loginA, int timeA, int finishesA,
+	const char *nameB, const char *loginB, int timeB, int finishesB,
+	const char *winner, const char *reason, int durationSec )
+{
+	if( !url || !url[0] || !mapname || !mapname[0] )
+		return;
+	if( !nameA || !nameA[0] || !nameB || !nameB[0] )
+		return;
+
+	std::string body;
+	body.reserve( 384 );
+	body += "{\"version\":\"";
+	jsonEscapeInto( body, version ? version : "" );
+	body += "\",\"map\":\"";
+	jsonEscapeInto( body, mapname );
+	body += "\",\"winner\":\"";
+	jsonEscapeInto( body, winner ? winner : "" );
+	body += "\",\"reason\":\"";
+	jsonEscapeInto( body, reason ? reason : "" );
+	body += "\",\"duration\":";
+	body += std::to_string( durationSec > 0 ? durationSec : 0 );
+
+	const char *keys[2] = { ",\"a\":{\"player\":\"", ",\"b\":{\"player\":\"" };
+	const char *names[2] = { nameA, nameB };
+	const char *logins[2] = { loginA, loginB };
+	const int times[2] = { timeA, timeB };
+	const int finishes[2] = { finishesA, finishesB };
+
+	for( int i = 0; i < 2; i++ ) {
+		body += keys[i];
+		jsonEscapeInto( body, names[i] );
+		body += "\",\"login\":\"";
+		jsonEscapeInto( body, logins[i] ? logins[i] : "" );
+		body += "\",\"time\":";
+		if( times[i] > 0 )
+			body += std::to_string( times[i] );
+		else
+			body += "null";
+		body += ",\"finishes\":";
+		body += std::to_string( finishes[i] > 0 ? finishes[i] : 0 );
+		body += "}";
+	}
+
+	body += "}";
+
+	rsQueuePost( url, token, std::move( body ) );
+}
+
+/*
  * RS_ApiFetchTop
  *
  * Fetch the map's live top scores from <url> (the central

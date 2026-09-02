@@ -830,6 +830,59 @@ TOURNEY_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, TOURNEY_ENTRY, "asGlobFuncs tourney entries")
 
+# --- 1o. 1v1 duels: report a concluded match-up ------------------------------
+# Adds RS_ApiReportDuel (impl in g_rs_api.cpp). Fire-and-forget POST like
+# RS_ApiFlag: hrace/duel.as calls it once when a duel concludes and nothing
+# reads a reply. Anchors re-emitted so they stay unique. The Dockerfile asserts
+# on "asFunc_RS_ApiReportDuel".
+DUEL_WRAPPER = (
+    "// racesow-docker: 1v1 duels - POSTs a concluded head-to-head (two players,\n"
+    "// the map, each one's best time and finish count, the winner and why it\n"
+    "// ended) to the central /api/game/duel so it lands on both profiles.\n"
+    "void RS_ApiReportDuel( const char *url, const char *token, const char *version,\n"
+    "\tconst char *mapname,\n"
+    "\tconst char *nameA, const char *loginA, int timeA, int finishesA,\n"
+    "\tconst char *nameB, const char *loginB, int timeB, int finishesB,\n"
+    "\tconst char *winner, const char *reason, int durationSec );\n"
+    "\n"
+    "static void asFunc_RS_ApiReportDuel( asstring_t *url, asstring_t *token, asstring_t *version,\n"
+    "\tasstring_t *mapname,\n"
+    "\tasstring_t *nameA, asstring_t *loginA, int timeA, int finishesA,\n"
+    "\tasstring_t *nameB, asstring_t *loginB, int timeB, int finishesB,\n"
+    "\tasstring_t *winner, asstring_t *reason, int durationSec )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !mapname || !mapname->buffer )\n"
+    "\t\treturn;\n"
+    "\tif( !nameA || !nameA->buffer || !nameB || !nameB->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiReportDuel( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tversion && version->buffer ? version->buffer : \"\",\n"
+    "\t\tmapname->buffer,\n"
+    "\t\tnameA->buffer,\n"
+    "\t\tloginA && loginA->buffer ? loginA->buffer : \"\",\n"
+    "\t\ttimeA, finishesA,\n"
+    "\t\tnameB->buffer,\n"
+    "\t\tloginB && loginB->buffer ? loginB->buffer : \"\",\n"
+    "\t\ttimeB, finishesB,\n"
+    "\t\twinner && winner->buffer ? winner->buffer : \"\",\n"
+    "\t\treason && reason->buffer ? reason->buffer : \"\",\n"
+    "\t\tdurationSec );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, DUEL_WRAPPER, "asFunc duel wrapper")
+
+DUEL_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiReportDuel( const String &in url, const String &in token, "
+    "const String &in version, const String &in map, "
+    "const String &in nameA, const String &in loginA, int timeA, int finishesA, "
+    "const String &in nameB, const String &in loginB, int timeB, int finishesB, "
+    "const String &in winner, const String &in reason, int durationSec )\", "
+    "asFUNCTION(asFunc_RS_ApiReportDuel), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, DUEL_ENTRY, "asGlobFuncs duel entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"
