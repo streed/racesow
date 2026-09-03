@@ -976,6 +976,47 @@ test("two replicas racing produce exactly one edition, and the loser never inser
   assert.equal(all.rows.filter((x) => x.series_key === "monthly-cup").length, 1);
 });
 
+test("the loser of a replica race adopts its own edition instead of blocking on it", async (t) => {
+  const race = await freshDb(t);
+  const jul = utc(2026, 7, 10);
+  for (const [m, n] of [["alpha", 9], ["bravo", 7], ["charlie", 5], ["delta", 4]]) {
+    await seedFinishes(race, m, n, jul, { players: 2 });
+  }
+  const now = utc(2026, 8, 1, 1);
+
+  const winner = await race.scheduleMonthlyEdition({ now });
+  assert.equal(winner.wrote, true);
+
+  // Replay the losing replica's exact interleaving. Its decision-row read and
+  // its slug read both ran BEFORE the winner committed (so both came back
+  // empty), and only the calendar scan — one statement later — sees the
+  // winner's edition. That gap is a few milliseconds wide in the wild, so it is
+  // staged here: drop the decision row, and blind the one slug lookup.
+  await race.pool.query("DELETE FROM tournament_auto_period WHERE series_key = 'monthly-cup'");
+  const realOne = race.one.bind(race);
+  race.one = async (sql, params) =>
+    /FROM tournament WHERE slug/.test(sql) ? null : realOne(sql, params);
+  let loser;
+  try {
+    loser = await race.scheduleMonthlyEdition({ now });
+  } finally {
+    race.one = realOne;
+  }
+
+  // The month must never be reported as blocked BY ITSELF: that tells an
+  // operator to go and cancel the very cup the generator just created.
+  assert.notEqual(loser.decision, "blocked", "the month blocked on its own edition");
+  assert.equal(loser.decision, "scheduled");
+  assert.equal(loser.tournamentId, winner.tournamentId, "the loser adopted a different tournament");
+  const all = await race.tournaments({ includeDrafts: true });
+  assert.equal(all.rows.filter((x) => x.series_key === "monthly-cup").length, 1);
+  // ...and the rebuilt decision row points back at the surviving edition, so the
+  // next sweep short-circuits on it rather than re-running this recovery.
+  const ap = await race.autoPeriod("monthly-cup", "2026-08");
+  assert.equal(ap.decision, "scheduled");
+  assert.equal(Number(ap.tournament_id), winner.tournamentId);
+});
+
 test("the skip rule compares against the last edition that RAN, and never against itself", async (t) => {
   const race = await freshDb(t);
   const jun = utc(2026, 6, 10);

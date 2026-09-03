@@ -6091,32 +6091,49 @@ class RaceDB {
         error: `slug ${monthlySlug(per)} is held by tournament ${num(holder.id)} (${holder.status})`,
       };
     }
-    if (mine) {
-      const status = mine.status;
+    // Adopting our own edition, from wherever it was found. `existsReason`
+    // differs only so the audit trail says which read turned it up.
+    const adopt = async (row, existsReason) => {
+      const status = row.status;
       // An operator cancelling this month's cup IS the decision. Recording it
       // terminally is what stops the generator retrying the slug every five
       // minutes for the rest of the day.
       const decision = status === "cancelled" ? "cancelled" : "scheduled";
       const detail = {
         ...carry,
-        reason: status === "cancelled"
-          ? "an operator cancelled this month's edition"
-          : "the edition already exists (decision record was rebuilt from the calendar)",
-        period: per, tournamentId: num(mine.id), status,
+        reason: status === "cancelled" ? "an operator cancelled this month's edition" : existsReason,
+        period: per, tournamentId: num(row.id), status,
       };
       if (dryRun) return { period: per, decision, wrote: false, detail, window: win };
       const { changed } = await this.recordAutoPeriod(seriesKey, per, decision, detail, now);
       if (changed) {
         await this.pool.query(
           "UPDATE tournament_auto_period SET tournament_id = $3 WHERE series_key = $1 AND period = $2",
-          [seriesKey, per, num(mine.id)]
+          [seriesKey, per, num(row.id)]
         );
       }
-      return { period: per, decision, wrote: changed, detail, tournamentId: num(mine.id), window: win };
+      return { period: per, decision, wrote: changed, detail, tournamentId: num(row.id), window: win };
+    };
+    if (mine) {
+      return adopt(mine, "the edition already exists (decision record was rebuilt from the calendar)");
     }
 
     // The calendar rule is never bypassed, not even by a force.
     const blockers = await this.overlappingTournaments(win.startsAt, win.endsAt);
+    // A peer replica can commit OUR edition in the gap between the slug lookup
+    // above and this scan — they are separate statements, so the loser of that
+    // race reads no slug holder and then sees the winner's row as an overlap.
+    // Reporting "blocked" there is a self-block: it names this month's own cup
+    // as the thing an operator must clear. It is the same "not a blocker, the
+    // answer" case as the slug holder, found one query later, so adopt it.
+    // Only an exact series+window match qualifies — anything else is a squatter
+    // and must still block (see `mine` above).
+    const oursOnCalendar = blockers.find(
+      (b) => b.series_key === seriesKey && b.starts_at === win.startsAt && b.ends_at === win.endsAt
+    );
+    if (oursOnCalendar) {
+      return adopt(oursOnCalendar, "a peer replica materialised this month's edition first");
+    }
     if (blockers.length) {
       const detail = {
         ...carry,
