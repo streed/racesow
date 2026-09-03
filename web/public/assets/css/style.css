@@ -1300,6 +1300,49 @@ tr.tincomplete td { opacity: .5; }
 .stkey .sw.r-US { background: var(--reg-us); }
 .stkey .sw.r-Unknown { background: var(--reg-other); }
 
+/* --------------------------------------------------------------------------
+   /runs — finished vs attempted over time.
+
+   Two series on ONE axis, so the pair has to be told apart by hue alone at a
+   glance and by label on inspection: the site's categorical pair (orange,
+   cyan) is used, validated for colourblind separation against this panel
+   background (deutan dE 23.6 / normal 34.4, both well clear of the floor), and
+   each line is additionally labelled at its end.
+
+   The swatch classes are shared with the legend, so a series' colour is defined
+   once here and can never drift between the legend and the line it names.
+   -------------------------------------------------------------------------- */
+.runchart { display: block; width: 100%; padding: 4px 14px 10px; }
+.runchart .runline { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.runchart .runline.r-attempted { stroke: var(--orange); }
+.runchart .runline.r-finished  { stroke: var(--cyan); }
+.runchart .runline.r-rate      { stroke: var(--green); }
+/* The still-filling final bucket. Dashed rather than dropped: the number is
+   real, just incomplete, and drawn solid it reads as a collapse in activity. */
+.runchart .runline.runpartial { stroke-dasharray: 3 3.5; opacity: .75; }
+/* A 2px ring in the surface colour so the end dot stays legible where the two
+   lines converge and overlap. */
+.runchart .rundot { stroke: var(--panel); stroke-width: 2; }
+.runchart .rundot.r-attempted { fill: var(--orange); }
+.runchart .rundot.r-finished  { fill: var(--cyan); }
+/* The end labels are the one place a series name wears its own colour — they
+   ARE the direct label, standing in for a second legend lookup. */
+/* Painted with a surface-coloured halo underneath: on the narrow layout the
+   label sits just above its end dot, where it can cross its own line. */
+.runchart .runend {
+  font-family: var(--cond); font-size: 12px; font-weight: 700; letter-spacing: .4px;
+  paint-order: stroke; stroke: var(--panel); stroke-width: 3px; stroke-linejoin: round;
+}
+.runchart .runend.r-attempted { fill: var(--orange); }
+.runchart .runend.r-finished  { fill: var(--cyan); }
+.runchart .srdaxis { stroke: var(--line-2); stroke-width: 1; }
+/* Invisible hover columns: the hit target spans the full plot height so the
+   tooltip is reachable anywhere above a bucket, not only on the line itself. */
+.runchart .runhit { fill: transparent; }
+.runchart .runhit:hover { fill: rgba(255,255,255,.04); }
+.stkey .sw.r-attempted { background: var(--orange); }
+.stkey .sw.r-finished  { background: var(--cyan); }
+
 /* Region table: the swatch repeats the chart's hue so the row and the bar are
    the same entity, and the name beside it means identity is never colour alone. */
 .rdot { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 8px; background: var(--muted); }
@@ -1313,6 +1356,11 @@ tr.tincomplete td { opacity: .5; }
   .seg { padding: 6px 9px; font-size: 12px; }
   .hmap { padding: 4px 8px 6px; }
   .tile .num.stat-word { font-size: 22px; }
+
+  /* Type and strokes are NOT scaled up here — the chart switches to a narrower,
+     squarer viewBox on this breakpoint instead (see runsNarrow in app.js), so
+     everything inside it is already close to 1:1 with screen pixels. */
+  .runchart { padding: 4px 6px 8px; }
 }
 
 /* ---------- /blog — site updates ---------- */

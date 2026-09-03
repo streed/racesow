@@ -19,6 +19,8 @@ import {
   FLAG_REASONS,
   DUEL_REASONS,
   PLAYTIME_WINDOWS,
+  RUN_ACTIVITY_WINDOWS,
+  RUN_ACTIVITY_BUCKETS,
   urlSlug,
   isSafeMapName,
 } from "./db.js";
@@ -375,6 +377,31 @@ api.get(
     const days = asInt(req.query.days);
     const tz = typeof req.query.tz === "string" && IANA_ZONES.has(req.query.tz) ? req.query.tz : "UTC";
     res.json(await race.playTimes({ days: PLAYTIME_WINDOWS.includes(days) ? days : 90, tz }));
+  })
+);
+
+// How many runs were finished and how many were attempted, bucketed by UTC day
+// or ISO week (see db.runActivity). Both parameters are snapped to their
+// allow-lists BEFORE the cache key is built, exactly as the playtimes route
+// does, so walking ?days=/?bucket= can't mint unbounded Redis entries. The TTL
+// matches: the finest bucket is a whole day, so a stale minute is invisible.
+const runActivityKey = (req) => {
+  const days = asInt(req.query.days);
+  const bucket = req.query.bucket;
+  return (
+    "/stats/runs?days=" +
+    (RUN_ACTIVITY_WINDOWS.includes(days) ? days : 90) +
+    "&bucket=" +
+    (RUN_ACTIVITY_BUCKETS.includes(bucket) ? bucket : "day")
+  );
+};
+api.get(
+  "/stats/runs",
+  cache(300, { edge: true, key: runActivityKey }),
+  wrap(async (req, res) => {
+    const days = asInt(req.query.days);
+    const bucket = RUN_ACTIVITY_BUCKETS.includes(req.query.bucket) ? req.query.bucket : "day";
+    res.json(await race.runActivity({ days: RUN_ACTIVITY_WINDOWS.includes(days) ? days : 90, bucket }));
   })
 );
 
@@ -4954,6 +4981,7 @@ const SITEMAP_PAGES = [
   ["/maps", "0.9"],
   ["/players", "0.9"],
   ["/stats", "0.8"],
+  ["/runs", "0.7"],
   ["/blog", "0.8"],
   ["/tournaments", "0.7"],
   ["/demo", "0.7"],

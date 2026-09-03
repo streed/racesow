@@ -2927,6 +2927,479 @@ function statsRegionPanel(d, cells, metric) {
     </div>`;
 }
 
+/* ==========================================================================
+ * /runs — runs finished vs runs attempted, over time.
+ *
+ * Two series, same unit (runs), so they share ONE linear axis: a second y-scale
+ * would let the two lines be slid past each other until they told whatever
+ * story the scaling chose, and the gap between attempted and finished is the
+ * entire point of the page.
+ *
+ * The two series do NOT start on the same date, and the page is built around
+ * saying so. Finishes are exact back to the finish log's first row; attempts
+ * only exist from the day the daily bucket shipped, because run_tally.attempts
+ * is a counter with no history (see db.runActivity). A missing series is drawn
+ * as a break in the line and named in the caption — never as zero, which would
+ * read as "nobody tried" and would put finishes above attempts, which cannot
+ * happen.
+ *
+ * Colour is identity (two named series), so it comes from the site's fixed
+ * categorical pair — orange for attempted, cyan for finished — and neither hue
+ * moves when the window changes. Both are direct-labelled at the line end and
+ * carry a legend, so the series are never distinguished by colour alone.
+ * ========================================================================== */
+const RUN_WINDOWS = [
+  { days: 30, label: "30 days" },
+  { days: 90, label: "90 days" },
+  { days: 365, label: "12 months" },
+  { days: 0, label: "All time" },
+];
+const RUN_BUCKETS = [
+  { bucket: "day", label: "Daily" },
+  { bucket: "week", label: "Weekly" },
+];
+// Keyed on what the API varies by, so the day/week and window toggles refetch
+// but nothing else does. Same TTL as the route's own cache.
+const runCube = new Map();
+
+// Smallest ceiling >= v that splits into `divisions` round steps, so the axis
+// reads 0/100/200/300/400 rather than 0/88/175/263/350. Steps are snapped to the
+// 1/2/2.5/5 x 10^n series people actually read numbers in.
+function niceCeil(v, divisions) {
+  const rough = v / divisions;
+  const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+  const norm = rough / mag;
+  let step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag;
+  // Runs are whole things, so a fractional step (only the 2.5 case, and only for
+  // small maxima) would label the axis 0/3/5/8/10 once rounded for display.
+  // Ceiling it to a whole number keeps the gridlines evenly spaced AND integral.
+  if (step > 1) step = Math.ceil(step);
+  return step * divisions;
+}
+
+// "2026-08-12" -> "12 Aug". The axis is dates, and the year is carried in the
+// caption rather than repeated under every tick.
+function runDayLabel(day, { year = false } = {}) {
+  const d = new Date(day + "T00:00:00Z");
+  const s = d.toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+  return year ? `${s} ${d.getUTCFullYear()}` : s;
+}
+
+// Phones get the narrow chart geometry (see runsChart). Read at render time
+// rather than cached: the page re-renders on navigation, which is when a rotated
+// tablet picks up the other layout.
+function runsNarrow() {
+  return typeof window !== "undefined" && window.innerWidth <= 700;
+}
+
+// Axis labels only: 1500 -> "1.5k". The y gutter is fixed width, and on a phone
+// the whole chart is scaled down, so a full "10,000" either overflows the plot
+// or forces a gutter wide enough to squeeze it. Tooltips and the table below
+// keep the exact figures.
+function fmtCompact(n) {
+  const v = Math.round(n);
+  if (v < 1000) return String(v);
+  if (v < 1_000_000) {
+    const k = v / 1000;
+    return (k < 10 && v % 1000 ? k.toFixed(1) : Math.round(k)) + "k";
+  }
+  const m = v / 1_000_000;
+  return (m < 10 && v % 1_000_000 ? m.toFixed(1) : Math.round(m)) + "M";
+}
+
+// Date ticks: first, last, and four evenly spaced between, rather than one per
+// bucket (365 of them would be a smear). Shared by both charts on the page so
+// the two stacked plots tick at the SAME dates — a reader compares them by
+// looking straight down, which only works if the axes line up.
+function runDateTicks(pts, xAt, H, segments = 5) {
+  const idx = [
+    ...new Set([
+      0,
+      ...Array.from({ length: Math.max(0, segments - 1) }, (_, i) => Math.round(((i + 1) * (pts.length - 1)) / segments)),
+      pts.length - 1,
+    ]),
+  ];
+  return idx
+    .filter((i) => i >= 0 && i < pts.length)
+    .map(
+      (i) =>
+        `<text class="sraxd" x="${xAt(i).toFixed(1)}" y="${H - 8}" text-anchor="${
+          i === 0 ? "start" : i === pts.length - 1 ? "end" : "middle"
+        }">${esc(runDayLabel(pts[i].day))}</text>`
+    )
+    .join("");
+}
+
+async function viewRuns(params) {
+  const days = RUN_WINDOWS.some((w) => String(w.days) === params.days) ? parseInt(params.days, 10) : 90;
+  const bucket = params.bucket === "week" ? "week" : "day";
+  const cubeKey = `${days}|${bucket}`;
+
+  let hit = runCube.get(cubeKey);
+  if (hit && Date.now() - hit.at > 300_000) hit = null;
+  if (!hit) {
+    loading();
+    hit = { at: Date.now(), d: await api("/stats/runs" + buildQuery({ days, bucket })) };
+    runCube.set(cubeKey, hit);
+  }
+  const d = hit.d;
+  const state = { days, bucket };
+
+  if (!d.points.length || (!d.totals.finishes && !d.totals.attempts)) {
+    app.innerHTML = `${runsHeader(d, state)}
+      <div class="empty">No runs recorded in this window — try a longer one.</div>`;
+    return;
+  }
+
+  app.innerHTML = `
+    ${runsHeader(d, state)}
+    ${runsTiles(d)}
+    <div class="panel statpanel">
+      <h3><span class="dot"></span>Runs ${d.bucket === "week" ? "per week" : "per day"}</h3>
+      ${runsChart(d)}
+      <div class="statcap">${runsCaption(d)}</div>
+    </div>
+    ${runsRatePanel(d)}
+    ${runsTable(d)}`;
+}
+
+function runsHeader(d, state) {
+  const link = (over) => "#/runs" + buildQuery({ ...state, ...over });
+  const seg = (items, keyName, current) =>
+    `<div class="segbar" role="group" aria-label="${esc(keyName === "days" ? "Window" : "Bucket")}">
+      ${items
+        .map((it) => {
+          const v = it[keyName];
+          const on = v === current;
+          return `<a class="seg ${on ? "on" : ""}" data-nav="${link({ [keyName]: v })}" href="${navHref(
+            link({ [keyName]: v })
+          )}">${esc(it.label)}</a>`;
+        })
+        .join("")}
+    </div>`;
+  return `
+    <div class="page-title">RUNS OVER <span class="accent">TIME</span></div>
+    <div class="page-sub">
+      ${fmtNum(d.totals.finishes)} finished · ${
+        d.attemptsFrom ? `${fmtNum(d.totals.attempts)} attempted` : "attempts not yet tracked"
+      } · bucketed by UTC ${d.bucket === "week" ? "week" : "day"}
+    </div>
+    <div class="statbar">
+      ${seg(RUN_WINDOWS, "days", state.days)}
+      ${seg(RUN_BUCKETS, "bucket", state.bucket)}
+    </div>`;
+}
+
+// Headline numbers. The completion rate is deliberately taken from the overlap
+// only (see db.runActivity) — dividing all finishes by the attempts we happen to
+// have recorded would report a rate well above the truth.
+function runsTiles(d) {
+  const ov = d.totals.overlap;
+  const rate = ov.rate == null ? null : Math.round(ov.rate * 1000) / 10;
+  return `
+    <div class="tiles">
+      ${tile(d.totals.finishes, "Runs finished", "accent")}
+      ${
+        d.attemptsFrom
+          ? tile(d.totals.attempts, "Runs attempted")
+          : statTile("—", "Runs attempted", "tracking not started")
+      }
+      ${
+        rate == null
+          ? statTile("—", "Completion rate", "needs both series")
+          : statTile(`${rate}%`, "Completion rate", `over ${fmtNum(ov.buckets)} ${d.bucket}s with both`)
+      }
+      ${statTile(
+        ov.rate ? (1 / ov.rate).toFixed(1) : "—",
+        "Attempts per finish",
+        ov.rate ? "in the overlapping span" : "needs both series"
+      )}
+    </div>`;
+}
+
+/* ---- the two-line chart -------------------------------------------------- *
+ * One axis, both series in runs. A null is a genuine gap: the path is broken
+ * there rather than dropped to the baseline, so "not recorded" never renders as
+ * "zero". Hover is a per-bucket transparent hit column carrying a <title>, the
+ * same tooltip mechanism the rest of the site's charts use. */
+function runsChart(d) {
+  // A phone gets its own geometry rather than the desktop chart scaled down: the
+  // SVG shrinks to the container width, so one 900x300 viewBox becomes a ~120px
+  // tall plot with 5px type. The narrow layout is squarer (the series still need
+  // vertical room to separate) and moves the direct labels above their end dots,
+  // where there is no right-hand gutter to put them in.
+  const narrow = runsNarrow();
+  const W = narrow ? 420 : 900, H = 300;
+  const padL = narrow ? 40 : 64, padR = narrow ? 14 : 74;
+  const padT = narrow ? 22 : 16, padB = 30;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const pts = d.points;
+  const n = (v) => v.toFixed(1);
+
+  // One shared domain across BOTH series — that is what makes the gap between
+  // the lines readable as a real quantity.
+  let max = 0;
+  for (const p of pts) max = Math.max(max, p.finishes || 0, p.attempts || 0);
+  max = Math.max(max, 1);
+  const yHi = niceCeil(max, 4);
+
+  const xAt = (i) => padL + (pts.length === 1 ? plotW / 2 : (i / (pts.length - 1)) * plotW);
+  const yAt = (v) => padT + (1 - v / yHi) * plotH;
+
+  // Break the path at every null instead of interpolating across it: a straight
+  // line through a gap invents data, and these gaps are exactly where the two
+  // series differ in coverage.
+  //
+  // The trailing partial bucket (today, or this week) is split off as its own
+  // dashed segment. It is a real number, but an incomplete one, and drawn solid
+  // it reads as activity collapsing rather than as a bucket still filling.
+  const pathFor = (key) => {
+    const drawn = [];
+    pts.forEach((p, i) => { if (p[key] != null) drawn.push(i); });
+    const tail = pts.length && pts[pts.length - 1].partial;
+    // Only the final segment is dashed, so the solid path keeps the last
+    // COMPLETE bucket as its endpoint.
+    const solidUpto = tail ? drawn.length - 2 : drawn.length - 1;
+    let solid = "", pen = false;
+    drawn.forEach((i, k) => {
+      if (k > solidUpto) return;
+      // A gap in the source data breaks the pen; consecutive indices keep it.
+      if (k && drawn[k - 1] !== i - 1) pen = false;
+      solid += `${pen ? "L" : "M"}${n(xAt(i))} ${n(yAt(pts[i][key]))}`;
+      pen = true;
+    });
+    let dashed = "";
+    if (tail && drawn.length >= 2) {
+      const [a, b] = [drawn[drawn.length - 2], drawn[drawn.length - 1]];
+      if (b === a + 1) dashed = `M${n(xAt(a))} ${n(yAt(pts[a][key]))}L${n(xAt(b))} ${n(yAt(pts[b][key]))}`;
+    }
+    return { solid, dashed };
+  };
+
+  const SERIES = [
+    { key: "attempts", cls: "attempted", label: "Attempted" },
+    { key: "finished", cls: "finished", label: "Finished" },
+  ];
+  // `finished` is the display name; the payload calls it `finishes`.
+  const valueKey = (s) => (s.key === "attempts" ? "attempts" : "finishes");
+
+  // 4 gridlines + labels.
+  let grid = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = (yHi / 4) * i, y = yAt(v);
+    grid += `<line class="srgrid" x1="${padL}" y1="${n(y)}" x2="${W - padR}" y2="${n(y)}"/>
+      <text class="sraxl" x="${padL - 8}" y="${n(y)}" text-anchor="end" dominant-baseline="middle">${esc(fmtCompact(v))}</text>`;
+  }
+
+  let lines = "";
+  for (const s of SERIES) {
+    const { solid, dashed } = pathFor(valueKey(s));
+    if (solid) lines += `<path class="runline r-${s.cls}" d="${solid}"/>`;
+    if (dashed) lines += `<path class="runline runpartial r-${s.cls}" d="${dashed}"/>`;
+  }
+
+  // Direct labels at each line's last real point, so the series are named on the
+  // chart itself and not only in the legend.
+  let ends = "";
+  for (const s of SERIES) {
+    const k = valueKey(s);
+    let last = -1;
+    pts.forEach((p, i) => { if (p[k] != null) last = i; });
+    if (last < 0) continue;
+    const x = xAt(last), y = yAt(pts[last][k]);
+    const lab = narrow
+      ? `<text class="runend r-${s.cls}" x="${n(x)}" y="${n(Math.max(y - 9, padT - 4))}" text-anchor="end">${esc(s.label)}</text>`
+      : `<text class="runend r-${s.cls}" x="${n(Math.min(x + 8, W - padR + 6))}" y="${n(y)}" dominant-baseline="middle">${esc(s.label)}</text>`;
+    ends += `<circle class="rundot r-${s.cls}" cx="${n(x)}" cy="${n(y)}" r="3.5"/>${lab}`;
+  }
+
+  // Transparent hover columns, one per bucket, each carrying the whole row.
+  const colW = pts.length > 1 ? plotW / (pts.length - 1) : plotW;
+  const hits = pts
+    .map((p, i) => {
+      const parts = [
+        runDayLabel(p.day, { year: true }) + (d.bucket === "week" ? " (week)" : ""),
+        p.attempts == null ? "attempts not tracked yet" : `${fmtNum(p.attempts)} attempted`,
+        p.finishes == null ? "no finish log yet" : `${fmtNum(p.finishes)} finished`,
+      ];
+      if (p.attempts && p.finishes != null) parts.push(`${Math.round((p.finishes / p.attempts) * 1000) / 10}% completed`);
+      if (p.partial) parts.push("incomplete bucket");
+      return `<rect class="runhit" x="${n(xAt(i) - colW / 2)}" y="${padT}" width="${n(colW)}" height="${n(
+        plotH
+      )}"><title>${esc(parts.join(" · "))}</title></rect>`;
+    })
+    .join("");
+
+  const ticks = runDateTicks(pts, xAt, H, narrow ? 2 : 5);
+
+  const legend = `<div class="stlegend">${SERIES.map(
+    (s) => `<span class="stkey"><span class="sw r-${s.cls}"></span>${esc(s.label)}</span>`
+  ).join("")}</div>`;
+
+  return `${legend}
+    <svg class="runchart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(
+      `Runs attempted and runs finished per ${d.bucket}, ${fmtNum(d.totals.attempts)} attempted and ${fmtNum(
+        d.totals.finishes
+      )} finished in this window`
+    )}">
+      ${grid}
+      ${lines}
+      ${ends}
+      <line class="srdaxis" x1="${padL}" y1="${n(yAt(0))}" x2="${W - padR}" y2="${n(yAt(0))}"/>
+      ${ticks}
+      ${hits}
+    </svg>`;
+}
+
+// Completion rate gets its OWN chart rather than a second axis on the one above:
+// it is a percentage, not a count, and overlaying it would need a scale that
+// makes the two lines' crossings meaningless.
+function runsRatePanel(d) {
+  const pts = d.points.filter((p) => p.attempts != null && p.finishes != null && p.attempts > 0);
+  if (pts.length < 2) return "";
+  const narrow = runsNarrow();
+  const W = narrow ? 420 : 900, H = narrow ? 190 : 170;
+  const padL = narrow ? 40 : 64, padR = narrow ? 14 : 74, padT = 14, padB = 28;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const n = (v) => v.toFixed(1);
+  const rate = (p) => (p.finishes / p.attempts) * 100;
+  const hi = Math.min(100, Math.ceil(Math.max(...pts.map(rate)) / 10) * 10) || 10;
+
+  const all = d.points;
+  const xAt = (i) => padL + (all.length === 1 ? plotW / 2 : (i / (all.length - 1)) * plotW);
+  const yAt = (v) => padT + (1 - v / hi) * plotH;
+
+  // Same split as the chart above: the still-filling final bucket is dashed, so
+  // a rate computed from a part-day is not read as a genuine drop.
+  const drawn = [];
+  all.forEach((p, i) => { if (p.attempts != null && p.finishes != null && p.attempts > 0) drawn.push(i); });
+  const tail = all.length && all[all.length - 1].partial && drawn[drawn.length - 1] === all.length - 1;
+  const solidUpto = tail ? drawn.length - 2 : drawn.length - 1;
+  let dd = "", pen = false;
+  drawn.forEach((i, k) => {
+    if (k > solidUpto) return;
+    if (k && drawn[k - 1] !== i - 1) pen = false;
+    dd += `${pen ? "L" : "M"}${n(xAt(i))} ${n(yAt(rate(all[i])))}`;
+    pen = true;
+  });
+  let ddTail = "";
+  if (tail && drawn.length >= 2) {
+    const [a, b] = [drawn[drawn.length - 2], drawn[drawn.length - 1]];
+    if (b === a + 1) ddTail = `M${n(xAt(a))} ${n(yAt(rate(all[a])))}L${n(xAt(b))} ${n(yAt(rate(all[b])))}`;
+  }
+
+  let grid = "";
+  for (let i = 0; i <= 2; i++) {
+    const v = (hi / 2) * i, y = yAt(v);
+    grid += `<line class="srgrid" x1="${padL}" y1="${n(y)}" x2="${W - padR}" y2="${n(y)}"/>
+      <text class="sraxl" x="${padL - 8}" y="${n(y)}" text-anchor="end" dominant-baseline="middle">${Math.round(v)}%</text>`;
+  }
+  const hits = all
+    .map((p, i) => {
+      if (p.attempts == null || p.finishes == null || p.attempts <= 0) return "";
+      const colW = all.length > 1 ? plotW / (all.length - 1) : plotW;
+      return `<rect class="runhit" x="${n(xAt(i) - colW / 2)}" y="${padT}" width="${n(colW)}" height="${n(
+        plotH
+      )}"><title>${esc(
+        `${runDayLabel(p.day, { year: true })} · ${Math.round(rate(p) * 10) / 10}% of ${fmtNum(p.attempts)} attempts finished`
+      )}</title></rect>`;
+    })
+    .join("");
+
+  return `
+    <div class="panel statpanel">
+      <h3><span class="dot teal"></span>Share of attempts that reached the finish</h3>
+      <svg class="runchart runrate" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(
+        `Percentage of attempted runs that were finished, per ${d.bucket}`
+      )}">
+        ${grid}
+        <path class="runline r-rate" d="${dd}"/>
+        ${ddTail ? `<path class="runline runpartial r-rate" d="${ddTail}"/>` : ""}
+        <line class="srdaxis" x1="${padL}" y1="${n(yAt(0))}" x2="${W - padR}" y2="${n(yAt(0))}"/>
+        ${runDateTicks(all, xAt, H, narrow ? 2 : 5)}
+        ${hits}
+      </svg>
+      <div class="statcap">
+        Only ${d.bucket}s that carry both numbers are plotted, so this line starts where attempt
+        tracking does. One player restarting a map twenty times counts as twenty attempts and, at
+        most, one finish — a low share is normal, and a hard map drags it down further.
+      </div>
+    </div>`;
+}
+
+// The table view: every bucket as numbers, so the page is readable without
+// relying on the chart (and without relying on colour to tell the series apart).
+function runsTable(d) {
+  const rows = [...d.points]
+    .reverse()
+    .slice(0, 60)
+    .map((p) => {
+      const r = p.attempts && p.finishes != null ? `${Math.round((p.finishes / p.attempts) * 1000) / 10}%` : "—";
+      return `<tr>
+        <td class="mono">${esc(runDayLabel(p.day, { year: true }))}${p.partial ? ` <span class="muted">(so far)</span>` : ""}</td>
+        <td class="num">${p.attempts == null ? "<span class='muted'>—</span>" : fmtNum(p.attempts)}</td>
+        <td class="num">${p.finishes == null ? "<span class='muted'>—</span>" : fmtNum(p.finishes)}</td>
+        <td class="num">${r}</td>
+      </tr>`;
+    })
+    .join("");
+  return `
+    <div class="page-title" style="font-size:20px">THE <span class="accent">NUMBERS</span></div>
+    <div class="panel statpanel">
+      <div class="table-wrap"><div class="tscroll">
+        <table class="data">
+          <thead><tr>
+            <th>${d.bucket === "week" ? "Week of" : "Day"}</th>
+            <th class="num">Attempted</th><th class="num">Finished</th><th class="num">Completed</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div></div>
+      <div class="statcap">
+        Most recent ${d.bucket === "week" ? "weeks" : "days"} first, up to 60 rows. A dash means the
+        figure was not being recorded then — not that it was zero.
+      </div>
+    </div>`;
+}
+
+// The honesty paragraph. Both series' real start dates come from the API, so
+// this says what the data actually covers instead of implying the lines share a
+// history they don't.
+function runsCaption(d) {
+  const bits = [];
+  bits.push(
+    `<b>Finished</b> counts every completed run from the finish log — not just personal bests${
+      d.finishesFrom ? `, back to ${esc(runDayLabel(d.finishesFrom, { year: true }))}` : ""
+    }.`
+  );
+  if (d.finishesSparseBefore) {
+    bits.push(
+      `The flat stretch up to ${esc(runDayLabel(d.finishesSparseBefore, { year: true }))} is the era
+       before the finish log was added: the only runs recorded there are the few recovered later from
+       demo files, so it is sparse rather than quiet.`
+    );
+  }
+  if (d.attemptsFrom) {
+    bits.push(
+      `<b>Attempted</b> counts every run started, finished or not, and is recorded from
+       ${esc(runDayLabel(d.attemptsFrom, { year: true }))} onwards — the day per-day attempt
+       tracking was added. Before that the servers only kept a running total with no dates, so
+       there is nothing to plot and the line simply starts there rather than sitting at zero.`
+    );
+  } else {
+    bits.push(
+      `<b>Attempted</b> has no data yet: per-day attempt tracking has just been added and fills in
+       from the next runs onwards. Until then only the finished line is drawn.`
+    );
+  }
+  bits.push(
+    `Buckets are UTC ${d.bucket === "week" ? "weeks (starting Monday)" : "days"}; the newest one is
+     still filling, so it is drawn dashed rather than as a drop. An attempt is counted when a player
+     starts a run, so restarts count again.`
+  );
+  return bits.join(" ");
+}
+
 /* ------------------------- achievements directory ------------------------ */
 // Every active achievement with rarity + recent earners. Hidden achievements
 // show as a masked card until somebody earns them.
@@ -3471,6 +3944,7 @@ async function router() {
     else if (path === "/compare") await viewCompare(params);
     else if (path === "/achievements") await viewAchievements();
     else if (path === "/stats") await viewStats(params);
+    else if (path === "/runs") await viewRuns(params);
     // Exact match first, same as /tournaments: "/blog" is the index,
     // "/blog/<slug>" one post.
     else if (path === "/blog") await viewBlog(params);

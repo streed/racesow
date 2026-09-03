@@ -719,6 +719,28 @@ const REGION_SQL = `CASE
 // Selectable windows, in days; 0 is all time. Also the API's allow-list, which
 // keeps the response cache key bounded.
 export const PLAYTIME_WINDOWS = [30, 90, 365, 0];
+// Same idea for the finished-vs-attempted series (see runActivity). Kept as its
+// own list because the two pages need not offer the same windows, and sharing
+// one would silently couple them.
+export const RUN_ACTIVITY_WINDOWS = [30, 90, 365, 0];
+export const RUN_ACTIVITY_BUCKETS = ["day", "week"];
+
+// UTC date-string arithmetic for the run-activity axis. Both take and return
+// 'YYYY-MM-DD' and go through Date.UTC, so they cross month, year and leap-day
+// boundaries without the local-zone drift that string slicing invites.
+const nextUtcDay = (day) => {
+  const d = new Date(day + "T00:00:00Z");
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+};
+// The Monday of `day`'s ISO week. getUTCDay() is 0 for Sunday, which belongs to
+// the week that STARTED six days earlier, not the one about to start.
+const isoWeekStart = (day) => {
+  const d = new Date(day + "T00:00:00Z");
+  const dow = (d.getUTCDay() + 6) % 7; // Mon=0 … Sun=6
+  d.setUTCDate(d.getUTCDate() - dow);
+  return d.toISOString().slice(0, 10);
+};
 
 class RaceDB {
   constructor(pool, caps) {
@@ -2871,6 +2893,178 @@ class RaceDB {
       // can re-slice it — region filter, runs vs players, day and hour
       // breakdowns — with no further requests and no unsound summing.
       cells: grid.map((r) => ({ region: r.region, dow: r.dow, hour: r.hour, runs: r.runs, players: r.players })),
+    };
+  }
+
+  // ---- Runs finished vs attempted, as a daily/weekly series ---------------
+  //
+  // Two series that look symmetrical on the page but come from opposite kinds
+  // of storage, which is the whole reason this method exists:
+  //
+  //   finished  — COUNT(*) over `finish`, one row per completed run with its
+  //     own timestamp. Exact, and complete back to the finish log's first row
+  //     (2026-07-22) plus anything a demo import backdated before it.
+  //
+  //   attempted — SUM over run_activity_daily, the per-flush deltas recorded at
+  //     ingest (migration 20260903120000000). run_tally.attempts is a cumulative
+  //     counter, so this table is the only per-day attempt history that exists,
+  //     and it only goes back to the day it shipped.
+  //
+  // Neither series is padded to the other's length. A day before its series
+  // began is NULL, not 0 — a zero is a real "nobody raced" and drawing one
+  // across the years before attempt tracking existed would state, in the most
+  // legible way available, something false (and would put finishes above
+  // attempts, which is impossible). The page reads `attemptsFrom`/`finishesFrom`
+  // back out and says where each line starts.
+  //
+  // Buckets are UTC days: run_activity_daily stores an already-cut DATE, so
+  // unlike playTimes there is no per-row timestamp left to re-cut into a
+  // viewer's zone. Weeks are folded from those days in JS (one code path, and
+  // the day query is small enough that pushing it into SQL buys nothing).
+  async runActivity({ days = 90, bucket = "day" } = {}) {
+    const winDays = RUN_ACTIVITY_WINDOWS.includes(days) ? days : 90;
+    const buck = bucket === "week" ? "week" : "day";
+    const since = winDays ? Math.floor(Date.now() / 1000) - winDays * 86400 : 0;
+
+    const finRows = await this.all(
+      `SELECT (to_timestamp(created_at) AT TIME ZONE 'UTC')::date::text AS day, COUNT(*)::int AS n
+         FROM finish WHERE created_at >= $1 GROUP BY 1`,
+      [since]
+    );
+    const attRows = await this.all(
+      `SELECT day::text AS day, SUM(attempts)::bigint AS n
+         FROM run_activity_daily
+        WHERE day >= (to_timestamp($1) AT TIME ZONE 'UTC')::date
+        GROUP BY 1`,
+      [since]
+    );
+
+    // Where each series genuinely begins, read from the WHOLE table rather than
+    // the window: "attempt tracking started on the 3rd" is a fact about the
+    // data, not about the 30 days the viewer happens to be looking at. Without
+    // this, every window that opens before tracking began would look like a
+    // stretch of zero-attempt days.
+    const span = await this.one(
+      `SELECT (SELECT MIN(created_at)::bigint FROM finish)         AS fin_lo,
+              (SELECT MAX(created_at)::bigint FROM finish)         AS fin_hi,
+              (SELECT MIN(day)::text FROM run_activity_daily)      AS att_lo,
+              (SELECT MAX(day)::text FROM run_activity_daily)      AS att_hi`
+    );
+
+    const utcDay = (ts) => new Date(ts * 1000).toISOString().slice(0, 10);
+    const finFrom = span && span.fin_lo != null ? utcDay(num(span.fin_lo)) : null;
+    const attFrom = (span && span.att_lo) || null;
+
+    const finMap = new Map(finRows.map((r) => [r.day, num(r.n)]));
+    const attMap = new Map(attRows.map((r) => [r.day, num(r.n)]));
+
+    // The dense day axis. Gaps inside a series' own lifetime are real zeros and
+    // must be drawn as such — a line that simply skips quiet days silently
+    // rescales the x-axis and turns a dead week into a straight segment.
+    const today = utcDay(Math.floor(Date.now() / 1000));
+    const firstData = [finFrom, attFrom].filter(Boolean).sort()[0] || today;
+    let start = winDays ? utcDay(since) : firstData;
+    // Nothing to say about days before either series existed, even in-window.
+    if (start < firstData) start = firstData;
+
+    const days_ = [];
+    for (let d = start; d <= today; d = nextUtcDay(d)) days_.push(d);
+
+    const point = (day) => ({
+      day,
+      // A series is NULL before its first record and a number from then on.
+      // Compared as ISO date strings, which sort lexicographically.
+      finishes: finFrom && day >= finFrom ? finMap.get(day) || 0 : null,
+      attempts: attFrom && day >= attFrom ? attMap.get(day) || 0 : null,
+    });
+
+    let points;
+    if (buck === "day") {
+      points = days_.map(point);
+      // Today is still accumulating, exactly as the current week is below. The
+      // page dashes it: an unflagged final point sitting well under yesterday's
+      // reads as activity falling off a cliff rather than as a day in progress.
+      if (points.length) points[points.length - 1].partial = true;
+    } else {
+      // Fold into ISO weeks (Monday start). A week is only reported for a series
+      // once the series covers ALL of it: a week half-inside the tracking start
+      // is a partial sum, and a partial sum plotted next to whole ones reads as
+      // a crash in activity rather than as the edge of the data.
+      const weeks = new Map();
+      for (const day of days_) {
+        const wk = isoWeekStart(day);
+        if (!weeks.has(wk)) weeks.set(wk, { day: wk, finishes: 0, attempts: 0, n: 0 });
+        const w = weeks.get(wk);
+        w.n++;
+        w.finishes += finMap.get(day) || 0;
+        w.attempts += attMap.get(day) || 0;
+      }
+      points = [...weeks.values()].map((w) => ({
+        day: w.day,
+        finishes: finFrom && w.day >= finFrom ? w.finishes : null,
+        attempts: attFrom && w.day >= attFrom ? w.attempts : null,
+        // The current week is genuinely incomplete; the page dashes it rather
+        // than letting it read as a collapse in activity.
+        partial: w.n < 7,
+      }));
+    }
+
+    // A long, almost-empty run at the START of the finish series is not a quiet
+    // period — it is the era before the finish log existed (2026-07-22), where
+    // the only rows are the handful a demo import backdated into it. Those rows
+    // are real, so they are still plotted; what would be wrong is letting the
+    // reader take a near-zero line as "nobody raced then". Detected from the
+    // data rather than hardcoded to the migration date, so a database that has
+    // no such imports (or a fresh one) simply reports null and says nothing.
+    const finishesSparseBefore = (() => {
+      const withFin = points.filter((p) => p.finishes != null);
+      const minRun = buck === "week" ? 8 : 30;
+      if (withFin.length < minRun * 2) return null;
+      // The LONGEST prefix that is at least 90% empty buckets.
+      let cut = null, empty = 0;
+      for (let i = 0; i < withFin.length; i++) {
+        if (!withFin[i].finishes) empty++;
+        if (i >= minRun - 1 && empty / (i + 1) >= 0.9) cut = i;
+      }
+      if (cut == null) return null;
+      // The ratio only falls below the threshold a little way INTO the dense
+      // era, so walk back to the last genuinely empty bucket — that, not the
+      // crossing point, is where the flat stretch actually ends.
+      while (cut > 0 && withFin[cut].finishes) cut--;
+      return withFin[cut].day;
+    })();
+
+    // Totals are summed over the RETURNED points so the headline always matches
+    // the chart under it — including the nulls, which contribute nothing.
+    const sum = (k) => points.reduce((n, p) => n + (p[k] || 0), 0);
+    const finishes = sum("finishes");
+    const attempts = sum("attempts");
+
+    return {
+      days: winDays,
+      bucket: buck,
+      since: since || null,
+      points,
+      // Where each line legitimately starts, so the page can label it instead of
+      // leaving the reader to assume the site had no attempts before this date.
+      finishesFrom: finFrom,
+      finishesSparseBefore,
+      attemptsFrom: attFrom,
+      attemptsThrough: (span && span.att_hi) || null,
+      finishesThrough: span && span.fin_hi != null ? utcDay(num(span.fin_hi)) : null,
+      totals: {
+        finishes,
+        attempts,
+        // Only meaningful where the two series overlap, so it is computed from
+        // the buckets that carry BOTH — a completion rate over a span where
+        // attempts were never recorded would be finishes divided by nothing.
+        overlap: (() => {
+          const both = points.filter((p) => p.finishes != null && p.attempts != null);
+          const f = both.reduce((n, p) => n + p.finishes, 0);
+          const a = both.reduce((n, p) => n + p.attempts, 0);
+          return { buckets: both.length, finishes: f, attempts: a, rate: a > 0 ? f / a : null };
+        })(),
+      },
     };
   }
 
@@ -6335,12 +6529,25 @@ class RaceDB {
       // them to the post-ingest achievements pass.
       const touched = new Set();
 
+      // Every attempt this request reports, summed across all its players, for
+      // the daily bucket written once at the end (see run_activity_daily). The
+      // per-player counters below are cumulative totals, so the DELTA that
+      // arrives on this flush is the only place a per-day rate can be taken
+      // from — once it is folded into run_tally.attempts it is gone.
+      let attemptDelta = 0;
+
       // Bump the per-(player,map,version) counters: race starts plus the
       // movement/behaviour metrics (wall jumps, dashes, prejump-rejected starts,
       // restarts) the game module attaches to the same flush. Missing metric
       // fields (older servers) default to 0, so this stays backward-compatible.
-      const bumpTally = (playerId, count, m = {}) =>
-        client.query(
+      const bumpTally = (playerId, count, m = {}) => {
+        // The HTTP route sanitises count to a non-negative integer, but ingest()
+        // is also called directly (tests, the demo importer), so the bucket
+        // coerces rather than trusting it — a NaN here would poison the day's
+        // total for every server, not just this row.
+        const n = Number(count);
+        if (Number.isFinite(n) && n > 0) attemptDelta += n;
+        return client.query(
           `INSERT INTO run_tally (player_id, map_id, version_id, finishes, attempts, last_attempt,
                                   wall_jumps, dashes, prejump_failures, restarts, distance, strafes)
            VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -6359,6 +6566,7 @@ class RaceDB {
             m.distance || 0, m.strafes || 0,
           ]
         );
+      };
 
       if (tally) {
         for (const a of attempts) {
@@ -6481,6 +6689,27 @@ class RaceDB {
           [String(now)]
         );
         this._perfectRunCache.delete(num(mapRow.id));
+      }
+
+      // One bucket row per transaction rather than one per bumpTally call: the
+      // per-player writes above already cost a round-trip each, and the day's
+      // total is the same number whether it is added in one piece or fifty.
+      // Guarded by `tally` for the same reason the tally bumps are — a topscores
+      // re-sync resends the whole top-50 every interval and reports no attempts,
+      // so counting it here would invent daily volume out of a mirror refresh.
+      //
+      // The day is cut in UTC from the ingest's own `now`, which is when the
+      // flush ARRIVED, not when each attempt was made. Over a day-sized bucket
+      // that only matters for runs straddling midnight, and there is no better
+      // timestamp on offer — the game sends counts, not events.
+      if (tally && attemptDelta > 0) {
+        await client.query(
+          `INSERT INTO run_activity_daily (day, server_id, attempts)
+           VALUES ((to_timestamp($1) AT TIME ZONE 'UTC')::date, $2, $3)
+           ON CONFLICT (day, server_id)
+           DO UPDATE SET attempts = run_activity_daily.attempts + EXCLUDED.attempts`,
+          [now, serverId == null ? 0 : serverId, attemptDelta]
+        );
       }
 
       return { ...counts, playerIds: [...touched] };
