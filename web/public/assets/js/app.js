@@ -3114,6 +3114,16 @@ function runsTiles(d) {
         "Attempts per finish",
         ov.rate ? "in the overlapping span" : "needs both series"
       )}
+      ${
+        // The lifetime counter. It predates dated recording by years and cannot
+        // be drawn on the chart (run_tally keeps totals, not events), so it gets
+        // a tile of its own — otherwise the page reads "no attempts" while the
+        // servers have counted hundreds of thousands. Labelled all-time so it is
+        // never mistaken for the window every other tile here describes.
+        d.lifetimeAttempts
+          ? statTile(fmtNum(d.lifetimeAttempts), "Attempts all time", "running total · no daily history")
+          : ""
+      }
     </div>`;
 }
 
@@ -3391,6 +3401,13 @@ function runsCaption(d) {
       `<b>Attempted</b> has no data yet: per-day attempt tracking has just been added and fills in
        from the next runs onwards. Until then only the finished line is drawn.`
     );
+    if (d.lifetimeAttempts) {
+      bits.push(
+        `The servers have counted ${fmtNum(d.lifetimeAttempts)} attempts all-time, but only as a
+         running total per player and map — no dates were kept against it, so those cannot be placed
+         on any day and are shown above as a single figure rather than guessed at here.`
+      );
+    }
   }
   bits.push(
     `Buckets are UTC ${d.bucket === "week" ? "weeks (starting Monday)" : "days"}; the newest one is

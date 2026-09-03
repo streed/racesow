@@ -2939,6 +2939,16 @@ class RaceDB {
       [since]
     );
 
+    // Every attempt the servers have EVER counted, from the cumulative counter.
+    // This is the ONLY attempt figure that covers the years before dated
+    // recording began — and it is a headline number, never a series: run_tally
+    // holds one total per (player, map, version) plus the timestamp of the most
+    // recent flush, so a row reading "2,203 attempts, last seen 14 Aug" gives no
+    // way to say how many of those happened on any given day. Surfacing it as a
+    // total keeps a real 300k-strong number visible without implying the chart
+    // could have drawn it.
+    const life = await this.one("SELECT COALESCE(SUM(attempts), 0) n FROM run_tally");
+
     // Where each series genuinely begins, read from the WHOLE table rather than
     // the window: "attempt tracking started on the 3rd" is a fact about the
     // data, not about the 30 days the viewer happens to be looking at. Without
@@ -3050,6 +3060,9 @@ class RaceDB {
       finishesFrom: finFrom,
       finishesSparseBefore,
       attemptsFrom: attFrom,
+      // All-time attempts (undateable — see above). Not windowed, and
+      // deliberately NOT summed with the per-day series, which it overlaps.
+      lifetimeAttempts: num(life && life.n),
       attemptsThrough: (span && span.att_hi) || null,
       finishesThrough: span && span.fin_hi != null ? utcDay(num(span.fin_hi)) : null,
       totals: {

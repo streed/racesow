@@ -224,6 +224,34 @@ test("a consistently active log reports no sparse stretch", async (t) => {
   assert.equal(d.finishesSparseBefore, null);
 });
 
+// The cumulative counter predates dated recording by years, so the page shows it
+// as a headline figure. It must never be folded into the plotted series — those
+// two numbers overlap, and adding them would double-count every recent attempt.
+test("the all-time attempt counter is reported separately from the dated series", async (t) => {
+  const race = await freshDb(t);
+  // Historic attempts with no dated bucket at all — the pre-tracking era.
+  await race.ingest({
+    version: VER, map: "e2m2", source: "racelog",
+    records: [{ ...finish("Old", 60000), attempts: 500 }],
+  });
+  await race.pool.query("DELETE FROM run_activity_daily");
+
+  let d = await race.runActivity({ days: 30 });
+  assert.equal(d.lifetimeAttempts, 500, "the counter survives even with no dated rows");
+  assert.equal(d.totals.attempts, 0, "the undateable counter must not enter the plotted total");
+  assert.equal(d.attemptsFrom, null);
+
+  // Once dated recording starts, the two coexist: the counter keeps climbing and
+  // the series reports only what it can actually place on a day.
+  await race.ingest({
+    version: VER, map: "e2m2", source: "racelog",
+    records: [{ ...finish("New", 55000), attempts: 7 }],
+  });
+  d = await race.runActivity({ days: 30 });
+  assert.equal(d.lifetimeAttempts, 507);
+  assert.equal(d.totals.attempts, 7);
+});
+
 test("only the newest bucket is flagged as still filling", async (t) => {
   const race = await freshDb(t);
   await race.ingest({
