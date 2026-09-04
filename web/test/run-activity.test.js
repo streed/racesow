@@ -252,6 +252,32 @@ test("the all-time attempt counter is reported separately from the dated series"
   assert.equal(d.totals.attempts, 7);
 });
 
+test("the all-time finish counter is reported separately from the finish log", async (t) => {
+  const race = await freshDb(t);
+  await race.ingest({
+    version: VER, map: "e2m2", source: "racelog",
+    records: [finish("Old", 60000), finish("Older", 61000)],
+  });
+  // The pre-log era: run_tally counted these finishes, but no dated row exists
+  // for them. That is the real shape of the production data, where the counter
+  // holds ~240k finishes and the log a few thousand.
+  await race.pool.query("DELETE FROM finish");
+
+  let d = await race.runActivity({ days: 30 });
+  assert.equal(d.lifetimeFinishes, 2, "the counter survives with no dated finish rows");
+  assert.equal(d.totals.finishes, 0, "the undateable counter must not enter the plotted total");
+  assert.equal(d.finishesFrom, null);
+
+  // Both keep their own books once the log is recording again.
+  await race.ingest({
+    version: VER, map: "e2m2", source: "racelog",
+    records: [finish("New", 55000)],
+  });
+  d = await race.runActivity({ days: 30 });
+  assert.equal(d.lifetimeFinishes, 3);
+  assert.equal(d.totals.finishes, 1);
+});
+
 test("only the newest bucket is flagged as still filling", async (t) => {
   const race = await freshDb(t);
   await race.ingest({

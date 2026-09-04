@@ -1336,6 +1336,15 @@ tr.tincomplete td { opacity: .5; }
 .runchart .runend.r-attempted { fill: var(--orange); }
 .runchart .runend.r-finished  { fill: var(--cyan); }
 .runchart .srdaxis { stroke: var(--line-2); stroke-width: 1; }
+/* The axis classes are shared with the SR charts, but those rules are scoped to
+   .srchart and this is not one — so nothing matched them here and the gridlines
+   fell back to SVG's defaults (stroke: none) while the tick labels fell back to
+   fill: BLACK, on a near-black panel. Redeclared for .runchart, with the labels
+   at full --text rather than the --faint the SR charts use: this axis carries
+   the magnitudes of both series and the reader compares two stacked plots by
+   their numbers, so they are content, not decoration. */
+.runchart .srgrid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 4; }
+.runchart .sraxl, .runchart .sraxd { fill: var(--text); font-family: var(--mono); font-size: 11px; }
 /* Invisible hover columns: the hit target spans the full plot height so the
    tooltip is reachable anywhere above a bucket, not only on the line itself. */
 .runchart .runhit { fill: transparent; }

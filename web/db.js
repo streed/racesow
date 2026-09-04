@@ -2939,15 +2939,25 @@ class RaceDB {
       [since]
     );
 
-    // Every attempt the servers have EVER counted, from the cumulative counter.
-    // This is the ONLY attempt figure that covers the years before dated
-    // recording began — and it is a headline number, never a series: run_tally
-    // holds one total per (player, map, version) plus the timestamp of the most
-    // recent flush, so a row reading "2,203 attempts, last seen 14 Aug" gives no
-    // way to say how many of those happened on any given day. Surfacing it as a
-    // total keeps a real 300k-strong number visible without implying the chart
-    // could have drawn it.
-    const life = await this.one("SELECT COALESCE(SUM(attempts), 0) n FROM run_tally");
+    // Every attempt AND every finish the servers have ever counted, from the
+    // cumulative counters. These are the only figures that cover the years
+    // before dated recording began — and they are headline numbers, never a
+    // series: run_tally holds one total per (player, map, version) plus the
+    // timestamp of the most recent flush, so a row reading "2,203 attempts, last
+    // seen 14 Aug" gives no way to say how many of those happened on any given
+    // day. Surfacing them as totals keeps real six-figure numbers visible
+    // without implying the chart could have drawn them.
+    //
+    // The finish counter matters as much as the attempt one: the finish LOG only
+    // goes back to 2026-07-22 (~4k rows), while the counter carries the whole
+    // imported history (~240k). Reporting only the log next to an all-time
+    // attempt total would read as though the site had barely any finishes.
+    // Their RATIO is not a completion rate — the two counters were not kept
+    // under the same reporting rules across that history — which is why the rate
+    // tile is still taken from the dated overlap alone.
+    const life = await this.one(
+      "SELECT COALESCE(SUM(attempts), 0) n, COALESCE(SUM(finishes), 0) f FROM run_tally"
+    );
 
     // Where each series genuinely begins, read from the WHOLE table rather than
     // the window: "attempt tracking started on the 3rd" is a fact about the
@@ -3060,9 +3070,10 @@ class RaceDB {
       finishesFrom: finFrom,
       finishesSparseBefore,
       attemptsFrom: attFrom,
-      // All-time attempts (undateable — see above). Not windowed, and
-      // deliberately NOT summed with the per-day series, which it overlaps.
+      // All-time attempts and finishes (undateable — see above). Not windowed,
+      // and deliberately NOT summed with the per-day series, which they overlap.
       lifetimeAttempts: num(life && life.n),
+      lifetimeFinishes: num(life && life.f),
       attemptsThrough: (span && span.att_hi) || null,
       finishesThrough: span && span.fin_hi != null ? utcDay(num(span.fin_hi)) : null,
       totals: {

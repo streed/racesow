@@ -3030,6 +3030,16 @@ function runDateTicks(pts, xAt, H, segments = 5) {
     .join("");
 }
 
+// Does the WINDOW actually carry an attempt figure? `attemptsFrom` only says
+// tracking has started at all — a window that closes before it, or a weekly view
+// whose only tracked week is still part-covered (and therefore dropped rather
+// than reported as a partial sum), holds no attempt bucket. Summing that to 0
+// and printing it would read as "nobody attempted", which is the one thing this
+// page exists not to say.
+function runsAttemptsTracked(d) {
+  return d.points.some((p) => p.attempts != null);
+}
+
 async function viewRuns(params) {
   const days = RUN_WINDOWS.some((w) => String(w.days) === params.days) ? parseInt(params.days, 10) : 90;
   const bucket = params.bucket === "week" ? "week" : "day";
@@ -3081,8 +3091,8 @@ function runsHeader(d, state) {
     <div class="page-title">RUNS OVER <span class="accent">TIME</span></div>
     <div class="page-sub">
       ${fmtNum(d.totals.finishes)} finished · ${
-        d.attemptsFrom ? `${fmtNum(d.totals.attempts)} attempted` : "attempts not yet tracked"
-      } · bucketed by UTC ${d.bucket === "week" ? "week" : "day"}
+        runsAttemptsTracked(d) ? `${fmtNum(d.totals.attempts)} attempted` : "attempts not tracked here"
+      } · in this window, from the dated records · bucketed by UTC ${d.bucket === "week" ? "week" : "day"}
     </div>
     <div class="statbar">
       ${seg(RUN_WINDOWS, "days", state.days)}
@@ -3098,11 +3108,15 @@ function runsTiles(d) {
   const rate = ov.rate == null ? null : Math.round(ov.rate * 1000) / 10;
   return `
     <div class="tiles">
-      ${tile(d.totals.finishes, "Runs finished", "accent")}
+      ${statTile(fmtNum(d.totals.finishes), "Runs finished", "in this window", "accent")}
       ${
-        d.attemptsFrom
-          ? tile(d.totals.attempts, "Runs attempted")
-          : statTile("—", "Runs attempted", "tracking not started")
+        runsAttemptsTracked(d)
+          ? statTile(fmtNum(d.totals.attempts), "Runs attempted", "in this window")
+          : statTile(
+              "—",
+              "Runs attempted",
+              d.attemptsFrom ? `no complete ${d.bucket} tracked yet` : "tracking not started"
+            )
       }
       ${
         rate == null
@@ -3115,11 +3129,19 @@ function runsTiles(d) {
         ov.rate ? "in the overlapping span" : "needs both series"
       )}
       ${
-        // The lifetime counter. It predates dated recording by years and cannot
-        // be drawn on the chart (run_tally keeps totals, not events), so it gets
-        // a tile of its own — otherwise the page reads "no attempts" while the
-        // servers have counted hundreds of thousands. Labelled all-time so it is
-        // never mistaken for the window every other tile here describes.
+        // The lifetime counters. They predate dated recording by years and
+        // cannot be drawn on the chart (run_tally keeps totals, not events), so
+        // they get tiles of their own — otherwise the page reads as though the
+        // site had a few thousand finishes and no attempts, while the servers
+        // have counted hundreds of thousands of both. Shown as a PAIR: an
+        // all-time attempt figure next to a windowed finish figure invites the
+        // two to be compared, and they measure different spans. Labelled
+        // all-time so neither is mistaken for the window the tiles above cover.
+        d.lifetimeFinishes
+          ? statTile(fmtNum(d.lifetimeFinishes), "Finishes all time", "running total · no daily history")
+          : ""
+      }
+      ${
         d.lifetimeAttempts
           ? statTile(fmtNum(d.lifetimeAttempts), "Attempts all time", "running total · no daily history")
           : ""
@@ -3401,13 +3423,26 @@ function runsCaption(d) {
       `<b>Attempted</b> has no data yet: per-day attempt tracking has just been added and fills in
        from the next runs onwards. Until then only the finished line is drawn.`
     );
-    if (d.lifetimeAttempts) {
-      bits.push(
-        `The servers have counted ${fmtNum(d.lifetimeAttempts)} attempts all-time, but only as a
-         running total per player and map — no dates were kept against it, so those cannot be placed
-         on any day and are shown above as a single figure rather than guessed at here.`
-      );
-    }
+  }
+  // The undateable pair, explained once for both series rather than only in the
+  // no-attempts case: the counters are much larger than anything the chart can
+  // draw (the finish log is a few thousand rows against a quarter of a million
+  // counted finishes), so leaving them unexplained makes the chart look like it
+  // lost most of the site's history rather than never having had it.
+  if (d.lifetimeFinishes || d.lifetimeAttempts) {
+    bits.push(
+      `The <b>all-time</b> figures above are something else again: running totals the servers have
+       always kept per player and map${
+         d.lifetimeFinishes && d.lifetimeAttempts
+           ? ` — ${fmtNum(d.lifetimeFinishes)} runs finished and ${fmtNum(d.lifetimeAttempts)} attempted`
+           : d.lifetimeFinishes
+             ? ` — ${fmtNum(d.lifetimeFinishes)} runs finished`
+             : ` — ${fmtNum(d.lifetimeAttempts)} runs attempted`
+       }, covering years the two lines above cannot reach. No dates are kept against them, so they
+       cannot be placed on a day, cannot be added to the totals beside them, and are not divided
+       into a completion rate: the two counters have not been kept under the same rules across that
+       whole history, so their ratio would not mean what the rate below does.`
+    );
   }
   bits.push(
     `Buckets are UTC ${d.bucket === "week" ? "weeks (starting Monday)" : "days"}; the newest one is
