@@ -43,12 +43,19 @@ cd "${REPO_ROOT}"
 
 # Containers to read from / write to. The game container holds BOTH the live
 # demo dir and the pakshare mount, so the mirror is a copy inside one container.
-GAME_CONTAINERS="${DEMO_GAME_CONTAINERS:-warsow-race}"
+GAME_CONTAINERS="${DEMO_GAME_CONTAINERS:-warsow-race warfork-race}"
 PAK_CONTAINER="${DEMO_PAK_CONTAINER:-racesow-pakserver}"
 # Central stats DB. Absent (agent box) => the DB-driven pull step is skipped.
 DB_CONTAINER="${DEMO_DB_CONTAINER:-racesow-postgres}"
 SERVED_DIR="${DEMO_SERVED_DIR:-/usr/share/nginx/html/demos}"
 GAME_DEMO_DIR="${DEMO_GAME_DIR:-/warsow/racemod/demos/server}"
+# Warfork writes under its OWN fs_basepath/fs_game (/warfork + racesow), and its
+# container is in a different compose project with no /pakshare mount — so it
+# needs both a different source dir and the host-relay path in step 1.
+WF_DEMO_DIR="${DEMO_GAME_DIR_WF:-/warfork/racesow/demos/server}"
+# Every demo extension we serve: APP_DEMO_EXTENSION_STR is .wdz20 on Warsow
+# 2.1.2 and .wfdz22 on Warfork 2.15.
+DEMO_EXTS="${DEMO_EXTS:-wdz20 wfdz22}"
 # Peer pak mirrors to pull missing demos from (space separated, no trailing /).
 PEERS="${DEMO_PEERS:-http://us.east.racesow.org:44445}"
 CURL_MAX_TIME="${DEMO_CURL_MAX_TIME:-60}"
@@ -78,20 +85,65 @@ flock -n 9 || { echo "another sync-demos run is in progress"; exit 0; }
 running() { docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -qx true; }
 
 # --- 1. mirror the live demo dir into the served tree ------------------------
+# The live dir a container writes to, which differs per game.
+demo_dir_for() {
+  case "$1" in
+    warfork*) printf '%s' "${WF_DEMO_DIR}" ;;
+    *)        printf '%s' "${GAME_DEMO_DIR}" ;;
+  esac
+}
+
+# The Warsow game container mounts the same pakshare volume the pak server does,
+# so its mirror is a plain copy INSIDE one container. The Warfork container is in
+# a different compose project and has no such mount, so its files have to travel
+# through the host. Copying the whole tree every tick would move hundreds of MB,
+# so diff the two listings first and `docker cp` only what is missing.
+relay_mirror() {
+  c="$1"; src="$2"
+  have="$(docker exec "${PAK_CONTAINER}" sh -c \
+    "cd ${SERVED_DIR} 2>/dev/null && find . -type f | sed 's|^\./||' | sort" 2>/dev/null || true)"
+  want="$(docker exec "${c}" sh -c \
+    "cd ${src} 2>/dev/null && find . -type f | sed 's|^\./||' | sort" 2>/dev/null || true)"
+  missing="$(comm -23 <(printf '%s\n' "${want}") <(printf '%s\n' "${have}") | sed '/^$/d')"
+  [ -z "${missing}" ] && { say "mirrored ${c}: nothing new"; return 0; }
+  n=0
+  tmp="$(mktemp -d)"
+  while IFS= read -r rel; do
+    [ -n "${rel}" ] || continue
+    mkdir -p "${tmp}/$(dirname "${rel}")" 2>/dev/null || continue
+    docker cp -q "${c}:${src}/${rel}" "${tmp}/${rel}" 2>/dev/null || continue
+    docker exec "${PAK_CONTAINER}" mkdir -p "${SERVED_DIR}/$(dirname "${rel}")" 2>/dev/null || continue
+    docker cp -q "${tmp}/${rel}" "${PAK_CONTAINER}:${SERVED_DIR}/${rel}" 2>/dev/null \
+      && n=$(( n + 1 ))
+    rm -f "${tmp}/${rel}"
+  done <<EOF
+${missing}
+EOF
+  rm -rf "${tmp}"
+  say "mirrored ${c}: +${n} file(s) into the served tree (via host)"
+  mirrored=$(( mirrored + n ))
+}
+
 mirrored=0
 for c in ${GAME_CONTAINERS}; do
   running "${c}" || { say "skip mirror: ${c} not running"; continue; }
-  before="$(docker exec "${c}" sh -c "find /pakshare/demos -type f 2>/dev/null | wc -l" || echo 0)"
+  src="$(demo_dir_for "${c}")"
   if [ "${DRY_RUN}" = 1 ]; then
-    pending="$(docker exec "${c}" sh -c "cd ${GAME_DEMO_DIR} 2>/dev/null && find . -type f | wc -l" || echo 0)"
-    say "[dry-run] ${c}: ${pending} file(s) in the live demo dir, ${before} already served"
+    pending="$(docker exec "${c}" sh -c "cd ${src} 2>/dev/null && find . -type f | wc -l" || echo 0)"
+    say "[dry-run] ${c}: ${pending} file(s) in ${src}"
     continue
   fi
+  # No pakshare mount (Warfork) => relay through the host instead.
+  if ! docker exec "${c}" sh -c '[ -d /pakshare ]' 2>/dev/null; then
+    relay_mirror "${c}" "${src}"
+    continue
+  fi
+  before="$(docker exec "${c}" sh -c "find /pakshare/demos -type f 2>/dev/null | wc -l" || echo 0)"
   # -u: only newer/missing, so this stays cheap on every tick. Dropping the
   # "server/" layer is what makes the served path the two-segment <map>/<file>
   # the web stores (hrace/demos.as RACE_DemoRelPath).
   docker exec "${c}" sh -c \
-    "mkdir -p /pakshare/demos && cp -uLrf ${GAME_DEMO_DIR}/. /pakshare/demos/ 2>/dev/null" \
+    "mkdir -p /pakshare/demos && cp -uLrf ${src}/. /pakshare/demos/ 2>/dev/null" \
     || warn "mirror failed for ${c}"
   after="$(docker exec "${c}" sh -c "find /pakshare/demos -type f 2>/dev/null | wc -l" || echo 0)"
   n=$(( after - before )); [ "${n}" -lt 0 ] && n=0
@@ -107,9 +159,16 @@ running "${PAK_CONTAINER}" || { warn "${PAK_CONTAINER} is not running — cannot
 # with the PLAYER fragment left in its original case. Lowercasing the whole path
 # would miss every demo by a player with a capital in their name.
 # $1 = "list" (print the aliases that are missing) or "create".
+# -name is built from DEMO_EXTS so a Warfork .wfdz22 gets the same case alias.
+find_exts=""
+for e in ${DEMO_EXTS}; do
+  [ -n "${find_exts}" ] && find_exts="${find_exts} -o"
+  find_exts="${find_exts} -name \"*.${e}\""
+done
+
 alias_prog='
 cd '"${SERVED_DIR}"' 2>/dev/null || exit 0
-find . -type f -name "*.wdz20" | while IFS= read -r f; do
+find . -type f \( '"${find_exts}"' \) | while IFS= read -r f; do
   rel=${f#./}
   case "${rel}" in */*) ;; *) continue ;; esac       # auto-recorded files sit at the root
   d=${rel%%/*}; b=${rel##*/}

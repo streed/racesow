@@ -208,16 +208,18 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     [ -n "${RCON_PASSWORD}" ]      && echo "set rcon_password \"${RCON_PASSWORD}\""
     [ -n "${SV_UPLOADS_BASEURL}" ] && echo "set sv_uploads_baseurl \"${SV_UPLOADS_BASEURL}\""
     echo "set sv_demodir \"\""
-    # Per-client demo capture does not exist on Warfork: its Client type has no
-    # demoStart/demoStop/demoCancel, so warfork/scriptpatches/patch-scripts-as2024.py
-    # stubs those 6 call sites out. With capture stubbed, reporting a demo
-    # POINTER would register a download link for a file that is never written —
-    # every Warfork PB used to mint a permanent 404 on the site. rs_record_demos
-    # gates BOTH the capture calls and RACE_ReportWrDemo (hrace/player.as), so
-    # turning it off here is exactly "no demos on Warfork". Ghost replays are
-    # independent (RS_Ghost* natives) and stay on. Flip this back to 1 when the
-    # 3 Client demo natives get registered in the Warfork game module.
-    echo "set rs_record_demos \"0\""
+    # Per-client demo capture now EXISTS on Warfork: the race-demo subsystem is
+    # vendored in as server/sv_racedemos.c and the three Client natives are bound
+    # by warfork/enginepatches/patch-racedemo-natives.py, so the script stubs are
+    # gone and hrace.as/player.as drive real recordings. (Before that, capture was
+    # stubbed while RACE_ReportWrDemo still fired, so every Warfork PB minted a
+    # permanent 404 on the site — hence the 19 dead player_demo rows from
+    # 2026-07-28..08-01, when this was 1 against a stubbed build.)
+    echo "set rs_record_demos \"1\""
+    # Warfork's APP_DEMO_EXTENSION_STR is .wfdz22, not Warsow's .wdz20. The engine
+    # appends it itself; this tells hrace/demos.as which one to put in the path it
+    # REPORTS to the web, so the download link matches the file on disk.
+    echo "set rs_demo_ext \"${DEMO_EXT:-.wfdz22}\""
     if [ -n "${INGEST_URL}" ]; then
         base="${INGEST_URL%/api/ingest}"
         echo "set rs_api_url \"${INGEST_URL}\""

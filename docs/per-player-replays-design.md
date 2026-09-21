@@ -36,13 +36,27 @@ mirror the site links to. An audit of all 253 `player_demo` rows found only 130
 | **Superseded pointer** — the engine keeps ONE demo per (player, map) and renames it on improvement; a dropped report leaves the row on the old time | 4 | `sync-demos.sh --repair-stale` repoints the row at the surviving faster file |
 | **No file was ever written** — 43 US runs pre-dating the `demos` volume (container overlay, lost on recreate) + 16 Warfork | 63 | unrecoverable; rows pruned |
 
-**Warfork records no demos at all.** Its `Client` type has no
-`demoStart/demoStop/demoCancel`, so `warfork/scriptpatches/patch-scripts-as2024.py`
-stubs the capture calls out — but the racemod still *reported* a pointer, so every
-Warfork PB minted a permanent 404. `warfork/entrypoint.sh` now sets
-`rs_record_demos 0`, which gates both the capture calls and `RACE_ReportWrDemo`.
-Flip it back to 1 when the three Client demo natives get registered in the
-Warfork game module (that remains the real fix — see Open risks).
+**Warfork records demos now (2026-09-15).** It used not to: its `Client` type had
+no `demoStart/demoStop/demoCancel`, so `patch-scripts-as2024.py` stubbed the
+capture calls out while the racemod still *reported* a pointer — every Warfork PB
+minted a permanent 404, and `rs_record_demos 0` was the stopgap that turned both
+halves off. The real fix is in: the whole per-client race-demo subsystem is
+vendored from racemod_2.1 as `warfork/enginepatches/sv_racedemos.c`, its call
+sites wired by `patch-racedemo-subsystem.py`, and the three natives bound by
+`patch-racedemo-natives.py`. The script stubs are gone and `rs_record_demos` is
+back to 1.
+
+Two things differ from Warsow and are easy to trip over:
+
+- **The extension is `.wfdz22`, not `.wdz20`** (`APP_DEMO_EXTENSION_STR`). The
+  engine appends it itself, but `RACE_DemoRelPath` has to put the same one in the
+  path it reports or the link 404s — hence the `rs_demo_ext` cvar, set by
+  `warfork/entrypoint.sh`. The web's `validDemoPath` accepts both.
+- **The Warfork container has no `/pakshare` mount** (different compose project),
+  so its demos cannot be copied to the served tree from inside the container the
+  way Warsow's are. `sync-demos.sh` detects this and relays the missing files
+  through the host with `docker cp`, diffing the two listings first so it moves
+  only what is new.
 
 ## In-game demo commands (2026-09-15)
 

@@ -1641,17 +1641,22 @@ function sanitizeRecord(r) {
   };
 }
 
-// A WR demo path is a relative "<map>/<file>.wdz20" the game host serves. It
+// A WR demo path is a relative "<map>/<file><ext>" the game host serves. It
 // becomes part of a download URL, so validate hard against path traversal:
 // no "..", no backslash, no leading slash, exactly one segment separator, a
-// .wdz20 extension, and only a URL-safe charset. The mod already restricts the
-// player-name fragment to [A-Za-z0-9_-] (hrace/demos.as RACE_DemoCleanName),
+// known demo extension, and only a URL-safe charset. The mod already restricts
+// the player-name fragment to [A-Za-z0-9_-] (hrace/demos.as RACE_DemoCleanName),
 // so this stays a tight allowlist rather than mirroring the engine's looser set.
+//
+// The extension is per-GAME, not per-server: APP_DEMO_EXTENSION_STR is .wdz20 on
+// Warsow 2.1.2 and .wfdz22 on Warfork 2.15. Both are accepted because both kinds
+// of node report here (hrace/demos.as picks one via rs_demo_ext).
 const DEMO_SEG = /^[A-Za-z0-9_.-]+$/;
+const DEMO_EXT_RE = /\.(wdz20|wfdz22)$/;
 function validDemoPath(p) {
   if (typeof p !== "string" || p.length === 0 || p.length > 256) return false;
   if (p.includes("..") || p.includes("\\") || p.startsWith("/")) return false;
-  if (!/\.wdz20$/.test(p)) return false;
+  if (!DEMO_EXT_RE.test(p)) return false;
   const parts = p.split("/");
   return parts.length === 2 && parts.every((s) => DEMO_SEG.test(s));
 }

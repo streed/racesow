@@ -221,6 +221,22 @@ test("per-player: a different player's slower run is stored as their own PB", as
   assert.equal(detail.wr.ghost.time, 12000, "WR ghost stays the fastest recorded run");
 });
 
+// Warfork's APP_DEMO_EXTENSION_STR is .wfdz22, not Warsow's .wdz20, and both
+// kinds of node report into the same ingest — so the path allowlist has to take
+// either. Before the Warfork race-demo subsystem existed this could not happen;
+// now a Warfork PB reports a .wfdz22 pointer and it must be accepted.
+test("a Warfork .wfdz22 demo path is accepted", async () => {
+  const res = await ingest(
+    JSON.stringify({
+      version: "wf 2.15",
+      map: "wfdemomap",
+      source: "wr_demo",
+      wr_demo: { name: "WfRunner", login: "", time: 9000, demo: "wfdemomap/wfdemomap_WfRunner_00-09-000.wfdz22", bytes: 4242 },
+    })
+  );
+  assert.equal(res.status, 200);
+});
+
 test("invalid demo paths and ghosts are rejected", async () => {
   const bad = (demo) =>
     ingest(
@@ -231,6 +247,10 @@ test("invalid demo paths and ghosts are rejected", async () => {
   assert.equal((await bad("no_subdir.wdz20")).status, 400);
   assert.equal((await bad("map/file.txt")).status, 400);
   assert.equal((await bad("map/a\\b.wdz20")).status, 400);
+  // A near-miss on the extension is still a reject, so widening the allowlist
+  // to Warfork's did not turn it into "any suffix goes".
+  assert.equal((await bad("map/file.wdz21")).status, 400);
+  assert.equal((await bad("map/file.wfdz2")).status, 400);
 
   // Ghost with a wrong-arity frame is rejected.
   const badGhost = JSON.stringify({

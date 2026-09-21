@@ -151,9 +151,12 @@ export function msToDemoTime(ms) {
   return `${pad(m, 2)}-${pad(s, 2)}-${pad(ms, 3)}`;
 }
 
-// The two-segment served path the web stores + validates.
-export function demoRelPath(map, name, timeMs) {
-  return `${map}/${map}_${cleanDemoName(name)}_${msToDemoTime(timeMs)}.wdz20`;
+// The two-segment served path the web stores + validates. The extension is
+// per-GAME (APP_DEMO_EXTENSION_STR): .wdz20 on Warsow, .wfdz22 on Warfork, so a
+// caller importing a Warfork demo has to say so or the link will not resolve.
+export const DEMO_EXT_RE = /\.(wdz20|wfdz22)$/i;
+export function demoRelPath(map, name, timeMs, ext = ".wdz20") {
+  return `${map}/${map}_${cleanDemoName(name)}_${msToDemoTime(timeMs)}${ext}`;
 }
 
 // Fallback map extraction: the worldmodel configstring `cs 30 "maps/<map>.bsp"`.
@@ -189,8 +192,10 @@ export async function parseDemoMeta(path) {
     timeMs,
     gametype: (meta.gametype || "").trim(),
     // The canonical served path/name a server-recorded demo of this run would
-    // have — what the ingest stores and the file is promoted to.
-    relPath: demoRelPath(map, name, timeMs),
+    // have — what the ingest stores and the file is promoted to. The extension
+    // comes from the file in hand so a Warfork .wfdz22 keeps its own, rather
+    // than being promoted to a .wdz20 name nothing will serve.
+    relPath: demoRelPath(map, name, timeMs, (DEMO_EXT_RE.exec(path) || [".wdz20"])[0].toLowerCase()),
   };
 }
 

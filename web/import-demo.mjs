@@ -63,7 +63,7 @@ const DEMO_SEG = /^[A-Za-z0-9_.-]+$/;
 function validDemoPath(p) {
   if (typeof p !== "string" || p.length === 0 || p.length > 256) return false;
   if (p.includes("..") || p.includes("\\") || p.startsWith("/")) return false;
-  if (!/\.wdz20$/.test(p)) return false;
+  if (!/\.(wdz20|wfdz22)$/.test(p)) return false;
   const parts = p.split("/");
   return parts.length === 2 && parts.every((s) => DEMO_SEG.test(s));
 }
@@ -88,7 +88,10 @@ function msToDemoTime(ms) {
   const s = Math.floor(ms / 1000); ms -= s * 1000;
   return `${pad(m, 2)}-${pad(s, 2)}-${pad(ms, 3)}`;
 }
-const demoRelPath = (map, name, timeMs) => `${map}/${map}_${cleanDemoName(name)}_${msToDemoTime(timeMs)}.wdz20`;
+// Extension is per-GAME: .wdz20 on Warsow, .wfdz22 on Warfork. Take it from the
+// file being imported so the pointer matches what actually gets served.
+const demoRelPath = (map, name, timeMs, ext = ".wdz20") =>
+  `${map}/${map}_${cleanDemoName(name)}_${msToDemoTime(timeMs)}${ext}`;
 
 // The demo names the engine's game directory, not the leaderboard's version
 // label, so map one onto the other. Overridable with --version because a future
@@ -338,7 +341,9 @@ async function main() {
     if (!Number.isInteger(strafeBp) || strafeBp < 0) strafeBp = null;
     else strafeBp = Math.min(strafeBp, MAX_STRAFE_QUALITY);
 
-    const relPath = opts["demo-path"] || demoRelPath(replay.map, run.player, run.timeMs);
+    const relPath = opts["demo-path"]
+      || demoRelPath(replay.map, run.player, run.timeMs,
+                     (/\.(wdz20|wfdz22)$/i.exec(file) || [".wdz20"])[0].toLowerCase());
     if (!flags.has("no-demo-pointer") && !validDemoPath(relPath))
       throw new Error(`demo path ${JSON.stringify(relPath)} would be rejected by the site`);
 

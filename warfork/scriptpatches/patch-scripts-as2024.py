@@ -17,14 +17,11 @@ Transforms (each idempotent; run over a COPY of progs/, never the repo source):
     accuracy.as / player.as / entityfinder.as. Safe: the racemod defines no
     custom `length`/`size` fields (verified), and `.length()` calls are skipped.
 
- 2. Stub the per-client demo-capture calls.
-    `client.demoStart/demoStop/demoCancel` are DenMSC-SDK Client methods Warsow
-    inherits from its game module; Warfork's Client type has none ("No matching
-    symbol 'demoStart'"). These drive the .wd WR-replay capture only — the ghost
-    trajectory replay (RS_Ghost* natives) is independent and unaffected, and the
-    RS_ApiReportWrDemo native already skips an empty/missing demo path. So we
-    neutralize the 6 call statements to unblock compile; real per-client demo
-    recording on Warfork is a follow-up (register the 3 Client natives).
+This script USED to also stub out `client.demoStart/demoStop/demoCancel`, which
+Warfork's Client type did not have. It does now: the race-demo subsystem is
+vendored into the engine as server/sv_racedemos.c and the three natives are
+bound by warfork/enginepatches/patch-racedemo-natives.py, so the calls compile
+and record for real. Nothing to neutralize any more.
 
 Usage:  patch-scripts-as2024.py <progs-dir>
 """
@@ -43,24 +40,18 @@ def main(progs):
 
     # 1. `.length` (not already a call) -> `.length()`
     length_re = re.compile(r"\.length\b(?!\s*\()")
-    # 2. `<expr>.demo{Start,Stop,Cancel}( ... );`  (single-statement, no ';' in args)
-    demo_re = re.compile(r"[A-Za-z_][\w.]*\.demo(?:Start|Stop|Cancel)\s*\([^;]*\)\s*;")
 
-    n_len = n_demo = 0
+    n_len = 0
     for path in as_files:
         with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
             src = f.read()
         src, c1 = length_re.subn(".length()", src)
-        # Replace with an empty BLOCK, not a bare `;`: several calls are the sole
-        # unbraced body of an if/else, where `;` raises "If/Else with empty statement".
-        src, c2 = demo_re.subn("{ /* warfork: demo capture stubbed (Client demo methods absent) */ }", src)
         n_len += c1
-        n_demo += c2
-        if c1 or c2:
+        if c1:
             with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
                 f.write(src)
 
-    print("patch-scripts-as2024.py: .length->.length() x%d, demo stubs x%d" % (n_len, n_demo))
+    print("patch-scripts-as2024.py: .length->.length() x%d" % n_len)
     # Guard: we expected to find both (a no-op run means the copy was wrong or the
     # scripts changed shape -- fail so the build doesn't silently ship unpatched).
     if n_len == 0:

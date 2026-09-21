@@ -12,6 +12,12 @@
 // never blocks. Everything no-ops when its URL cvar is empty.
 
 Cvar rsRecordDemos( "rs_record_demos", "1", 0 );
+// The engine's demo extension, which is per-GAME, not per-server: Warsow writes
+// .wdz20 and Warfork .wfdz22 (APP_DEMO_EXTENSION_STR). The engine appends it
+// itself, so this is only needed to reconstruct the path we REPORT to the web -
+// get it wrong and every download link 404s. Set by warfork/entrypoint.sh on the
+// Warfork boxes; the default is the Warsow one.
+Cvar rsDemoExt( "rs_demo_ext", ".wdz20", 0 );
 // POST target for ghost uploads (INGEST_URL/api/ingest/ghost); set by
 // entrypoint.sh. Empty = ghost upload disabled.
 Cvar rsApiGhostUrl( "rs_api_ghost_url", "", 0 );
@@ -83,13 +89,14 @@ String RACE_DemoTimeString( uint millis )
 }
 
 // The demo path RELATIVE TO the served demos/ dir. The engine writes to
-// demos/server/<map>/<map>_<clean>_<MM-SS-mmm>.wdz20; entrypoint.sh exports
+// demos/server/<map>/<map>_<clean>_<MM-SS-mmm><ext>; entrypoint.sh exports
 // demos/server/* to the pak-mirror's demos/ root, so the web-visible path is
-// "<map>/<map>_<clean>_<MM-SS-mmm>.wdz20" (two segments — matches the web's
-// validDemoPath check).
+// "<map>/<map>_<clean>_<MM-SS-mmm><ext>" (two segments — matches the web's
+// validDemoPath check). <ext> is rs_demo_ext: .wdz20 on Warsow, .wfdz22 on
+// Warfork.
 String RACE_DemoRelPath( const String &in map, Client@ client, uint timeMs )
 {
-    return map + "/" + map + "_" + RACE_DemoName( client ) + "_" + RACE_DemoTimeString( timeMs ) + ".wdz20";
+    return map + "/" + map + "_" + RACE_DemoName( client ) + "_" + RACE_DemoTimeString( timeMs ) + rsDemoExt.string;
 }
 
 // Tell the web a new WR on this map has a downloadable demo (source "wr_demo").

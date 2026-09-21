@@ -90,6 +90,15 @@ COPY warfork/enginepatches/patch-brushmodel-nonfatal.py /tmp/patch-brushmodel-no
 # each command across all four nodes. The shared script detects which of the two
 # source shapes it is looking at and applies the matching anchors.
 COPY server/enginepatches/patch-demolist-split.py /tmp/patch-demolist-split.py
+# Per-client RACE demos. Warfork's sv_demos.c only knows SERVER demos, so a
+# player's personal-best run was never recorded and the three Client demo
+# natives the gametype calls did not exist (the scripts had to be stubbed). The
+# subsystem is vendored as its own translation unit next to sv_demos.c — the
+# server/ CMakeLists globs "*.c", so no build-file change is needed — and the
+# two patches below wire up its call sites and its AngelScript bindings.
+COPY warfork/enginepatches/sv_racedemos.c source/server/sv_racedemos.c
+COPY warfork/enginepatches/patch-racedemo-subsystem.py /tmp/patch-racedemo-subsystem.py
+COPY warfork/enginepatches/patch-racedemo-natives.py   /tmp/patch-racedemo-natives.py
 RUN cd source \
     && python3 /tmp/patch-api-natives.py \
     && python3 /tmp/patch-mirror-natives.py \
@@ -101,6 +110,12 @@ RUN cd source \
     && python3 /tmp/patch-demolist-split.py \
     && grep -q 'racesow-docker: demolist split' server/sv_demos.c \
     && grep -q 'racedemolist' server/sv_client.c \
+    && python3 /tmp/patch-racedemo-subsystem.py \
+    && python3 /tmp/patch-racedemo-natives.py \
+    && grep -q 'race_demos'        server/server.h \
+    && grep -q 'SV_RaceDemo_WriteSnap' server/sv_main.c \
+    && grep -q 'racerecordpurge'   server/sv_ccmds.c \
+    && grep -q 'objectGameClient_DemoStart' game/g_ascript.cpp \
     && grep -q 'entity disabled'          game/g_clip.cpp \
     && ! grep -q 'G_Error( "GClip_SetBrushModel' game/g_clip.cpp \
     && grep -q 'asFunc_RS_ApiReportRace'  game/g_ascript.cpp \
