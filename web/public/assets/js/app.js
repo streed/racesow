@@ -1950,6 +1950,15 @@ const ABOUT_CMDS = [
     ],
   },
   {
+    title: "Saved runs & recordings",
+    rows: [
+      ["/racedemolist [start#]", "List the saved runs for the map you're on — one demo per player, their personal best, each numbered. A long list starts at the newest; pass a number to page back through it."],
+      ["/racedemoget <#>", "Download one of those runs by its number, so you can watch it back."],
+      ["/demolist [start#]", "List this server's own recordings instead: a whole session with everyone on the server in it, rather than one player's run."],
+      ["/demoget <#>", "Download one of those by its number."],
+    ],
+  },
+  {
     title: "Reverse mode",
     note: "Race the map backwards. Cross the FINISH line to start your timer, run the checkpoints in reverse, and cross the START line to finish. Prejump rules still apply. Your time is saved on a separate “<map>-reversed” leaderboard (shown with a REVERSE badge on this site) and never mixes with the normal times.",
     rows: [

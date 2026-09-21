@@ -220,6 +220,15 @@ RUN python3 /tmp/patch-status-hide-bots.py \
 COPY enginepatches/patch-motd-live.py /tmp/patch-motd-live.py
 RUN python3 /tmp/patch-motd-live.py \
     && grep -q "racesow-docker: live MOTD" server/sv_motd.c
+# demolist split: racemod_2.1 repointed demolist/demoget at demos/server/<map>,
+# which orphaned every SERVER autorecord sitting at the demos/server root (no
+# in-game command could list or fetch them). Put those back on demolist/demoget
+# - the stock meaning, and what Warfork already does - and give the per-map
+# race demos their own racedemolist/racedemoget.
+COPY enginepatches/patch-demolist-split.py /tmp/patch-demolist-split.py
+RUN python3 /tmp/patch-demolist-split.py \
+    && grep -q "racesow-docker: demolist split" server/sv_demos.c \
+    && grep -q "racedemolist" server/sv_client.c
 RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=OFF -DCMAKE_BUILD_TYPE=Release . \
     && make wsw_server -j"$(nproc)" \
     && cp build/wsw_server.x86_64 /wsw_server.x86_64 \

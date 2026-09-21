@@ -44,6 +44,32 @@ Warfork PB minted a permanent 404. `warfork/entrypoint.sh` now sets
 Flip it back to 1 when the three Client demo natives get registered in the
 Warfork game module (that remains the real fix — see Open risks).
 
+## In-game demo commands (2026-09-15)
+
+`demolist` and `demoget` are ENGINE commands (`sv_client.c` -> `sv_demos.c`), not
+racemod ones — nothing in this repo registers them, which is why grepping for
+them finds nothing.
+
+They had drifted apart across the two games. racemod_2.1 repointed both at
+`demos/server/<current map>` — the per-player race demos — which quietly orphaned
+the SERVER autorecords sitting at the `demos/server` root: 200 files on EU that no
+in-game command could list or fetch. Warfork never took that change, so there the
+same command still meant the root. One name, two meanings, depending which of the
+four nodes you were standing on.
+
+`server/enginepatches/patch-demolist-split.py` (shared by both Dockerfiles; it
+detects which of the two source shapes it is looking at) settles it:
+
+| command | lists | contents |
+|---|---|---|
+| `demolist` / `demoget <#>` | `demos/server` | server autorecords — a whole session, everyone on the server in it |
+| `racedemolist` / `racedemoget <#>` | `demos/server/<map>` | per-player race demos — one per player, their PB |
+
+Both pairs share one body: each is a thin wrapper over a `_Dir` helper taking the
+folder. `racedemoget` answers with the same client-side `demoget "<path>"` verb as
+`demoget`, so stock clients download it with no client change — only the
+server-side command name is new. `/help demolist` documents both.
+
 **Ongoing:** `scripts/sync-demos.sh` (systemd `racesow-demo-sync.timer`, every
 10 min on BOTH boxes) mirrors each box's freshly recorded demos into its pak
 share — `export_pakshare` otherwise only runs at container launch, so a new PB

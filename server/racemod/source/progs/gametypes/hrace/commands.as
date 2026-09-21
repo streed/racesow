@@ -765,6 +765,12 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         cmdlist.addCell( "/cps" );
         cmdlist.addCell( "Shows your per-checkpoint splits vs your PB and the server record." );
 
+        cmdlist.addCell( "/racedemolist, /racedemoget <#>" );
+        cmdlist.addCell( "List the players' saved runs on this map and download one. /help racedemolist" );
+
+        cmdlist.addCell( "/demolist, /demoget <#>" );
+        cmdlist.addCell( "List this server's own match recordings and download one." );
+
         cmdlist.addCell( "/maplist" );
         cmdlist.addCell( "Lets you search available maps." );
 
@@ -1007,6 +1013,19 @@ bool Cmd_Help( Client@ client, const String &cmdString, const String &argsString
         client.printMessage( S_COLOR_YELLOW + "/top <map>" + "\n" );
         client.printMessage( S_COLOR_WHITE + "- Shows a list of the top record times for the current map (or the given map) along with the names and time" + "\n" );
         client.printMessage( S_COLOR_WHITE + "  difference compared to the number 1 time. To see all lists visit: " + race_toplists.string + "." + "\n" );
+    }
+    else if ( command == "demolist" || command == "demoget"
+              || command == "racedemolist" || command == "racedemoget" )
+    {
+        client.printMessage( S_COLOR_YELLOW + "/racedemolist [start#]" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Lists the saved runs for the map you are on: one demo per player, their" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  personal best. Every entry is numbered." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/racedemoget <#>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- Downloads one of them by its number, so you can watch it back." + "\n" );
+        client.printMessage( S_COLOR_YELLOW + "/demolist [start#] and /demoget <#>" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- The same pair for this server's OWN recordings: a whole session with everyone" + "\n" );
+        client.printMessage( S_COLOR_WHITE + "  on the server in it, rather than a single player's run." + "\n" );
+        client.printMessage( S_COLOR_WHITE + "- A long list starts at the newest; pass a number to page back through it." + "\n" );
     }
     else if ( command == "maplist" )
     {

@@ -84,6 +84,12 @@ COPY server/enginepatches/patch-quiet-fakeclient-connect.py /tmp/patch-quiet-fak
 # racemod_2.1; this is the Warfork half. WARFORK-ONLY, so it lives in
 # warfork/enginepatches rather than the shared server/ set.
 COPY warfork/enginepatches/patch-brushmodel-nonfatal.py /tmp/patch-brushmodel-nonfatal.py
+# demolist split. Warfork's demolist/demoget already read the demos/server root
+# (it never took racemod_2.1's per-map repoint), so here the patch only ADDS
+# racedemolist/racedemoget for the per-map race demos — keeping one meaning for
+# each command across all four nodes. The shared script detects which of the two
+# source shapes it is looking at and applies the matching anchors.
+COPY server/enginepatches/patch-demolist-split.py /tmp/patch-demolist-split.py
 RUN cd source \
     && python3 /tmp/patch-api-natives.py \
     && python3 /tmp/patch-mirror-natives.py \
@@ -92,6 +98,9 @@ RUN cd source \
     && python3 /tmp/patch-motd-live.py \
     && python3 /tmp/patch-quiet-fakeclient-connect.py \
     && python3 /tmp/patch-brushmodel-nonfatal.py \
+    && python3 /tmp/patch-demolist-split.py \
+    && grep -q 'racesow-docker: demolist split' server/sv_demos.c \
+    && grep -q 'racedemolist' server/sv_client.c \
     && grep -q 'entity disabled'          game/g_clip.cpp \
     && ! grep -q 'G_Error( "GClip_SetBrushModel' game/g_clip.cpp \
     && grep -q 'asFunc_RS_ApiReportRace'  game/g_ascript.cpp \
