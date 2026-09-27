@@ -18,6 +18,11 @@ field be checked against physics.py before anything is compiled.
       ]
     }
 
+A 180-degree turn may carry "shortcut": true: an optional, hard route across
+the inside of the U on small stepping stones (layout._shortcut). It needs a
+straight of at least SHORTCUT_MIN_LEG on both sides, because the windows are
+cut into those two straights' walls.
+
 The start room, start timer, finish timer and finish room are implicit: every
 course has exactly one of each, so the model is never asked to place them and
 can never forget them.
@@ -42,6 +47,7 @@ RAMP_MIN, RAMP_MAX = 128, 2048
 TURN_RADIUS_MAX = 2048
 GAP_MIN = 32
 DROP_MAX = 512
+SHORTCUT_MIN_LEG = 320   # layout.SHORTCUT_BACK + window/2 + footing; kept in step by a test
 
 # The JSON Schema handed to the model as its structured-output format. It is
 # deliberately flat — every segment carries every field, irrelevant ones set
@@ -58,8 +64,9 @@ SEGMENT_SCHEMA = {
         "radius": {"type": "integer"},
         "rise": {"type": "integer"},
         "drop": {"type": "integer"},
+        "shortcut": {"type": "boolean"},
     },
-    "required": ["type", "length", "direction", "angle", "radius", "rise", "drop"],
+    "required": ["type", "length", "direction", "angle", "radius", "rise", "drop", "shortcut"],
     "additionalProperties": False,
 }
 
@@ -86,7 +93,7 @@ def normalize(spec):
     stored spec reads the way a human would write it."""
     keep = {
         "straight": ("length",),
-        "turn": ("direction", "angle", "radius"),
+        "turn": ("direction", "angle", "radius", "shortcut"),
         "ramp": ("length", "rise"),
         "gap": ("length", "drop"),
         "checkpoint": (),
@@ -99,6 +106,8 @@ def normalize(spec):
         for k in keep.get(t, ()):
             if k in seg:
                 clean[k] = seg[k]
+        if clean.get("shortcut") is False:
+            del clean["shortcut"]   # the default; keep stored specs short
         out["segments"].append(clean)
     return out
 
@@ -152,6 +161,16 @@ def validate(spec):
             if seg.get("angle") not in TURN_ANGLES:
                 errs.append(f"{where}: angle {seg.get('angle')!r} must be one of {TURN_ANGLES}")
             num("radius", turn_radius_min(width), TURN_RADIUS_MAX)
+            if seg.get("shortcut"):
+                if seg.get("angle") != 180:
+                    errs.append(f"{where}: a shortcut needs a 180-degree turn, not {seg.get('angle')!r}")
+                for j, side in ((i - 1, "before"), (i + 1, "after")):
+                    nb = segs[j] if 0 <= j < len(segs) else None
+                    if (not isinstance(nb, dict) or nb.get("type") != "straight"
+                            or not isinstance(nb.get("length"), (int, float))
+                            or nb["length"] < SHORTCUT_MIN_LEG):
+                        errs.append(f"{where}: a shortcut needs a straight of at least "
+                                    f"{SHORTCUT_MIN_LEG} directly {side} the turn")
         elif t == "ramp":
             length = num("length", RAMP_MIN, RAMP_MAX)
             rise = num("rise", -1024, 1024)

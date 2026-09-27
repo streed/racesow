@@ -25,9 +25,17 @@ client loads the copies in turn with bound `map` commands. Nothing about the
 real map is changed, and the copies are deleted afterwards.
 
 Views come from the course itself (layout.Course.landmarks): the start, every
-gap and checkpoint, and the finish. Pass --views to use your own
+gap, checkpoint and shortcut, and the finish. Pass --views to use your own
 [[name, [x, y, z], yaw], ...] instead; z only needs to be above the floor you
 want to stand on.
+
+OVERVIEW (--overview). Level views cannot show a course from above, so the
+overview recompiles the map with invisible camera pads high over it
+(layout._camera_pads; the sky shell grows to contain them). It then drops the
+spectator onto a pad and tilts the view down by holding +lookdown for
+pitch / cl_pitchspeed seconds, since that is the one control over pitch a
+client has. It needs q3map2 as well as the client. Each overview view runs in
+its own client session, so no pitch carries over from one to the next.
 """
 
 import argparse
@@ -66,15 +74,53 @@ def auto_views(course):
         views.append([name, [round(x), round(y), round(pos[2] + 32)], round(heading) % 360])
 
     counts = {}
+    width = course.spec["width"]
     for kind, pos, heading in course.landmarks:
         counts[kind] = counts.get(kind, 0) + 1
         if kind == "start":
             behind(pos, heading, layout.ROOM_LEN - layout.SPAWN_BACK, "start")
         elif kind == "stop":
             behind(pos, heading, 448, "finish")
+        elif kind == "shortcut":
+            # From the far side of the corridor, looking out of the window
+            # along the line of stepping stones.
+            behind(pos, heading, width - 48, f"shortcut{counts[kind]}")
         else:
             behind(pos, heading, 448, f"{kind}{counts[kind]}")
     return views[:len(KEYS)]
+
+
+# The client's field of view (cg_fov 100 across) at 16:9: half-angles used to
+# fit the course in frame, with some room to spare.
+HALF_FOV_X = math.radians(50)
+HALF_FOV_Y = math.atan(math.tan(HALF_FOV_X) * 9 / 16)
+PITCH_SPEED = 30.0   # cl_pitchspeed while tilting, degrees per second
+
+
+def overview_views(course):
+    """Two views from the air: straight down, and a three-quarter look from
+    beyond the start side. Each is [name, pad (x, y, z), yaw, pitch]."""
+    xs = [x for poly, _ in course.floor_polys for x, _ in poly]
+    ys = [y for poly, _ in course.floor_polys for _, y in poly]
+    zs = [z for _, _, z in course.route]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    cx, cy, top = (x0 + x1) / 2, (y0 + y1) / 2, max(zs)
+    ex, ey = x1 - x0, y1 - y0
+    # Put the course's long axis across the screen. Looking down with yaw
+    # 90, screen-up is +Y and screen-across is X.
+    yaw = 90 if ex >= ey else 0
+    across, along = (ex, ey) if yaw == 90 else (ey, ex)
+    h = 1.15 * max(across / 2 / math.tan(HALF_FOV_X), along / 2 / math.tan(HALF_FOV_Y))
+    views = [["overview_top", [round(cx), round(cy), round(top + h)], yaw, 89]]
+    # Three-quarter: back off from the centre along -screen-up and rise so
+    # the centre sits in the middle of a 40-degree downward look.
+    pitch = 40
+    back = 0.55 * along + 0.6 * across
+    bx = cx - math.cos(math.radians(yaw)) * back
+    by = cy - math.sin(math.radians(yaw)) * back
+    views.append(["overview_angle", [round(bx), round(by), round(top + back * math.tan(math.radians(pitch)))],
+                  yaw, pitch])
+    return views
 
 
 def tga_to_png(tga_path, png_path):
@@ -112,7 +158,8 @@ def stage_views(pk3_path, views, basewsw):
         if f.startswith(PREFIX):
             os.remove(os.path.join(basewsw, f))
     names = []
-    for i, (_, (x, y, z), yaw) in enumerate(views):
+    for i, view in enumerate(views):
+        _, (x, y, z), yaw = view[:3]
         b = Bsp(bsp_bytes)
         lump = EntityLump(b.entity_text())
         spawns = [e for e in lump.entities if e.classname == "info_player_deathmatch"]
@@ -143,7 +190,7 @@ def run(pk3_path, views, warsow, out, width=1280, height=720, display=":77", log
     console = os.path.join(udir, "console.log")
 
     cfg = ["set cg_draw2D 0", "set cg_gun 0", "set r_screenshot_jpeg 0", "set cg_fov 100",
-           'bind KP_ENTER "screenshot"']
+           f"set cl_pitchspeed {PITCH_SPEED:g}", 'bind KP_ENTER "screenshot"', 'bind l "+lookdown"']
     cfg += [f'bind {k} "map {n}"' for k, n in zip(KEYS, names)]
     with open(os.path.join(udir, "mapgen_views.cfg"), "w") as fh:
         fh.write("\n".join(cfg) + "\n")
@@ -191,6 +238,11 @@ def run(pk3_path, views, warsow, out, width=1280, height=720, display=":77", log
             if i:
                 key(KEYS[i])
                 loaded(i + 1)
+            if len(view) > 3 and view[3]:
+                subprocess.run(["xdotool", "keydown", "l"], env=env)
+                time.sleep(view[3] / PITCH_SPEED)
+                subprocess.run(["xdotool", "keyup", "l"], env=env)
+                time.sleep(2)
             before = text().count("Wrote ")
             key("KP_Enter")
             t0 = time.time()
@@ -219,6 +271,31 @@ def run(pk3_path, views, warsow, out, width=1280, height=720, display=":77", log
     return written
 
 
+def overview(spec, warsow, out, q3map2=None, width=1280, height=720, log=print):
+    """Compile a camera-pad variant of the map and film it from above."""
+    import build as buildmod
+
+    course = layout.build(spec)
+    views = overview_views(course)
+    pads = [(x, y, z - 40) for _, (x, y, z), _, _ in views]
+    for v in views:           # the spawn goes a little above its pad and drops onto it
+        v[1][2] += 8
+    tmp = tempfile.mkdtemp(prefix="mapgen-overview-")
+    try:
+        pk3, _ = buildmod.build(spec, tmp, q3map2=q3map2, camera_pads=pads)
+        written = []
+        for i, v in enumerate(views):
+            shots = run(pk3, [v], warsow, tmp + f"/shot{i}", width, height, log=lambda m: None)
+            dst = os.path.join(out, f"{v[0]}.png")
+            os.makedirs(out, exist_ok=True)
+            shutil.move(shots[0], dst)
+            written.append(dst)
+            log(f"wrote {dst}")
+        return written
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("pk3")
@@ -227,6 +304,9 @@ def main(argv=None):
     p.add_argument("--warsow", required=True, help="Warsow 2.1.2 client directory")
     p.add_argument("--out", required=True)
     p.add_argument("--size", default="1280x720")
+    p.add_argument("--overview", action="store_true",
+                   help="also film the course from above (needs --spec and q3map2)")
+    p.add_argument("--q3map2", help="for --overview (default: $Q3MAP2, then PATH)")
     args = p.parse_args(argv)
     if args.views:
         with open(args.views) as fh:
@@ -238,6 +318,11 @@ def main(argv=None):
         p.error("pass --spec or --views")
     w, h = (int(v) for v in args.size.split("x"))
     run(args.pk3, views, args.warsow, args.out, w, h)
+    if args.overview:
+        if not args.spec:
+            p.error("--overview needs --spec")
+        with open(args.spec) as fh:
+            overview(json.load(fh), args.warsow, args.out, args.q3map2, w, h)
     return 0
 
 

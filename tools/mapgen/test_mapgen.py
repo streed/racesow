@@ -133,6 +133,49 @@ class Layout(unittest.TestCase):
                {"type": "turn", "direction": "left", "angle": 180, "radius": 512}]
         layout.build(course_of({"type": "straight", "length": 512}, *lap, *lap))
 
+    def s_course(self, radius=768, leg=1024, angle=180):
+        return course_of({"type": "straight", "length": leg},
+                         {"type": "turn", "direction": "left", "angle": angle, "radius": radius,
+                          "shortcut": True},
+                         {"type": "straight", "length": leg},
+                         {"type": "turn", "direction": "right", "angle": angle, "radius": radius,
+                          "shortcut": True},
+                         {"type": "straight", "length": leg})
+
+    def test_shortcut_stones_are_clearable_and_fill_the_span(self):
+        c = layout.build(self.s_course())
+        self.assertEqual(len(c.shortcuts), 2)
+        for sc in c.shortcuts:
+            self.assertEqual(sc["span"], 2 * 768 - 384)
+            self.assertLessEqual(sc["gap"], physics.max_gap(0))
+            # "Precise": the gaps are near the limit, not a stroll.
+            self.assertGreater(sc["gap"], 0.8 * physics.max_gap(0))
+            # Stones + gaps fill the span (the reported gap is rounded).
+            filled = sc["platforms"] * layout.SHORTCUT_PLATFORM + (sc["platforms"] + 1) * sc["gap"]
+            self.assertLessEqual(abs(filled - sc["span"]), sc["platforms"] + 1)
+            self.assertGreater(sc["saves"], 1000)
+        self.assertEqual([k for k, _, _ in c.landmarks].count("shortcut"), 2)
+
+    def test_shortcut_cuts_a_window_in_both_legs(self):
+        # 5 segments: 3 straights x 2 walls, 2 windows per shortcut x 2 = 4 extra pieces.
+        plain = layout.build(course_of({"type": "straight", "length": 1024}))
+        c = layout.build(self.s_course())
+        walls = [p for p in c.world if p.tex == "wall"]
+        stones = [p for p in c.world if p.tex == "platform"]
+        self.assertEqual(len(stones), sum(s["platforms"] for s in c.shortcuts))
+        # Every stone sits in the open inside a U: none touches a wall.
+        for st in stones:
+            for w in walls:
+                if st.zmax() > w.zmin and w.zmax() > st.zmin:
+                    self.assertFalse(layout._sat_overlap(st.poly, w.poly), "stone inside a wall")
+        self.assertGreater(len(walls), len([p for p in plain.world if p.tex == "wall"]))
+
+    def test_shortcut_rules(self):
+        self.assertTrue(any("180-degree" in e for e in specmod.validate(self.s_course(angle=90))))
+        self.assertTrue(any("straight of at least" in e
+                            for e in specmod.validate(self.s_course(leg=200))))
+        self.assertEqual(specmod.SHORTCUT_MIN_LEG, layout.SHORTCUT_MIN_LEG)
+
     def test_preview_is_svg(self):
         svg = layout.preview_svg(layout.build(example()))
         self.assertTrue(svg.startswith("<svg") and svg.rstrip().endswith("</svg>"))
@@ -191,7 +234,7 @@ class FakeClient:
 def flat(spec):
     out = dict(spec)
     out["segments"] = [dict({"length": 0, "direction": "none", "angle": 0, "radius": 0,
-                             "rise": 0, "drop": 0}, **s) for s in spec["segments"]]
+                             "rise": 0, "drop": 0, "shortcut": False}, **s) for s in spec["segments"]]
     return out
 
 

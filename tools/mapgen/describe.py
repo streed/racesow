@@ -38,10 +38,12 @@ Top-level fields:
   title  a short human title
   width  corridor width, {specmod.WIDTH_MIN}-{specmod.WIDTH_MAX}. 384 is a good default; wider suits strafing.
 
-Segment types (every segment carries every field; set unused ones to 0 / "none"):
+Segment types (every segment carries every field; set unused ones to 0 / "none" /
+false):
   straight   length {specmod.STRAIGHT_MIN}-{specmod.STRAIGHT_MAX}
   turn       direction left|right, angle one of {list(specmod.TURN_ANGLES)},
-             radius (centre line) >= width/2 + 64 and <= {specmod.TURN_RADIUS_MAX}
+             radius (centre line) >= width/2 + 64 and <= {specmod.TURN_RADIUS_MAX},
+             shortcut true|false (see below)
   ramp       length {specmod.RAMP_MIN}-{specmod.RAMP_MAX}, rise (negative = downhill),
              |rise| <= length * 0.577 (30 degrees)
   gap        a pit to jump across. length is lip to lip; drop is how much LOWER the
@@ -51,6 +53,15 @@ Segment types (every segment carries every field; set unused ones to 0 / "none")
              before it (ramps and gaps reset that) and must be followed by a
              straight or turn to land on. Falling in kills the player.
   checkpoint a timing split at that point; use 1-4 spread along longer courses.
+
+Shortcuts: a 180-degree turn may set "shortcut": true. The generator cuts a window
+in the inner wall of the straights on both sides of the U and lays a line of small
+stepping stones across the drop inside it. The gaps are near the limit of what
+a run-speed jump clears, and a fall is death, so it is a precise, optional route
+that skips the whole bend (a bigger radius saves more). The main route around
+the bend stays. It needs a straight of at least {specmod.SHORTCUT_MIN_LEG} directly before
+AND directly after the turn (not a checkpoint, ramp or gap in between). Put
+checkpoints outside the stretch a shortcut skips.
 
 The course must not cross itself: the generator rejects any overlap, so keep an
 eye on where turns send it. Aim for a run of roughly 20-60 seconds at 320 ups

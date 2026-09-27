@@ -30,6 +30,21 @@ SHELL_MARGIN = 512      # sky shell distance from the course bounds
 PIT_DEPTH = 384         # how far below the lowest floor the kill volume sits
 WEDGE_DEG = 11.25       # turn tessellation; 8 wedges per 90 degrees
 
+# Shortcuts across the inside of a 180-degree turn (spec: turn.shortcut).
+# A window is cut in the inner wall of both legs, SHORTCUT_BACK from the turn,
+# and a line of PLATFORM-sized stepping stones crosses the drop between them.
+# The gaps are made as long as physics allows at run speed (physics.max_gap,
+# already carrying its 0.8 margin), times SHORTCUT_GAP_FILL, so the route is
+# precise rather than impossible: 64-unit stones leave 32 units of footing
+# for a 32-unit player, and ground acceleration (pm_accelerate 12,
+# gs_pmove.c:98) reaches 320 ups in ~13 units, so every stone can be taken
+# off from at full run speed without a run-up.
+SHORTCUT_BACK = 192
+SHORTCUT_WINDOW = 96
+SHORTCUT_PLATFORM = 64
+SHORTCUT_GAP_FILL = 0.92
+SHORTCUT_MIN_LEG = SHORTCUT_BACK + SHORTCUT_WINDOW // 2 + 80
+
 TEX = {
     "floor": "mapgen_v1/floor",
     "wall": "mapgen_v1/wall",
@@ -38,6 +53,7 @@ TEX = {
     "checkpoint": "mapgen_v1/checkpoint",
     "edge": "mapgen_v1/edge",
     "trim": "mapgen_v1/trim",
+    "platform": "mapgen_v1/edge",
     "sky": "mapgen_v1/sky",
     "trigger": "mapgen_v1/trigger",
 }
@@ -88,7 +104,8 @@ class Course:
         self.hulls = []
         self.floor_polys = [] # (poly, tex) for the preview
         self.route = []       # centre-line points (x, y, z) for the preview + future bot
-        self.landmarks = []   # (kind, (x, y, z), heading): start, gap, checkpoint, finish
+        self.landmarks = []   # (kind, (x, y, z), heading): start, gap, checkpoint, shortcut, finish
+        self.shortcuts = []   # one dict per turn.shortcut: platforms, gap, distance saved
         self.length = 0.0     # centre-line length, start trigger -> finish trigger
 
 
@@ -118,7 +135,8 @@ def _sat_overlap(a, b, eps=1.0):
 
 
 class _Walker:
-    def __init__(self, spec):
+    def __init__(self, spec, camera_pads=()):
+        self.camera_pads = camera_pads
         self.c = Course(spec)
         self.w = spec["width"]
         self.x = self.y = 0.0
@@ -128,6 +146,8 @@ class _Walker:
         self.problems = []
         self.seg = -1          # index of the segment being laid (-1 = start room)
         self.tn = 0
+        self.walls = {}        # seg -> the frame and world indexes of a straight's walls
+        self.pending = None    # a shortcut turn waiting for the straight after it
 
     # -- frame helpers ------------------------------------------------------
     def frame(self):
@@ -165,15 +185,77 @@ class _Walker:
             poly = _rect(o, f, l, 0, length, half, half)
             self.c.world.append(Prism(poly, lo - FLOOR_THICK, top0, gx, gy, tex, self.heading))
             self.c.floor_polys.append((poly, tex))
+        idx = {}
         for side in (+1, -1):
-            if side > 0:
-                poly = _rect(o, f, l, 0, length, -half, half + WALL_THICK)
-            else:
-                poly = _rect(o, f, l, 0, length, half + WALL_THICK, -half)
-            self.c.world.append(Prism(poly, base, top0 + WALL_HEIGHT, gx, gy, "wall"))
+            idx[side] = len(self.c.world)
+            self.c.world.append(Prism(self._wall_poly(o, f, l, side, 0, length),
+                                      base, top0 + WALL_HEIGHT, gx, gy, "wall"))
+        if rise == 0:
+            self.walls[self.seg] = {"o": o, "f": f, "l": l, "length": length, "idx": idx,
+                                    "base": base, "top": z0 + WALL_HEIGHT}
         self.hull(_rect(o, f, l, 0, length, half + WALL_THICK, half + WALL_THICK),
                   base, max(z0, z0 + rise) + WALL_HEIGHT)
         self.advance(length, rise)
+
+    def _wall_poly(self, o, f, l, side, a, b):
+        """Side wall footprint from a to b along a straight: +1 left, -1 right."""
+        half = self.w / 2.0
+        if side > 0:
+            return _rect(o, f, l, a, b, -half, half + WALL_THICK)
+        return _rect(o, f, l, a, b, half + WALL_THICK, -half)
+
+    def cut_window(self, seg, side, a, b):
+        """Replace a straight's side wall with two pieces, leaving [a, b] open."""
+        w = self.walls[seg]
+        o, f, l, n = w["o"], w["f"], w["l"], w["length"]
+        k = w["idx"][side]
+        self.c.world[k] = Prism.flat(self._wall_poly(o, f, l, side, 0, a), w["base"], w["top"], "wall")
+        self.c.world.append(Prism.flat(self._wall_poly(o, f, l, side, b, n), w["base"], w["top"], "wall"))
+
+    def _shortcut(self, leg_b):
+        """Stepping stones across the inside of the U-turn just laid.
+
+        Both legs are straight (spec.validate insists), parallel, and 2r apart
+        centre to centre. The inside of the U is the drop between their inner
+        floor edges: span = 2r - width. The windows face each other across it.
+        """
+        p = self.pending
+        self.pending = None
+        sign, r = p["sign"], p["radius"]
+        (ax, ay), f, l = p["origin"], p["f"], p["l"]
+        half = self.w / 2.0
+        leg_a = p["turn"] - 1
+        back = SHORTCUT_BACK
+        # Leg A runs toward the turn: its window is `back` before the leg's end.
+        la = self.walls[leg_a]["length"]
+        self.cut_window(leg_a, sign, la - back - SHORTCUT_WINDOW / 2, la - back + SHORTCUT_WINDOW / 2)
+        # Leg B runs away from it: its window is `back` after the leg's start.
+        # The inside of the U is on the same side (left for a left turn) of
+        # both legs, because leg B runs the opposite way.
+        self.cut_window(leg_b, sign, back - SHORTCUT_WINDOW / 2, back + SHORTCUT_WINDOW / 2)
+
+        u = (l[0] * sign, l[1] * sign)                   # across the U, A to B
+        v = (-u[1], u[0])
+        edge = (ax - f[0] * back + u[0] * half, ay - f[1] * back + u[1] * half)
+        span = 2 * r - self.w
+        gmax = physics.max_gap(0) * SHORTCUT_GAP_FILL
+        P = SHORTCUT_PLATFORM
+        n = 0 if span <= gmax else math.ceil((span - gmax) / (P + gmax))
+        gap = (span - n * P) / (n + 1)
+        heading = math.degrees(math.atan2(u[1], u[0])) % 360.0
+        z = p["z"]
+        for i in range(n):
+            d = gap * (i + 1) + P * i + P / 2
+            c = (edge[0] + u[0] * d, edge[1] + u[1] * d)
+            poly = _rect(c, u, v, -P / 2, P / 2, P / 2, P / 2)
+            self.c.world.append(Prism.flat(poly, z - FLOOR_THICK, z, "platform", heading))
+            self.c.floor_polys.append((poly, "platform"))
+        # Centre line A -> B along the main route: back + half the circle + back.
+        # Straight across: 2r. Both measured between the two window centres.
+        saves = 2 * back + math.pi * r - 2 * r
+        self.c.shortcuts.append({"turn": p["turn"], "platforms": n, "gap": round(gap),
+                                 "span": round(span), "saves": round(saves)})
+        self.c.landmarks.append(("shortcut", (edge[0], edge[1], z), heading))
 
     def end_wall(self, behind):
         """Wall across the corridor, just behind the cursor or just ahead."""
@@ -262,10 +344,17 @@ class _Walker:
             if t == "straight":
                 self.box_run(seg["length"])
                 self.runup += seg["length"]
+                if self.pending and self.pending["turn"] == i - 1:
+                    self._shortcut(i)
             elif t == "ramp":
                 self.box_run(seg["length"], seg["rise"])
                 self.runup = 0.0
             elif t == "turn":
+                if seg.get("shortcut"):
+                    o, f, l = self.frame()
+                    self.pending = {"turn": i, "origin": o, "f": f, "l": l, "z": self.z,
+                                    "sign": 1 if seg["direction"] == "left" else -1,
+                                    "radius": seg["radius"]}
                 self.turn(seg["direction"], seg["angle"], seg["radius"])
                 self.runup += math.radians(seg["angle"]) * seg["radius"]
             elif t == "checkpoint":
@@ -279,8 +368,23 @@ class _Walker:
         self._self_intersections()
         if self.problems:
             raise LayoutError(self.problems)
+        self._camera_pads()
         self._shell()
         return self.c
+
+    def _camera_pads(self):
+        """Screenshot-only: invisible solid pads high above the course.
+
+        The engine drops a spawn point to the floor under it and gives a
+        spectator only its yaw (screenshots.py), so the one way to film from
+        the air is to give the spawn something to stand on. The pads use the
+        nodraw trigger shader, so they are solid but never rendered. They go
+        in BEFORE the sky shell is sized, so the shell grows to contain them.
+        Never used for a map anyone plays: only screenshots.py passes them.
+        """
+        for x, y, z in self.camera_pads:
+            poly = [(x - 48, y - 48), (x + 48, y - 48), (x + 48, y + 48), (x - 48, y + 48)]
+            self.c.world.append(Prism.flat(poly, z - 16, z, "trigger"))
 
     def _start_room(self):
         o, f, l = self.frame()
@@ -372,17 +476,18 @@ def _segname(i):
     return f"segment {i}"
 
 
-def build(spec):
-    """Validate ranges, then lay out. Raises LayoutError listing every problem."""
+def build(spec, camera_pads=()):
+    """Validate ranges, then lay out. Raises LayoutError listing every problem.
+    camera_pads is for screenshots.py's overview only; see _camera_pads."""
     problems = specmod.validate(spec)
     if problems:
         raise LayoutError(problems)
-    return _Walker(spec).run()
+    return _Walker(spec, camera_pads).run()
 
 
 def preview_svg(course, px=900):
     """Top-down plan of the course: what the web form shows before compiling."""
-    colors = {"floor": "#8a8f98", "start": "#3fae5a", "finish": "#d0463c",
+    colors = {"floor": "#8a8f98", "start": "#3fae5a", "finish": "#d0463c", "platform": "#ff6a1a",
               "edge": "#e8b923"}
     (x0, y0, _), (x1, y1, _) = course.bounds
     w, h = x1 - x0, y1 - y0

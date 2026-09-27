@@ -161,9 +161,10 @@ def check_bsp(bsp_bytes):
     return problems
 
 
-def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False):
-    """spec -> (pk3 path, report dict). Raises LayoutError / BuildError."""
-    course = layout.build(spec)
+def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, camera_pads=()):
+    """spec -> (pk3 path, report dict). Raises LayoutError / BuildError.
+    camera_pads: screenshots.py's overview variant only (layout._camera_pads)."""
+    course = layout.build(spec, camera_pads)
     q3 = find_q3map2(q3map2)
     if not q3:
         raise BuildError("q3map2 not found: pass --q3map2, set Q3MAP2, or build "
@@ -197,6 +198,11 @@ def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False):
             # it; nobody should be slower. Shown on the form as "about N s".
             "par_seconds": round(course.length / 320.0, 1),
             "checkpoints": sum(1 for s in spec["segments"] if s["type"] == "checkpoint"),
+            # Optional stepping-stone routes across U-turns, and the par with
+            # every one of them taken.
+            "shortcuts": course.shortcuts,
+            "par_seconds_shortcuts": round((course.length - sum(s["saves"] for s in course.shortcuts))
+                                           / 320.0, 1),
         }
         return pk3, report
     finally:
