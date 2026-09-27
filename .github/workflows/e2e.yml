@@ -15,6 +15,10 @@
 #   mesh boot        the 3-node cross-server mirror mesh: every node's gametype
 #                    compiles and the peer set configures (verify-mesh boot-only,
 #                    the deterministic subset of the mesh gate).
+#   generated map    tools/mapgen compiles its example course with a pinned
+#                    q3map2, and the real server boots the Race gametype on it
+#                    (the static checks say it is raceable; this says the
+#                    engine agrees the .pk3 is a map).
 name: e2e
 
 on:
@@ -62,3 +66,21 @@ jobs:
         # verify-mesh.sh is a bash script (set -o pipefail, [[ ]]); run it with
         # bash, not the runner's default dash `sh`.
         run: bash server/test/verify-mesh.sh --no-build --boot-only
+
+      - name: build the mapgen toolchain (pinned q3map2; runs its own tests)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./tools
+          file: ./tools/mapgen/Dockerfile
+          load: true
+          tags: racesow-mapgen:ci
+          cache-from: type=gha,scope=racesow-mapgen
+          cache-to: type=gha,mode=max,scope=racesow-mapgen
+
+      - name: generated map boots on the real server
+        run: |
+          mkdir -p mapgen-out
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/mapgen-out:/out" \
+              racesow-mapgen:ci build examples/gen_first_light.json --out /out
+          bash server/test/boot-test.sh warsow-race:2.1.2 \
+              --map gen_first_light --maps-dir mapgen-out

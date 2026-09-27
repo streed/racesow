@@ -59,3 +59,5 @@ jobs:
         run: node --test server/test/demoname.test.mjs
       - name: demo metadata parser (client-demo attribution)
         run: node --test server/test/demo-meta.test.mjs
+      - name: mapgen (spec, layout, brush winding, describe loop; compile tests run in e2e)
+        run: python3 tools/mapgen/test_mapgen.py
