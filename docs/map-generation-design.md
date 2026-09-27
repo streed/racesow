@@ -117,7 +117,68 @@ image on the result with `boot-test.sh --maps-dir`.
 
 ## Phase 3: the website form
 
-<!-- filled in below -->
+The pieces a form needs mostly exist already. The one that does not is **who
+is asking**.
+
+**Identity is the open decision.** The site has no player login. The only
+accounts are staff (`admin_user`, created with `node admin.js admin-add`,
+roles admin/moderator, gated by `requireRole` in `web/server.js`). A player's
+name on a record comes from the game unverified. The options:
+
+| option | cost | abuse surface |
+| --- | --- | --- |
+| **A. staff-only form** at `/admin/mapgen`, behind `requireAuth` | none: reuses sessions + CSRF | none |
+| B. public form, per-IP rate limit, every result held for review | small | model spend per request; needs a hard daily budget |
+| C. public form tied to an in-game identity (`/mapgen <code>` links a browser to a player) | a new identity feature | bounded per player |
+
+Recommendation: **ship A first.** Moderators already review public map flags
+(`/admin/flags`), so "a player asked in Discord, a moderator typed it in" is a
+workflow the site already has. B or C can follow once real generation costs
+and quality are known. The worker, queue and publish path below are the same
+for all three; only the form's gate changes.
+
+**Queue: a table, polled.** This matches how the site already coordinates
+work. There is no message broker. The two web replicas use atomic claims in
+Postgres (`claimServerRestart`), and the `heatmaps` sidecar is a self-looping
+container that polls the DB and writes into a shared volume. So:
+
+- A migration `web/migrations/<ts>_mapgen_job.sql` (auto-applied on web boot)
+  adds `mapgen_job` (id, description, requested_by, status
+  `queued|planning|building|review|published|rejected|failed`, spec jsonb,
+  report jsonb, error, timestamps).
+- A `mapgen` compose service runs the `racesow-mapgen` image in a loop:
+  1. claim the oldest `queued` row (`UPDATE … WHERE status='queued' …
+     RETURNING`, the same atomic-claim shape);
+  2. run `plan` then `build`;
+  3. write the `.pk3`, `.svg` and `.map` to `./data/mapgen/<job>/`;
+  4. set `status=review`.
+  It needs `ANTHROPIC_API_KEY` and nothing else from web.
+- The form page shows the plan SVG as soon as `plan` finishes, and a 3D view
+  once built (`tools/bsp2gltf` into the existing replay viewer). In phase 2 it
+  also shows the bot's proof run.
+
+**Publishing: pre-blocked, then unblocked by a moderator.** Maps reach the
+servers as pk3s in `server/maps/`. The entrypoint symlinks them in at boot, and
+`/api/game/blocked-maps` removes blocked ones. That gives a safe publish path
+with no new mechanism:
+
+1. **Approve** (moderator): copy the pk3 into `server/maps/` and insert its
+   name into the block list *first*. It is installed but not votable.
+2. **Load**: a new pk3 is only seen at server boot (`scripts/setup.sh:191`).
+   The daily restart (`systemd/racesow-restart.timer`, 05:00) picks it up with
+   no extra downtime. "Publish now" can reuse the existing restart flag
+   (`/api/game/ops`).
+3. **Unblock** (moderator, `/admin/maps/:id/unblock`): `hrace/blockedmaps.as`
+   re-fetches every 30 s, so the map becomes votable live.
+4. **US box**: it has its own `server/maps` and no map sync. It should pull
+   approved generated pk3s from EU over HTTPS, the way it already reaches every
+   `rs_api_*_url`, before its own restart. That is a small script beside
+   `fetch-maps.sh`, which already does atomic, zip-checked, ClamAV-scanned
+   installs.
+
+Adding a generated map to `server/configs/mappool.txt` stays a manual,
+curated decision. Being installed and unblocked makes a map votable; it does
+not put it in the automatic rotation.
 
 ## Phases
 
@@ -125,7 +186,7 @@ image on the result with `boot-test.sh --maps-dir`.
 | --- | --- | --- |
 | 1 | strafe-only greybox: spec, layout, compile, static checks, CLI, Docker, CI boot | **built** |
 | 2 | headless pmove bot; proof-run demo in the replay viewer | design |
-| 3 | website form → job queue → review → publish | design |
+| 3 | staff form → `mapgen_job` table → worker → pre-blocked publish → moderator unblock | design |
 | 4 | vocabulary growth gated on phase 2: jump pads, walljump walls, themed texture sets | idea |
 
 ## Decisions and why
