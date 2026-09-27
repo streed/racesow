@@ -4,8 +4,9 @@ A player describes a map in words: "a fast flowing course, two big drops,
 finish on a long straight." The system builds it, proves it can be raced, and
 puts it in the rotation. No mapper is involved.
 
-Status (2026-09-27): **phase 1 is built** as `tools/mapgen` (CLI + Docker
-image + CI). Phases 2-4 below are design only.
+Status (2026-09-28): **phase 1 is built** as `tools/mapgen` (CLI + Docker
+image + CI), and so is phase 3's request path: the `/mapgen` page, the
+daily-identity quota and the worker. Phase 2 and publishing are design only.
 
 ## The one idea worth remembering
 
@@ -117,45 +118,64 @@ image on the result with `boot-test.sh --maps-dir`.
 
 ## Phase 3: the website form
 
-The pieces a form needs mostly exist already. The one that does not is **who
-is asking**.
+Status: **the form, quota, queue and worker are built** (`/mapgen`,
+`web/mapgen-identity.js`, `tools/mapgen/worker.py`). Publishing is still design.
 
-**Identity is the open decision.** The site has no player login. The only
-accounts are staff (`admin_user`, created with `node admin.js admin-add`,
-roles admin/moderator, gated by `requireRole` in `web/server.js`). A player's
-name on a record comes from the game unverified. The options:
+**Who is asking: a daily identity, not an account.** The site has no player
+login, and a map request should not need one. Each request is attributed to
+an identity computed the way Tastatur counts visitors
+(`streed/tastatur`, `app/lib/ingest/identifier.rb`, `salt_store.rb`):
 
-| option | cost | abuse surface |
-| --- | --- | --- |
-| **A. staff-only form** at `/admin/mapgen`, behind `requireAuth` | none: reuses sessions + CSRF | none |
-| B. public form, per-IP rate limit, every result held for review | small | model spend per request; needs a hard daily budget |
-| C. public form tied to an in-game identity (`/mapgen <code>` links a browser to a player) | a new identity feature | bounded per player |
+```
+identity = HMAC-SHA256(daily_salt, "mapgen" ‖ ip ‖ coarse browser profile)[0:16]
+```
 
-Recommendation: **ship A first.** Moderators already review public map flags
-(`/admin/flags`), so "a player asked in Discord, a moderator typed it in" is a
-workflow the site already has. B or C can follow once real generation costs
-and quality are known. The worker, queue and publish path below are the same
-for all three; only the form's gate changes.
+- **IP handling:** IPv6 is cut to its /64, so privacy-extension addresses stay
+  one person. The browser profile is family + major version + OS family +
+  desktop/mobile/tablet, never the raw user-agent.
+- **The salt:** 32 random bytes under `racesow:mapgen:salt:<UTC date>` in the
+  site's Redis, which already runs with persistence off. It's minted with
+  `SET NX EX`, so both web replicas agree, and it expires shortly after its
+  day ends.
+- **What the database holds:** only the 16-byte digest, never the IP, the
+  user-agent or the salt. Once the salt expires, nobody can recompute or link
+  that day's identities.
+- **The daily reset:** a new day means a new salt and so a new identity.
+  Unlike Tastatur there is no "previous" salt, because a quota has no
+  sessions to carry across midnight.
+- **Fail closed:** if Redis is unreachable, requests get a 503. They never
+  fall back to an unsalted hash, which is recoverable. The existing map-flag
+  reporter hash is `sha256("mapflag:" + ip)` with no secret, so anyone holding
+  it can recover the IPv4 address by brute force. Moving it to this identity
+  would be a small follow-up.
 
-**Queue: a table, polled.** This matches how the site already coordinates
-work. There is no message broker. The two web replicas use atomic claims in
-Postgres (`claimServerRestart`), and the `heatmaps` sidecar is a self-looping
-container that polls the DB and writes into a shared volume. So:
+**Two limits, in one transaction.** `mapgen_quota` gives each identity
+`MAPGEN_DAILY_PER_IDENTITY` maps (default 2). `mapgen_budget` gives the site
+`MAPGEN_DAILY_BUDGET` (default 40; 0 switches requests off). Each is a single
+conditional upsert (`ON CONFLICT DO UPDATE ... WHERE used < limit
+RETURNING`) that returns no row at the limit, so the two replicas cannot
+over-grant. The per-identity limit is a courtesy: like Tastatur's visitor
+count, it treats one IP plus one browser as one person, so a new browser or
+network gets a new quota, and a shared IP with the same browser shares one.
+The site budget is the cost ceiling that no requester can get around.
 
-- A migration `web/migrations/<ts>_mapgen_job.sql` (auto-applied on web boot)
-  adds `mapgen_job` (id, description, requested_by, status
-  `queued|planning|building|review|published|rejected|failed`, spec jsonb,
-  report jsonb, error, timestamps).
-- A `mapgen` compose service runs the `racesow-mapgen` image in a loop:
-  1. claim the oldest `queued` row (`UPDATE … WHERE status='queued' …
-     RETURNING`, the same atomic-claim shape);
-  2. run `plan` then `build`;
-  3. write the `.pk3`, `.svg` and `.map` to `./data/mapgen/<job>/`;
-  4. set `status=review`.
-  It needs `ANTHROPIC_API_KEY` and nothing else from web.
-- The form page shows the plan SVG as soon as `plan` finishes, and a 3D view
-  once built (`tools/bsp2gltf` into the existing replay viewer). In phase 2 it
-  also shows the bot's proof run.
+**Queue: a table, polled.** The same shape as the rest of the site: no broker,
+and atomic claims in Postgres. `mapgen_job` rows carry a random 32-hex
+`token`, the only handle ever handed out, so descriptions cannot be read by
+walking ids. The `mapgen` compose service (profile `mapgen`, needs
+`ANTHROPIC_API_KEY`) runs `worker.py`:
+
+1. It claims with `FOR UPDATE SKIP LOCKED` and plans with Claude.
+2. It gives the map a unique name, `gen_<model's name>_<token[:6]>`.
+3. It builds, writes `./data/mapgen/<token>/`, and leaves the job at `review`.
+4. A failed build refunds the requester's map, because that one's our bug. A
+   failed plan does not, because the model call is the cost being bounded.
+
+**The page** (`/mapgen`, footer "Make a map") keeps no state: no cookie and no
+localStorage. It asks `/api/mapgen/mine`, and the same person on the same day
+computes the same identity. It polls every 5 s while a job is running and shows
+each built map's plan preview. All `/api/mapgen/*` responses are `no-store`:
+they depend on who is asking, so no cache may keep them.
 
 **Publishing: pre-blocked, then unblocked by a moderator.** Maps reach the
 servers as pk3s in `server/maps/`. The entrypoint symlinks them in at boot, and
@@ -186,7 +206,7 @@ not put it in the automatic rotation.
 | --- | --- | --- |
 | 1 | strafe-only greybox: spec, layout, compile, static checks, CLI, Docker, CI boot | **built** |
 | 2 | headless pmove bot; proof-run demo in the replay viewer | design |
-| 3 | staff form → `mapgen_job` table → worker → pre-blocked publish → moderator unblock | design |
+| 3 | public form with daily identity quota → `mapgen_job` table → worker | **built** (publish step: design) |
 | 4 | vocabulary growth gated on phase 2: jump pads, walljump walls, themed texture sets | idea |
 
 ## Decisions and why

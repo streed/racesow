@@ -30,6 +30,7 @@ import { createStreamRegistry } from "./streams.js";
 import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js";
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
 import { cache, invalidate } from "./cache.js";
+import { createSaltStore, identify, SaltUnavailableError } from "./mapgen-identity.js";
 import {
   BLOG_TAGS,
   isBlogTag,
@@ -99,6 +100,20 @@ const MAPPACK_DIR = process.env.MAPPACK_DIR || "/mappack";
 // /api/maps/:id/heatmap.png and its metadata is folded into /api/maps/:id; both
 // degrade to "absent" until the sidecar has rendered a map.
 const HEATMAP_DIR = process.env.HEATMAP_DIR || "/data/heatmaps";
+// Generated-map requests (/mapgen). Each daily identity gets
+// MAPGEN_DAILY_PER_IDENTITY maps; the whole site gets MAPGEN_DAILY_BUDGET,
+// which is the hard cost ceiling (0 turns requests off). The worker
+// (tools/mapgen/worker.py) writes each job's files under MAPGEN_DIR/<token>/.
+const intEnv = (name, dflt) => {
+  const v = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(v) && v >= 0 ? v : dflt;
+};
+const MAPGEN_PER_IDENTITY = intEnv("MAPGEN_DAILY_PER_IDENTITY", 2);
+const MAPGEN_BUDGET = intEnv("MAPGEN_DAILY_BUDGET", 40);
+const MAPGEN_DIR = process.env.MAPGEN_DIR || "/data/mapgen";
+const MAPGEN_DESC_MIN = 10;
+const MAPGEN_DESC_MAX = 500;
+const mapgenSalts = createSaltStore();
 
 // Legacy single-server token (optional). Per-server tokens live in the DB
 // `server` table and are the recommended path for multi-server deploys.
@@ -530,6 +545,121 @@ api.post(
   })
 );
 
+
+/* --------------------------- generated maps ------------------------------ *
+ * Anyone can describe a map; each daily identity gets MAPGEN_PER_IDENTITY.
+ * The identity is computed per request from the IP and coarse browser
+ * profile under a salt that lives only in Redis (mapgen-identity.js). There
+ * is no cookie and no login, and nothing here stores the IP. Every response
+ * depends on who asks, so none of it may be cached (no cache() middleware,
+ * and no-store for the edge). */
+const mapgenNoStore = (_req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+};
+
+async function mapgenWho(req) {
+  return identify(mapgenSalts, { ip: req.ip, userAgent: req.get("user-agent") });
+}
+
+function mapgenQuota(who, used, budgetUsed) {
+  return {
+    limit: MAPGEN_PER_IDENTITY,
+    used,
+    remaining: Math.max(0, MAPGEN_PER_IDENTITY - used),
+    resetsAt: who.resetsAt,
+    // Whether the site as a whole can take more today. The count itself is not
+    // published.
+    open: MAPGEN_BUDGET > 0 && budgetUsed < MAPGEN_BUDGET,
+  };
+}
+
+// Refuse rather than guess. Without the salt there is no identity, and
+// falling back to an unsalted hash of the IP would quietly break the one
+// promise this feature makes.
+function mapgenFail(res, e) {
+  if (e instanceof SaltUnavailableError) {
+    return res.status(503).json({ error: "Map requests are unavailable right now. Try again in a minute." });
+  }
+  throw e;
+}
+
+api.get("/mapgen/quota", mapgenNoStore, wrap(async (req, res) => {
+  let who;
+  try { who = await mapgenWho(req); } catch (e) { return mapgenFail(res, e); }
+  const [used, budgetUsed] = await Promise.all([
+    race.mapgenUsed({ identity: who.id, day: who.day }),
+    race.mapgenBudgetUsed(who.day),
+  ]);
+  res.json(mapgenQuota(who, used, budgetUsed));
+}));
+
+// Today's requests from whoever is asking. This is how the page remembers
+// them across a reload without a cookie: it simply asks again, and the same
+// person on the same day computes the same identity.
+api.get("/mapgen/mine", mapgenNoStore, wrap(async (req, res) => {
+  let who;
+  try { who = await mapgenWho(req); } catch (e) { return mapgenFail(res, e); }
+  const [jobs, used, budgetUsed] = await Promise.all([
+    race.mapgenJobsFor({ identity: who.id, day: who.day }),
+    race.mapgenUsed({ identity: who.id, day: who.day }),
+    race.mapgenBudgetUsed(who.day),
+  ]);
+  res.json({ jobs, quota: mapgenQuota(who, used, budgetUsed) });
+}));
+
+api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (req, res) => {
+  const raw = req.body && typeof req.body.description === "string" ? req.body.description : "";
+  // Collapse whitespace so the length limits measure words, not padding.
+  const description = raw.replace(/\s+/g, " ").trim();
+  if (description.length < MAPGEN_DESC_MIN || description.length > MAPGEN_DESC_MAX) {
+    return res.status(400).json({
+      error: `Describe the map in ${MAPGEN_DESC_MIN} to ${MAPGEN_DESC_MAX} characters.`,
+    });
+  }
+  let who;
+  try { who = await mapgenWho(req); } catch (e) { return mapgenFail(res, e); }
+  if (MAPGEN_BUDGET === 0) {
+    return res.status(503).json({ error: "Map requests are switched off right now." });
+  }
+  const r = await race.mapgenSubmit({
+    identity: who.id,
+    day: who.day,
+    description,
+    perIdentity: MAPGEN_PER_IDENTITY,
+    budget: MAPGEN_BUDGET,
+  });
+  if (!r.ok) {
+    res.set("Retry-After", String(Math.max(1, who.resetsAt - Math.floor(Date.now() / 1000))));
+    const error = r.reason === "identity"
+      ? `You've used today's ${MAPGEN_PER_IDENTITY} maps. New ones open at 00:00 UTC.`
+      : "The map generator has made all the maps it can today. Try again after 00:00 UTC.";
+    return res.status(429).json({ error, reason: r.reason, resetsAt: who.resetsAt });
+  }
+  const job = await race.mapgenJob(r.token);
+  const budgetUsed = await race.mapgenBudgetUsed(who.day);
+  res.status(202).json({ job, quota: mapgenQuota(who, r.used, budgetUsed) });
+}));
+
+// A job by its random token. Anyone holding the token can see the job, which
+// is what lets a requester share "my map is building" as a link.
+api.get("/mapgen/jobs/:token", mapgenNoStore, wrap(async (req, res) => {
+  const job = await race.mapgenJob(req.params.token);
+  if (!job) return res.status(404).json({ error: "no such request" });
+  res.json(job);
+}));
+
+// The worker's top-down plan preview, once planning has finished. Served
+// only for a known token, from a fixed file name: no path comes from the URL.
+api.get("/mapgen/jobs/:token/plan.svg", mapgenNoStore, wrap(async (req, res) => {
+  const job = await race.mapgenJob(req.params.token);
+  if (!job || !job.mapName) return res.status(404).json({ error: "no plan yet" });
+  res.sendFile(path.join(MAPGEN_DIR, req.params.token, "plan.svg"), {
+    headers: { "Content-Type": "image/svg+xml", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'" },
+  }, (err) => {
+    if (err && !res.headersSent) res.status(404).json({ error: "no plan yet" });
+  });
+}));
 
 /* ------------------------------- blog ------------------------------------ *
  * Short site-update posts. Two reads: the paginated list (teasers only) and one
@@ -4992,6 +5122,7 @@ const SITEMAP_PAGES = [
   ["/demo", "0.7"],
   ["/achievements", "0.7"],
   ["/live", "0.5"],
+  ["/mapgen", "0.5"],
   ["/about", "0.4"],
   ["/colors", "0.4"],
 ];

@@ -1242,6 +1242,131 @@ function wireFlag(id) {
   });
 }
 
+/* ------------------------------ make a map ------------------------------ */
+// Describe a course; tools/mapgen builds it. Each person gets a few maps a day.
+// "Person" is a daily identity the server computes from the request itself
+// (web/mapgen-identity.js), so this page keeps no state of its own: it asks
+// /mapgen/mine, and the same browser on the same network on the same day gets
+// the same answer, with no cookie and no localStorage.
+let mapgenTimer = null;
+function stopMapgenPoll() {
+  if (mapgenTimer) clearTimeout(mapgenTimer);
+  mapgenTimer = null;
+}
+
+const MAPGEN_STATUS = {
+  queued: ["Queued", "Waiting for the generator."],
+  planning: ["Planning", "Turning your description into a course."],
+  building: ["Building", "Compiling and checking the map."],
+  review: ["Ready for review", "Built and checked. A moderator reviews it before it goes on the servers."],
+  published: ["On the servers", "Vote for it in game."],
+  rejected: ["Not published", "A moderator decided not to publish this one."],
+  failed: ["Failed", ""],
+};
+const MAPGEN_DONE = new Set(["review", "published", "rejected", "failed"]);
+
+function mapgenJobCard(j) {
+  const [label, blurb] = MAPGEN_STATUS[j.status] || [j.status, ""];
+  const r = j.report || {};
+  const facts = j.mapName
+    ? `<div class="mg-facts"><b>${esc(j.mapName)}</b>${r.par_seconds ? ` · about ${esc(String(r.par_seconds))} s at run speed` : ""}${r.checkpoints ? ` · ${esc(String(r.checkpoints))} checkpoint${r.checkpoints === 1 ? "" : "s"}` : ""}</div>`
+    : "";
+  // Only a built map has a plan file; a failed build may still carry a name.
+  const plan = j.mapName && (j.status === "review" || j.status === "published")
+    ? `<img class="mg-plan" alt="Top-down plan of ${esc(j.mapName)}" loading="lazy"
+         src="/api/mapgen/jobs/${esc(j.token)}/plan.svg">`
+    : "";
+  return `<article class="panel mg-job">
+      <div class="mg-job-head">
+        <span class="pill mg-status ${esc(j.status)}">${esc(label)}</span>
+        <time datetime="${esc(new Date(j.createdAt * 1000).toISOString())}">${esc(new Date(j.createdAt * 1000).toISOString().slice(11, 16))} UTC</time>
+      </div>
+      <p class="mg-desc">${esc(j.description)}</p>
+      ${facts}
+      ${j.status === "failed" ? `<p class="mg-err">${esc(j.error || "Something went wrong.")}</p>` : blurb ? `<p class="mg-blurb">${esc(blurb)}</p>` : ""}
+      ${plan}
+    </article>`;
+}
+
+function mapgenQuotaLine(q) {
+  if (!q.open && q.remaining > 0) return "The generator has made all the maps it can today. Back after 00:00 UTC.";
+  if (q.remaining === 0) return `You've used today's ${q.limit} maps. New ones open at 00:00 UTC.`;
+  return `${q.remaining} of ${q.limit} map${q.limit === 1 ? "" : "s"} left today · resets 00:00 UTC`;
+}
+
+async function viewMapgen() {
+  loading();
+  app.innerHTML = `
+    <div class="page-title"><span class="accent">MAKE</span> A MAP</div>
+    <p class="page-sub">Describe a race course and the generator builds it: a strafe course with
+      turns, ramps and jumpable gaps, checked to be finishable at plain run speed before anyone sees it.
+      Finished maps are reviewed before they reach the servers.</p>
+    <form class="panel mg-form" id="mg-form">
+      <label class="flag-label" for="mg-desc">Your map</label>
+      <textarea id="mg-desc" class="mg-input" rows="4" maxlength="500"
+        placeholder="e.g. a fast flowing course with two big drops, a tight hairpin and a long finishing straight"></textarea>
+      <div class="flag-actions">
+        <button class="btn mg-submit" type="submit">Build it</button>
+        <span class="mg-count">0 / 500</span>
+        <span class="flag-msg mg-msg" role="status" aria-live="polite"></span>
+      </div>
+      <p class="mg-quota" id="mg-quota"></p>
+    </form>
+    <div class="page-title" style="font-size:20px">YOUR MAPS <span class="accent">·</span> today</div>
+    <div id="mg-jobs"><div class="empty">Loading…</div></div>
+    <p class="mg-privacy">No account and no cookie. The server recognises you for the day from a
+      one-way hash of your network address and browser type, under a key it throws away at
+      midnight UTC. Your address is never stored.</p>`;
+
+  const form = document.getElementById("mg-form");
+  const input = document.getElementById("mg-desc");
+  const count = form.querySelector(".mg-count");
+  const msg = form.querySelector(".mg-msg");
+  const submit = form.querySelector(".mg-submit");
+  const quotaEl = document.getElementById("mg-quota");
+  const jobsEl = document.getElementById("mg-jobs");
+
+  const render = (d) => {
+    quotaEl.textContent = mapgenQuotaLine(d.quota);
+    submit.disabled = d.quota.remaining === 0 || !d.quota.open;
+    jobsEl.innerHTML = d.jobs.length
+      ? d.jobs.map(mapgenJobCard).join("")
+      : `<div class="empty">Nothing yet today.</div>`;
+    stopMapgenPoll();
+    if (d.jobs.some((j) => !MAPGEN_DONE.has(j.status))) {
+      mapgenTimer = setTimeout(refresh, 5000);
+    }
+  };
+  const refresh = async () => {
+    try {
+      render(await api("/mapgen/mine"));
+    } catch (err) {
+      jobsEl.innerHTML = `<div class="empty">Map requests are unavailable right now.</div>`;
+      submit.disabled = true;
+    }
+  };
+
+  input.addEventListener("input", () => { count.textContent = `${input.value.length} / 500`; });
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    submit.disabled = true;
+    msg.className = "flag-msg mg-msg";
+    msg.textContent = "Sending…";
+    try {
+      await apiPost("/mapgen", { description: input.value });
+      msg.textContent = "Queued. It shows up below.";
+      msg.classList.add("ok");
+      input.value = "";
+      count.textContent = "0 / 500";
+    } catch (err) {
+      msg.classList.add("err");
+      msg.textContent = String((err && err.message) || "Couldn't send. Please try again.");
+    }
+    await refresh();
+  });
+  await refresh();
+}
+
 /* ------------------------------ replay view ------------------------------ */
 // The 3D viewer is a lazily-imported ES module (three.js). It returns a
 // cleanup function we must call when leaving the route to free the WebGL
@@ -3986,6 +4111,7 @@ async function viewBlogPost(slug) {
 
 async function router() {
   stopLiveRefresh();
+  stopMapgenPoll();
   stopReplay();
   stopServerStream();
   // Legacy "#/…" URL (old shared link / bookmark): rewrite to the clean path
@@ -4016,6 +4142,7 @@ async function router() {
     else if (path === "/tournaments") await viewTournaments();
     else if (path.startsWith("/tournaments/")) await viewTournament(decodeURIComponent(path.slice(13)));
     else if (path === "/live") await viewLive();
+    else if (path === "/mapgen") await viewMapgen();
     else if (path === "/about") await viewAbout();
     else if (path === "/colors") viewColors();
     else if (path.startsWith("/server/")) await viewServer(parseInt(path.split("/")[2], 10));

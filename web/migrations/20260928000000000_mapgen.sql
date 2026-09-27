@@ -1,0 +1,69 @@
+-- Player-requested generated maps: the job queue and the daily quota.
+--
+-- A player describes a map on /mapgen; tools/mapgen/worker.py turns it into a
+-- compiled, checked .pk3 (see docs/map-generation-design.md). Nobody logs in.
+-- Each request is attributed to an IDENTITY, a 128-bit HMAC of the requester's
+-- IP and coarse browser profile under a salt that lives only in Redis and is
+-- replaced every UTC day (web/mapgen-identity.js, a port of Tastatur's visitor
+-- hash). The database never sees an IP, a user-agent, or the salt. Once a day's
+-- salt is gone, the identities stored under it cannot be recomputed or linked
+-- to anyone.
+--
+-- mapgen_quota: how many maps each identity has requested today. One row per
+--   (day, identity), incremented by a single conditional upsert
+--   (... ON CONFLICT DO UPDATE ... WHERE used < limit RETURNING used), which is
+--   atomic across both web replicas without a lock: a request that would go
+--   over the limit gets no row back. Rows older than yesterday are deleted on
+--   the next submission, so the table only ever holds about two days.
+--
+-- mapgen_budget: the site-wide count per day, claimed in the same transaction.
+--   This is the real cost ceiling. The per-identity quota is a courtesy that a
+--   new browser or network gets around; this one no requester can.
+--
+-- mapgen_job: one row per request. `token` is the only handle ever given out.
+--   It is random, so job ids cannot be walked to read other people's
+--   descriptions. `identity` and `quota_day` are kept only so the requester
+--   can list today's jobs and a build failure can refund the quota. They are
+--   cleared after two days, together with the quota rows.
+
+-- Up Migration
+CREATE TABLE IF NOT EXISTS mapgen_quota (
+  day      DATE    NOT NULL,
+  identity BYTEA   NOT NULL CHECK (octet_length(identity) = 16),
+  used     INTEGER NOT NULL CHECK (used >= 0),
+  PRIMARY KEY (day, identity)
+);
+
+CREATE TABLE IF NOT EXISTS mapgen_budget (
+  day  DATE    PRIMARY KEY,
+  used INTEGER NOT NULL CHECK (used >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS mapgen_job (
+  id          BIGSERIAL PRIMARY KEY,
+  token       TEXT    NOT NULL UNIQUE CHECK (token ~ '^[0-9a-f]{32}$'),
+  description TEXT    NOT NULL,
+  status      TEXT    NOT NULL DEFAULT 'queued'
+              CHECK (status IN ('queued', 'planning', 'building', 'review',
+                                'published', 'rejected', 'failed')),
+  quota_day   DATE,
+  identity    BYTEA   CHECK (identity IS NULL OR octet_length(identity) = 16),
+  map_name    TEXT,
+  spec        JSONB,
+  report      JSONB,
+  error       TEXT,
+  created_at  BIGINT  NOT NULL,
+  started_at  BIGINT,
+  finished_at BIGINT
+);
+
+-- The worker claims the oldest queued job with FOR UPDATE SKIP LOCKED.
+CREATE INDEX IF NOT EXISTS mapgen_job_queued ON mapgen_job (id) WHERE status = 'queued';
+-- "My requests today".
+CREATE INDEX IF NOT EXISTS mapgen_job_identity ON mapgen_job (quota_day, identity)
+  WHERE identity IS NOT NULL;
+
+-- Down Migration
+DROP TABLE IF EXISTS mapgen_job CASCADE;
+DROP TABLE IF EXISTS mapgen_budget CASCADE;
+DROP TABLE IF EXISTS mapgen_quota CASCADE;

@@ -72,6 +72,21 @@ a spec is the thing to store, review and diff.
 Generated maps are named `gen_*`. Like any new bsp name, each one starts with
 an empty leaderboard.
 
+## Worker: player requests from the website
+
+`worker.py` serves the `/mapgen` page. The web queues a request only after
+checking the requester's daily identity quota (2 maps a day by default, see
+`web/mapgen-identity.js`) and the site's daily budget. The worker then plans,
+builds and checks the map and leaves it at `review` in
+`MAPGEN_DIR/<token>/`. Nothing is published automatically.
+
+```
+docker compose --profile mapgen up -d mapgen    # needs ANTHROPIC_API_KEY in .env
+```
+
+A failed build refunds the requester's map. A failed plan does not, because
+the model call is the cost the quota bounds. See the design doc's phase 3.
+
 ## Look: racesow dev textures
 
 `assets.py` draws the texture set procedurally in pure Python, so no image

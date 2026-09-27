@@ -3817,6 +3817,102 @@ class RaceDB {
     return r.rowCount;
   }
 
+  // --- Generated-map requests (migration 20260928000000000_mapgen) ------------
+  // `identity` is the 16-byte daily identity from web/mapgen-identity.js and
+  // `day` its UTC day ("YYYY-MM-DD"). Neither is ever derived here.
+
+  // Claim one map for this identity and the site, and queue the job, all in one
+  // transaction: either all three happen or none do. Each claim is a single
+  // conditional upsert that returns no row once its limit is reached, so two
+  // replicas racing on someone's last map cannot both win it.
+  async mapgenSubmit({ identity, day, description, perIdentity, budget, now = Math.floor(Date.now() / 1000) }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Housekeeping first, on the same connection: nothing older than
+      // yesterday needs an identity, and the day's salt that could have given
+      // it meaning is already gone.
+      await client.query("DELETE FROM mapgen_quota WHERE day < $1::date - 1", [day]);
+      await client.query(
+        "UPDATE mapgen_job SET identity = NULL WHERE identity IS NOT NULL AND quota_day < $1::date - 1",
+        [day]
+      );
+      const mine = await client.query(
+        `INSERT INTO mapgen_quota (day, identity, used) VALUES ($1, $2, 1)
+         ON CONFLICT (day, identity) DO UPDATE SET used = mapgen_quota.used + 1
+         WHERE mapgen_quota.used < $3
+         RETURNING used`,
+        [day, identity, perIdentity]
+      );
+      if (!mine.rows.length) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "identity" };
+      }
+      const site = await client.query(
+        `INSERT INTO mapgen_budget (day, used) VALUES ($1, 1)
+         ON CONFLICT (day) DO UPDATE SET used = mapgen_budget.used + 1
+         WHERE mapgen_budget.used < $2
+         RETURNING used`,
+        [day, budget]
+      );
+      if (!site.rows.length) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "budget" };
+      }
+      const token = crypto.randomBytes(16).toString("hex");
+      await client.query(
+        `INSERT INTO mapgen_job (token, description, quota_day, identity, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [token, description, day, identity, now]
+      );
+      await client.query("COMMIT");
+      return { ok: true, token, used: num(mine.rows[0].used) };
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  async mapgenUsed({ identity, day }) {
+    const r = await this.one("SELECT used FROM mapgen_quota WHERE day = $1 AND identity = $2", [day, identity]);
+    return r ? num(r.used) : 0;
+  }
+
+  async mapgenBudgetUsed(day) {
+    const r = await this.one("SELECT used FROM mapgen_budget WHERE day = $1", [day]);
+    return r ? num(r.used) : 0;
+  }
+
+  // The public face of a job. Never the identity, the day or the internal id.
+  _mapgenJobRow(r) {
+    return {
+      token: r.token,
+      description: r.description,
+      status: r.status,
+      mapName: r.map_name || null,
+      report: r.report || null,
+      error: r.error || null,
+      createdAt: num(r.created_at),
+      finishedAt: r.finished_at == null ? null : num(r.finished_at),
+    };
+  }
+
+  async mapgenJob(token) {
+    if (typeof token !== "string" || !/^[0-9a-f]{32}$/.test(token)) return null;
+    const r = await this.one("SELECT * FROM mapgen_job WHERE token = $1", [token]);
+    return r ? this._mapgenJobRow(r) : null;
+  }
+
+  async mapgenJobsFor({ identity, day }) {
+    const rows = await this.all(
+      "SELECT * FROM mapgen_job WHERE quota_day = $1 AND identity = $2 ORDER BY id DESC",
+      [day, identity]
+    );
+    return rows.map((r) => this._mapgenJobRow(r));
+  }
+
   // --- Map review flags ------------------------------------------------------
   // A public "flag this map for review" report. Deduped per reporter via the
   // partial unique index (uq_map_flag_open): a repeat OPEN flag for the same

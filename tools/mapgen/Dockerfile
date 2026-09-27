@@ -33,7 +33,7 @@ FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip ca-certificates \
         libassimp5 libglib2.0-0t64 libjpeg-turbo8 libminizip1t64 libpng16-16t64 libxml2 \
-    && pip3 install --no-cache-dir --break-system-packages "anthropic>=1.8,<2" \
+    && pip3 install --no-cache-dir --break-system-packages "anthropic>=1.8,<2" "psycopg[binary]>=3.2,<4" \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=q3map2 /build/nr/install/q3map2.x86_64 /usr/local/bin/q3map2
 COPY mapfix /opt/tools/mapfix

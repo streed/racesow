@@ -28,6 +28,7 @@ import layout  # noqa: E402
 import mapfile  # noqa: E402
 import physics  # noqa: E402
 import screenshots  # noqa: E402
+import worker  # noqa: E402
 import spec as specmod  # noqa: E402
 
 EXAMPLE = os.path.join(HERE, "examples", "gen_first_light.json")
@@ -222,6 +223,18 @@ class Screenshots(unittest.TestCase):
         for _, pos, yaw in views:
             self.assertEqual(len(pos), 3)
             self.assertTrue(0 <= yaw < 360)
+
+
+class Worker(unittest.TestCase):
+    def test_names_are_unique_per_job_and_stay_valid(self):
+        a = worker.unique_name("gen_icy_loop", "544abc1feb437de9c40cbda493b862e2")
+        b = worker.unique_name("gen_icy_loop", "8c1e5dc4b09dd5b13d94d459c5a4d6f6")
+        self.assertEqual(a, "gen_icy_loop_544abc")
+        self.assertNotEqual(a, b)
+        long = worker.unique_name("gen_" + "x" * 36, "0" * 32)
+        weird = worker.unique_name("Gen-Ice Loop!!", "0" * 32)
+        for name in (a, b, long, weird):
+            self.assertRegex(name, specmod.NAME_RE)
 
 
 class Describe(unittest.TestCase):
