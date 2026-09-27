@@ -10,7 +10,12 @@ instead of relying on a winding convention.
 
 import layout
 
-TEX_SCALE = 2.0   # 128 px textures tile every 256 units; grid lines every 64
+TEX_SCALE = 1.0   # 256 px textures, 1 px = 1 unit: the dev grid is to scale
+
+# Quake's base texture axes for an upward face are s = +X, t = -Y, so an
+# unrotated texture's "up" points along +Y (heading 90). A top face laid at
+# `heading` is turned by heading - 90 to put the texture's up down the course.
+FLOOR_ROT_OFFSET = -90.0
 
 
 def _sub(a, b):
@@ -32,26 +37,42 @@ def _fmt(v):
     return f"{r:.3f}".rstrip("0")
 
 
-def _face(p0, p1, p2, outward, tex):
+def _mirrored(outward):
+    """Quake projects a wall texture along the wall's dominant axis with fixed
+    s/t axes (s = +Y for X-facing walls, s = +X for Y-facing ones), so on
+    walls facing -X or +Y the image reads mirror-image: RACESOW backwards on
+    one side of every corridor. Those faces get a negative s scale. Ties go
+    to X, matching the order q3map2 tests the base axes in."""
+    nx, ny, nz = outward
+    if abs(nz) > max(abs(nx), abs(ny)):
+        return False
+    return nx < 0 if abs(nx) >= abs(ny) else ny > 0
+
+
+def _face(p0, p1, p2, outward, tex, rot=0.0):
     n = _cross(_sub(p2, p0), _sub(p1, p0))
     if _dot(n, outward) < 0:
         p1, p2 = p2, p1
     pts = " ".join("( " + " ".join(_fmt(c) for c in p) + " )" for p in (p0, p1, p2))
-    return f"{pts} {tex} 0 0 0 {TEX_SCALE} {TEX_SCALE} 0 0 0"
+    sx = -TEX_SCALE if _mirrored(outward) else TEX_SCALE
+    return f"{pts} {tex} 0 0 {_fmt(rot % 360.0)} {_fmt(sx)} {_fmt(TEX_SCALE)} 0 0 0"
 
 
 def brush_lines(prism):
     tex = layout.TEX[prism.tex]
     # Side faces of a floor/sloped piece use the wall texture; only the walking
     # surface carries the floor/start/finish colour.
-    side_tex = layout.TEX["wall"] if prism.tex in ("floor", "start", "finish", "edge") else tex
+    side_tex = (layout.TEX["wall"]
+                if prism.tex in ("floor", "start", "finish", "edge", "trim", "checkpoint")
+                else tex)
+    rot = 0.0 if prism.heading is None else prism.heading + FLOOR_ROT_OFFSET
     poly = prism.poly
     n = len(poly)
     top = [(x, y, prism.top_at(x, y)) for x, y in poly]
     bot = [(x, y, prism.zmin) for x, y in poly]
     faces = [
         _face(bot[0], bot[1], bot[2], (0, 0, -1), side_tex),
-        _face(top[0], top[1], top[2], (0, 0, 1), tex),
+        _face(top[0], top[1], top[2], (0, 0, 1), tex, rot),
     ]
     for i in range(n):
         a, b = poly[i], poly[(i + 1) % n]
@@ -76,7 +97,7 @@ def write(course):
            _kv("message", spec["title"]),
            # Flat greybox lighting: the sky shader carries a sun and skylight;
            # _minlight keeps shadowed corners readable.
-           _kv("_minlight", 48),
+           _kv("_minlight", 16),
            _kv("_color", "1 1 1")]
     for b, prism in enumerate(course.world):
         out.append(f"// brush {b}")

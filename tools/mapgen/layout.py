@@ -37,6 +37,7 @@ TEX = {
     "finish": "mapgen_v1/finish",
     "checkpoint": "mapgen_v1/checkpoint",
     "edge": "mapgen_v1/edge",
+    "trim": "mapgen_v1/trim",
     "sky": "mapgen_v1/sky",
     "trigger": "mapgen_v1/trigger",
 }
@@ -50,13 +51,16 @@ class LayoutError(Exception):
 
 class Prism:
     """Convex CCW footprint `poly` [(x, y)], bottom at `zmin`, top plane
-    z = top0 + gx * x + gy * y."""
+    z = top0 + gx * x + gy * y. `heading` (degrees) turns the top face's
+    texture so its "up" points down the course: chevrons and lettering on
+    the floor read the way the player runs."""
 
-    def __init__(self, poly, zmin, top0, gx=0.0, gy=0.0, tex="floor"):
+    def __init__(self, poly, zmin, top0, gx=0.0, gy=0.0, tex="floor", heading=None):
         self.poly = [(float(x), float(y)) for x, y in poly]
         self.zmin = float(zmin)
         self.top0, self.gx, self.gy = float(top0), float(gx), float(gy)
         self.tex = tex
+        self.heading = heading
 
     def top_at(self, x, y):
         return self.top0 + self.gx * x + self.gy * y
@@ -65,8 +69,8 @@ class Prism:
         return max(self.top_at(x, y) for x, y in self.poly)
 
     @classmethod
-    def flat(cls, poly, zmin, zmax, tex):
-        return cls(poly, zmin, zmax, 0.0, 0.0, tex)
+    def flat(cls, poly, zmin, zmax, tex, heading=None):
+        return cls(poly, zmin, zmax, 0.0, 0.0, tex, heading)
 
 
 class Hull:
@@ -84,6 +88,7 @@ class Course:
         self.hulls = []
         self.floor_polys = [] # (poly, tex) for the preview
         self.route = []       # centre-line points (x, y, z) for the preview + future bot
+        self.landmarks = []   # (kind, (x, y, z), heading): start, gap, checkpoint, finish
         self.length = 0.0     # centre-line length, start trigger -> finish trigger
 
 
@@ -158,7 +163,7 @@ class _Walker:
         base = lo - FLOOR_THICK if wall_floor is None else wall_floor
         if floor:
             poly = _rect(o, f, l, 0, length, half, half)
-            self.c.world.append(Prism(poly, lo - FLOOR_THICK, top0, gx, gy, tex))
+            self.c.world.append(Prism(poly, lo - FLOOR_THICK, top0, gx, gy, tex, self.heading))
             self.c.floor_polys.append((poly, tex))
         for side in (+1, -1):
             if side > 0:
@@ -178,10 +183,23 @@ class _Walker:
         self.c.world.append(Prism.flat(_rect(o, f, l, a, b, half, half),
                                        self.z - FLOOR_THICK, self.z + WALL_HEIGHT, "wall"))
 
-    def trigger(self, classname_target, target_keys):
-        """Full-width trigger slab straddling the cursor + its target entity."""
+    def stripe(self, tex, back, fwd):
+        """A painted strip across the floor: a 5-unit slab standing 1 unit
+        proud of it (well under STEP_SIZE, so it never trips a player, and
+        never coplanar, so it never z-fights)."""
+        o, f, l = self.frame()
+        poly = _rect(o, f, l, back, fwd, self.w / 2.0, self.w / 2.0)
+        self.c.world.append(Prism.flat(poly, self.z - 4, self.z + 1, tex, self.heading))
+
+    def trigger(self, classname_target, target_keys, stripe=None):
+        """Full-width trigger slab straddling the cursor + its target entity,
+        with the line painted on the floor under it."""
         o, f, l = self.frame()
         half = self.w / 2.0
+        if stripe:
+            self.stripe(stripe, -TRIGGER_DEPTH, TRIGGER_DEPTH)
+        kind = target_keys["classname"].replace("target_", "").replace("timer", "")
+        self.c.landmarks.append((kind, (self.x, self.y, self.z), self.heading))
         name = self.targetname(target_keys["classname"].split("_")[-1])
         poly = _rect(o, f, l, -TRIGGER_DEPTH / 2, TRIGGER_DEPTH / 2, half, half)
         brush = Prism.flat(poly, self.z, self.z + TRIGGER_HEIGHT, "trigger")
@@ -212,11 +230,12 @@ class _Walker:
             if r_in - WALL_THICK > 1:
                 rings.append((r_in - WALL_THICK, r_in, "wall",
                               self.z - FLOOR_THICK, self.z + WALL_HEIGHT))
+            mid_heading = self.heading + sign * angle * (i + 0.5) / n
             for ri, ro, tex, zlo, zhi in rings:
                 poly = [pt(ri, a), pt(ro, a), pt(ro, b), pt(ri, b)]
                 if sign < 0:
                     poly.reverse()
-                self.c.world.append(Prism.flat(poly, zlo, zhi, tex))
+                self.c.world.append(Prism.flat(poly, zlo, zhi, tex, mid_heading))
                 if tex == "floor":
                     self.c.floor_polys.append((poly, tex))
             ri = max(r_in - WALL_THICK, 0.0)
@@ -250,7 +269,8 @@ class _Walker:
                 self.turn(seg["direction"], seg["angle"], seg["radius"])
                 self.runup += math.radians(seg["angle"]) * seg["radius"]
             elif t == "checkpoint":
-                self.trigger("trigger_multiple", {"classname": "target_checkpoint"})
+                self.trigger("trigger_multiple", {"classname": "target_checkpoint"},
+                             stripe="checkpoint")
             elif t == "gap":
                 self._gap(i, seg, segs)
 
@@ -272,11 +292,11 @@ class _Walker:
         spawn = (o[0] + f[0] * SPAWN_BACK, o[1] + f[1] * SPAWN_BACK, self.z + 40)
         self.c.entities.append(({"classname": "info_player_deathmatch",
                                  "origin": spawn, "angle": self.heading}, []))
-        self.trigger("trigger_multiple", {"classname": "target_starttimer"})
+        self.trigger("trigger_multiple", {"classname": "target_starttimer"}, stripe="trim")
         self.runup = ROOM_LEN - SPAWN_BACK
 
     def _finish_room(self):
-        self.trigger("trigger_multiple", {"classname": "target_stoptimer"})
+        self.trigger("trigger_multiple", {"classname": "target_stoptimer"}, stripe="trim")
         self.box_run(ROOM_LEN, tex="finish")
         self.end_wall(behind=False)
 
@@ -292,9 +312,8 @@ class _Walker:
             self.problems.append(
                 f"{where}: must land on a straight or turn, not on {nxt!r}")
         # Mark the take-off lip so the gap reads from a distance.
-        o, f, l = self.frame()
-        lip = _rect(o, f, l, -32, 0, self.w / 2.0, self.w / 2.0)
-        self.c.world.append(Prism.flat(lip, self.z - 4, self.z + 1, "edge"))
+        self.stripe("edge", -32, 0)
+        self.c.landmarks.append(("gap", (self.x, self.y, self.z), self.heading))
         land = self.z - seg["drop"]
         wall_floor = min(self.z, land) - FLOOR_THICK - 128
         self.box_run(seg["length"], floor=False, wall_floor=wall_floor)

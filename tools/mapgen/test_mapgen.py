@@ -21,11 +21,13 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import assets  # noqa: E402
 import build  # noqa: E402
 import describe  # noqa: E402
 import layout  # noqa: E402
 import mapfile  # noqa: E402
 import physics  # noqa: E402
+import screenshots  # noqa: E402
 import spec as specmod  # noqa: E402
 
 EXAMPLE = os.path.join(HERE, "examples", "gen_first_light.json")
@@ -192,6 +194,36 @@ def flat(spec):
     return out
 
 
+class Assets(unittest.TestCase):
+    def test_every_asset_generates(self):
+        files = assets.files()
+        for kind in assets.TEXTURES:
+            data = files[f"textures/{assets.VERSION}/{kind}.tga"]
+            # 18-byte header + 256 x 256 x 3
+            self.assertEqual(len(data), 18 + assets.SIZE * assets.SIZE * 3, kind)
+
+    def test_every_texture_layout_uses_exists(self):
+        for name in layout.TEX.values():
+            kind = name.split("/", 1)[1]
+            self.assertTrue(kind in assets.TEXTURES or kind in ("sky", "trigger"), name)
+
+    def test_walls_are_darker_than_floors(self):
+        def luma(c):
+            px = c.px
+            return sum(0.299 * r + 0.587 * g + 0.114 * b for r, g, b in px) / len(px)
+        self.assertLess(luma(assets.wall()), 0.6 * luma(assets.floor()))
+
+
+class Screenshots(unittest.TestCase):
+    def test_views_cover_every_landmark(self):
+        views = screenshots.auto_views(layout.build(example()))
+        self.assertEqual([v[0] for v in views],
+                         ["start", "gap1", "checkpoint1", "gap2", "finish"])
+        for _, pos, yaw in views:
+            self.assertEqual(len(pos), 3)
+            self.assertTrue(0 <= yaw < 360)
+
+
 class Describe(unittest.TestCase):
     def test_repair_loop_feeds_problems_back(self):
         bad = flat(course_of({"type": "straight", "length": 512},
@@ -237,6 +269,22 @@ class Compile(unittest.TestCase):
             pb, _ = build.build(example(), b)
             with open(pa, "rb") as fa, open(pb, "rb") as fb:
                 self.assertEqual(fa.read(), fb.read())
+
+    def test_screenshot_views_move_the_spawn(self):
+        from entities import EntityLump
+        from bsp import Bsp as _Bsp
+        views = [["a", [100, 200, 300], 45]]
+        with tempfile.TemporaryDirectory() as out, tempfile.TemporaryDirectory() as base:
+            pk3, _ = build.build(example(), out)
+            (name,) = screenshots.stage_views(pk3, views, base)
+            with zipfile.ZipFile(os.path.join(base, name + ".pk3")) as zf:
+                data = zf.read(f"maps/{name}.bsp")
+                self.assertIn(f"textures/{assets.VERSION}/floor.tga", zf.namelist())
+        spawn = next(e for e in EntityLump(_Bsp(data).entity_text()).entities
+                     if e.classname == "info_player_deathmatch")
+        self.assertEqual(spawn.get("origin"), "100 200 300")
+        self.assertEqual(spawn.get("angles"), "0 45 0")
+        self.assertIsNone(spawn.get("angle"))
 
     def test_check_catches_a_missing_stop_timer(self):
         with tempfile.TemporaryDirectory() as out:

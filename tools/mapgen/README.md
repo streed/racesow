@@ -72,6 +72,42 @@ a spec is the thing to store, review and diff.
 Generated maps are named `gen_*`. Like any new bsp name, each one starts with
 an empty leaderboard.
 
+## Look: racesow dev textures
+
+`assets.py` draws the texture set procedurally in pure Python, so no image
+files are committed. It uses the site's palette: `--orange #ff6a1a`,
+`--cyan`, `--green`, on navy.
+
+| texture | use |
+| --- | --- |
+| `floor` | light grey, 64-unit cells, 16-unit sub-grid, unit labels |
+| `wall` | dark slate, the same grid, orange pinstripe + RACESOW wordmark; clearly darker than any floor |
+| `start` | navy pad, green chevrons pointing down the course, START |
+| `finish` | black / white checker with an orange FINISH band |
+| `checkpoint` | cyan line painted across the floor under each checkpoint trigger |
+| `edge` | orange / black hazard stripes on every gap lip |
+| `trim` | orange stripe on the start and finish lines |
+
+Textures are 256 px and the texture scale is 1, so 1 px = 1 unit and the grid
+measures true distances. Floor textures are rotated per piece so chevrons and
+lettering face down the course. Wall faces that Quake would texture
+mirror-image get a negative scale, so RACESOW reads correctly on both sides.
+
+## Screenshots in the real client
+
+```
+screenshots.py build/gen_first_light.pk3 --spec examples/gen_first_light.json \
+    --warsow ~/warsow-2.1.2 --out shots/
+```
+
+This runs the stock Warsow 2.1.2 client (the same tarball `server/Dockerfile`
+downloads) under Xvfb with software GL, and takes one screenshot per
+landmark: the start, each gap and checkpoint, and the finish. Each view is a
+throwaway copy of the bsp with the spawn point moved to the camera, and the
+real map is untouched. Views are level at eye height, because the engine drops
+spawns to the floor and applies only their yaw; the plan `.svg` is the
+overview. Needs `Xvfb`, `xdotool` and Mesa.
+
 ## q3map2
 
 Use the Docker image, which builds a pinned netradiant-custom q3map2:

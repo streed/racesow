@@ -222,6 +222,8 @@ not put it in the automatic rotation.
 - **A new bsp name is an empty board.** Every generated map starts with no
   records. That is fine for new maps, but a bug-fix rebuild of a published map
   must keep its name, or its records strand (see `tools/mapfix/README.md`).
-- **Server-side load is proven, client-side rendering is not.** CI proves the
-  server loads the map. Nothing yet renders it in a real client; the
-  in-browser `bsp2gltf` view is geometry only.
+- **Client rendering is checked by hand, not in CI.** CI proves the server
+  loads the map. `tools/mapgen/screenshots.py` renders it in the real Warsow
+  client (Xvfb + software GL), and that is how the textures and lighting were
+  tuned. But it needs the ~465 MB client and is not part of any CI lane yet.
+  It is the natural source of the review page's previews in phase 3.
