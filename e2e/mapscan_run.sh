@@ -60,8 +60,11 @@ echo ">> rcon map ${MAP}"
 # While an rcon command runs, the engine redirects its console output into the
 # rcon reply (qcommon/common.c, Com_BeginRedirect), and "map" spawns the new
 # level inside that command. So "SpawnServer: <map>" and the gametype init come
-# back over UDP and never reach docker logs. Read them from the reply, then
-# confirm with getstatus that the server is running the map afterwards.
+# back over UDP and never reach docker logs. Read the spawn from the reply.
+# The reply is ~1 KB datagrams of the whole script compile, so its tail is not
+# something to wait on; getstatus is only answered once SV_Map has returned, so
+# "mapname=<map>" with the race script's g_race_gametype=1 proves the spawn and
+# the gametype init both finished.
 python3 - "${IP}" "${RCON}" "${MAP}" <<'EOF'
 import re, socket, sys, time
 ip, pw, m = sys.argv[1:]
@@ -69,7 +72,7 @@ OOB = b"\xff\xff\xff\xff"
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.sendto(OOB + b"rcon " + pw.encode() + b" map " + m.encode() + b"\n", (ip, 44400))
 reply, deadline = "", time.time() + 60
-s.settimeout(5)
+s.settimeout(15)
 while time.time() < deadline:
     try:
         d = s.recvfrom(65535)[0]
@@ -86,8 +89,6 @@ def fail(why):
     print("!! " + why); print(reply[-3000:]); sys.exit(1)
 if "SpawnServer: " + m not in reply:
     fail("the rcon reply has no 'SpawnServer: %s'" % m)
-if "Gametype 'Race' initialized" not in reply.split("SpawnServer: " + m, 1)[1]:
-    fail("%s spawned but the gametype never initialised" % m)
 if re.search(r"Couldn't find map|ERROR: .*" + re.escape(m), reply):
     fail("errors while loading %s" % m)
 
@@ -101,14 +102,14 @@ while time.time() < deadline:
         kv = d.decode("latin1", "replace").split("\n")[1].split("\\")
         info = dict(zip(kv[1::2], kv[2::2]))
         mapname = info.get("mapname", "?")
-        if mapname == m:
+        if mapname == m and info.get("g_race_gametype") == "1":
             break
     except (socket.timeout, IndexError):
         pass
     time.sleep(1)
 else:
-    fail("getstatus says the server runs '%s', not %s" % (mapname, m))
-print(">> getstatus: mapname=%s" % mapname)
+    fail("getstatus never showed %s with the race gametype up (last: mapname=%s)" % (m, mapname))
+print(">> getstatus: mapname=%s gametype=%s g_race_gametype=1" % (mapname, info.get("gametype")))
 EOF
 [ "$(docker inspect -f '{{.State.Running}}' "${NAME}")" = "true" ] || { echo "!! the server died after the map change"; logs | tail -30; exit 1; }
 echo ">> PASS: ${MAP} was added at runtime and is running, no restart"
