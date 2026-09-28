@@ -3024,8 +3024,9 @@ class RaceDB {
         finishes: finFrom && w.day >= finFrom ? w.finishes : null,
         attempts: attFrom && w.day >= attFrom ? w.attempts : null,
         // The current week is genuinely incomplete; the page dashes it rather
-        // than letting it read as a collapse in activity.
-        partial: w.n < 7,
+        // than letting it read as a collapse in activity. On a Sunday it already
+        // has all 7 days, but today is one of them and is still accumulating.
+        partial: w.n < 7 || w.day === isoWeekStart(today),
       }));
     }
 
