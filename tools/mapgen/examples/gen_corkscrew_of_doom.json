@@ -1,0 +1,168 @@
+{
+  "name": "gen_corkscrew_of_doom",
+  "title": "Corkscrew of Doom",
+  "width": 448,
+  "segments": [
+    {
+      "type": "straight",
+      "length": 512
+    },
+    {
+      "rise": -440,
+      "type": "ramp",
+      "length": 768
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "turn",
+      "angle": 180,
+      "radius": 480,
+      "shortcut": true,
+      "direction": "left"
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "drop": 384,
+      "type": "gap",
+      "length": 300
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "rise": -368,
+      "type": "ramp",
+      "length": 640
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "turn",
+      "angle": 180,
+      "radius": 480,
+      "shortcut": true,
+      "direction": "left"
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "checkpoint"
+    },
+    {
+      "rise": -440,
+      "type": "ramp",
+      "length": 768
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "turn",
+      "angle": 180,
+      "radius": 480,
+      "shortcut": true,
+      "direction": "left"
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "drop": 384,
+      "type": "gap",
+      "length": 300
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "rise": -368,
+      "type": "ramp",
+      "length": 640
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "turn",
+      "angle": 180,
+      "radius": 480,
+      "shortcut": true,
+      "direction": "left"
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "checkpoint"
+    },
+    {
+      "rise": -440,
+      "type": "ramp",
+      "length": 768
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "turn",
+      "angle": 180,
+      "radius": 480,
+      "shortcut": true,
+      "direction": "left"
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "drop": 384,
+      "type": "gap",
+      "length": 300
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "rise": -368,
+      "type": "ramp",
+      "length": 640
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "turn",
+      "angle": 180,
+      "radius": 480,
+      "shortcut": true,
+      "direction": "left"
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "straight",
+      "length": 640
+    }
+  ]
+}
