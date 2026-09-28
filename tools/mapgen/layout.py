@@ -46,6 +46,16 @@ SHORTCUT_PLATFORM = 64
 SHORTCUT_GAP_FILL = 0.92
 SHORTCUT_MIN_LEG = SHORTCUT_BACK + SHORTCUT_WINDOW // 2 + 80
 
+# Checkpoints the generator adds itself (plan_checkpoints). One every
+# CP_EVERY of route (8 s of par at 320 ups), never closer than CP_MIN to
+# another checkpoint, none within CP_END_MIN of the start or finish line, and
+# each on a straight at least CP_EDGE from its ends, so the trigger and its
+# painted line sit on plain, level floor.
+CP_EVERY = 2560
+CP_MIN = 1024
+CP_END_MIN = 768
+CP_EDGE = 64
+
 FIN_THICK = 32          # slalom and split fins, along the course
 SPLIT_GATE = 96         # gates in a split's safe lane: 3 player widths
 VOID_DEPTH = 160        # side walls reach this far below a floorless piece
@@ -115,6 +125,7 @@ class Course:
         self.shortcuts = []   # one dict per turn.shortcut: platforms, gap, distance saved
         self.features = []    # one dict per slalom / beam / split
         self.overpasses = []  # (lower seg, upper seg, clearance): where the course crosses itself
+        self.auto_checkpoints = []  # (segment, distance into it) of each checkpoint the generator added
         self.length = 0.0     # centre-line length, start trigger -> finish trigger
 
 
@@ -129,6 +140,96 @@ def _rect(o, f, l, back, fwd, right, left):
 def _band(o, f, l, back, fwd, lo, hi):
     """Footprint spanning [back, fwd] along f and [lo, hi] across it (left +)."""
     return _rect(o, f, l, back, fwd, -lo, hi)
+
+
+def _seg_length(seg):
+    t = seg["type"]
+    if t == "turn":
+        return math.radians(seg["angle"]) * seg["radius"]
+    if t == "checkpoint":
+        return 0.0
+    return float(seg["length"])
+
+
+def plan_checkpoints(spec):
+    """Where the generator adds checkpoints: a sorted list of
+    (segment index, distance into that straight).
+
+    Like the start and finish, checkpoints are the generator's job, so no
+    course ships without splits however the plan was written. Checkpoints the
+    plan already has are kept and counted. The rest are added greedily: at
+    the first allowed spot once CP_EVERY of route has gone by without one.
+
+    Allowed spots are on straights, CP_EDGE clear of the straight's ends,
+    outside the stretch a shortcut skips (a player who takes the stones must
+    still cross every checkpoint), CP_MIN from any other checkpoint and
+    CP_END_MIN from the start and finish lines. A course with no checkpoint
+    after that, but room for one, gets one at the allowed spot nearest its
+    middle.
+    """
+    segs = spec["segments"]
+    at = [0.0]
+    for seg in segs:
+        at.append(at[-1] + _seg_length(seg))
+    total = at[-1]
+    planned = [at[i] for i, seg in enumerate(segs) if seg["type"] == "checkpoint"]
+
+    # Allowed intervals of route distance, each tagged with its straight.
+    allowed = [(at[i] + CP_EDGE, at[i + 1] - CP_EDGE, i) for i, seg in enumerate(segs)
+               if seg["type"] == "straight" and seg["length"] > 2 * CP_EDGE]
+    blocked = [(0.0, CP_END_MIN), (total - CP_END_MIN, total)]
+    reach = SHORTCUT_BACK + SHORTCUT_WINDOW / 2 + CP_EDGE
+    for i, seg in enumerate(segs):
+        if seg["type"] == "turn" and seg.get("shortcut"):
+            blocked.append((at[i] - reach, at[i + 1] + reach))
+
+    def carve(spans, cut):
+        out = []
+        for a, b, i in spans:
+            for c, d in cut:
+                if d <= a or c >= b:
+                    continue
+                if c > a:
+                    out.append((a, c, i))
+                a = max(a, d)
+                if a >= b:
+                    break
+            else:
+                out.append((a, b, i))
+                continue
+            if a < b:
+                out.append((a, b, i))
+        return [(a, b, i) for a, b, i in out if b >= a]
+
+    for cut in blocked:
+        allowed = carve(allowed, [cut])
+    allowed = carve(allowed, [(c - CP_MIN, c + CP_MIN) for c in planned])
+    allowed.sort()
+
+    def first_from(target):
+        for a, b, i in allowed:
+            if b >= target:
+                return max(a, target), i
+        return None
+
+    added = []
+    last = 0.0
+    while True:
+        spot = first_from(last + CP_EVERY)
+        if spot is None:
+            break
+        d, i = spot
+        passed = [c for c in planned if last < c <= d]
+        if passed:
+            last = max(passed)
+            continue
+        added.append((d, i))
+        last = d
+        allowed = carve(allowed, [(d - CP_MIN, d + CP_MIN)])
+    if not planned and not added and allowed:
+        a, b, i = min(allowed, key=lambda s: min(abs(s[0] - total / 2), abs(s[1] - total / 2)))
+        added.append((min(max(total / 2, a), b), i))
+    return [(i, round(d - at[i], 1)) for d, i in sorted(added)]
 
 
 def _sat_overlap(a, b, eps=1.0):
@@ -305,6 +406,17 @@ class _Walker:
         ent["origin"] = (self.x, self.y, self.z + 32)
         self.c.entities.append((ent, []))
 
+    def checkpoint(self):
+        self.trigger("trigger_multiple", {"classname": "target_checkpoint"}, stripe="checkpoint")
+
+    def checkpoint_at(self, o, f, a):
+        """A checkpoint `a` units into the straight that starts at o along f
+        and has just been laid (straights are level, so the cursor's z holds)."""
+        here = (self.x, self.y)
+        self.x, self.y = o[0] + f[0] * a, o[1] + f[1] * a
+        self.checkpoint()
+        self.x, self.y = here
+
     def turn(self, direction, angle, radius):
         sign = 1.0 if direction == "left" else -1.0
         o, f, l = self.frame()
@@ -466,14 +578,23 @@ class _Walker:
         self._start_room()
 
         segs = s["segments"]
+        auto = {}
+        for i, a in plan_checkpoints(s):
+            auto.setdefault(i, []).append(a)
         for i, seg in enumerate(segs):
             self.seg = i
             t = seg["type"]
             if t == "straight":
+                o, f, _ = self.frame()
                 self.box_run(seg["length"])
                 self.runup += seg["length"]
                 if self.pending and self.pending["turn"] == i - 1:
                     self._shortcut(i)
+                # After the shortcut, so landmarks stay in course order: a
+                # checkpoint on a shortcut's exit leg is past its window.
+                for a in auto.get(i, ()):
+                    self.checkpoint_at(o, f, a)
+                    self.c.auto_checkpoints.append((i, a))
             elif t == "ramp":
                 self.box_run(seg["length"], seg["rise"])
                 self.runup = 0.0
@@ -486,8 +607,7 @@ class _Walker:
                 self.turn(seg["direction"], seg["angle"], seg["radius"])
                 self.runup += math.radians(seg["angle"]) * seg["radius"]
             elif t == "checkpoint":
-                self.trigger("trigger_multiple", {"classname": "target_checkpoint"},
-                             stripe="checkpoint")
+                self.checkpoint()
             elif t == "gap":
                 self._gap(i, seg, segs)
             elif t == "slalom":

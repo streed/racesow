@@ -82,7 +82,7 @@ with the 0.8 margin applied. Ramps are capped at 30°.
 | `turn` | direction, angle ∈ {45, 90, 135, 180}, radius | radius ≥ width/2 + 64 |
 | `ramp` | length, rise | ≤ 30°; resets run-up |
 | `gap` | length, drop | ≤ `max_gap(drop)`; needs 192 units of run-up; must land on a straight, turn, slalom or split |
-| `checkpoint` | — | `trigger_multiple` → `target_checkpoint` |
+| `checkpoint` | — | `trigger_multiple` → `target_checkpoint`; optional, since the generator fills any stretch over 2,560 units without one |
 | `turn` + `shortcut` | a 180 with straights ≥ 320 either side | stepping stones at 92% of `max_gap(0)` across the U |
 | `slalom` | length, count 2–12 | fins leave 160-unit gates; ≥ 256 between fins; width ≥ 224 |
 | `beam` | length, beam_width | 48 ≤ beam ≤ width − 128; walls reach 160 below it |
@@ -94,7 +94,9 @@ every crossing is reported as an overpass.
 
 The start room, spawn, start timer, stop timer, finish room, sky shell and pit
 kill volume are implicit: every course has exactly one of each, so the model
-cannot forget them. The timers use the racemod's defrag-style entities
+cannot forget them. Checkpoints are guaranteed the same way: the generator
+keeps the plan's own and adds one on a straight roughly every 8 s of par,
+never inside a stretch a shortcut skips. The timers use the racemod's defrag-style entities
 (`hrace/entities/timers.as`), so a generated map races exactly like an
 imported one.
 

@@ -35,7 +35,9 @@ A course may pass over itself where one part runs high enough above another
 
 The start room, start timer, finish timer and finish room are implicit: every
 course has exactly one of each, so the model is never asked to place them and
-can never forget them.
+can never forget them. Checkpoints are partly implicit: any the spec places
+are kept, and layout.plan_checkpoints adds more wherever a long stretch has
+none.
 
 This module validates field ranges only. Whether the pieces fit together — a
 gap with no run-up, a course that crosses itself — is layout.py's job, because

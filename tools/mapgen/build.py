@@ -197,7 +197,9 @@ def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, cam
             # Par: the centre line at plain run speed. A strafing player beats
             # it; nobody should be slower. Shown on the form as "about N s".
             "par_seconds": round(course.length / 320.0, 1),
-            "checkpoints": sum(1 for s in spec["segments"] if s["type"] == "checkpoint"),
+            # The plan's own checkpoints plus the ones the generator added.
+            "checkpoints": sum(1 for e, _ in course.entities if e["classname"] == "target_checkpoint"),
+            "auto_checkpoints": len(course.auto_checkpoints),
             # Optional stepping-stone routes across U-turns, and the par with
             # every one of them taken.
             "shortcuts": course.shortcuts,

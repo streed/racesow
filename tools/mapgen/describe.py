@@ -29,7 +29,8 @@ with long straights and sweeping turns are what make a course fun.
 
 You do not place geometry. You write a course SPEC: an ordered list of segments that
 a generator lays end to end. The start room, start timer, finish timer and finish
-room are added automatically — do not describe them.
+room are added automatically — do not describe them. So are enough checkpoints
+(see below).
 
 Units: 1 unit ~ 1 inch; the player is 32 wide and 64 tall.
 
@@ -52,7 +53,10 @@ false):
              A gap needs >= {int(physics.MIN_RUNUP)} units of straight/turn floor right
              before it (ramps and gaps reset that) and must be followed by a
              straight or turn to land on. Falling in kills the player.
-  checkpoint a timing split at that point; use 1-4 spread along longer courses.
+  checkpoint a timing split at that point. Optional: the generator adds one on a
+             straight every ~{layout.CP_EVERY} units of route wherever the plan leaves a
+             longer stretch without one, so place your own only where a split
+             means something (the top of a climb, just past a hard section).
   slalom     length, count {specmod.SLALOM_COUNT[0]}-{specmod.SLALOM_COUNT[1]}: full-height fins off alternate walls,
              each leaving a {specmod.SLALOM_GATE}-unit gate, so the line is a weave. Needs width >=
              {specmod.SLALOM_GATE + specmod.SLALOM_FIN_MIN} and length >= {specmod.SLALOM_SPACING} * (count + 1).

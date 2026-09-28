@@ -68,23 +68,35 @@ CLOSE_UP = {"beam": 160, "split": 224}
 
 def _back_along_route(route, pos, back):
     """The point `back` units before `pos` along the course's centre line
-    (a polyline of (x, y, z)), or None if pos is not on it. The nearest
-    vertex is found in 3-D, so a landmark on an overpass is never matched to
-    the corridor passing under it."""
+    (a polyline of (x, y, z)), or None if pos is not on it. pos may lie
+    anywhere on an edge (a checkpoint in the middle of a straight). The edge
+    is chosen in 3-D, so a landmark on an overpass is never matched to the
+    corridor passing under it."""
     if len(route) < 2:
         return None
-    i = min(range(len(route)), key=lambda k: math.dist(route[k], pos))
-    if math.dist(route[i][:2], pos[:2]) > 1.0:
+    best = None
+    for k in range(1, len(route)):
+        a, b = route[k - 1], route[k]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((pos[0] - a[0]) * dx + (pos[1] - a[1]) * dy) / L2))
+        q = tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+        d = math.dist(q, pos)
+        if best is None or d < best[0]:
+            best = (d, k, q)
+    _, k, q = best
+    if math.dist(q[:2], pos[:2]) > 1.0:
         return None
-    left = back
-    while i > 0:
-        a, b = route[i - 1], route[i]
-        d = math.dist(a[:2], b[:2])
+    left, here = back, q
+    while k > 0:
+        a = route[k - 1]
+        d = math.dist(a[:2], here[:2])
         if d >= left:
             t = left / d if d else 0.0
-            return tuple(b[k] + (a[k] - b[k]) * t for k in range(3))
+            return tuple(here[i] + (a[i] - here[i]) * t for i in range(3))
         left -= d
-        i -= 1
+        here = a
+        k -= 1
     return tuple(route[0])
 
 
@@ -233,7 +245,16 @@ def stage_views(pk3_path, views, basewsw):
     return names
 
 
-def run(pk3_path, views, warsow, out, width=1280, height=720, display=":77", log=print):
+def run(pk3_path, views, warsow, out, width=1280, height=720, display=":77", log=print, first=1):
+    """Film each view; returns the PNG paths. One client session changes view
+    with a bound key, so more views than KEYS are filmed in batches, and the
+    files are numbered on across batches from `first`."""
+    if len(views) > len(KEYS):
+        written = []
+        for k in range(0, len(views), len(KEYS)):
+            written += run(pk3_path, views[k:k + len(KEYS)], warsow, out, width, height,
+                           display, log, first + k)
+        return written
     basewsw = os.path.join(warsow, "basewsw")
     os.makedirs(out, exist_ok=True)
     names = stage_views(pk3_path, views, basewsw)
@@ -304,7 +325,7 @@ def run(pk3_path, views, warsow, out, width=1280, height=720, display=":77", log
                     raise RuntimeError(f"no screenshot for view {view[0]}")
                 time.sleep(0.5)
             tga = [l for l in text().splitlines() if l.startswith("Wrote ")][-1][6:].strip()
-            png = os.path.join(out, f"{i + 1:02d}_{view[0]}.png")
+            png = os.path.join(out, f"{first + i:02d}_{view[0]}.png")
             tga_to_png(tga, png)
             written.append(png)
             log(f"wrote {png}")

@@ -304,6 +304,60 @@ class Layout(unittest.TestCase):
         self.assertEqual(len(knot.overpasses), 4)
         self.assertEqual(len(knot.shortcuts), 3)
 
+    # -- checkpoints the generator adds ----------------------------------------
+    def _cps(self, course):
+        return [ent["origin"] for ent, _ in course.entities if ent["classname"] == "target_checkpoint"]
+
+    def test_checkpoints_are_added_where_the_plan_has_none(self):
+        c = layout.build(course_of({"type": "straight", "length": 4096},
+                                   {"type": "straight", "length": 4096},
+                                   {"type": "straight", "length": 4096}))
+        cps = self._cps(c)
+        # 12,288 units: one every CP_EVERY, none near the start or finish.
+        self.assertEqual(len(cps), 4)
+        start_x = layout.ROOM_LEN
+        xs = [x - start_x for x, _, _ in cps]
+        self.assertAlmostEqual(xs[0], layout.CP_EVERY)
+        for a, b in zip(xs, xs[1:]):
+            self.assertGreaterEqual(b - a, layout.CP_EVERY - 1e-6)
+        self.assertLessEqual(xs[-1], 3 * 4096 - layout.CP_END_MIN)
+        # Each one is a real, timed checkpoint with its trigger and painted line.
+        triggers = [e for e, b in c.entities if e["classname"] == "trigger_multiple"
+                    and e["target"].startswith("mg_checkpoint")]
+        self.assertEqual(len(triggers), 4)
+        self.assertEqual(len(c.auto_checkpoints), 4)
+
+    def test_planned_checkpoints_are_kept_and_spaced_around(self):
+        segs = [{"type": "straight", "length": 4096}, {"type": "checkpoint"},
+                {"type": "straight", "length": 4096}]
+        c = layout.build(course_of(*segs))
+        cps = sorted(x - layout.ROOM_LEN for x, _, _ in self._cps(c))
+        self.assertIn(4096, [round(x) for x in cps])
+        for a, b in zip(cps, cps[1:]):
+            self.assertGreaterEqual(b - a, layout.CP_MIN - 1e-6)
+
+    def test_short_course_still_gets_one(self):
+        c = layout.build(course_of({"type": "straight", "length": 2048}))
+        self.assertEqual(len(self._cps(c)), 1)
+
+    def test_no_checkpoint_in_the_stretch_a_shortcut_skips(self):
+        # Long S with both bends shortcut: every added checkpoint must be on a
+        # straight, outside [window A, window B] of each shortcut.
+        spec = self.s_course(leg=3000)
+        c = layout.build(spec)
+        self.assertTrue(c.auto_checkpoints)
+        reach = layout.SHORTCUT_BACK + layout.SHORTCUT_WINDOW / 2
+        for seg, a in c.auto_checkpoints:
+            self.assertEqual(spec["segments"][seg]["type"], "straight")
+            n = spec["segments"][seg]["length"]
+            before = seg + 1 < len(spec["segments"]) and spec["segments"][seg + 1].get("shortcut")
+            after = seg > 0 and spec["segments"][seg - 1].get("shortcut")
+            if before:
+                self.assertLessEqual(a, n - reach)
+            if after:
+                self.assertGreaterEqual(a, reach)
+            self.assertTrue(layout.CP_EDGE <= a <= n - layout.CP_EDGE)
+
     def test_preview_is_svg(self):
         svg = layout.preview_svg(layout.build(example()))
         self.assertTrue(svg.startswith("<svg") and svg.rstrip().endswith("</svg>"))
@@ -391,7 +445,7 @@ class Screenshots(unittest.TestCase):
     def test_views_cover_every_landmark(self):
         views = screenshots.auto_views(layout.build(example()))
         self.assertEqual([v[0] for v in views],
-                         ["start", "gap1", "checkpoint1", "gap2", "finish"])
+                         ["start", "gap1", "checkpoint1", "checkpoint2", "gap2", "finish"])
         for _, pos, yaw in views:
             self.assertEqual(len(pos), 3)
             self.assertTrue(0 <= yaw < 360)

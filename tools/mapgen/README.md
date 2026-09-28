@@ -51,10 +51,20 @@ description ──Claude──▶ spec.json ──layout──▶ brushes ──
 | `turn` | `direction`, `angle` (45/90/135/180), `radius`, `shortcut` | a curved corridor; a 180 with `shortcut: true` adds wall windows and stepping stones across the U |
 | `ramp` | `length`, `rise` | a sloped straight, at most 30 degrees |
 | `gap` | `length`, `drop` | a pit to jump, sized against `physics.max_gap(drop)` |
-| `checkpoint` | none | a timing split, painted across the floor |
+| `checkpoint` | none | a timing split, painted across the floor (optional: see below) |
 | `slalom` | `length`, `count` | full-height fins off alternate walls, each leaving a 160-unit gate: the line is a weave |
 | `beam` | `length`, `beam_width` | no floor but a bridge down the middle, over the pit |
 | `split` | `length`, `direction`, `count` | a median wall and two lanes: the `direction` lane runs straight over `count` holes (85% of a run-speed jump, each after a full run-up), the other is solid but weaves through tight fins |
+
+**Checkpoints are guaranteed.** Like the start and finish, the generator adds
+them itself (`layout.plan_checkpoints`). It keeps any the plan placed, then adds
+one on a straight every 2,560 units of route (8 s of par) wherever the plan left
+a longer stretch without one. Each added checkpoint is at least 1,024 from any
+other, 768 from the start and finish lines, 64 clear of its straight's ends,
+and never inside the stretch a shortcut skips, so a player who takes the stones
+still crosses every one. A course too short for that spacing still gets one,
+near its middle. The report's `checkpoints` counts both kinds, and
+`auto_checkpoints` counts the added ones.
 
 The holes, stones and gates are sized from `physics.py`, so every route is
 clearable at a plain 320 ups. The risky routes (shortcuts, a split's fast lane,
