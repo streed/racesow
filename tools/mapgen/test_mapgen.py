@@ -12,6 +12,7 @@ import copy
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import types
@@ -461,6 +462,103 @@ class Worker(unittest.TestCase):
         weird = worker.unique_name("Gen-Ice Loop!!", "0" * 32)
         for name in (a, b, long, weird):
             self.assertRegex(name, specmod.NAME_RE)
+
+
+class _FakeCursor:
+    def __init__(self, log):
+        self.log = log
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=()):
+        self.log.append((" ".join(sql.split()), params))
+
+
+class _FakeConn:
+    """Records what the worker writes; enough of psycopg's shape for run_job."""
+
+    def __init__(self):
+        self.log = []
+
+    def cursor(self):
+        return _FakeCursor(self.log)
+
+    def commit(self):
+        pass
+
+
+class Publish(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = os.path.join(self.tmp, "store")
+        os.makedirs(self.store)
+        open(os.path.join(self.store, worker.STORE_SENTINEL), "w").close()
+        self.pk3 = os.path.join(self.tmp, "gen_test_abcdef.pk3")
+        with open(self.pk3, "wb") as fh:
+            fh.write(b"PK\x03\x04 a pack")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_copies_into_the_store_and_never_rewrites(self):
+        dest = worker.publish(self.pk3, self.store)
+        self.assertEqual(dest, os.path.join(self.store, "gen_test_abcdef.pk3"))
+        with open(dest, "rb") as fh:
+            self.assertEqual(fh.read(), b"PK\x03\x04 a pack")
+        self.assertEqual(oct(os.stat(dest).st_mode & 0o777), "0o644")
+        # No half-copied leftovers the engine or the snapshot could pick up.
+        self.assertEqual(sorted(os.listdir(self.store)), [worker.STORE_SENTINEL, "gen_test_abcdef.pk3"])
+        with self.assertRaises(worker.PublishError):
+            worker.publish(self.pk3, self.store)
+
+    def test_refuses_a_directory_that_is_not_the_store(self):
+        empty = os.path.join(self.tmp, "mountpoint")
+        os.makedirs(empty)
+        for where in (empty, "", None, os.path.join(self.tmp, "missing")):
+            with self.assertRaises(worker.PublishError):
+                worker.publish(self.pk3, where)
+        self.assertEqual(os.listdir(empty), [])
+
+    def _run(self, store):
+        conn = _FakeConn()
+        out = os.path.join(self.tmp, "work")
+
+        def planner(description, log):
+            return flat(example()), 1
+
+        def builder(spec, out_dir, q3map2=None):
+            os.makedirs(out_dir, exist_ok=True)
+            pk3 = os.path.join(out_dir, spec["name"] + ".pk3")
+            shutil.copyfile(self.pk3, pk3)
+            open(os.path.join(out_dir, spec["name"] + ".svg"), "w").write("<svg/>")
+            return pk3, {"name": spec["name"], "pk3": pk3, "par_seconds": 29.0}
+
+        job = (7, "ab" * 16, "a map", "2026-09-28", b"x" * 16)
+        outcome = worker.run_job(conn, job, out, planner, builder, store=store)
+        return outcome, conn.log
+
+    def test_a_checked_map_is_published_without_a_human_step(self):
+        outcome, log = self._run(self.store)
+        self.assertEqual(outcome, "publishing")
+        name = worker.unique_name("gen_first_light", "ab" * 16)
+        self.assertTrue(os.path.isfile(os.path.join(self.store, name + ".pk3")))
+        final = log[-1][0]
+        self.assertIn("status = 'publishing'", final)
+        self.assertIn("published_at", final)
+        self.assertFalse(any("'review'" in sql for sql, _ in log))
+
+    def test_a_store_that_is_not_there_fails_the_job_and_refunds_it(self):
+        outcome, log = self._run(os.path.join(self.tmp, "nowhere"))
+        self.assertEqual(outcome, "failed")
+        sqls = [sql for sql, _ in log]
+        self.assertTrue(any("status = 'failed'" in q for q in sqls))
+        self.assertTrue(any("UPDATE mapgen_quota SET used = used - 1" in q for q in sqls))
+        failed = [p for q, p in log if "status = 'failed'" in q][0]
+        self.assertEqual(failed[0], worker.PUBLISH_FAILED)
 
 
 class Describe(unittest.TestCase):

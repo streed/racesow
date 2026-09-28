@@ -24,6 +24,22 @@
 
 Cvar rsApiBlockedUrl( "rs_api_blocked_url", "", 0 );
 
+// --- Generated-map sync -------------------------------------------------------
+//
+// With rs_api_mapsync_url and this server's own rs_api_token set, the same poll
+// goes to GET /api/game/map-sync instead: it returns the blocklist plus one
+// "?<map>" line per freshly published generated map (tools/mapgen/worker.py
+// copies it into the shared map store; sv_mapscan loads it within a minute).
+// The next poll answers with ?have=a,b for the ones the engine's map list now
+// holds, which is how a generated map's page on the site learns it is on the
+// servers. The "?" lines never reach raceBlockedMaps. If a sync poll fails for
+// good (a revoked token, an old web build), the rest of this map falls back to
+// the public blocklist URL, so blocking never depends on the sync working.
+Cvar rsApiMapSyncUrl( "rs_api_mapsync_url", "", 0 );
+String[] mapgenAsked;         // generated maps the site asked about last poll
+bool mapSyncFailed = false;   // this map: stop trying the sync endpoint
+bool mapSyncInFlight = false; // the last fetch went to the sync endpoint
+
 const uint API_BLOCKED_REFRESH_MS = 30 * 1000;
 // 0 = no fetch yet this map, so the first think frame fires one immediately;
 // then one per refresh interval (same levelTime idiom as apiTopLastFetch).
@@ -176,6 +192,7 @@ String RACE_MapBlockedReason( const String &in mapName )
 void RACE_ParseBlockedList( const String &in text )
 {
     raceBlockedMaps.resize( 0 );
+    mapgenAsked.resize( 0 );
     // getToken() returns "" once the index passes the last token (same idiom as
     // the vote arg parsing). The cap is a defensive backstop against a
     // pathological payload — no server blocks anywhere near this many maps.
@@ -184,15 +201,57 @@ void RACE_ParseBlockedList( const String &in text )
         String tok = text.getToken( i );
         if ( tok.length() == 0 )
             break;
+        if ( tok.substr( 0, 1 ) == "?" )
+        {
+            if ( tok.length() > 1 && mapgenAsked.length() < 64 )
+                mapgenAsked.insertLast( tok.substr( 1 ).removeColorTokens().tolower() );
+            continue;
+        }
         raceBlockedMaps.insertLast( tok.removeColorTokens().tolower() );
     }
 }
 
+// The asked-about maps the engine's map list now holds, comma-separated. One
+// walk of the list (as GetMapsByPattern does) however many were asked about,
+// and only when some were.
+String RACE_MapgenHave()
+{
+    if ( mapgenAsked.length() == 0 )
+        return "";
+    String have = "";
+    const String@ map;
+    uint i = 0;
+    while ( true )
+    {
+        @map = ML_GetMapByNum( i++ );
+        if ( @map == null )
+            break;
+        String clean = map.removeColorTokens().tolower();
+        for ( uint k = 0; k < mapgenAsked.length(); k++ )
+        {
+            if ( mapgenAsked[k] == clean )
+            {
+                if ( have.length() > 0 )
+                    have += ",";
+                have += clean;
+                break;
+            }
+        }
+    }
+    return have;
+}
+
+bool RACE_MapSyncEnabled()
+{
+    return !mapSyncFailed && rsApiMapSyncUrl.string.length() > 0 && rsApiToken.string.length() > 0;
+}
+
 // Poll for a freshly-fetched list and refresh on the periodic interval. Called
-// from GT_ThinkRules; a no-op when rs_api_blocked_url is unset.
+// from GT_ThinkRules; a no-op when neither rs_api_blocked_url nor the map sync
+// is configured.
 void RACE_ApiBlockedThink()
 {
-    if ( rsApiBlockedUrl.string.length() == 0 )
+    if ( rsApiBlockedUrl.string.length() == 0 && !RACE_MapSyncEnabled() )
         return;
 
     if ( apiBlockedLastFetch == 0 )
@@ -207,17 +266,38 @@ void RACE_ApiBlockedThink()
         RACE_ParseBlockedList( seed );
     }
 
-    if ( RS_ApiPollBlocked() == 1 )
+    int polled = RS_ApiPollBlocked();
+    if ( polled == 1 )
     {
         String payload = RS_BlockedListText();
         RACE_ParseBlockedList( payload );
+    }
+    else if ( polled == -1 && mapSyncInFlight )
+    {
+        // Fall back to the public list at once rather than a whole interval on.
+        mapSyncFailed = true;
+        apiBlockedLastFetch = 0;
     }
 
     if ( apiBlockedLastFetch == 0 || levelTime - apiBlockedLastFetch >= API_BLOCKED_REFRESH_MS )
     {
         apiBlockedLastFetch = levelTime == 0 ? 1 : levelTime;
-        // empty token: the endpoint is public (same as topscores), so the ingest
-        // write-credential has no business riding along on this request.
-        RS_ApiFetchBlocked( rsApiBlockedUrl.string, "" );
+        if ( RACE_MapSyncEnabled() )
+        {
+            // The sync endpoint is per-server, so it takes this server's token.
+            String url = rsApiMapSyncUrl.string;
+            String have = RACE_MapgenHave();
+            if ( have.length() > 0 )
+                url += "?have=" + have;
+            mapSyncInFlight = true;
+            RS_ApiFetchBlocked( url, rsApiToken.string );
+        }
+        else if ( rsApiBlockedUrl.string.length() > 0 )
+        {
+            // empty token: the endpoint is public (same as topscores), so the
+            // ingest write-credential has no business riding along on this request.
+            mapSyncInFlight = false;
+            RS_ApiFetchBlocked( rsApiBlockedUrl.string, "" );
+        }
     }
 }

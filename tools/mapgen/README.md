@@ -109,9 +109,13 @@ an empty leaderboard.
 
 `worker.py` serves the `/mapgen` page. The web queues a request only after
 checking the requester's daily identity quota (2 maps a day by default, see
-`web/mapgen-identity.js`) and the site's daily budget. The worker then plans,
-builds and checks the map and leaves it at `review` in
-`MAPGEN_DIR/<token>/`. Nothing is published automatically.
+`web/mapgen-identity.js`) and the site's daily budget, and returns the job's
+token; the requester lands on `/mapgen/<token>`, which follows the job live.
+The worker plans, builds and checks the map in `MAPGEN_DIR/<token>/`, then
+publishes it: a map that passes every check is copied into the shared map
+store (`MAPGEN_STORE`), where each game server's `sv_mapscan` loads it and
+confirms it over `/api/game/map-sync`. The page says "On the servers" once
+every active server has it.
 
 ```
 docker compose --profile mapgen up -d mapgen    # needs ANTHROPIC_API_KEY in .env

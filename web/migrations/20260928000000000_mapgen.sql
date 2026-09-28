@@ -25,6 +25,19 @@
 --   descriptions. `identity` and `quota_day` are kept only so the requester
 --   can list today's jobs and a build failure can refund the quota. They are
 --   cleared after two days, together with the quota rows.
+--   Status runs queued -> planning -> building -> publishing -> published, or
+--   ends in failed. There is no human step: a map that passes every automated
+--   check is copied into the shared map store (publishing), and it is
+--   published once a game server reports that its map scan loaded it.
+--
+-- mapgen_seen: which game server has confirmed which published map, and when.
+--   Game servers poll /api/game/map-sync every ~30 s (hrace/blockedmaps.as);
+--   the reply names the maps they should look for, and the next poll reports
+--   the ones their engine's map list now holds.
+--
+-- mapgen_server: when each game server last polled map-sync. A server that
+--   polled in the last few minutes is "active", and a map is on every server
+--   once every active server has confirmed it.
 
 -- Up Migration
 CREATE TABLE IF NOT EXISTS mapgen_quota (
@@ -44,8 +57,8 @@ CREATE TABLE IF NOT EXISTS mapgen_job (
   token       TEXT    NOT NULL UNIQUE CHECK (token ~ '^[0-9a-f]{32}$'),
   description TEXT    NOT NULL,
   status      TEXT    NOT NULL DEFAULT 'queued'
-              CHECK (status IN ('queued', 'planning', 'building', 'review',
-                                'published', 'rejected', 'failed')),
+              CHECK (status IN ('queued', 'planning', 'building', 'publishing',
+                                'published', 'failed')),
   quota_day   DATE,
   identity    BYTEA   CHECK (identity IS NULL OR octet_length(identity) = 16),
   map_name    TEXT,
@@ -54,7 +67,9 @@ CREATE TABLE IF NOT EXISTS mapgen_job (
   error       TEXT,
   created_at  BIGINT  NOT NULL,
   started_at  BIGINT,
-  finished_at BIGINT
+  finished_at BIGINT,
+  published_at BIGINT,   -- copied into the map store
+  live_at      BIGINT    -- first game server confirmed it
 );
 
 -- The worker claims the oldest queued job with FOR UPDATE SKIP LOCKED.
@@ -63,7 +78,25 @@ CREATE INDEX IF NOT EXISTS mapgen_job_queued ON mapgen_job (id) WHERE status = '
 CREATE INDEX IF NOT EXISTS mapgen_job_identity ON mapgen_job (quota_day, identity)
   WHERE identity IS NOT NULL;
 
+-- Maps a game server should be asked about: recently copied to the store.
+CREATE INDEX IF NOT EXISTS mapgen_job_published ON mapgen_job (published_at)
+  WHERE published_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS mapgen_seen (
+  job_id      BIGINT NOT NULL REFERENCES mapgen_job (id) ON DELETE CASCADE,
+  server_name TEXT   NOT NULL,
+  seen_at     BIGINT NOT NULL,
+  PRIMARY KEY (job_id, server_name)
+);
+
+CREATE TABLE IF NOT EXISTS mapgen_server (
+  server_name TEXT   PRIMARY KEY,
+  last_sync   BIGINT NOT NULL
+);
+
 -- Down Migration
+DROP TABLE IF EXISTS mapgen_server CASCADE;
+DROP TABLE IF EXISTS mapgen_seen CASCADE;
 DROP TABLE IF EXISTS mapgen_job CASCADE;
 DROP TABLE IF EXISTS mapgen_budget CASCADE;
 DROP TABLE IF EXISTS mapgen_quota CASCADE;

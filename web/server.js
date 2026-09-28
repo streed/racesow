@@ -642,11 +642,13 @@ api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (r
 }));
 
 // A job by its random token. Anyone holding the token can see the job, which
-// is what lets a requester share "my map is building" as a link.
+// is what lets a requester share "my map is building" as a link. Alongside the
+// job: its place in the queue while it waits, and each active game server with
+// the time it confirmed the published map (null until it has).
 api.get("/mapgen/jobs/:token", mapgenNoStore, wrap(async (req, res) => {
-  const job = await race.mapgenJob(req.params.token);
-  if (!job) return res.status(404).json({ error: "no such request" });
-  res.json(job);
+  const d = await race.mapgenJobDetail(req.params.token);
+  if (!d) return res.status(404).json({ error: "no such request" });
+  res.json({ ...d.job, queue: d.queue, servers: d.servers });
 }));
 
 // The worker's top-down plan preview, once planning has finished. Served
@@ -1070,6 +1072,38 @@ api.get("/game/blocked-maps", cache(30), wrap(async (_req, res) => {
   const names = await race.blockedMapNames();
   res.type("text/plain").send(names.length ? names.join("\n") + "\n" : "");
 }));
+
+// The gametype's live map sync (hrace/blockedmaps.as), polled every ~30 s with
+// the server's own token. The reply is the blocked-maps list, plus one
+// "?<map>" line per recently published generated map this server has not yet
+// confirmed. The next poll's ?have=a,b,c names the ones the engine's map list
+// now holds (sv_mapscan loads new packs from the shared store), which is how a
+// generated map's page learns it is on the servers. A "?" token can never be
+// a map name, so an older gametype that reads this as a plain blocklist is
+// unaffected. Not cached: the reply depends on who is asking.
+api.get(
+  "/game/map-sync",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).type("text/plain").send("unauthorized\n");
+    if (ident.revoked) return res.status(403).type("text/plain").send("server revoked\n");
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  wrap(async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    const have = typeof req.query.have === "string"
+      ? req.query.have.toLowerCase().split(",").map((s) => s.trim()).filter(Boolean)
+      : [];
+    const [blocked, ask] = await Promise.all([
+      race.blockedMapNames(),
+      race.mapgenSync({ serverName: req.ingest.serverName, have }),
+    ]);
+    const lines = [...blocked, ...ask.map((n) => "?" + n)];
+    res.type("text/plain").send(lines.length ? lines.join("\n") + "\n" : "");
+  })
+);
 
 // Out-of-band ops channel for a game box's healthcheck watchdog
 // (server/gamehealth.sh), polled every healthcheck interval.

@@ -6,7 +6,9 @@ puts it in the rotation. No mapper is involved.
 
 Status (2026-09-28): **phase 1 is built** as `tools/mapgen` (CLI + Docker
 image + CI), and so is phase 3's request path: the `/mapgen` page, the
-daily-identity quota and the worker. Phase 2 and publishing are design only.
+daily-identity quota, the worker, automatic publishing into the shared map
+store, and a per-request page that follows each map onto the servers. Phase 2
+is design only.
 
 ## The one idea worth remembering
 
@@ -177,38 +179,50 @@ walking ids. The `mapgen` compose service (profile `mapgen`, needs
 
 1. It claims with `FOR UPDATE SKIP LOCKED` and plans with Claude.
 2. It gives the map a unique name, `gen_<model's name>_<token[:6]>`.
-3. It builds, writes `./data/mapgen/<token>/`, and leaves the job at `review`.
-4. A failed build refunds the requester's map, because that one's our bug. A
-   failed plan does not, because the model call is the cost being bounded.
+3. It builds and checks the map in `./data/mapgen/<token>/`.
+4. It publishes it: every map that passes every automated check goes to the
+   servers, with no human step (see Publishing below).
+5. A failed build or publish refunds the requester's map, because that one's
+   our fault. A failed plan does not, because the model call is the cost being
+   bounded.
 
-**The page** (`/mapgen`, footer "Make a map") keeps no state: no cookie and no
-localStorage. It asks `/api/mapgen/mine`, and the same person on the same day
-computes the same identity. It polls every 5 s while a job is running and shows
-each built map's plan preview. All `/api/mapgen/*` responses are `no-store`:
-they depend on who is asking, so no cache may keep them.
+**The pages.** Submitting on `/mapgen` (footer "Make a map") returns the job's
+token and opens `/mapgen/<token>`, the job's own page and the link to share.
+It shows five steps with their times: queued (with the place in line),
+planning, building and checking, publishing, on the servers. Once built it
+shows the map's facts and plan, and each active game server as it confirms
+the map. It polls every 3 s (5 s while queued) until every active server has
+the map or the job failed. `/mapgen` itself keeps no state, no cookie and no
+localStorage: it lists today's requests from `/api/mapgen/mine`, each linking
+to its page. All `/api/mapgen/*` responses are `no-store`.
 
-**Publishing: pre-blocked, then unblocked by a moderator.** Maps reach the
-servers as pk3s in `server/maps/`. The entrypoint symlinks them in at boot, and
-`/api/game/blocked-maps` removes blocked ones. That gives a safe publish path
-with no new mechanism:
+**Publishing: automatic once every check passes.** The checks are the spec
+ranges, the layout rules (clearable gaps, no self-collision, run-up), the
+compile, `tools/mapfix` and the race-entity checks on the compiled bsp. Then:
 
-1. **Approve** (moderator): copy the pk3 into `server/maps/` and insert its
-   name into the block list *first*. It is installed but not votable.
-2. **Load**: a new pk3 is only seen at server boot (`scripts/setup.sh:191`).
-   The daily restart (`systemd/racesow-restart.timer`, 05:00) picks it up with
-   no extra downtime. "Publish now" can reuse the existing restart flag
-   (`/api/game/ops`).
-3. **Unblock** (moderator, `/admin/maps/:id/unblock`): `hrace/blockedmaps.as`
-   re-fetches every 30 s, so the map becomes votable live.
-4. **US box**: it has its own `server/maps` and no map sync. It should pull
-   approved generated pk3s from EU over HTTPS, the way it already reaches every
-   `rs_api_*_url`, before its own restart. That is a small script beside
-   `fetch-maps.sh`, which already does atomic, zip-checked, ClamAV-scanned
-   installs.
+1. **Publish** (`worker.py publish`): copy the pk3 into the shared map store
+   (`MAPGEN_STORE`, EU's `server/maps`, docs/shared-maps.md). It refuses a
+   directory without the store's sentinel and never rewrites an existing pack.
+   The copy lands under a dot-name the engine does not scan and is renamed in
+   one step. Status `publishing`.
+2. **Load**: every game server reads the store directly (`fs_cdpath`, US over
+   NFS) and `sv_mapscan` loads new packs within a minute, with no restart.
+3. **Confirm**: `hrace/blockedmaps.as` polls `GET /api/game/map-sync` every
+   30 s with the server's own token. The reply is the blocklist plus a
+   `?<map>` line per recently published map the server has not confirmed. The
+   next poll's `?have=` lists the ones the engine's map list now holds. The
+   first confirmation sets the job `published` (`live_at`), and each server's
+   is kept in `mapgen_seen` for the page. A server counts as active if it
+   polled in the last 5 minutes. If a sync poll fails for good, that map's
+   remaining polls use the public blocklist URL, so blocking never depends on
+   the sync.
+4. **Pulling a map**: a moderator blocks it (`/admin`), and the blocklist hides
+   it from every vote path within 30 s. Removing the pack follows the store's
+   rules.
 
 Adding a generated map to `server/configs/mappool.txt` stays a manual,
-curated decision. Being installed and unblocked makes a map votable; it does
-not put it in the automatic rotation.
+curated decision. A published map is votable; it is not in the automatic
+rotation.
 
 ## Phases
 
@@ -216,7 +230,7 @@ not put it in the automatic rotation.
 | --- | --- | --- |
 | 1 | strafe-only greybox: spec, layout, compile, static checks, CLI, Docker, CI boot | **built** |
 | 2 | headless pmove bot; proof-run demo in the replay viewer | design |
-| 3 | public form with daily identity quota → `mapgen_job` table → worker | **built** (publish step: design) |
+| 3 | public form with daily identity quota → `mapgen_job` table → worker → automatic publish → per-job page with server confirmations | **built** |
 | 4a | strafe-only vocabulary: slalom, beam, split lanes, overpasses | **built** |
 | 4b | vocabulary growth gated on phase 2: jump pads, walljump walls, themed texture sets | idea |
 
@@ -248,8 +262,10 @@ not put it in the automatic rotation.
   `describe.plan` yet (no API key in the environment it was built in). Expect
   prompt tuning once real descriptions flow.
 - **"Fun" is not checked.** Everything above proves a course *can* be raced.
-  Whether it is worth racing is a human call, which is why phase 3 puts a
-  review step before anything reaches the rotation.
+  Whether it is worth racing is a human call. Generated maps publish without
+  one (a published map is votable, not in the rotation), so the check is
+  after the fact: a moderator blocks a bad one and it leaves every vote path
+  within 30 s.
 - **A new bsp name is an empty board.** Every generated map starts with no
   records. That is fine for new maps, but a bug-fix rebuild of a published map
   must keep its name, or its records strand (see `tools/mapfix/README.md`).
@@ -257,4 +273,4 @@ not put it in the automatic rotation.
   loads the map. `tools/mapgen/screenshots.py` renders it in the real Warsow
   client (Xvfb + software GL), and that is how the textures and lighting were
   tuned. But it needs the ~465 MB client and is not part of any CI lane yet.
-  It is the natural source of the review page's previews in phase 3.
+  It is the natural source of previews for each request's page.

@@ -733,6 +733,12 @@ const nextUtcDay = (day) => {
   d.setUTCDate(d.getUTCDate() + 1);
   return d.toISOString().slice(0, 10);
 };
+// Generated maps: a game server that polled map-sync this recently counts as
+// active (it polls every ~30 s), and servers are asked about a published map
+// for this long after it was published.
+const MAPGEN_ACTIVE_S = 5 * 60;
+const MAPGEN_ASK_S = 7 * 24 * 3600;
+
 // The Monday of `day`'s ISO week. getUTCDay() is 0 for Sunday, which belongs to
 // the week that STARTED six days earlier, not the one about to start.
 const isoWeekStart = (day) => {
@@ -3896,8 +3902,84 @@ class RaceDB {
       report: r.report || null,
       error: r.error || null,
       createdAt: num(r.created_at),
+      startedAt: r.started_at == null ? null : num(r.started_at),
       finishedAt: r.finished_at == null ? null : num(r.finished_at),
+      publishedAt: r.published_at == null ? null : num(r.published_at),
+      liveAt: r.live_at == null ? null : num(r.live_at),
     };
+  }
+
+  // Everything the job page shows: the job, its place in the queue while it
+  // waits, and each active game server with the time it confirmed the map (or
+  // null while it has not yet). A server is active if it polled map-sync in
+  // the last `activeWithin` seconds; a server that confirmed the map is listed
+  // even if it has since gone quiet.
+  async mapgenJobDetail(token, { now = Math.floor(Date.now() / 1000), activeWithin = MAPGEN_ACTIVE_S } = {}) {
+    if (typeof token !== "string" || !/^[0-9a-f]{32}$/.test(token)) return null;
+    const r = await this.one("SELECT * FROM mapgen_job WHERE token = $1", [token]);
+    if (!r) return null;
+    const job = this._mapgenJobRow(r);
+    let queue = null;
+    if (r.status === "queued") {
+      const q = await this.one(
+        "SELECT count(*)::int AS ahead FROM mapgen_job WHERE status = 'queued' AND id < $1",
+        [r.id]
+      );
+      const busy = await this.one(
+        "SELECT count(*)::int AS n FROM mapgen_job WHERE status IN ('planning', 'building')"
+      );
+      queue = { position: num(q.ahead) + 1, ahead: num(q.ahead), building: num(busy.n) };
+    }
+    const rows = await this.all(
+      `SELECT s.server_name, seen.seen_at
+         FROM mapgen_server s
+         LEFT JOIN mapgen_seen seen ON seen.server_name = s.server_name AND seen.job_id = $1
+        WHERE s.last_sync >= $2 OR seen.seen_at IS NOT NULL
+        ORDER BY s.server_name`,
+      [r.id, now - activeWithin]
+    );
+    const servers = rows.map((x) => ({
+      name: x.server_name,
+      seenAt: x.seen_at == null ? null : num(x.seen_at),
+    }));
+    return { job, queue, servers };
+  }
+
+  // One game server's map-sync poll (hrace/blockedmaps.as). `have` is the
+  // generated maps its engine's map list now holds, out of the ones it was
+  // asked about last time. Records each confirmation, flips a job to
+  // published on its first one, notes that the server is active, and returns
+  // the maps this server has not confirmed yet: recently published ones only,
+  // so the list stays a handful long.
+  async mapgenSync({ serverName, have = [], now = Math.floor(Date.now() / 1000), horizon = MAPGEN_ASK_S }) {
+    const names = [...new Set(have)].filter((n) => /^gen_[a-z0-9_]{2,60}$/.test(n)).slice(0, 64);
+    await this.pool.query(
+      `INSERT INTO mapgen_server (server_name, last_sync) VALUES ($1, $2)
+       ON CONFLICT (server_name) DO UPDATE SET last_sync = EXCLUDED.last_sync`,
+      [serverName, now]
+    );
+    if (names.length) {
+      await this.pool.query(
+        `INSERT INTO mapgen_seen (job_id, server_name, seen_at)
+         SELECT id, $2, $3 FROM mapgen_job
+          WHERE map_name = ANY($1) AND status IN ('publishing', 'published')
+         ON CONFLICT (job_id, server_name) DO NOTHING`,
+        [names, serverName, now]
+      );
+      await this.pool.query(
+        `UPDATE mapgen_job SET status = 'published', live_at = $2
+          WHERE map_name = ANY($1) AND status = 'publishing'`,
+        [names, now]
+      );
+    }
+    const rows = await this.all(
+      `SELECT j.map_name FROM mapgen_job j
+        WHERE j.status IN ('publishing', 'published') AND j.published_at >= $1
+          AND NOT EXISTS (SELECT 1 FROM mapgen_seen s WHERE s.job_id = j.id AND s.server_name = $2)
+        ORDER BY j.published_at`,
+      [now - horizon, serverName]
+    );
+    return rows.map((x) => x.map_name);
   }
 
   async mapgenJob(token) {

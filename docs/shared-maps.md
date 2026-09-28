@@ -71,10 +71,11 @@ fallback.
   still lists its maps, and a vote for one fails to load. Block the map first
   (the blocklist hides it from every vote path within 30 s), then remove the
   pack.
-- **Block before you add.** The live blocklist is re-read every 30 s. A
-  generated map copied into the store before it is blocked is votable for up
-  to a minute. The publish flow in `docs/map-generation-design.md` blocks
-  first.
+- **Generated maps publish themselves.** The mapgen worker copies every map
+  that passes its checks into the store (dot-name, then rename), and servers
+  confirm loading it over `/api/game/map-sync`. To add any other map without
+  it being votable at once, block it first: the live blocklist is re-read
+  every 30 s.
 - **Only EU writes.** The export is read-only. `fetch-maps.sh` refuses to run
   on a box whose `server/.env` sets `MAP_STORE_DIR` (`MAPS_DEST_FORCE=1`
   overrides).

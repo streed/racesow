@@ -428,6 +428,11 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # every ~30s so a map blocked in the web admin leaves the vote pool
         # without a restart. Same list the g_maplist build above already drops.
         echo "set rs_api_blocked_url \"${INGEST_URL%/api/ingest}/api/game/blocked-maps\""
+        # Generated-map sync (hrace/blockedmaps.as): with this server's token,
+        # the same poll goes here instead and also confirms which freshly
+        # published generated maps sv_mapscan has loaded, so their pages on the
+        # site can say "on the servers". Falls back to the list above on error.
+        echo "set rs_api_mapsync_url \"${INGEST_URL%/api/ingest}/api/game/map-sync\""
         # Per-map weapon table (hrace/mapweapons.as): the gametype polls this so
         # `callvote randmap rl` / `randmap strafe` filters the vote pool by what
         # a map plays like. Static between map re-scans, so it refreshes rarely.

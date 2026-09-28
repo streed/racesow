@@ -55,6 +55,7 @@ CFG="${BOX}/racemod/configs/server/env.cfg"
 grep -qx 'set rs_api_url "http://web:8080/api/ingest"' "${CFG}" || fail "rs_api_url missing from env.cfg"
 grep -qx 'set rs_api_token "sekrit-token"'             "${CFG}" || fail "rs_api_token missing from env.cfg"
 grep -qx 'set rs_api_version "wsw 2.1-test"'           "${CFG}" || fail "rs_api_version missing from env.cfg"
+grep -qx 'set rs_api_mapsync_url "http://web:8080/api/game/map-sync"' "${CFG}" || fail "rs_api_mapsync_url missing from env.cfg"
 grep -qx 'set sv_hostname "Test Race Server"'          "${CFG}" || fail "sv_hostname missing from env.cfg"
 grep -qx 'set rcon_password "rc0n"'                    "${CFG}" || fail "rcon_password missing from env.cfg"
 

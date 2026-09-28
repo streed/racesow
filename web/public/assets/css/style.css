@@ -913,6 +913,40 @@ a.replay-badge { text-decoration: none; }
   border-radius: 8px; border: 1px solid var(--line);
 }
 .mg-privacy { max-width: 720px; margin-top: 18px; font-size: 12px; color: var(--faint); }
+.mg-status.publishing { color: var(--orange); border-color: var(--orange); }
+.mg-open { display: inline-block; margin-top: 8px; font-size: 13px; }
+/* One request's page (/mapgen/<token>) */
+.mg-desc-lg { max-width: 720px; font-size: 17px; font-style: italic; color: var(--text); }
+.mg-track { max-width: 720px; padding: 16px 18px; display: grid; gap: 12px; }
+.mg-steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; }
+.mg-step { display: grid; gap: 4px; align-content: start; font-size: 12px; color: var(--faint); position: relative; padding-top: 16px; }
+.mg-step::before { content: ""; position: absolute; top: 5px; left: 0; right: 0; height: 2px; background: var(--line); }
+.mg-step .mg-dot { position: absolute; top: 0; left: 0; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--bg-2, #10121a); border: 2px solid var(--faint); }
+.mg-step.done { color: var(--muted); }
+.mg-step.done::before { background: var(--green); }
+.mg-step.done .mg-dot { background: var(--green); border-color: var(--green); }
+.mg-step.now { color: var(--text); }
+.mg-step.now .mg-dot { border-color: var(--orange); background: var(--orange); animation: mg-pulse 1.4s ease-in-out infinite; }
+.mg-step.failed { color: #ff7a6b; }
+.mg-step.failed .mg-dot { border-color: #ff7a6b; background: #ff7a6b; }
+.mg-step-label { font-weight: 600; text-transform: uppercase; letter-spacing: .4px; }
+.mg-step time { font-variant-numeric: tabular-nums; }
+@keyframes mg-pulse { 50% { box-shadow: 0 0 0 5px rgba(255, 106, 26, .25); } }
+@media (prefers-reduced-motion: reduce) { .mg-step.now .mg-dot { animation: none; } }
+@media (max-width: 560px) {
+  .mg-steps { grid-template-columns: 1fr; gap: 0; }
+  .mg-step { padding: 0 0 10px 22px; }
+  .mg-step::before { top: 0; bottom: 0; left: 5px; right: auto; width: 2px; height: auto; }
+}
+.mg-now { margin: 0; }
+.mg-servers { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; font-size: 13px; }
+.mg-servers li { display: flex; gap: 10px; align-items: baseline; color: var(--muted); }
+.mg-servers li::before { content: "…"; width: 1em; color: var(--faint); }
+.mg-servers li.ok::before { content: "✓"; color: var(--green); }
+.mg-srv { font-weight: 600; color: var(--text); min-width: 6em; }
+.mg-share { max-width: 720px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
+.mg-url { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 
 /* ------------------------------- live stream ----------------------------- */
 .srv-stream { margin-bottom: 18px; padding: 10px; background: #000; }

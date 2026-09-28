@@ -176,3 +176,88 @@ test("the database holds 16-byte identities and never an address", async () => {
     }
   }
 });
+
+test("a queued job knows its place in line", async () => {
+  // Every job so far is still queued (no worker runs in this test), oldest first.
+  const jobs = await dbQuery("SELECT token FROM mapgen_job WHERE status = 'queued' ORDER BY id");
+  assert.ok(jobs.rows.length >= 2);
+  const first = await alice.get(`/mapgen/jobs/${jobs.rows[0].token}`);
+  const second = await alice.get(`/mapgen/jobs/${jobs.rows[1].token}`);
+  assert.deepEqual(first.json.queue, { position: 1, ahead: 0, building: 0 });
+  assert.deepEqual(second.json.queue, { position: 2, ahead: 1, building: 0 });
+  assert.deepEqual(first.json.servers, []);
+});
+
+// --- game servers confirm published maps over /api/game/map-sync ------------
+
+async function enroll(name) {
+  const token = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.createHash("sha256").update(token).digest("hex");
+  await dbQuery("INSERT INTO server (name, token_hash, created_at) VALUES ($1, $2, $3)", [name, hash, 1]);
+  return token;
+}
+
+async function sync(token, have) {
+  const q = have ? `?have=${encodeURIComponent(have)}` : "";
+  const r = await fetch(`${base}/api/game/map-sync${q}`, { headers: { authorization: `Bearer ${token}` } });
+  return { status: r.status, text: await r.text(), cache: r.headers.get("cache-control") };
+}
+
+test("map-sync: a published map is asked about, confirmed, and then shown as on the servers", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const token = "ab".repeat(16);
+  await dbQuery(
+    `INSERT INTO mapgen_job (token, description, status, map_name, report, created_at, started_at, finished_at, published_at)
+     VALUES ($1, 'a published one', 'publishing', 'gen_sync_test_ababab', '{}', $2, $2, $2, $2)`,
+    [token, now - 60]
+  );
+  const eu = await enroll("EU");
+  const us = await enroll("US");
+
+  assert.equal((await fetch(`${base}/api/game/map-sync`)).status, 401);
+  assert.equal((await sync("not-a-token")).status, 401);
+
+  // Both servers are asked about it; neither has loaded it yet.
+  let r = await sync(eu);
+  assert.equal(r.status, 200);
+  assert.equal(r.cache, "no-store");
+  assert.ok(r.text.split("\n").includes("?gen_sync_test_ababab"), r.text);
+  r = await sync(us);
+  assert.ok(r.text.split("\n").includes("?gen_sync_test_ababab"));
+  let job = (await alice.get(`/mapgen/jobs/${token}`)).json;
+  assert.equal(job.status, "publishing");
+  assert.equal(job.queue, null);
+  assert.deepEqual(job.servers.map((s) => [s.name, s.seenAt]), [["EU", null], ["US", null]]);
+
+  // EU's scan picked it up. Junk and unknown names in the same list are ignored.
+  r = await sync(eu, "gen_sync_test_ababab,../../etc/passwd,gen_never_built_000000");
+  assert.equal(r.status, 200);
+  assert.ok(!r.text.includes("?gen_sync_test_ababab"), "a confirmed map is not asked about again");
+  job = (await alice.get(`/mapgen/jobs/${token}`)).json;
+  assert.equal(job.status, "published");
+  assert.ok(job.liveAt >= now - 5);
+  const byName = Object.fromEntries(job.servers.map((s) => [s.name, s.seenAt]));
+  assert.ok(byName.EU >= now - 5);
+  assert.equal(byName.US, null);
+  // US still gets asked until it confirms too.
+  assert.ok((await sync(us)).text.includes("?gen_sync_test_ababab"));
+  await sync(us, "gen_sync_test_ababab");
+  job = (await alice.get(`/mapgen/jobs/${token}`)).json;
+  assert.ok(job.servers.every((s) => s.seenAt));
+  // The first confirmation's time stands.
+  assert.ok(job.liveAt <= byName.EU);
+  const seen = await dbQuery("SELECT server_name FROM mapgen_seen ORDER BY server_name");
+  assert.deepEqual(seen.rows.map((x) => x.server_name), ["EU", "US"]);
+});
+
+test("map-sync carries the blocklist, and a revoked server is refused", async () => {
+  await dbQuery("INSERT INTO map (name) VALUES ('badmap') ON CONFLICT DO NOTHING");
+  await dbQuery(
+    "INSERT INTO map_block (map_id, reason, blocked_at, blocked_by) SELECT id, 'test', 1, 'cli' FROM map WHERE name = 'badmap'"
+  );
+  const tok = await enroll("BLK");
+  const r = await sync(tok);
+  assert.ok(r.text.split("\n").includes("badmap"), r.text);
+  await dbQuery("UPDATE server SET status = 'revoked' WHERE name = 'BLK'");
+  assert.equal((await sync(tok)).status, 403);
+});
