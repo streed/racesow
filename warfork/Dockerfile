@@ -84,6 +84,13 @@ COPY server/enginepatches/patch-quiet-fakeclient-connect.py /tmp/patch-quiet-fak
 # racemod_2.1; this is the Warfork half. WARFORK-ONLY, so it lives in
 # warfork/enginepatches rather than the shared server/ set.
 COPY warfork/enginepatches/patch-brushmodel-nonfatal.py /tmp/patch-brushmodel-nonfatal.py
+# Race triggers. Stock multi_trigger FREES a trigger_once / wait -1 trigger after
+# its first touch, and that is how most race maps build their checkpoint and
+# finish volumes -- so the first client through (a player, or a mesh mirror bot)
+# consumed each CP/finish for everyone until the next map. Warsow carries the
+# racemod_2.1 fix (keep it alive in race); this is the Warfork half, plus the
+# same tree's target_speaker relay. WARFORK-ONLY, like the brushmodel fix.
+COPY warfork/enginepatches/patch-race-triggers.py /tmp/patch-race-triggers.py
 # demolist split. Warfork's demolist/demoget already read the demos/server root
 # (it never took racemod_2.1's per-map repoint), so here the patch only ADDS
 # racedemolist/racedemoget for the per-map race demos — keeping one meaning for
@@ -107,6 +114,8 @@ RUN cd source \
     && python3 /tmp/patch-motd-live.py \
     && python3 /tmp/patch-quiet-fakeclient-connect.py \
     && python3 /tmp/patch-brushmodel-nonfatal.py \
+    && python3 /tmp/patch-race-triggers.py \
+    && grep -q 'ent->wait <= 0 && !GS_RaceGametype()' game/g_trigger.cpp \
     && python3 /tmp/patch-demolist-split.py \
     && grep -q 'racesow-docker: demolist split' server/sv_demos.c \
     && grep -q 'racedemolist' server/sv_client.c \

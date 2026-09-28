@@ -34,6 +34,7 @@ map load, api fetch wiring.
 | `entrypoint.sh` | env → `rs_api_*`/`rs_mirror_*` cvars; shared-map symlink + `g_maplist`; launch |
 | `configs/server.cfg` | race gameplay tuning (`sv_pure 0` for v1) |
 | `enginepatches/` | Gelmo racesow natives (`g_racesow.*`, `gs_racesow.*`) + `patch-pjstate-natives.py` + UPSTREAM |
+| `enginepatches/patch-race-triggers.py` | racemod_2.1 parity: `trigger_once`/`wait -1` checkpoint + finish triggers stay alive in race; `target_speaker` relays to its targets |
 | `scriptpatches/patch-scripts-as2024.py` | Warfork-only AS2024 adaptation of the shared scripts |
 | `build-from-source.sh` | standalone local source build (dev iteration) |
 | `../docker-compose.warfork.yml` | additive deploy service (ports 44410/44411/44451, shared maps) |
