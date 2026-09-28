@@ -203,6 +203,9 @@ def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, cam
             "shortcuts": course.shortcuts,
             "par_seconds_shortcuts": round((course.length - sum(s["saves"] for s in course.shortcuts))
                                            / 320.0, 1),
+            # Slaloms, beams and splits, and where the course passes over itself.
+            "features": course.features,
+            "overpasses": course.overpasses,
         }
         return pk3, report
     finally:

@@ -81,8 +81,16 @@ with the 0.8 margin applied. Ramps are capped at 30°.
 | `straight` | length | counts toward run-up |
 | `turn` | direction, angle ∈ {45, 90, 135, 180}, radius | radius ≥ width/2 + 64 |
 | `ramp` | length, rise | ≤ 30°; resets run-up |
-| `gap` | length, drop | ≤ `max_gap(drop)`; needs 192 units of run-up; must land on a straight or turn |
+| `gap` | length, drop | ≤ `max_gap(drop)`; needs 192 units of run-up; must land on a straight, turn, slalom or split |
 | `checkpoint` | — | `trigger_multiple` → `target_checkpoint` |
+| `turn` + `shortcut` | a 180 with straights ≥ 320 either side | stepping stones at 92% of `max_gap(0)` across the U |
+| `slalom` | length, count 2–12 | fins leave 160-unit gates; ≥ 256 between fins; width ≥ 224 |
+| `beam` | length, beam_width | 48 ≤ beam ≤ width − 128; walls reach 160 below it |
+| `split` | length, direction, count 1–6 | lanes ≥ 176; fast-lane holes at 85% of `max_gap(0)`, each after 192 of run-up; safe lane weaves 96-unit gates |
+
+A course may pass over itself. The self-intersection test is 3-D, so a
+crossing is legal when the upper floor clears the lower corridor's walls, and
+every crossing is reported as an overpass.
 
 The start room, spawn, start timer, stop timer, finish room, sky shell and pit
 kill volume are implicit: every course has exactly one of each, so the model
@@ -207,7 +215,8 @@ not put it in the automatic rotation.
 | 1 | strafe-only greybox: spec, layout, compile, static checks, CLI, Docker, CI boot | **built** |
 | 2 | headless pmove bot; proof-run demo in the replay viewer | design |
 | 3 | public form with daily identity quota → `mapgen_job` table → worker | **built** (publish step: design) |
-| 4 | vocabulary growth gated on phase 2: jump pads, walljump walls, themed texture sets | idea |
+| 4a | strafe-only vocabulary: slalom, beam, split lanes, overpasses | **built** |
+| 4b | vocabulary growth gated on phase 2: jump pads, walljump walls, themed texture sets | idea |
 
 ## Decisions and why
 

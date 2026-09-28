@@ -8,8 +8,9 @@ exactly one brush writer (mapfile.py) and one overlap test.
 The walk also enforces the rules that need geometry rather than ranges:
 
   * a gap needs MIN_RUNUP of flat floor before it (physics.py);
-  * a gap must land on floor, not on another gap or the finish trigger;
-  * the course must not run through itself.
+  * a gap must land on floor, not on another gap, a beam or the finish trigger;
+  * the course must not run through itself. It may pass OVER itself: the test
+    is 3-D, and every such crossing is reported in Course.overpasses.
 
 Coordinates are Quake's: Z up, heading 0 = +X, angles counter-clockwise.
 """
@@ -45,6 +46,10 @@ SHORTCUT_PLATFORM = 64
 SHORTCUT_GAP_FILL = 0.92
 SHORTCUT_MIN_LEG = SHORTCUT_BACK + SHORTCUT_WINDOW // 2 + 80
 
+FIN_THICK = 32          # slalom and split fins, along the course
+SPLIT_GATE = 96         # gates in a split's safe lane: 3 player widths
+VOID_DEPTH = 160        # side walls reach this far below a floorless piece
+
 TEX = {
     "floor": "mapgen_v1/floor",
     "wall": "mapgen_v1/wall",
@@ -54,6 +59,8 @@ TEX = {
     "edge": "mapgen_v1/edge",
     "trim": "mapgen_v1/trim",
     "platform": "mapgen_v1/edge",
+    "beam": "mapgen_v1/edge",
+    "pylon": "mapgen_v1/pylon",
     "sky": "mapgen_v1/sky",
     "trigger": "mapgen_v1/trigger",
 }
@@ -106,6 +113,8 @@ class Course:
         self.route = []       # centre-line points (x, y, z) for the preview + future bot
         self.landmarks = []   # (kind, (x, y, z), heading): start, gap, checkpoint, shortcut, finish
         self.shortcuts = []   # one dict per turn.shortcut: platforms, gap, distance saved
+        self.features = []    # one dict per slalom / beam / split
+        self.overpasses = []  # (lower seg, upper seg, clearance): where the course crosses itself
         self.length = 0.0     # centre-line length, start trigger -> finish trigger
 
 
@@ -115,6 +124,11 @@ def _rect(o, f, l, back, fwd, right, left):
     def p(a, b):
         return (o[0] + f[0] * a + l[0] * b, o[1] + f[1] * a + l[1] * b)
     return [p(back, -right), p(fwd, -right), p(fwd, left), p(back, left)]
+
+
+def _band(o, f, l, back, fwd, lo, hi):
+    """Footprint spanning [back, fwd] along f and [lo, hi] across it (left +)."""
+    return _rect(o, f, l, back, fwd, -lo, hi)
 
 
 def _sat_overlap(a, b, eps=1.0):
@@ -331,6 +345,120 @@ class _Walker:
         self.heading = (self.heading + sign * angle) % 360.0
         self.c.length += math.radians(angle) * radius
 
+    def _fins(self, o, f, l, spots, lanes, tex="pylon"):
+        """Full-height fins across a lane. spots: distances along the piece;
+        lanes: for each spot, the [lo, hi] lateral band the fin fills."""
+        for a, (lo, hi) in zip(spots, lanes):
+            poly = _band(o, f, l, a - FIN_THICK / 2, a + FIN_THICK / 2, lo, hi)
+            self.c.world.append(Prism.flat(poly, self.z - FLOOR_THICK, self.z + WALL_HEIGHT, tex))
+
+    def _reroute(self, o, f, l, points):
+        """Replace the straight centre line of the piece just laid with one
+        through `points` [(along, across)], keeping the length honest."""
+        end = self.c.route.pop()
+        prev = self.c.route[-1]
+        self.c.length -= math.dist(prev[:2], end[:2])
+        z = self.z
+        for a, b in points:
+            p = (o[0] + f[0] * a + l[0] * b, o[1] + f[1] * a + l[1] * b, z)
+            self.c.length += math.dist(prev[:2], p[:2])
+            self.c.route.append(p)
+            prev = p
+        self.c.length += math.dist(prev[:2], end[:2])
+        self.c.route.append(end)
+
+    def slalom(self, length, count):
+        """Fins off alternate walls, first from the left, each leaving a
+        SLALOM_GATE gate beside it: the line through the gates is a weave."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        gate = specmod.SLALOM_GATE
+        self.c.landmarks.append(("slalom", (self.x, self.y, self.z), self.heading))
+        self.box_run(length)
+        spacing = length / (count + 1)
+        spots = [spacing * (i + 1) for i in range(count)]
+        # Even fins hang off the left wall, so their gate is on the right.
+        lanes = [(-half + gate, half) if i % 2 == 0 else (-half, half - gate) for i in range(count)]
+        self._fins(o, f, l, spots, lanes)
+        mid = half - gate / 2
+        self._reroute(o, f, l, [(a, -mid if i % 2 == 0 else mid) for i, a in enumerate(spots)])
+        self.c.features.append({"type": "slalom", "segment": self.seg, "fins": count,
+                                "gate": gate, "spacing": round(spacing)})
+        return spacing   # clear floor after the last fin: the run-up it leaves
+
+    def beam(self, length, width):
+        """No floor but a beam down the middle; the walls reach down past it
+        so the only way out of a fall is the kill volume in the pit."""
+        o, f, l = self.frame()
+        z = self.z
+        self.stripe("edge", -32, 0)
+        self.c.landmarks.append(("beam", (self.x, self.y, z), self.heading))
+        self.box_run(length, floor=False, wall_floor=z - FLOOR_THICK - VOID_DEPTH)
+        poly = _rect(o, f, l, 0, length, width / 2.0, width / 2.0)
+        self.c.world.append(Prism.flat(poly, z - FLOOR_THICK, z, "beam", self.heading))
+        self.c.floor_polys.append((poly, "beam"))
+        self.c.features.append({"type": "beam", "segment": self.seg, "width": width,
+                                "length": length})
+
+    def split(self, length, direction, count):
+        """Two lanes either side of a median wall. The fast lane (`direction`)
+        runs straight over `count` holes, each SPLIT_HOLE_FILL of a run-speed
+        jump and each after a full run-up; a fall is death. The safe lane is
+        solid floor through a tight weave of fins. SPLIT_MOUTH of open floor at
+        each end lets the player see both lanes and choose."""
+        o, f, l = self.frame()
+        z = self.z
+        half = self.w / 2.0
+        m = specmod.SPLIT_MEDIAN / 2.0
+        mouth = specmod.SPLIT_MOUTH
+        fast = 1 if direction == "left" else -1
+        lane_w = half - m
+        self.c.landmarks.append(("split", (self.x, self.y, z), self.heading))
+        self.box_run(length, floor=False, wall_floor=z - FLOOR_THICK - VOID_DEPTH)
+
+        def lane(side):
+            return (m, half) if side > 0 else (-half, -m)
+
+        def floor(a, b, lo, hi, tex="floor"):
+            poly = _band(o, f, l, a, b, lo, hi)
+            self.c.world.append(Prism.flat(poly, z - FLOOR_THICK, z, tex, self.heading))
+            self.c.floor_polys.append((poly, tex))
+
+        floor(0, mouth, -half, half)
+        floor(length - mouth, length, -half, half)
+        self.c.world.append(Prism.flat(_band(o, f, l, mouth, length - mouth, -m, m),
+                                       z - FLOOR_THICK - VOID_DEPTH, z + WALL_HEIGHT, "wall"))
+        # Fast lane: runway, hole, runway, hole, ..., landing. Spare length is
+        # shared out between the runways.
+        hole = specmod.split_hole()
+        inner = length - 2 * mouth
+        runway = specmod.SPLIT_RUNWAY + (inner - specmod.SPLIT_LANDING
+                                         - count * (specmod.SPLIT_RUNWAY + hole)) / count
+        lo, hi = lane(fast)
+        a = mouth
+        for _ in range(count):
+            floor(a, a + runway, lo, hi)
+            a += runway
+            lip = _band(o, f, l, a - 32, a, lo, hi)
+            self.c.world.append(Prism.flat(lip, z - 4, z + 1, "edge", self.heading))
+            a += hole
+        floor(a, length - mouth, lo, hi)
+        # Safe lane: solid, with count + 1 fins alternating between its two
+        # sides (outer wall and median), each leaving a SPLIT_GATE gate.
+        slo, shi = lane(-fast)
+        floor(mouth, length - mouth, slo, shi)
+        n = count + 1
+        spacing = inner / (n + 1)
+        spots = [mouth + spacing * (i + 1) for i in range(n)]
+        bands = [(slo, shi - SPLIT_GATE), (slo + SPLIT_GATE, shi)]
+        self._fins(o, f, l, spots, [bands[i % 2] for i in range(n)])
+        # The centre line takes the fast lane (par assumes the brave route).
+        c = fast * (m + lane_w / 2)
+        self._reroute(o, f, l, [(mouth, c), (length - mouth, c)])
+        self.c.features.append({"type": "split", "segment": self.seg, "fast_lane": direction,
+                                "holes": count, "hole": hole, "safe_fins": n,
+                                "gate": SPLIT_GATE})
+
     # -- the walk -----------------------------------------------------------
     def run(self):
         s = self.c.spec
@@ -362,6 +490,14 @@ class _Walker:
                              stripe="checkpoint")
             elif t == "gap":
                 self._gap(i, seg, segs)
+            elif t == "slalom":
+                self.runup = self.slalom(seg["length"], seg["count"])
+            elif t == "beam":
+                self.beam(seg["length"], seg["beam_width"])
+                self.runup += seg["length"]
+            elif t == "split":
+                self.split(seg["length"], seg["direction"], seg["count"])
+                self.runup = float(specmod.SPLIT_MOUTH)
 
         self.seg = len(segs)
         self._finish_room()
@@ -412,9 +548,9 @@ class _Walker:
                 f"needs {int(physics.MIN_RUNUP)} of straight/turn run-up (ramps and "
                 "other gaps reset it)")
         nxt = segs[i + 1]["type"] if i + 1 < len(segs) else "finish"
-        if nxt not in ("straight", "turn"):
+        if nxt not in ("straight", "turn", "slalom", "split"):
             self.problems.append(
-                f"{where}: must land on a straight or turn, not on {nxt!r}")
+                f"{where}: must land on a straight, turn, slalom or split, not on {nxt!r}")
         # Mark the take-off lip so the gap reads from a distance.
         self.stripe("edge", -32, 0)
         self.c.landmarks.append(("gap", (self.x, self.y, self.z), self.heading))
@@ -427,17 +563,30 @@ class _Walker:
 
     def _self_intersections(self):
         hs = self.c.hulls
+        over = {}
         for i in range(len(hs)):
             for j in range(i + 1, len(hs)):
                 a, b = hs[i], hs[j]
                 if abs(a.seg - b.seg) <= 1:
                     continue  # neighbours share an edge by construction
                 if a.zhi <= b.zlo or b.zhi <= a.zlo:
-                    continue  # one passes cleanly over the other
+                    # One passes cleanly over the other: an overpass, if their
+                    # footprints actually cross.
+                    if _sat_overlap(a.poly, b.poly):
+                        lo, hi = (a, b) if a.zhi <= b.zlo else (b, a)
+                        key = (lo.seg, hi.seg)
+                        over[key] = min(over.get(key, 1e9), hi.zlo - lo.zhi)
+                    continue
                 if _sat_overlap(a.poly, b.poly):
                     self.problems.append(
                         f"course runs into itself: {_segname(a.seg)} overlaps {_segname(b.seg)}")
                     return
+        # One entry per crossing: runs of adjacent segment pairs are the same
+        # bridge seen piece by piece.
+        for (lo, hi), clear in sorted(over.items()):
+            if any(abs(lo - p["lower"]) <= 1 and abs(hi - p["upper"]) <= 1 for p in self.c.overpasses):
+                continue
+            self.c.overpasses.append({"lower": lo, "upper": hi, "clearance": round(clear)})
 
     def _shell(self):
         """Seal the course in a sky box and put a kill volume in the pit.
@@ -488,7 +637,7 @@ def build(spec, camera_pads=()):
 def preview_svg(course, px=900):
     """Top-down plan of the course: what the web form shows before compiling."""
     colors = {"floor": "#8a8f98", "start": "#3fae5a", "finish": "#d0463c", "platform": "#ff6a1a",
-              "edge": "#e8b923"}
+              "edge": "#e8b923", "beam": "#ff6a1a"}
     (x0, y0, _), (x1, y1, _) = course.bounds
     w, h = x1 - x0, y1 - y0
     s = px / max(w, h)

@@ -53,6 +53,18 @@ false):
              before it (ramps and gaps reset that) and must be followed by a
              straight or turn to land on. Falling in kills the player.
   checkpoint a timing split at that point; use 1-4 spread along longer courses.
+  slalom     length, count {specmod.SLALOM_COUNT[0]}-{specmod.SLALOM_COUNT[1]}: full-height fins off alternate walls,
+             each leaving a {specmod.SLALOM_GATE}-unit gate, so the line is a weave. Needs width >=
+             {specmod.SLALOM_GATE + specmod.SLALOM_FIN_MIN} and length >= {specmod.SLALOM_SPACING} * (count + 1).
+  beam       length {specmod.STRAIGHT_MIN}-2048, beam_width >= {specmod.BEAM_MIN} and <= width - {2 * specmod.BEAM_WALL_CLEAR}:
+             the floor drops away except a narrow bridge down the middle; a
+             fall is death. Precise strafing; narrow beams are very hard.
+  split      length, direction left|right, count {specmod.SPLIT_COUNT[0]}-{specmod.SPLIT_COUNT[1]}: a median wall splits
+             the corridor. The lane on `direction` is the fast lane: straight,
+             over `count` holes of {specmod.split_hole()} units, each after a full run-up (a
+             fall is death). The other lane is solid but weaves through tight
+             fins. Needs width >= {2 * specmod.SPLIT_LANE_MIN + specmod.SPLIT_MEDIAN} and length >= 2*{specmod.SPLIT_MOUTH} + count*{specmod.SPLIT_RUNWAY + specmod.split_hole()} + {specmod.SPLIT_LANDING}.
+             It leaves only {specmod.SPLIT_MOUTH} units of run-up for a gap right after it.
 
 Shortcuts: a 180-degree turn may set "shortcut": true. The generator cuts a window
 in the inner wall of the straights on both sides of the U and lays a line of small
@@ -63,9 +75,14 @@ the bend stays. It needs a straight of at least {specmod.SHORTCUT_MIN_LEG} direc
 AND directly after the turn (not a checkpoint, ramp or gap in between). Put
 checkpoints outside the stretch a shortcut skips.
 
-The course must not cross itself: the generator rejects any overlap, so keep an
-eye on where turns send it. Aim for a run of roughly 20-60 seconds at 320 ups
-(the sum of lengths / 320). Follow the user's description as closely as these
+The course must not run INTO itself: the generator rejects any overlap, so keep
+an eye on where turns send it. It MAY pass OVER itself (an overpass): where it
+crosses an earlier part, the higher floor must be at least
+{layout.WALL_HEIGHT + 2 * layout.FLOOR_THICK} units above the lower one (the lower corridor's walls are
+{layout.WALL_HEIGHT} high). Ramps are the way to gain that height. Around a gap, beam or
+split the walls also reach {layout.VOID_DEPTH} units lower, so give those more clearance.
+
+Aim for a run of roughly 20-60 seconds at 320 ups (the sum of lengths / 320). Follow the user's description as closely as these
 rules allow; when it asks for something impossible, get as close as you can."""
 
 

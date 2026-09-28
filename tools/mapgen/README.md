@@ -29,7 +29,9 @@ description ──Claude──▶ spec.json ──layout──▶ brushes ──
    for floors, walls, curve wedges and trigger volumes. It adds the start room,
    spawn, start timer, finish timer and finish room, and seals everything in a
    sky box with a kill volume in the pit. It rejects a gap without run-up, a
-   gap landing on anything but floor, and a course that crosses itself.
+   gap landing on anything but floor, and a course that runs into itself. A
+   course may pass *over* itself (the test is 3-D); every crossing is
+   reported as an overpass.
 3. **`mapfile.py`**: writes the brushes as Quake 3 `.map` text. Each face's
    point order is chosen from its known outward normal, so it never relies on
    a winding convention.
@@ -40,6 +42,27 @@ description ──Claude──▶ spec.json ──layout──▶ brushes ──
    there is exactly one start timer and one stop timer, that every timer and
    checkpoint is fired by a trigger that kept its brush model, and that there
    is a spawn point.
+
+### Course pieces
+
+| segment | fields | what it lays down |
+| --- | --- | --- |
+| `straight` | `length` | floor and two walls |
+| `turn` | `direction`, `angle` (45/90/135/180), `radius`, `shortcut` | a curved corridor; a 180 with `shortcut: true` adds wall windows and stepping stones across the U |
+| `ramp` | `length`, `rise` | a sloped straight, at most 30 degrees |
+| `gap` | `length`, `drop` | a pit to jump, sized against `physics.max_gap(drop)` |
+| `checkpoint` | none | a timing split, painted across the floor |
+| `slalom` | `length`, `count` | full-height fins off alternate walls, each leaving a 160-unit gate: the line is a weave |
+| `beam` | `length`, `beam_width` | no floor but a bridge down the middle, over the pit |
+| `split` | `length`, `direction`, `count` | a median wall and two lanes: the `direction` lane runs straight over `count` holes (85% of a run-speed jump, each after a full run-up), the other is solid but weaves through tight fins |
+
+The holes, stones and gates are sized from `physics.py`, so every route is
+clearable at a plain 320 ups. The risky routes (shortcuts, a split's fast lane,
+a narrow beam) are faster, and a fall is death.
+
+A course can cross itself if the upper floor is high enough: at least the
+lower corridor's wall height plus both floor slabs above it. The report lists
+each crossing as `{"lower": seg, "upper": seg, "clearance": units}`.
 
 ### What "raceable" means here
 
@@ -102,6 +125,7 @@ files are committed. It uses the site's palette: `--orange #ff6a1a`,
 | `checkpoint` | cyan line painted across the floor under each checkpoint trigger |
 | `edge` | orange / black hazard stripes on every gap lip |
 | `trim` | orange stripe on the start and finish lines |
+| `pylon` | navy with cyan bands on slalom and split fins: steer round it (orange means a fall) |
 
 Textures are 256 px and the texture scale is 1, so 1 px = 1 unit and the grid
 measures true distances. Floor textures are rotated per piece so chevrons and
@@ -117,7 +141,11 @@ screenshots.py build/gen_first_light.pk3 --spec examples/gen_first_light.json \
 
 This runs the stock Warsow 2.1.2 client (the same tarball `server/Dockerfile`
 downloads) under Xvfb with software GL, and takes one screenshot per
-landmark: the start, each gap and checkpoint, and the finish. Each view is a
+landmark: the start, each gap, checkpoint, slalom, beam, split and shortcut,
+and the finish. Cameras stand on the course's centre line a set distance
+before the landmark (closer for a beam or split), so they are on the real
+floor through turns and ramps, and look at it. With more landmarks than the
+ten view keys, the first of every kind is kept. Each view is a
 throwaway copy of the bsp with the spawn point moved to the camera, and the
 real map is untouched. Views are level at eye height, because the engine drops
 spawns to the floor and applies only their yaw; the plan `.svg` is the

@@ -176,6 +176,134 @@ class Layout(unittest.TestCase):
                             for e in specmod.validate(self.s_course(leg=200))))
         self.assertEqual(specmod.SHORTCUT_MIN_LEG, layout.SHORTCUT_MIN_LEG)
 
+    # -- slalom, beam, split, overpass -----------------------------------------
+    # The course starts heading +X, so on a first segment "across" is Y.
+    def _ys(self, prism):
+        return min(y for _, y in prism.poly), max(y for _, y in prism.poly)
+
+    def test_slalom_fins_alternate_and_leave_the_gate(self):
+        w = 448
+        c = layout.build(course_of({"type": "slalom", "length": 1280, "count": 4}, width=w))
+        fins = [p for p in c.world if p.tex == "pylon"]
+        self.assertEqual(len(fins), 4)
+        fins.sort(key=lambda p: min(x for x, _ in p.poly))
+        for i, fin in enumerate(fins):
+            lo, hi = self._ys(fin)
+            if i % 2 == 0:   # off the left wall (+Y): the gate is on the right
+                self.assertAlmostEqual(hi, w / 2)
+                self.assertAlmostEqual(lo - (-w / 2), specmod.SLALOM_GATE)
+            else:
+                self.assertAlmostEqual(lo, -w / 2)
+                self.assertAlmostEqual(w / 2 - hi, specmod.SLALOM_GATE)
+            self.assertGreaterEqual(fin.zmax() - fin.zmin, layout.WALL_HEIGHT)
+        # The route weaves through the gates, so it is longer than the straight.
+        plain = layout.build(course_of({"type": "straight", "length": 1280}, width=w))
+        self.assertGreater(c.length, plain.length + 50)
+        self.assertEqual(c.features[0]["fins"], 4)
+
+    def test_beam_is_the_only_floor_and_the_walls_reach_below_it(self):
+        c = layout.build(course_of({"type": "straight", "length": 512},
+                                   {"type": "beam", "length": 768, "beam_width": 64},
+                                   {"type": "straight", "length": 512}))
+        beams = [p for p in c.world if p.tex == "beam"]
+        self.assertEqual(len(beams), 1)
+        lo, hi = self._ys(beams[0])
+        self.assertAlmostEqual(hi - lo, 64)
+        self.assertAlmostEqual(beams[0].zmax(), 0)
+        # Nothing else walkable under the beam's stretch of corridor.
+        x0 = min(x for x, _ in beams[0].poly)
+        x1 = max(x for x, _ in beams[0].poly)
+        for p in c.world:
+            if p.tex == "floor":
+                px = [x for x, _ in p.poly]
+                self.assertFalse(min(px) < x1 - 1 and max(px) > x0 + 1, "floor under a beam")
+        deepest = min(p.zmin for p in c.world if p.tex == "wall")
+        self.assertLessEqual(deepest, -layout.FLOOR_THICK - layout.VOID_DEPTH)
+
+    def test_split_holes_are_clearable_after_a_full_runup(self):
+        c = layout.build(course_of({"type": "straight", "length": 512},
+                                   {"type": "split", "length": 1600, "direction": "left", "count": 3},
+                                   {"type": "straight", "length": 512}, width=448))
+        f = c.features[0]
+        self.assertEqual((f["holes"], f["fast_lane"]), (3, "left"))
+        self.assertLessEqual(f["hole"], physics.max_gap(0))
+        self.assertGreater(f["hole"], 0.8 * physics.max_gap(0))
+        # Fast lane floor (+Y side): pieces separated by exactly the holes,
+        # each piece before a hole at least a full run-up long.
+        seg_x0 = 512 + layout.ROOM_LEN
+        m = specmod.SPLIT_MEDIAN / 2
+        lane = sorted((p for p in c.world if p.tex == "floor" and self._ys(p) == (m, 224)),
+                      key=lambda p: min(x for x, _ in p.poly))
+        self.assertEqual(len(lane), 4)
+        for a, b in zip(lane, lane[1:]):
+            a_x1 = max(x for x, _ in a.poly)
+            self.assertAlmostEqual(min(x for x, _ in b.poly) - a_x1, f["hole"])
+            self.assertGreaterEqual(a_x1 - min(x for x, _ in a.poly), specmod.SPLIT_RUNWAY - 1e-6)
+        self.assertGreaterEqual(min(x for x, _ in lane[0].poly), seg_x0)
+        # Safe lane (-Y side): one solid floor, count + 1 fins, every gate
+        # three players wide.
+        safe = [p for p in c.world if p.tex == "floor" and self._ys(p) == (-224, -m)]
+        self.assertEqual(len(safe), 1)
+        fins = [p for p in c.world if p.tex == "pylon"]
+        self.assertEqual(len(fins), 4)
+        for fin in fins:
+            lo, hi = self._ys(fin)
+            self.assertAlmostEqual(max(lo - (-224), -m - hi), layout.SPLIT_GATE)
+        self.assertGreaterEqual(layout.SPLIT_GATE, 3 * 32)
+
+    def test_new_piece_rules(self):
+        errs = specmod.validate(course_of({"type": "slalom", "length": 600, "count": 4},
+                                          {"type": "beam", "length": 400, "beam_width": 400},
+                                          {"type": "split", "length": 700, "direction": "none",
+                                           "count": 2}, width=320))
+        for frag in ("closer than", "beam_width 400", "'left' or 'right'", "width >= 384",
+                     "need length >="):
+            self.assertTrue(any(frag in e for e in errs), f"{frag!r} not in {errs}")
+        self.assertTrue(any("whole number" in e for e in specmod.validate(
+            course_of({"type": "slalom", "length": 1280, "count": 4.0}))))
+        # A gap may land on a slalom or split, not on a beam; a split leaves
+        # too little run-up for a gap right after it.
+        jump = [{"type": "straight", "length": 512}, {"type": "gap", "length": 128, "drop": 0}]
+        layout.build(course_of(*jump, {"type": "slalom", "length": 768, "count": 2}))
+        self.assertLayoutRejects(course_of(*jump, {"type": "beam", "length": 512, "beam_width": 96}),
+                                 "must land")
+        self.assertLayoutRejects(course_of({"type": "split", "length": 800, "direction": "right",
+                                            "count": 1},
+                                           {"type": "gap", "length": 96, "drop": 0},
+                                           {"type": "straight", "length": 512}), "run-up")
+
+    def crossing(self, rise):
+        # Climb, turn back, then turn across the first straight.
+        return course_of({"type": "straight", "length": 1024},
+                         {"type": "ramp", "length": 800, "rise": rise},
+                         {"type": "turn", "direction": "left", "angle": 180, "radius": 512},
+                         {"type": "straight", "length": 512},
+                         {"type": "turn", "direction": "left", "angle": 90, "radius": 512},
+                         {"type": "straight", "length": 1024})
+
+    def test_overpass_is_reported_and_a_low_crossing_rejected(self):
+        c = layout.build(self.crossing(400))
+        self.assertEqual(c.overpasses, [{"lower": 0, "upper": 5, "clearance":
+                                         400 - layout.FLOOR_THICK - layout.WALL_HEIGHT}])
+        self.assertLayoutRejects(self.crossing(200), "runs into itself")
+        # The spiral passes over itself too, lap over lap, but one bridge is
+        # one overpass however many pieces make it up.
+        self.assertEqual(layout.build(example()).overpasses, [])
+
+    def test_every_example_lays_out(self):
+        examples = os.path.join(HERE, "examples")
+        for fn in sorted(os.listdir(examples)):
+            with open(os.path.join(examples, fn)) as fh:
+                spec = json.load(fh)
+            self.assertEqual(specmod.validate(spec), [], fn)
+            layout.build(spec)
+        # The knot: every new piece, and four places it crosses itself.
+        with open(os.path.join(examples, "gen_gordian_knot.json")) as fh:
+            knot = layout.build(json.load(fh))
+        self.assertEqual({f["type"] for f in knot.features}, {"slalom", "beam", "split"})
+        self.assertEqual(len(knot.overpasses), 4)
+        self.assertEqual(len(knot.shortcuts), 3)
+
     def test_preview_is_svg(self):
         svg = layout.preview_svg(layout.build(example()))
         self.assertTrue(svg.startswith("<svg") and svg.rstrip().endswith("</svg>"))
@@ -234,7 +362,8 @@ class FakeClient:
 def flat(spec):
     out = dict(spec)
     out["segments"] = [dict({"length": 0, "direction": "none", "angle": 0, "radius": 0,
-                             "rise": 0, "drop": 0, "shortcut": False}, **s) for s in spec["segments"]]
+                             "rise": 0, "drop": 0, "shortcut": False, "count": 0,
+                             "beam_width": 0}, **s) for s in spec["segments"]]
     return out
 
 
@@ -297,6 +426,23 @@ class Describe(unittest.TestCase):
         client = FakeClient([bad] * describe.MAX_ATTEMPTS)
         with self.assertRaises(RuntimeError):
             describe.plan("anything", client=client, log=lambda m: None)
+
+    def test_views_show_every_kind_when_there_are_more_than_keys(self):
+        segs = [{"type": "straight", "length": 512}]
+        for _ in range(6):
+            segs += [{"type": "checkpoint"}, {"type": "straight", "length": 512}]
+        segs += [{"type": "slalom", "length": 768, "count": 2}, {"type": "straight", "length": 512},
+                 {"type": "beam", "length": 512, "beam_width": 96},
+                 {"type": "straight", "length": 512},
+                 {"type": "split", "length": 1000, "direction": "left", "count": 1},
+                 {"type": "straight", "length": 512}]
+        views = screenshots.auto_views(layout.build(course_of(*segs, width=448)))
+        names = [v[0] for v in views]
+        self.assertEqual(len(names), len(screenshots.KEYS))
+        for want in ("start", "slalom1", "beam1", "split1", "finish"):
+            self.assertIn(want, names)
+        self.assertEqual(names[0], "start")
+        self.assertEqual(names[-1], "finish")
 
     def test_schema_is_what_the_prompt_describes(self):
         self.assertEqual(set(specmod.SEGMENT_SCHEMA["properties"]["type"]["enum"]),

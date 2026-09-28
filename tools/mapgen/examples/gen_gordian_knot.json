@@ -1,0 +1,159 @@
+{
+  "name": "gen_gordian_knot",
+  "title": "Gordian Knot",
+  "width": 448,
+  "segments": [
+    {
+      "type": "straight",
+      "length": 640
+    },
+    {
+      "type": "slalom",
+      "length": 1280,
+      "count": 4
+    },
+    {
+      "type": "checkpoint"
+    },
+    {
+      "type": "ramp",
+      "length": 1024,
+      "rise": 512
+    },
+    {
+      "type": "straight",
+      "length": 448
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 180,
+      "radius": 640,
+      "shortcut": true
+    },
+    {
+      "type": "straight",
+      "length": 448
+    },
+    {
+      "type": "beam",
+      "length": 768,
+      "beam_width": 96
+    },
+    {
+      "type": "straight",
+      "length": 256
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 90,
+      "radius": 512
+    },
+    {
+      "type": "straight",
+      "length": 1280
+    },
+    {
+      "type": "gap",
+      "length": 256,
+      "drop": 256
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "type": "gap",
+      "length": 256,
+      "drop": 256
+    },
+    {
+      "type": "straight",
+      "length": 256
+    },
+    {
+      "type": "ramp",
+      "length": 640,
+      "rise": -320
+    },
+    {
+      "type": "straight",
+      "length": 256
+    },
+    {
+      "type": "split",
+      "length": 1600,
+      "direction": "right",
+      "count": 3
+    },
+    {
+      "type": "checkpoint"
+    },
+    {
+      "type": "straight",
+      "length": 448
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 180,
+      "radius": 576,
+      "shortcut": true
+    },
+    {
+      "type": "straight",
+      "length": 768
+    },
+    {
+      "type": "gap",
+      "length": 160,
+      "drop": 0
+    },
+    {
+      "type": "slalom",
+      "length": 1792,
+      "count": 5
+    },
+    {
+      "type": "straight",
+      "length": 3456
+    },
+    {
+      "type": "ramp",
+      "length": 1664,
+      "rise": 832
+    },
+    {
+      "type": "straight",
+      "length": 448
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 180,
+      "radius": 1024,
+      "shortcut": true
+    },
+    {
+      "type": "straight",
+      "length": 448
+    },
+    {
+      "type": "checkpoint"
+    },
+    {
+      "type": "straight",
+      "length": 512
+    },
+    {
+      "type": "beam",
+      "length": 2048,
+      "beam_width": 64
+    },
+    {
+      "type": "straight",
+      "length": 768
+    }
+  ]
+}

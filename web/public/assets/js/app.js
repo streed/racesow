@@ -1265,11 +1265,23 @@ const MAPGEN_STATUS = {
 };
 const MAPGEN_DONE = new Set(["review", "published", "rejected", "failed"]);
 
+// " · 2 slaloms · 1 beam · 3 shortcuts · 4 overpasses" from a build report.
+function mapgenPieces(r) {
+  const n = {};
+  for (const f of Array.isArray(r.features) ? r.features : []) n[f.type] = (n[f.type] || 0) + 1;
+  if (Array.isArray(r.shortcuts) && r.shortcuts.length) n.shortcut = r.shortcuts.length;
+  if (Array.isArray(r.overpasses) && r.overpasses.length) n.overpass = r.overpasses.length;
+  const plural = (w, k) => (k === 1 ? w : w === "overpass" ? "overpasses" : w + "s");
+  return Object.entries(n)
+    .map(([w, k]) => ` · ${esc(String(k))} ${esc(plural(w, k))}`)
+    .join("");
+}
+
 function mapgenJobCard(j) {
   const [label, blurb] = MAPGEN_STATUS[j.status] || [j.status, ""];
   const r = j.report || {};
   const facts = j.mapName
-    ? `<div class="mg-facts"><b>${esc(j.mapName)}</b>${r.par_seconds ? ` · about ${esc(String(r.par_seconds))} s at run speed` : ""}${r.checkpoints ? ` · ${esc(String(r.checkpoints))} checkpoint${r.checkpoints === 1 ? "" : "s"}` : ""}</div>`
+    ? `<div class="mg-facts"><b>${esc(j.mapName)}</b>${r.par_seconds ? ` · about ${esc(String(r.par_seconds))} s at run speed` : ""}${r.checkpoints ? ` · ${esc(String(r.checkpoints))} checkpoint${r.checkpoints === 1 ? "" : "s"}` : ""}${mapgenPieces(r)}</div>`
     : "";
   // Only a built map has a plan file; a failed build may still carry a name.
   const plan = j.mapName && (j.status === "review" || j.status === "published")
@@ -1299,7 +1311,7 @@ async function viewMapgen() {
   app.innerHTML = `
     <div class="page-title"><span class="accent">MAKE</span> A MAP</div>
     <p class="page-sub">Describe a race course and the generator builds it: a strafe course with
-      turns, ramps and jumpable gaps, checked to be finishable at plain run speed before anyone sees it.
+      turns, ramps, gaps, slaloms, beams and split lanes, and it can even cross over itself. It is checked to be finishable at plain run speed before anyone sees it.
       Finished maps are reviewed before they reach the servers.</p>
     <form class="panel mg-form" id="mg-form">
       <label class="flag-label" for="mg-desc">Your map</label>

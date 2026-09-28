@@ -61,9 +61,24 @@ def cmd_check(args):
         with open(args.svg, "w") as fh:
             fh.write(layout.preview_svg(course))
     _emit(args, {"ok": True, "route_length": round(course.length),
-                 "par_seconds": round(course.length / 320.0, 1)},
-          f"ok: {round(course.length)} units, par ~{course.length / 320.0:.1f} s at 320 ups")
+                 "par_seconds": round(course.length / 320.0, 1),
+                 "features": course.features, "overpasses": course.overpasses},
+          f"ok: {round(course.length)} units, par ~{course.length / 320.0:.1f} s at 320 ups"
+          + _extras(course.features, course.shortcuts, course.overpasses))
     return 0
+
+
+def _extras(features, shortcuts, overpasses):
+    """ "; 2 slalom(s), 1 beam(s), 1 shortcut(s), 1 overpass(es)", or ""."""
+    counts = {}
+    for f in features:
+        counts[f["type"]] = counts.get(f["type"], 0) + 1
+    parts = [f"{n} {t}(s)" for t, n in counts.items()]
+    if shortcuts:
+        parts.append(f"{len(shortcuts)} shortcut(s)")
+    if overpasses:
+        parts.append(f"{len(overpasses)} overpass(es)")
+    return "; " + ", ".join(parts) if parts else ""
 
 
 def _build(args, spec):
@@ -79,7 +94,8 @@ def _build(args, spec):
         return 2 if "not found" in str(e) else 1
     report["ok"] = True
     _emit(args, report, f"ok: {pk3}  (par ~{report['par_seconds']} s, "
-                        f"{report['checkpoints']} checkpoint(s))")
+                        f"{report['checkpoints']} checkpoint(s))"
+                        + _extras(report["features"], report["shortcuts"], report["overpasses"]))
     return 0
 
 

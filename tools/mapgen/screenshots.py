@@ -63,6 +63,31 @@ KEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
 PREFIX = "zz_mapgen_view_"
 
 
+CLOSE_UP = {"beam": 160, "split": 224}
+
+
+def _back_along_route(route, pos, back):
+    """The point `back` units before `pos` along the course's centre line
+    (a polyline of (x, y, z)), or None if pos is not on it. The nearest
+    vertex is found in 3-D, so a landmark on an overpass is never matched to
+    the corridor passing under it."""
+    if len(route) < 2:
+        return None
+    i = min(range(len(route)), key=lambda k: math.dist(route[k], pos))
+    if math.dist(route[i][:2], pos[:2]) > 1.0:
+        return None
+    left = back
+    while i > 0:
+        a, b = route[i - 1], route[i]
+        d = math.dist(a[:2], b[:2])
+        if d >= left:
+            t = left / d if d else 0.0
+            return tuple(b[k] + (a[k] - b[k]) * t for k in range(3))
+        left -= d
+        i -= 1
+    return tuple(route[0])
+
+
 def auto_views(course):
     """Camera spots that show what matters on a race course."""
     views = []
@@ -73,21 +98,49 @@ def auto_views(course):
         y = pos[1] - math.sin(h) * back
         views.append([name, [round(x), round(y), round(pos[2] + 32)], round(heading) % 360])
 
+    def along(pos, back, name):
+        # Walk back along the centre line rather than straight back along the
+        # heading: the camera then stands on the floor that is really there
+        # (a ramp behind a landmark is lower or higher than the landmark) and
+        # inside the corridor through a turn. It looks at the landmark.
+        cam = _back_along_route(course.route, pos, back)
+        if cam is None:
+            return False
+        yaw = math.degrees(math.atan2(pos[1] - cam[1], pos[0] - cam[0])) % 360
+        views.append([name, [round(cam[0]), round(cam[1]), round(cam[2] + 32)], round(yaw) % 360])
+        return True
+
     counts = {}
     width = course.spec["width"]
     for kind, pos, heading in course.landmarks:
         counts[kind] = counts.get(kind, 0) + 1
         if kind == "start":
             behind(pos, heading, layout.ROOM_LEN - layout.SPAWN_BACK, "start")
-        elif kind == "stop":
-            behind(pos, heading, 448, "finish")
         elif kind == "shortcut":
             # From the far side of the corridor, looking out of the window
             # along the line of stepping stones.
             behind(pos, heading, width - 48, f"shortcut{counts[kind]}")
         else:
-            behind(pos, heading, 448, f"{kind}{counts[kind]}")
-    return views[:len(KEYS)]
+            name = "finish" if kind == "stop" else f"{kind}{counts[kind]}"
+            # Close enough that a beam or a split's two lanes fill the frame.
+            back = CLOSE_UP.get(kind, 448)
+            if not along(pos, back, name):
+                behind(pos, heading, back, name)
+    if len(views) <= len(KEYS):
+        return views
+    # More landmarks than keys: the start, the finish and the first of every
+    # kind come first, then the rest in course order, and the pick is shown
+    # in course order.
+    firsts = {0, len(views) - 1}
+    seen = set()
+    for i, v in enumerate(views):
+        kind = v[0].rstrip("0123456789")
+        if kind not in seen:
+            seen.add(kind)
+            firsts.add(i)
+    pick = sorted(firsts)[:len(KEYS)]
+    pick += [i for i in range(len(views)) if i not in firsts][:len(KEYS) - len(pick)]
+    return [views[i] for i in sorted(pick)]
 
 
 # The client's field of view (cg_fov 100 across) at 16:9: half-angles used to

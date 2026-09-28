@@ -12,6 +12,7 @@ distances off the floor:
     checkpoint  cyan line strip with "CP" markers
     edge        orange / black hazard stripes on every gap lip
     trim        orange racing stripe on the start and finish lines
+    pylon       slalom and split fins: navy with cyan bands, "go round me"
 
 Textures are 256 px and mapfile.TEX_SCALE is 1, so 1 px = 1 game unit and
 the grid is true to scale.
@@ -228,9 +229,21 @@ def trim():
     return c
 
 
+def pylon():
+    # Obstacles to steer round, not edges to fear: cyan (the checkpoint
+    # colour) rather than the orange hazard stripes that mark a fall. Bands
+    # run vertically on a wall face, so a fin reads as a post from any angle.
+    c = Canvas(SIZE, NAVY_2)
+    for x in range(0, SIZE, 64):
+        c.rect(x + 8, 0, x + 40, SIZE, CYAN)
+    c.rect(0, 0, SIZE, 6, WHITE)
+    c.rect(0, SIZE - 6, SIZE, SIZE, WHITE)
+    return c
+
+
 TEXTURES = {
     "floor": floor, "wall": wall, "start": start, "finish": finish,
-    "checkpoint": checkpoint, "edge": edge, "trim": trim,
+    "checkpoint": checkpoint, "edge": edge, "trim": trim, "pylon": pylon,
 }
 
 
