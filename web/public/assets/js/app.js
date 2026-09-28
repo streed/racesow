@@ -1270,9 +1270,10 @@ function mapgenPieces(r) {
   for (const f of Array.isArray(r.features) ? r.features : []) n[f.type] = (n[f.type] || 0) + 1;
   if (Array.isArray(r.shortcuts) && r.shortcuts.length) n.shortcut = r.shortcuts.length;
   if (Array.isArray(r.overpasses) && r.overpasses.length) n.overpass = r.overpasses.length;
+  const names = { wallclimb: "wall climb", wallgap: "wall-kick gap", dash: "dash drop" };
   const plural = (w, k) => (k === 1 ? w : w === "overpass" ? "overpasses" : w + "s");
   return Object.entries(n)
-    .map(([w, k]) => ` · ${esc(String(k))} ${esc(plural(w, k))}`)
+    .map(([w, k]) => ` · ${esc(String(k))} ${esc(plural(names[w] || w, k))}`)
     .join("");
 }
 
@@ -1438,7 +1439,7 @@ async function viewMapgen() {
   app.innerHTML = `
     <div class="page-title"><span class="accent">MAKE</span> A MAP</div>
     <p class="page-sub">Describe a race course and the generator builds it: a strafe course with
-      turns, ramps, gaps, slaloms, beams and split lanes, and it can even cross over itself. It is checked to be finishable at plain run speed before anyone sees it.
+      turns, ramps, gaps, slaloms, beams, split lanes and open track, with wall jumps and dashes if you ask for them, and it can even cross over itself. Every jump is checked against the game's own movement before anyone sees it.
       A map that passes every check goes straight onto the game servers.</p>
     <form class="panel mg-form" id="mg-form">
       <label class="flag-label" for="mg-desc">Your map</label>

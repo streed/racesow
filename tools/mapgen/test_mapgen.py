@@ -371,6 +371,179 @@ def _v(s):
     return tuple(float(x) for x in s.split())
 
 
+class SpecialMoves(unittest.TestCase):
+    """Wall climbs, wall-kick gaps, dash drops and open track. Each special
+    piece must be impossible with a plain run-speed jump, even a perfect one,
+    and possible with the move it is built for."""
+
+    def test_move_numbers_match_the_engine(self):
+        # gs_pmove.c: 174 and 330, scaled by GRAVITY / BASEGRAVITY = 850 / 800.
+        self.assertAlmostEqual(physics.DASH_UP, 184.875)
+        self.assertAlmostEqual(physics.WJ_UP, 350.625)
+        self.assertEqual(physics.DASH_SPEED, 451.0)
+        # A kick while running along a wall keeps 320 / sqrt(1.09) along it.
+        self.assertAlmostEqual(physics.wall_jump_speed(), 306.5, places=1)
+        # Jump apex 46.1 + an 18-unit step; a wall jump adds 72.3 on top.
+        self.assertAlmostEqual(physics.plain_climb(), 64.1, places=1)
+        self.assertAlmostEqual(physics.wall_climb(), 0.8 * (46.1 + 72.3), places=0)
+
+    def test_every_window_excludes_the_plain_move(self):
+        lo, hi = specmod.WALLCLIMB_RISE
+        self.assertGreater(lo, physics.plain_climb())
+        self.assertLessEqual(hi, physics.wall_climb())
+        for d in range(specmod.WALLGAP_DROP[0], specmod.WALLGAP_DROP[1] + 1, 2):
+            # The ledge is out of any jump's reach, whatever the speed; a dash
+            # is lower still. Only the kick gets there.
+            self.assertGreater(-d, physics.plain_climb(), d)
+            self.assertGreater(-d, physics.DASH_UP ** 2 / (2 * physics.GRAVITY) + physics.STEP_SIZE)
+            lo, hi = specmod.wallgap_window(d)
+            self.assertLessEqual(hi, physics.wall_jump_reach(d), d)
+            self.assertGreater(hi - lo, 150, f"wall-kick window at drop {d} too thin to build")
+        for d in range(specmod.DASH_DROP[0], specmod.DASH_DROP[1] + 1, 64):
+            lo, hi = specmod.dash_window(d)
+            self.assertGreater(lo, physics.jump_reach(d), d)
+            self.assertLessEqual(hi, physics.dash_reach(d), d)
+            self.assertGreater(hi - lo, 40, f"dash window at drop {d} too thin to build")
+
+    def test_dash_pad_keeps_walls_out_of_kicking_range(self):
+        # The best a wall jump can do from a wall that ends DASH_PAD before the
+        # lip: take off earlier along it so the kick comes at the jump's apex
+        # right at the wall's end, then fly. It must not reach a dash gap.
+        pad = specmod.DASH_PAD
+        for d in range(specmod.DASH_DROP[0], specmod.DASH_DROP[1] + 1, 64):
+            t = physics._flight(physics.WJ_UP, d + physics.jump_apex())
+            best = physics.wall_jump_speed() * t - pad
+            self.assertLess(best, specmod.dash_window(d)[0], d)
+
+    def test_validation(self):
+        def errs(*segs):
+            return specmod.validate(course_of({"type": "straight", "length": 512}, *segs,
+                                              {"type": "straight", "length": 512}))
+        self.assertEqual(errs({"type": "wallclimb", "length": 512, "rise": 80,
+                               "direction": "left"}), [])
+        self.assertTrue(errs({"type": "wallclimb", "length": 512, "rise": 60,
+                              "direction": "left"}))   # jumpable
+        self.assertTrue(errs({"type": "wallclimb", "length": 512, "rise": 120,
+                              "direction": "left"}))   # beyond a wall jump
+        self.assertTrue(errs({"type": "wallclimb", "length": 512, "rise": 80,
+                              "direction": "none"}))
+        lo, hi = specmod.wallgap_window(-80)
+        ok = {"type": "wallgap", "length": (lo + hi) // 2, "drop": -80, "direction": "right"}
+        self.assertEqual(errs(ok), [])
+        self.assertTrue(errs(dict(ok, length=lo - 1)))
+        self.assertTrue(errs(dict(ok, length=hi + 1)))
+        self.assertTrue(errs(dict(ok, drop=0)))       # a flat gap can be strafe-jumped
+        self.assertTrue(errs(dict(ok, drop=-60)))     # low enough to jump onto
+        lo, hi = specmod.dash_window(512)
+        self.assertEqual(errs({"type": "dash", "length": lo, "drop": 512}), [])
+        self.assertTrue(errs({"type": "dash", "length": lo - 1, "drop": 512}))
+        self.assertTrue(errs({"type": "dash", "length": 300, "drop": 128}))
+        self.assertEqual(errs({"type": "straight", "length": 256, "open": True}), [])
+        self.assertTrue(errs({"type": "slalom", "length": 768, "count": 2, "open": True}))
+        self.assertTrue(errs({"type": "straight", "length": 256, "open": "yes"}))
+
+    def test_normalize_keeps_only_a_true_open(self):
+        n = specmod.normalize(course_of(
+            {"type": "straight", "length": 256, "open": False, "rise": 0},
+            {"type": "turn", "direction": "left", "angle": 90, "radius": 256, "open": True,
+             "shortcut": False},
+            {"type": "dash", "length": 480, "drop": 512, "open": False, "direction": "none"}))
+        self.assertEqual(n["segments"], [
+            {"type": "straight", "length": 256},
+            {"type": "turn", "direction": "left", "angle": 90, "radius": 256, "open": True},
+            {"type": "dash", "length": 480, "drop": 512}])
+
+    def test_route_length_counts_the_dash_pad(self):
+        spec = course_of({"type": "straight", "length": 512},
+                         {"type": "dash", "length": 480, "drop": 512},
+                         {"type": "straight", "length": 512})
+        plain = course_of({"type": "straight", "length": 512},
+                          {"type": "straight", "length": specmod.DASH_PAD + 480},
+                          {"type": "straight", "length": 512})
+        self.assertAlmostEqual(layout.build(spec).length, layout.build(plain).length, delta=1)
+        self.assertEqual(specmod.route_length(spec["segments"][1]), specmod.DASH_PAD + 480)
+
+    def _walls(self, c, tex="wall"):
+        return [p for p in c.world if p.tex == tex]
+
+    def test_open_track_has_no_walls_and_painted_edges(self):
+        shut = layout.build(course_of({"type": "straight", "length": 512},
+                                      {"type": "turn", "direction": "left", "angle": 90,
+                                       "radius": 320}, {"type": "straight", "length": 512}))
+        open_ = layout.build(course_of({"type": "straight", "length": 512, "open": True},
+                                       {"type": "turn", "direction": "left", "angle": 90,
+                                        "radius": 320, "open": True},
+                                       {"type": "straight", "length": 512, "open": True}))
+        # Only the start and finish rooms keep walls: 2 side walls + an end wall each.
+        self.assertEqual(len(self._walls(open_)), 6)
+        self.assertGreater(len(self._walls(shut)), len(self._walls(open_)) + 10)
+        edges = [p for p in open_.world if p.tex == "edge"]
+        self.assertGreaterEqual(len(edges), 2 + 2 * 8 + 2)   # straights, 8 wedges x 2, straight
+
+    def test_wallclimb_is_a_step_with_a_kick_wall(self):
+        c = layout.build(course_of({"type": "straight", "length": 512},
+                                   {"type": "wallclimb", "length": 512, "rise": 80,
+                                    "direction": "left"},
+                                   {"type": "straight", "length": 512}))
+        kick = self._walls(c, "kick")
+        self.assertEqual(len(kick), 1)
+        self.assertEqual(kick[0].zmax(), 80 + layout.WALL_HEIGHT)
+        # The kick wall is on the left: +y, heading 0.
+        self.assertGreater(min(y for _, y in kick[0].poly), 384 / 2 - 1)
+        tops = sorted({p.zmax() for p in c.world if p.tex == "floor"})
+        self.assertEqual(tops, [0.0, 80.0])
+        # The course carries on at the new height, and the route shows the step.
+        self.assertEqual(c.route[-1][2], 80.0)
+        self.assertEqual(c.features[0]["type"], "wallclimb")
+
+    def test_wallgap_has_one_kick_wall_and_no_floor(self):
+        lo, hi = specmod.wallgap_window(-80)
+        c = layout.build(course_of({"type": "straight", "length": 512},
+                                   {"type": "wallgap", "length": lo + 100, "drop": -80,
+                                    "direction": "right"},
+                                   {"type": "straight", "length": 512}))
+        kick = self._walls(c, "kick")
+        self.assertEqual(len(kick), 1)
+        self.assertLess(max(y for _, y in kick[0].poly), -384 / 2 + 1)   # right side
+        self.assertEqual(kick[0].zmax(), 80 + layout.WALL_HEIGHT)
+        self.assertEqual(c.route[-1][2], 80.0)
+
+    def test_special_gaps_need_a_run_up_and_a_landing(self):
+        wg = {"type": "wallgap", "length": 200, "drop": -80, "direction": "left"}
+        # A jump off a ramp flies high enough to skip the kick: level floor first.
+        ramp = {"type": "ramp", "length": 256, "rise": 64}
+        for before in ([ramp], [ramp, {"type": "straight", "length": 256}]):
+            with self.assertRaises(layout.LayoutError) as e:
+                layout.build(course_of(*before, wg, {"type": "straight", "length": 512}))
+            self.assertIn(f"needs {specmod.WALL_RUNUP}", str(e.exception))
+        layout.build(course_of(ramp, {"type": "straight", "length": 384}, wg,
+                               {"type": "straight", "length": 512}))
+        climb = {"type": "wallclimb", "length": 384, "rise": 80, "direction": "left"}
+        with self.assertRaises(layout.LayoutError) as e:
+            layout.build(course_of({"type": "straight", "length": 512},
+                                   {"type": "ramp", "length": 512, "rise": 256}, climb,
+                                   {"type": "straight", "length": 512}))
+        self.assertIn(f"needs {specmod.WALL_RUNUP}", str(e.exception))
+        dlo, _ = specmod.dash_window(384)
+        with self.assertRaises(layout.LayoutError) as e:
+            layout.build(course_of({"type": "straight", "length": 512},
+                                   {"type": "dash", "length": dlo, "drop": 384},
+                                   {"type": "ramp", "length": 512, "rise": 128}))
+        self.assertIn("must land", str(e.exception))
+        # A dash brings its own pad, so it may follow a ramp.
+        layout.build(course_of({"type": "straight", "length": 512},
+                               {"type": "ramp", "length": 512, "rise": -256},
+                               {"type": "dash", "length": dlo, "drop": 384},
+                               {"type": "straight", "length": 512}))
+
+    def test_shortcut_next_to_open_straights(self):
+        c = layout.build(course_of({"type": "straight", "length": 512, "open": True},
+                                   {"type": "turn", "direction": "left", "angle": 180,
+                                    "radius": 512, "shortcut": True},
+                                   {"type": "straight", "length": 512, "open": True}))
+        self.assertEqual(len(c.shortcuts), 1)
+
+
 class MapFile(unittest.TestCase):
     def test_every_face_points_out_of_its_brush(self):
         """q3map2 computes normal = cross(p2 - p0, p1 - p0). If any face of any

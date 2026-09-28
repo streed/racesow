@@ -37,6 +37,10 @@ TOKEN_FIELDS = ("input_tokens", "output_tokens",
 
 def system_prompt():
     gaps = ", ".join(f"drop {d}: {int(physics.max_gap(d))}" for d in (0, 64, 128, 256))
+    kick = ", ".join("drop %d: %d" % (d, specmod.wallgap_window(d)[1])
+                     for d in (specmod.WALLGAP_DROP[0], -88, -80, specmod.WALLGAP_DROP[1]))
+    dash = ", ".join("drop %d: %d-%d" % (d, *specmod.dash_window(d)) for d in (384, 512, 768, 1024))
+    landings = "straight, turn, slalom, split or wallclimb"
     return f"""You design race courses for Warsow's race mode (racesow). Players run from a
 start timer to a stop timer as fast as they can; strafe-jumping (bunnyhopping) lets
 good players go far faster than the 320 units/s run speed, so wide, flowing corridors
@@ -71,7 +75,9 @@ Top-level fields:
   width  corridor width, {specmod.WIDTH_MIN}-{specmod.WIDTH_MAX}. 384 is a good default; wider suits strafing.
 
 Segment types (every segment carries every field; set unused ones to 0 / "none" /
-false):
+false). Straights, turns, ramps and gaps also take "open": true to drop their side
+walls and float over the void (painted edges; falling off kills the player).
+Open track is harder and faster-looking; walls help the player corner.
   straight   length {specmod.STRAIGHT_MIN}-{specmod.STRAIGHT_MAX}
   turn       direction left|right, angle one of {list(specmod.TURN_ANGLES)},
              radius (centre line) >= width/2 + 64 and <= {specmod.TURN_RADIUS_MAX},
@@ -83,7 +89,7 @@ false):
              Max clearable length by drop: {gaps}.
              A gap needs >= {int(physics.MIN_RUNUP)} units of straight/turn floor right
              before it (ramps and gaps reset that) and must be followed by a
-             straight or turn to land on. Falling in kills the player.
+             {landings} to land on. Falling in kills the player.
   checkpoint a timing split at that point. Optional: the generator adds one on a
              straight every ~{layout.CP_EVERY} units of route wherever the plan leaves a
              longer stretch without one, so place your own only where a split
@@ -100,6 +106,30 @@ false):
              fall is death). The other lane is solid but weaves through tight
              fins. Needs width >= {2 * specmod.SPLIT_LANE_MIN + specmod.SPLIT_MEDIAN} and length >= 2*{specmod.SPLIT_MOUTH} + count*{specmod.SPLIT_RUNWAY + specmod.split_hole()} + {specmod.SPLIT_LANDING}.
              It leaves only {specmod.SPLIT_MOUTH} units of run-up for a gap right after it.
+
+Special moves. The "special" key dashes on the ground (a burst to 451 ups, low arc)
+and wall-jumps in the air (a second, higher jump off a wall the player is running
+along). Wall climbs and wall-kick gaps REQUIRE the wall jump from everyone: no jump
+reaches their ledge. A dash drop requires the dash at run speed (a player carrying
+strafe speed may jump it instead).
+  wallclimb  length >= {specmod.WALLCLIMB_MIN}, rise {specmod.WALLCLIMB_RISE[0]}-{specmod.WALLCLIMB_RISE[1]}, direction left|right: halfway along,
+             the floor steps up `rise` (too high to jump onto). A kick wall runs
+             along the `direction` side; the other side is open. It needs
+             {specmod.WALL_RUNUP} units of level floor before the ledge, counting its own first
+             half (a ramp resets that: a jump off a ramp would skip the kick).
+  wallgap    length {specmod.WALLGAP_MIN}+, drop {specmod.WALLGAP_DROP[0]} to {specmod.WALLGAP_DROP[1]} (NEGATIVE: the landing is that much
+             HIGHER), direction left|right: a gap up onto a ledge too high to
+             jump onto, with a kick wall along the `direction` side and open void
+             on the other. Longest length by drop: {kick}.
+             It needs {specmod.WALL_RUNUP} units of level straight/turn floor right before it
+             and lands like a gap.
+  dash       length, drop {specmod.DASH_DROP[0]} to {specmod.DASH_DROP[1]}: a {specmod.DASH_PAD}-unit open take-off pad, then an open gap
+             that only a dash carries. length (the gap, lip to lip) MUST be in the
+             window for its drop: {dash}. It needs nothing before it (the pad is
+             its run-up) and lands like a gap. It adds {specmod.DASH_PAD} + length to the route.
+A technical course strings these together with short straights and tight turns
+of every angle; a wall jump or dash is at most once per jump, so give each its own
+piece.
 
 Shortcuts: a 180-degree turn may set "shortcut": true. The generator cuts a window
 in the inner wall of the straights on both sides of the U and lays a line of small

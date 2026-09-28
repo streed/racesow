@@ -72,6 +72,10 @@ that `server/Dockerfile` builds (DenMSC/racemod_2.1, `race-demos`):
 | step height | 18 | `gs_public.h:272` |
 | player box | 32 × 32 × 64 | `gs_pmove.c:31-32` |
 | walkable slope | normal.z ≥ 0.7 | `gs_public.h:223` |
+| dash speed | 451 | `gs_public.h:74` |
+| dash upward speed | 174 × 850/800 = 184.9 | `gs_pmove.c:110` |
+| wall-jump upward speed | 330 × 850/800 = 350.6 | `gs_pmove.c:117` |
+| wall-jump bounce | 0.3 | `gs_pmove.c:119` |
 
 These give a flat-gap limit of 168 units and a ledge limit of 36 units, both
 with the 0.8 margin applied. Ramps are capped at 30°.
@@ -83,12 +87,56 @@ with the 0.8 margin applied. Ramps are capped at 30°.
 | `straight` | length | counts toward run-up |
 | `turn` | direction, angle ∈ {45, 90, 135, 180}, radius | radius ≥ width/2 + 64 |
 | `ramp` | length, rise | ≤ 30°; resets run-up |
-| `gap` | length, drop | ≤ `max_gap(drop)`; needs 192 units of run-up; must land on a straight, turn, slalom or split |
+| `gap` | length, drop | ≤ `max_gap(drop)`; needs 192 units of run-up; must land on a straight, turn, slalom, split or wallclimb |
 | `checkpoint` | — | `trigger_multiple` → `target_checkpoint`; optional, since the generator fills any stretch over 2,560 units without one |
 | `turn` + `shortcut` | a 180 with straights ≥ 320 either side | stepping stones at 92% of `max_gap(0)` across the U |
 | `slalom` | length, count 2–12 | fins leave 160-unit gates; ≥ 256 between fins; width ≥ 224 |
 | `beam` | length, beam_width | 48 ≤ beam ≤ width − 128; walls reach 160 below it |
 | `split` | length, direction, count 1–6 | lanes ≥ 176; fast-lane holes at 85% of `max_gap(0)`, each after 192 of run-up; safe lane weaves 96-unit gates |
+| `wallclimb` | length ≥ 384, rise 72–94, direction | a step-up halfway along with a kick wall on `direction`; 384 of level floor before the ledge |
+| `wallgap` | length 64–270…302, drop −94…−72, direction | a gap up onto a ledge, kick wall along `direction`; 384 of level run-up; lands like a gap |
+| `dash` | length, drop 384–1,024 | a 192-unit open pad, then a gap longer than any run-speed jump and within a dash |
+| any straight, turn, ramp, gap + `open` | `open: true` | no side walls; the floor edges are painted |
+
+### Special moves: what "required" means
+
+The special key dashes on the ground and wall-jumps in the air
+(`PM_CheckDash`, `PM_CheckWallJump`). The three special pieces are sized so
+the move is needed, and the claim is only as strong as the physics behind it:
+
+- **Wall climbs and wall-kick gaps need the wall jump from everyone.** Their
+  ledge is 72–94 up. A jump reaches 46 plus the 18-unit step (64); a jump
+  plus a wall jump reaches 118 (0.8 margin: 94). Strafing adds speed, never
+  height, so no run-up gets a player onto the ledge without the kick. The one
+  way round it, a jump off an upward ramp (the jump speed is added to the
+  ramp's), is closed by requiring 384 units of level floor first; by then
+  that arc is back down below the ledge.
+- **Dash drops need the dash at run speed.** A dash is 451 ups but low, so it
+  out-reaches a 320-ups jump only on a long drop: at 512 down a perfect jump
+  reaches 472 and a dash 542 (0.9 margin, since a dash sets its speed exactly).
+  A player carrying strafe speed can jump them instead. That is the same
+  promise every other gap makes: finishable at run speed, faster with skill.
+- **No low-ceiling dash slot.** It looks like a way to force a dash (a jump
+  would bonk its head), but crouching works in the air and lowers the head 24
+  units, while a dash blocks crouching for 400 ms. A crouch-jump fits under
+  any ceiling a dash does.
+- **No distance-only wall-kick gap.** Built first, and the in-game test below
+  caught it: holding forward and strafe into the wall is air strafing, and it
+  crossed a flat 290-unit gap with a plain jump.
+
+These were checked in the real Warsow 2.1.2 client, not only on paper. A
+script compiled a test map per piece, joined a dm warmup, held the keys with
+real timing (xdotool) and read the player's position back with `viewpos`,
+each piece twice with the move and twice without:
+
+| piece | with the move | without |
+| --- | --- | --- |
+| wall climb, 80 up | on the ledge; peak 111–112 | peak 48–49; stopped at the ledge face |
+| wall-kick gap, 220 across and 80 up | on the ledge; peak 118 | peak 49; hit the face and fell |
+| dash drop, 488 across and 512 down | across; peak 18–19 | fell ~60 short |
+
+The "without" runs on the wall pieces held forward and strafe into the wall
+(the strafe that crossed the flat gap) and still could not gain the height.
 
 A course may pass over itself. The self-intersection test is 3-D, so a
 crossing is legal when the upper floor clears the lower corridor's walls, and
@@ -308,7 +356,8 @@ repair turn, not a failed request.
 | 2 | headless pmove bot; proof-run demo in the replay viewer | design |
 | 3 | public form with daily identity quota → `mapgen_job` table → worker → automatic publish → per-job page with server confirmations | **built** |
 | 4a | strafe-only vocabulary: slalom, beam, split lanes, overpasses | **built** |
-| 4b | vocabulary growth gated on phase 2: jump pads, walljump walls, themed texture sets | idea |
+| 4b | special moves: wall climbs, wall-kick gaps, dash drops, open track (checked in the real client) | **built** |
+| 4c | vocabulary growth gated on phase 2: jump pads, themed texture sets | idea |
 
 ## Decisions and why
 

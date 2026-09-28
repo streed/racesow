@@ -8,7 +8,8 @@ exactly one brush writer (mapfile.py) and one overlap test.
 The walk also enforces the rules that need geometry rather than ranges:
 
   * a gap needs MIN_RUNUP of flat floor before it (physics.py);
-  * a gap must land on floor, not on another gap, a beam or the finish trigger;
+  * a gap must land on floor, not on another gap, a beam or the finish trigger
+    (so must a wall-kick gap or a dash);
   * the course must not run through itself. It may pass OVER itself: the test
     is 3-D, and every such crossing is reported in Course.overpasses.
 
@@ -67,6 +68,8 @@ BRUSH_MAX = 1500
 FIN_THICK = 32          # slalom and split fins, along the course
 SPLIT_GATE = 96         # gates in a split's safe lane: 3 player widths
 VOID_DEPTH = 160        # side walls reach this far below a floorless piece
+EDGE_BAND = 16          # painted edge along an open floor, flush with it
+WALLCLIMB_ARC = 96      # how far before a wall climb's ledge the centre line rises
 
 TEX = {
     "floor": "mapgen_v1/floor",
@@ -79,6 +82,7 @@ TEX = {
     "platform": "mapgen_v1/edge",
     "beam": "mapgen_v1/edge",
     "pylon": "mapgen_v1/pylon",
+    "kick": "mapgen_v1/kick",
     "sky": "mapgen_v1/sky",
     "trigger": "mapgen_v1/trigger",
 }
@@ -151,12 +155,7 @@ def _band(o, f, l, back, fwd, lo, hi):
 
 
 def _seg_length(seg):
-    t = seg["type"]
-    if t == "turn":
-        return math.radians(seg["angle"]) * seg["radius"]
-    if t == "checkpoint":
-        return 0.0
-    return float(seg["length"])
+    return specmod.route_length(seg)
 
 
 def plan_checkpoints(spec):
@@ -293,8 +292,10 @@ class _Walker:
         self.c.hulls.append(Hull(poly, zlo, zhi, self.seg))
 
     # -- pieces -------------------------------------------------------------
-    def box_run(self, length, rise=0.0, tex="floor", floor=True, wall_floor=None):
-        """A straight run: floor slab (optionally sloped) + two side walls."""
+    def box_run(self, length, rise=0.0, tex="floor", floor=True, wall_floor=None, walls=(1, -1)):
+        """A straight run: floor slab (optionally sloped) + the side walls in
+        `walls` (+1 left, -1 right). A side without a wall is open: its floor
+        edge is painted instead."""
         o, f, l = self.frame()
         half = self.w / 2.0
         z0 = self.z
@@ -310,9 +311,14 @@ class _Walker:
             self.c.floor_polys.append((poly, tex))
         idx = {}
         for side in (+1, -1):
-            idx[side] = len(self.c.world)
-            self.c.world.append(Prism(self._wall_poly(o, f, l, side, 0, length),
-                                      base, top0 + WALL_HEIGHT, gx, gy, "wall"))
+            if side in walls:
+                idx[side] = len(self.c.world)
+                self.c.world.append(Prism(self._wall_poly(o, f, l, side, 0, length),
+                                          base, top0 + WALL_HEIGHT, gx, gy, "wall"))
+            elif floor:
+                band = (_band(o, f, l, 0, length, half - EDGE_BAND, half) if side > 0
+                        else _band(o, f, l, 0, length, -half, -half + EDGE_BAND))
+                self.c.world.append(Prism(band, lo - 4, top0 + 1, gx, gy, "edge"))
         if rise == 0:
             self.walls[self.seg] = {"o": o, "f": f, "l": l, "length": length, "idx": idx,
                                     "base": base, "top": z0 + WALL_HEIGHT}
@@ -329,7 +335,9 @@ class _Walker:
 
     def cut_window(self, seg, side, a, b):
         """Replace a straight's side wall with two pieces, leaving [a, b] open."""
-        w = self.walls[seg]
+        w = self.walls.get(seg)
+        if w is None or side not in w["idx"]:
+            return          # an open side: nothing to cut
         o, f, l, n = w["o"], w["f"], w["l"], w["length"]
         k = w["idx"][side]
         self.c.world[k] = Prism.flat(self._wall_poly(o, f, l, side, 0, a), w["base"], w["top"], "wall")
@@ -425,7 +433,7 @@ class _Walker:
         self.checkpoint()
         self.x, self.y = here
 
-    def turn(self, direction, angle, radius):
+    def turn(self, direction, angle, radius, walls=True):
         sign = 1.0 if direction == "left" else -1.0
         o, f, l = self.frame()
         cx, cy = o[0] + l[0] * radius * sign, o[1] + l[1] * radius * sign
@@ -441,11 +449,16 @@ class _Walker:
 
         for i in range(n):
             a, b = a0 + step * i, a0 + step * (i + 1)
-            rings = [(r_in, r_out, "floor", self.z - FLOOR_THICK, self.z),
-                     (r_out, r_out + WALL_THICK, "wall", self.z - FLOOR_THICK, self.z + WALL_HEIGHT)]
-            if r_in - WALL_THICK > 1:
-                rings.append((r_in - WALL_THICK, r_in, "wall",
-                              self.z - FLOOR_THICK, self.z + WALL_HEIGHT))
+            rings = [(r_in, r_out, "floor", self.z - FLOOR_THICK, self.z)]
+            if walls:
+                rings.append((r_out, r_out + WALL_THICK, "wall", self.z - FLOOR_THICK,
+                              self.z + WALL_HEIGHT))
+                if r_in - WALL_THICK > 1:
+                    rings.append((r_in - WALL_THICK, r_in, "wall",
+                                  self.z - FLOOR_THICK, self.z + WALL_HEIGHT))
+            else:   # open: paint both floor edges
+                rings += [(r_out - EDGE_BAND, r_out, "edge", self.z - 4, self.z + 1),
+                          (r_in, r_in + EDGE_BAND, "edge", self.z - 4, self.z + 1)]
             mid_heading = self.heading + sign * angle * (i + 0.5) / n
             for ri, ro, tex, zlo, zhi in rings:
                 poly = [pt(ri, a), pt(ro, a), pt(ro, b), pt(ri, b)]
@@ -592,9 +605,10 @@ class _Walker:
         for i, seg in enumerate(segs):
             self.seg = i
             t = seg["type"]
+            sides = () if seg.get("open") else (1, -1)
             if t == "straight":
                 o, f, _ = self.frame()
-                self.box_run(seg["length"])
+                self.box_run(seg["length"], walls=sides)
                 self.runup += seg["length"]
                 if self.pending and self.pending["turn"] == i - 1:
                     self._shortcut(i)
@@ -604,7 +618,7 @@ class _Walker:
                     self.checkpoint_at(o, f, a)
                     self.c.auto_checkpoints.append((i, a))
             elif t == "ramp":
-                self.box_run(seg["length"], seg["rise"])
+                self.box_run(seg["length"], seg["rise"], walls=sides)
                 self.runup = 0.0
             elif t == "turn":
                 if seg.get("shortcut"):
@@ -612,7 +626,7 @@ class _Walker:
                     self.pending = {"turn": i, "origin": o, "f": f, "l": l, "z": self.z,
                                     "sign": 1 if seg["direction"] == "left" else -1,
                                     "radius": seg["radius"]}
-                self.turn(seg["direction"], seg["angle"], seg["radius"])
+                self.turn(seg["direction"], seg["angle"], seg["radius"], walls=bool(sides))
                 self.runup += math.radians(seg["angle"]) * seg["radius"]
             elif t == "checkpoint":
                 self.checkpoint()
@@ -626,6 +640,19 @@ class _Walker:
             elif t == "split":
                 self.split(seg["length"], seg["direction"], seg["count"])
                 self.runup = float(specmod.SPLIT_MOUTH)
+            elif t == "wallclimb":
+                if self.runup + seg["length"] / 2.0 < specmod.WALL_RUNUP:
+                    self.problems.append(
+                        f"segment {i} (wallclimb): only {int(self.runup + seg['length'] / 2)} "
+                        f"units of flat floor before its ledge; it needs {specmod.WALL_RUNUP} "
+                        "(a ramp resets it, because a jump off a ramp flies high enough "
+                        "to skip the kick). Lengthen it or put a straight before it")
+                self.wallclimb(seg["length"], seg["rise"], seg["direction"])
+                self.runup = seg["length"] / 2.0
+            elif t == "wallgap":
+                self._gap(i, seg, segs, kick=seg["direction"])
+            elif t == "dash":
+                self._dash(i, seg, segs)
 
         self.seg = len(segs)
         self._finish_room()
@@ -686,26 +713,101 @@ class _Walker:
         self.box_run(ROOM_LEN, tex="finish")
         self.end_wall(behind=False)
 
-    def _gap(self, i, seg, segs):
-        where = f"segment {i} (gap)"
-        if self.runup < physics.MIN_RUNUP:
+    LANDINGS = ("straight", "turn", "slalom", "split", "wallclimb")
+
+    def _landing(self, where, i, segs):
+        nxt = segs[i + 1]["type"] if i + 1 < len(segs) else "finish"
+        if nxt not in self.LANDINGS:
+            self.problems.append(
+                f"{where}: must land on a {', '.join(self.LANDINGS[:-1])} or "
+                f"{self.LANDINGS[-1]}, not on {nxt!r}")
+
+    def _gap(self, i, seg, segs, kick=None):
+        """A pit to jump. With `kick` ("left"/"right") it is a wall-kick gap:
+        open on both sides except one kick wall along it, from the lip to
+        the landing, to wall-jump off mid-air."""
+        kind = "wallgap" if kick else "gap"
+        where = f"segment {i} ({kind})"
+        if kick and self.runup < specmod.WALL_RUNUP:
+            self.problems.append(
+                f"{where}: only {int(self.runup)} units of flat floor before it; a wall-kick "
+                f"gap needs {specmod.WALL_RUNUP} (straights and turns; a ramp resets it, "
+                "because a jump off a ramp flies high enough to skip the kick)")
+        elif self.runup < physics.MIN_RUNUP:
             self.problems.append(
                 f"{where}: only {int(self.runup)} units of flat floor before it; a gap "
                 f"needs {int(physics.MIN_RUNUP)} of straight/turn run-up (ramps and "
                 "other gaps reset it)")
-        nxt = segs[i + 1]["type"] if i + 1 < len(segs) else "finish"
-        if nxt not in ("straight", "turn", "slalom", "split"):
-            self.problems.append(
-                f"{where}: must land on a straight, turn, slalom or split, not on {nxt!r}")
+        self._landing(where, i, segs)
         # Mark the take-off lip so the gap reads from a distance.
         self.stripe("edge", -32, 0)
-        self.c.landmarks.append(("gap", (self.x, self.y, self.z), self.heading))
+        self.c.landmarks.append((kind, (self.x, self.y, self.z), self.heading))
         land = self.z - seg["drop"]
         wall_floor = min(self.z, land) - FLOOR_THICK - 128
-        self.box_run(seg["length"], floor=False, wall_floor=wall_floor)
+        if kick:
+            o, f, l = self.frame()
+            side = 1 if kick == "left" else -1
+            self.c.world.append(Prism.flat(self._wall_poly(o, f, l, side, 0, seg["length"]),
+                                           wall_floor, max(self.z, land) + WALL_HEIGHT, "kick"))
+            self.box_run(seg["length"], floor=False, wall_floor=wall_floor, walls=())
+            self.c.features.append({"type": "wallgap", "segment": self.seg, "side": kick,
+                                    "length": seg["length"], "drop": seg["drop"]})
+        else:
+            sides = () if seg.get("open") else (1, -1)
+            self.box_run(seg["length"], floor=False, wall_floor=wall_floor, walls=sides)
         self.z = land
         self.c.route[-1] = (self.x, self.y, self.z)
         self.runup = 0.0
+
+    def _dash(self, i, seg, segs):
+        """A DASH_PAD open take-off pad, then an open gap `drop` down that is
+        longer than any run-speed jump (spec.dash_window). The pad keeps any
+        wall of the piece before it out of wall-jump reach of the lip."""
+        where = f"segment {i} (dash)"
+        self._landing(where, i, segs)
+        self.box_run(specmod.DASH_PAD, walls=())
+        self.stripe("edge", -32, 0)
+        self.c.landmarks.append(("dash", (self.x, self.y, self.z), self.heading))
+        land = self.z - seg["drop"]
+        self.box_run(seg["length"], floor=False, walls=())
+        self.z = land
+        self.c.route[-1] = (self.x, self.y, self.z)
+        self.runup = 0.0
+        self.c.features.append({"type": "dash", "segment": self.seg,
+                                "length": seg["length"], "drop": seg["drop"]})
+
+    def wallclimb(self, length, rise, direction):
+        """A ledge `rise` high halfway along, too high to jump onto, with a
+        kick wall on `direction` the whole way: run along the wall, jump,
+        wall-jump off it and land on top. The other side is open."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        z = self.z
+        a = length / 2.0
+        side = 1 if direction == "left" else -1
+        self.c.landmarks.append(("wallclimb", (self.x, self.y, z), self.heading))
+        for b0, b1, top in ((0, a, z), (a, length, z + rise)):
+            poly = _rect(o, f, l, b0, b1, half, half)
+            self.c.world.append(Prism.flat(poly, z - FLOOR_THICK, top, "floor", self.heading))
+            self.c.floor_polys.append((poly, "floor"))
+            band = (_band(o, f, l, b0, b1, -half, -half + EDGE_BAND) if side > 0
+                    else _band(o, f, l, b0, b1, half - EDGE_BAND, half))
+            self.c.world.append(Prism.flat(band, top - 4, top + 1, "edge"))
+        # The ledge's lip, so its height reads from the run-up.
+        self.c.world.append(Prism.flat(_rect(o, f, l, a, a + 32, half - EDGE_BAND, half - EDGE_BAND),
+                                       z + rise - 4, z + rise + 1, "edge", self.heading))
+        wall = self._wall_poly(o, f, l, side, 0, length)
+        self.c.world.append(Prism.flat(wall, z - FLOOR_THICK, z + rise + WALL_HEIGHT, "kick"))
+        self.hull(_rect(o, f, l, 0, length, half + WALL_THICK, half + WALL_THICK),
+                  z - FLOOR_THICK, z + rise + WALL_HEIGHT)
+        # The centre line climbs over the last WALLCLIMB_ARC before the ledge,
+        # the way the jump does, so a camera on it never cuts through the face.
+        self.advance(a - WALLCLIMB_ARC)
+        self.z += rise
+        self.advance(WALLCLIMB_ARC)
+        self.advance(length - a)
+        self.c.features.append({"type": "wallclimb", "segment": self.seg, "side": direction,
+                                "rise": rise})
 
     def _self_intersections(self):
         hs = self.c.hulls
