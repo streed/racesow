@@ -127,13 +127,18 @@ the move is needed, and the claim is only as strong as the physics behind it:
 These were checked in the real Warsow 2.1.2 client, not only on paper. A
 script compiled a test map per piece, joined a dm warmup, held the keys with
 real timing (xdotool) and read the player's position back with `viewpos`,
-each piece twice with the move and twice without:
+with the move and without:
 
 | piece | with the move | without |
 | --- | --- | --- |
-| wall climb, 80 up | on the ledge; peak 111–112 | peak 48–49; stopped at the ledge face |
-| wall-kick gap, 220 across and 80 up | on the ledge; peak 118 | peak 49; hit the face and fell |
-| dash drop, 488 across and 512 down | across; peak 18–19 | fell ~60 short |
+| wall climb, 80 up | 5 of 7 on the ledge; peak 109–125 | 0 of 7; peak 48–49, stopped at the ledge face |
+| wall-kick gap, 220 across and 80 up | 2 of 2 on the ledge; peak 118 | 0 of 2; peak 49–50, hit the face and fell |
+| dash drop, 488 across and 512 down | 2 of 2 across; peak 18–19 | 0 of 2; fell ~60 short |
+
+Both wall-climb misses were the script jumping early (it triggers off a
+polled position): the player peaked at 112 before the ledge and dropped back.
+The height was there; the timing was not, which is the move working as a
+timed move.
 
 The "without" runs on the wall pieces held forward and strafe into the wall
 (the strafe that crossed the flat gap) and still could not gain the height.
