@@ -73,6 +73,9 @@ def publish(pk3, store):
     place in one step, so a server never loads half a pack."""
     if not store or not os.path.isfile(os.path.join(store, STORE_SENTINEL)):
         raise PublishError(f"{store!r} is not the map store (no {STORE_SENTINEL})")
+    size = os.path.getsize(pk3)
+    if size > buildmod.PK3_MAX_BYTES:   # build() already refuses these; the store is shared
+        raise PublishError(f"{pk3} is {size} bytes; at most {buildmod.PK3_MAX_BYTES}")
     name = os.path.basename(pk3)
     dest = os.path.join(store, name)
     if os.path.exists(dest):

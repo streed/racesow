@@ -261,3 +261,11 @@ test("map-sync carries the blocklist, and a revoked server is refused", async ()
   await dbQuery("UPDATE server SET status = 'revoked' WHERE name = 'BLK'");
   assert.equal((await sync(tok)).status, 403);
 });
+
+test("a description is stored without control or bidi characters", async () => {
+  await dbQuery("UPDATE mapgen_budget SET used = 0");   // earlier tests spent the day's budget
+  const eve = as("192.0.2.77", CHROME);
+  const r = await eve.submit("A long \u202Eeulb\u202C course\u0007 with\n\n\ttwo big drops and a finish");
+  assert.equal(r.status, 202);
+  assert.equal(r.json.job.description, "A long eulb course with two big drops and a finish");
+});

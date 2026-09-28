@@ -60,6 +60,16 @@ def stage(course, work):
     return map_path
 
 
+# Ceilings on a build (the course's own size limits are in spec.ROUTE_MAX and
+# layout.EXTENT_MAX_* / BRUSH_MAX). A greybox course compiles in seconds and
+# the largest example is a 6.1 MB bsp in a 0.36 MB pack, so these only stop a
+# runaway: a compile that hangs, or a map too heavy to ship to every server
+# and every player who downloads it.
+STAGE_TIMEOUT = {"-bsp": 300, "-vis": 300, "-light": 600}   # seconds
+BSP_MAX_BYTES = 16 * 1024 * 1024
+PK3_MAX_BYTES = 4 * 1024 * 1024
+
+
 def compile_map(q3map2, work, map_path, fast=True, log=None):
     # Stage flag first, then the common options: q3map2 reads anything before
     # the stage as noise ("Unknown option -light") and quietly skips it.
@@ -75,7 +85,11 @@ def compile_map(q3map2, work, map_path, fast=True, log=None):
     ]
     out = []
     for args in stages:
-        p = subprocess.run([q3map2] + args + [map_path], capture_output=True, text=True)
+        try:
+            p = subprocess.run([q3map2] + args + [map_path], capture_output=True, text=True,
+                               timeout=STAGE_TIMEOUT[args[0]])
+        except subprocess.TimeoutExpired:
+            raise BuildError(f"q3map2 {args[0]} took longer than {STAGE_TIMEOUT[args[0]]} s")
         out.append(p.stdout + p.stderr)
         if log:
             log.write(out[-1])
@@ -179,11 +193,15 @@ def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, cam
             bsp_path, _ = compile_map(q3, work, map_path, fast=fast, log=log)
         with open(bsp_path, "rb") as fh:
             bsp_bytes = strip_timestamp(fh.read())
+        if len(bsp_bytes) > BSP_MAX_BYTES:
+            raise BuildError(f"compiled bsp is {len(bsp_bytes)} bytes; at most {BSP_MAX_BYTES}")
         problems = check_bsp(bsp_bytes)
         if problems:
             raise BuildError("compiled map failed its checks:\n  " + "\n  ".join(problems))
         name = spec["name"]
         pk3 = pack(name, bsp_bytes, out_dir)
+        if os.path.getsize(pk3) > PK3_MAX_BYTES:
+            raise BuildError(f"pack is {os.path.getsize(pk3)} bytes; at most {PK3_MAX_BYTES}")
         with open(os.path.join(out_dir, name + ".svg"), "w") as fh:
             fh.write(layout.preview_svg(course))
         with open(os.path.join(out_dir, name + ".map"), "w") as fh:

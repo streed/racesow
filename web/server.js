@@ -610,8 +610,15 @@ api.get("/mapgen/mine", mapgenNoStore, wrap(async (req, res) => {
 
 api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (req, res) => {
   const raw = req.body && typeof req.body.description === "string" ? req.body.description : "";
-  // Collapse whitespace so the length limits measure words, not padding.
-  const description = raw.replace(/\s+/g, " ").trim();
+  // Drop control and invisible formatting characters (including the
+  // bidirectional overrides that can make text read differently from what it
+  // says), then collapse whitespace so the length limits measure words, not
+  // padding. The worker cleans and fences the text again before the model
+  // sees it (tools/mapgen/describe.py), and the page always escapes it.
+  const description = raw
+    .replace(/[\p{Cc}\p{Cf}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   if (description.length < MAPGEN_DESC_MIN || description.length > MAPGEN_DESC_MAX) {
     return res.status(400).json({
       error: `Describe the map in ${MAPGEN_DESC_MIN} to ${MAPGEN_DESC_MAX} characters.`,

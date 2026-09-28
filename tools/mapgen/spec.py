@@ -44,6 +44,7 @@ gap with no run-up, a course that crosses itself — is layout.py's job, because
 that needs the geometry.
 """
 
+import math
 import re
 
 import physics
@@ -51,7 +52,19 @@ import physics
 SEGMENT_TYPES = ("straight", "turn", "ramp", "gap", "checkpoint", "slalom", "beam", "split")
 TURN_ANGLES = (45, 90, 135, 180)
 NAME_RE = re.compile(r"^gen_[a-z0-9_]{2,36}$")
+# The title is the one free-text field the model writes, and it lands in the
+# compiled map (worldspawn "message", shown on the loading screen) and on the
+# site. The model's output is as untrusted as the description that steered it,
+# so the title is held to plain words: letters, digits, spaces and a little
+# punctuation. No quotes, braces, backslashes or newlines (they would break out
+# of the .map key/value syntax and add entities), no ^ (Warsow colour codes),
+# no . or / (no URLs), no @ or # (no handles).
+TITLE_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9 '&!?,:-]{0,38}[A-Za-z0-9!?'])?$")
 
+# Size ceilings, so a runaway plan cannot produce a map that is slow to build,
+# slow to download or heavy for every game server to load. The examples use
+# a fraction of each (the largest route is ~31,600 units).
+ROUTE_MAX = 40000        # centre-line units, start line to finish line (~125 s par)
 WIDTH_MIN, WIDTH_MAX = 256, 768
 MAX_SEGMENTS = 64
 STRAIGHT_MIN, STRAIGHT_MAX = 128, 4096
@@ -170,8 +183,10 @@ def validate(spec):
     if not isinstance(name, str) or not NAME_RE.match(name):
         errs.append(f"name {name!r} must match {NAME_RE.pattern} "
                     "(lowercase; the gen_ prefix marks generated maps in the pool)")
-    if not isinstance(spec.get("title"), str) or not spec["title"].strip():
-        errs.append("title must be a non-empty string")
+    title = spec.get("title")
+    if not isinstance(title, str) or not TITLE_RE.match(title) or "  " in title:
+        errs.append(f"title {title!r} must be 1-40 characters of letters, digits, single "
+                    "spaces and ' & ! ? , : - (no other punctuation), naming the course's theme")
 
     width = spec.get("width")
     if not isinstance(width, int) or not WIDTH_MIN <= width <= WIDTH_MAX:
@@ -184,6 +199,21 @@ def validate(spec):
         return errs
     if len(segs) > MAX_SEGMENTS:
         errs.append(f"{len(segs)} segments; at most {MAX_SEGMENTS}")
+
+    route = 0.0
+    for seg in segs:
+        if not isinstance(seg, dict):
+            continue
+        v = seg.get("radius" if seg.get("type") == "turn" else "length")
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            if seg.get("type") == "turn":
+                a = seg.get("angle")
+                route += math.radians(a if isinstance(a, (int, float)) else 0) * v
+            elif seg.get("type") != "checkpoint":
+                route += v
+    if route > ROUTE_MAX:
+        errs.append(f"the route is {int(route)} units long; at most {ROUTE_MAX} "
+                    f"(about {ROUTE_MAX // 320} s at 320 ups)")
 
     slope = physics.max_ramp_slope()
     for i, seg in enumerate(segs):

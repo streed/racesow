@@ -82,11 +82,20 @@ def brush_lines(prism):
     return ["{"] + faces + ["}"]
 
 
+# Characters that would end a quoted key or value, or the line, in .map
+# syntax. A value holding one could close the entity and open another, so it
+# is refused outright rather than escaped: the .map format has no escapes.
+_UNSAFE = ('"', "\n", "\r", "\\", "{", "}")
+
+
 def _kv(k, v):
     if isinstance(v, tuple):
         v = " ".join(_fmt(c) for c in v)
     elif isinstance(v, float):
         v = _fmt(v)
+    v = str(v)
+    if any(c in str(k) + v for c in _UNSAFE):
+        raise ValueError(f"unsafe .map key/value: {k!r} {v!r}")
     return f'"{k}" "{v}"'
 
 

@@ -88,6 +88,15 @@ the map. The e2e CI lane covers the second: it builds this toolchain and boots
 the real `warsow-race` image on `examples/gen_first_light.json` through
 `server/test/boot-test.sh --maps-dir`.
 
+### Limits and untrusted input
+
+The description and the model's output are both treated as untrusted, and
+every map is size-capped before it can reach the servers: route length,
+footprint, brush count, q3map2 time, bsp size and pack size. The title is
+held to plain words, and the `.map` writer refuses anything that could add an
+entity. The full list, with values, is in `docs/map-generation-design.md`
+("Untrusted input, bounded output").
+
 ## Output
 
 `build/` receives:

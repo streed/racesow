@@ -56,6 +56,14 @@ CP_MIN = 1024
 CP_END_MIN = 768
 CP_EDGE = 64
 
+# Size ceilings on the laid-out course (spec.ROUTE_MAX bounds its length):
+# how far it may spread and how many brushes it may take, so no plan builds a
+# map that is slow to compile, heavy to download or heavy for every server to
+# load. The examples reach about 11,400 across and 420 brushes.
+EXTENT_MAX_XY = 16384
+EXTENT_MAX_Z = 8192
+BRUSH_MAX = 1500
+
 FIN_THICK = 32          # slalom and split fins, along the course
 SPLIT_GATE = 96         # gates in a split's safe lane: 3 player widths
 VOID_DEPTH = 160        # side walls reach this far below a floorless piece
@@ -622,11 +630,29 @@ class _Walker:
         self.seg = len(segs)
         self._finish_room()
         self._self_intersections()
+        self._size_limits()
         if self.problems:
             raise LayoutError(self.problems)
         self._camera_pads()
         self._shell()
         return self.c
+
+    def _size_limits(self):
+        xs = [x for p in self.c.world for x, _ in p.poly]
+        ys = [y for p in self.c.world for _, y in p.poly]
+        zs = [z for p in self.c.world for z in (p.zmin, p.zmax())]
+        dx, dy, dz = max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)
+        if max(dx, dy) > EXTENT_MAX_XY:
+            self.problems.append(
+                f"the course spreads {int(dx)} x {int(dy)} units; at most {EXTENT_MAX_XY} "
+                "in each direction (fold it back on itself with turns)")
+        if dz > EXTENT_MAX_Z:
+            self.problems.append(f"the course is {int(dz)} units tall; at most {EXTENT_MAX_Z}")
+        brushes = len(self.c.world) + sum(len(b) for _, b in self.c.entities)
+        if brushes > BRUSH_MAX:
+            self.problems.append(
+                f"the course needs {brushes} brushes; at most {BRUSH_MAX} "
+                "(fewer slalom fins, splits or tight turns)")
 
     def _camera_pads(self):
         """Screenshot-only: invisible solid pads high above the course.

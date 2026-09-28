@@ -224,6 +224,49 @@ Adding a generated map to `server/configs/mappool.txt` stays a manual,
 curated decision. A published map is votable; it is not in the automatic
 rotation.
 
+## Untrusted input, bounded output
+
+**Prompt injection.** The description is typed by anyone on the internet, so
+nothing it says is trusted, and neither is the model output it steered.
+
+- **Web** (`POST /api/mapgen`): control characters and invisible formatting
+  characters, including bidi overrides, are stripped, whitespace is
+  collapsed, and the text is capped at 10-500 characters. The page always
+  escapes it.
+- **Model input** (`describe.user_message`): the text is cleaned again, its
+  angle brackets are swapped for look-alikes, and it is fenced in
+  `<description>` tags it cannot close. The system prompt says the fenced
+  text is a course description only: it cannot change the rules or the
+  format, and any instructions in it are ignored.
+- **Model output**: structured output fixes the JSON shape, and
+  `spec.validate` then rejects anything out of range; a rejection goes back
+  as a repair turn. The one free-text field is the title, which lands in the
+  compiled map and on the site. `spec.TITLE_RE` holds it to letters, digits,
+  single spaces and `' & ! ? , : -` (no quotes, braces, backslashes,
+  newlines, `^` colour codes, `.`, `/`, `@` or `#`). The name is
+  `NAME_RE`-checked and rebuilt by the worker.
+- **Map writer**: `mapfile._kv` refuses any key or value containing `"`, a
+  newline, `\`, `{` or `}`, so even a title that got past validation could
+  not close the worldspawn entity and add one of its own.
+
+**Size limits.** Every limit is checked before the map reaches the store.
+The examples use a fraction of each (at most ~31,600 units of route, ~11,400
+across, 419 brushes, a 6.1 MB bsp in a 0.36 MB pack).
+
+| limit | where | value |
+| --- | --- | --- |
+| segments | `spec.MAX_SEGMENTS` | 64 |
+| route length | `spec.ROUTE_MAX` | 40,000 units (~125 s par) |
+| footprint | `layout.EXTENT_MAX_XY` / `_Z` | 16,384 across each way, 8,192 tall |
+| brushes | `layout.BRUSH_MAX` | 1,500 |
+| q3map2 time | `build.STAGE_TIMEOUT` | 300 s bsp, 300 s vis, 600 s light |
+| compiled bsp | `build.BSP_MAX_BYTES` | 16 MiB |
+| pack | `build.PK3_MAX_BYTES`, checked again in `worker.publish` | 4 MiB |
+| maps per day | `MAPGEN_DAILY_BUDGET` (site), 2 per identity | 40 |
+
+The planner is told the limits, so a plan that breaks one comes back as a
+repair turn, not a failed request.
+
 ## Phases
 
 | phase | what | status |
