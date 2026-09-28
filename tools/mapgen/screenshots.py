@@ -10,10 +10,10 @@ PNG per view, taken by the engine's own `screenshot` command, so what you see
 is exactly what a player sees: real lightmaps, real textures, the real
 renderer.
 
-HOW A VIEW IS PLACED. Game commands (`position set`, `noclip`) need a joined,
-cheating player and proved unreliable from a scripted client, and the race
-gametype picks a spectator's first spot itself from info_player_deathmatch,
-ignoring info_player_intermission. So each view is its own copy of the
+HOW A VIEW IS PLACED. The race gametype script overrides the engine's
+`position` command with its own save/load version that has no `set`, and it
+picks a spectator's first spot itself from info_player_deathmatch, ignoring
+info_player_intermission. So each view is its own copy of the
 compiled bsp with the spawn point moved to the camera. That is an entity-lump
 edit through tools/mapfix/bsp.py, with no recompile. Two engine rules shape
 what a view can be: a spawn point is dropped to the floor below it
@@ -36,6 +36,13 @@ spectator onto a pad and tilts the view down by holding +lookdown for
 pitch / cl_pitchspeed seconds, since that is the one control over pitch a
 client has. It needs q3map2 as well as the client. Each overview view runs in
 its own client session, so no pitch carries over from one to the next.
+
+FLY-THROUGH (--flythrough VIDEO.webm). A start-to-finish video along the
+course's centre line (flight_path), filmed frame by frame: the client loads
+the map under the dm gametype, whose `position set` the race script does not
+override, teleports the spectator for each frame and takes a JPEG screenshot,
+which is piped to ffmpeg (MJPEG in, VP8 WebM out). The engine allows one
+`position` command per 500 ms, so a 30 s video takes about ten minutes.
 """
 
 import argparse
@@ -245,6 +252,77 @@ def stage_views(pk3_path, views, basewsw):
     return names
 
 
+class _Client:
+    """One headless Warsow client session: Xvfb, the stock client with a
+    private home directory, a startup cfg, and helpers to press keys, wait
+    for map loads and take screenshots."""
+
+    def __init__(self, warsow, cfg, first_map, gametype="race", width=1280, height=720,
+                 display=":77"):
+        self.home = tempfile.mkdtemp(prefix="mapgen-wsw-")
+        self.udir = os.path.join(self.home, ".local/share/warsow-2.1/basewsw")
+        os.makedirs(self.udir)
+        self.console = os.path.join(self.udir, "console.log")
+        with open(os.path.join(self.udir, "mapgen_views.cfg"), "w") as fh:
+            fh.write("\n".join(cfg) + "\n")
+        self.env = dict(os.environ, HOME=self.home, DISPLAY=display,
+                        LIBGL_ALWAYS_SOFTWARE="1", SDL_AUDIODRIVER="dummy")
+        self.xvfb = subprocess.Popen(["Xvfb", display, "-screen", "0", f"{width}x{height}x24"],
+                                     stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        self.game = subprocess.Popen(
+            ["./warsow.x86_64", "+set", "logconsole", "console.log", "+set", "logconsole_flush", "1",
+             "+set", "s_module", "0", "+set", "vid_fullscreen", "0", "+set", "vid_mode", "-1",
+             "+set", "vid_customwidth", str(width), "+set", "vid_customheight", str(height),
+             "+set", "g_gametype", gametype, "+exec", "mapgen_views.cfg", "+map", first_map],
+            cwd=warsow, env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def text(self):
+        try:
+            with open(self.console, errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def key(self, k):
+        subprocess.run(["xdotool", "key", "--clearmodifiers", k], env=self.env)
+
+    def loaded(self, n):
+        t0 = time.time()
+        while self.text().count("connected from loopback") < n:
+            if time.time() - t0 > 240 or self.game.poll() is not None:
+                raise RuntimeError("client did not load the map:\n" + self.text()[-1500:])
+            time.sleep(1)
+        time.sleep(8)          # let the first frames settle
+        self.key("Escape")     # dismiss the join menu a spectator gets
+        time.sleep(2)
+        if n == 1:
+            wid = subprocess.run(["xdotool", "search", "--name", "Warsow"], env=self.env,
+                                 capture_output=True, text=True).stdout.split()
+            if wid:
+                subprocess.run(["xdotool", "windowactivate", "--sync", wid[0]], env=self.env)
+
+    def shot(self, what):
+        """Take a screenshot (KP_Enter is bound to it); returns the file."""
+        before = self.text().count("Wrote ")
+        self.key("KP_Enter")
+        t0 = time.time()
+        while self.text().count("Wrote ") <= before:
+            if time.time() - t0 > 30:
+                raise RuntimeError(f"no screenshot for {what}")
+            time.sleep(0.05)
+        return [ln for ln in self.text().splitlines() if ln.startswith("Wrote ")][-1][6:].strip()
+
+    def close(self):
+        self.game.terminate()
+        try:
+            self.game.wait(5)
+        except subprocess.TimeoutExpired:
+            self.game.kill()
+        self.xvfb.terminate()
+        shutil.rmtree(self.home, ignore_errors=True)
+
+
 def run(pk3_path, views, warsow, out, width=1280, height=720, display=":77", log=print, first=1):
     """Film each view; returns the PNG paths. One client session changes view
     with a bound key, so more views than KEYS are filmed in batches, and the
@@ -258,91 +336,186 @@ def run(pk3_path, views, warsow, out, width=1280, height=720, display=":77", log
     basewsw = os.path.join(warsow, "basewsw")
     os.makedirs(out, exist_ok=True)
     names = stage_views(pk3_path, views, basewsw)
-    home = tempfile.mkdtemp(prefix="mapgen-wsw-")
-    udir = os.path.join(home, ".local/share/warsow-2.1/basewsw")
-    os.makedirs(udir)
-    console = os.path.join(udir, "console.log")
-
     cfg = ["set cg_draw2D 0", "set cg_gun 0", "set r_screenshot_jpeg 0", "set cg_fov 100",
            f"set cl_pitchspeed {PITCH_SPEED:g}", 'bind KP_ENTER "screenshot"', 'bind l "+lookdown"']
     cfg += [f'bind {k} "map {n}"' for k, n in zip(KEYS, names)]
-    with open(os.path.join(udir, "mapgen_views.cfg"), "w") as fh:
-        fh.write("\n".join(cfg) + "\n")
-
-    env = dict(os.environ, HOME=home, DISPLAY=display,
-               LIBGL_ALWAYS_SOFTWARE="1", SDL_AUDIODRIVER="dummy")
-    xvfb = subprocess.Popen(["Xvfb", display, "-screen", "0", f"{width}x{height}x24"],
-                            stderr=subprocess.DEVNULL)
-    time.sleep(2)
-    game = subprocess.Popen(
-        ["./warsow.x86_64", "+set", "logconsole", "console.log", "+set", "logconsole_flush", "1",
-         "+set", "s_module", "0", "+set", "vid_fullscreen", "0", "+set", "vid_mode", "-1",
-         "+set", "vid_customwidth", str(width), "+set", "vid_customheight", str(height),
-         "+set", "g_gametype", "race", "+exec", "mapgen_views.cfg", "+map", names[0]],
-        cwd=warsow, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    def text():
-        try:
-            with open(console, errors="replace") as fh:
-                return fh.read()
-        except OSError:
-            return ""
-
-    def key(k):
-        subprocess.run(["xdotool", "key", "--clearmodifiers", k], env=env)
-
-    def loaded(n):
-        t0 = time.time()
-        while text().count("connected from loopback") < n:
-            if time.time() - t0 > 240 or game.poll() is not None:
-                raise RuntimeError("client did not load the map:\n" + text()[-1500:])
-            time.sleep(1)
-        time.sleep(8)          # let the first frames settle
-        key("Escape")          # dismiss the join menu a spectator gets
-        time.sleep(2)
-
+    client = None
     written = []
     try:
-        loaded(1)
-        wid = subprocess.run(["xdotool", "search", "--name", "Warsow"], env=env,
-                             capture_output=True, text=True).stdout.split()
-        if wid:
-            subprocess.run(["xdotool", "windowactivate", "--sync", wid[0]], env=env)
-        for i, (view, name) in enumerate(zip(views, names)):
+        client = _Client(warsow, cfg, names[0], width=width, height=height, display=display)
+        client.loaded(1)
+        for i, view in enumerate(views):
             if i:
-                key(KEYS[i])
-                loaded(i + 1)
+                client.key(KEYS[i])
+                client.loaded(i + 1)
             if len(view) > 3 and view[3]:
-                subprocess.run(["xdotool", "keydown", "l"], env=env)
+                subprocess.run(["xdotool", "keydown", "l"], env=client.env)
                 time.sleep(view[3] / PITCH_SPEED)
-                subprocess.run(["xdotool", "keyup", "l"], env=env)
+                subprocess.run(["xdotool", "keyup", "l"], env=client.env)
                 time.sleep(2)
-            before = text().count("Wrote ")
-            key("KP_Enter")
-            t0 = time.time()
-            while text().count("Wrote ") <= before:
-                if time.time() - t0 > 30:
-                    raise RuntimeError(f"no screenshot for view {view[0]}")
-                time.sleep(0.5)
-            tga = [l for l in text().splitlines() if l.startswith("Wrote ")][-1][6:].strip()
             png = os.path.join(out, f"{first + i:02d}_{view[0]}.png")
-            tga_to_png(tga, png)
+            tga_to_png(client.shot(f"view {view[0]}"), png)
             written.append(png)
             log(f"wrote {png}")
     finally:
-        game.terminate()
-        try:
-            game.wait(5)
-        except subprocess.TimeoutExpired:
-            game.kill()
-        xvfb.terminate()
+        if client:
+            client.close()
         for n in names:
             try:
                 os.remove(os.path.join(basewsw, n + ".pk3"))
             except OSError:
                 pass
-        shutil.rmtree(home, ignore_errors=True)
     return written
+
+
+# Fly-through (--flythrough). The camera runs the course's centre line at a
+# strafing racer's pace, EYE above the floor, looking LOOK_AHEAD down the
+# route. The line is smoothed a little (SMOOTH samples either side), which
+# rounds the polyline's corners but stays inside a slalom's gates; the view
+# direction is smoothed more (LOOK_SMOOTH), so turns sweep rather than snap.
+FLY_SPEED = 1100.0
+FLY_FPS = 30
+EYE = 36
+LOOK_AHEAD = 384
+SMOOTH = 2
+LOOK_SMOOTH = 8
+HOLD = 1.0            # seconds held on the first and last frame
+# The engine rejects a second `position` command within 500 ms of game time
+# (g_cmds.cpp, Cmd_Position_f), so each frame waits this long.
+POSITION_EVERY = 0.52
+
+
+def flight_path(course, speed=FLY_SPEED, fps=FLY_FPS):
+    """Camera keyframes [(x, y, z, pitch, yaw)] from the start spawn to the
+    finish room, one per video frame. pitch is Quake's (positive looks down)."""
+    route = list(course.route)
+    # Start at the spawn: the route begins at the start line, one room length
+    # after it, straight ahead.
+    (x0, y0, z0), (x1, y1, _) = route[0], route[1]
+    d = math.dist((x0, y0), (x1, y1)) or 1.0
+    back = layout.ROOM_LEN - layout.SPAWN_BACK
+    route.insert(0, (x0 - (x1 - x0) / d * back, y0 - (y1 - y0) / d * back, z0))
+    # Stop short of the finish room's end wall.
+    route[-1] = tuple(route[-2][i] + (route[-1][i] - route[-2][i]) * 0.6 for i in range(3))
+
+    step = speed / fps
+    pts, carry = [route[0]], 0.0
+    for a, b in zip(route, route[1:]):
+        seg = math.dist(a[:2], b[:2])
+        t = step - carry
+        while t <= seg:
+            pts.append(tuple(a[i] + (b[i] - a[i]) * t / seg for i in range(3)))
+            t += step
+        carry = seg - (t - step)
+    n = len(pts)
+
+    def avg(i, r):
+        lo, hi = max(0, i - r), min(n, i + r + 1)
+        return tuple(sum(p[k] for p in pts[lo:hi]) / (hi - lo) for k in range(3))
+
+    cam = [avg(i, SMOOTH) for i in range(n)]
+    ahead = max(1, round(LOOK_AHEAD / step))
+    looks = []
+    for i in range(n):
+        j = min(n - 1, i + ahead)
+        if j == i:
+            looks.append(looks[-1] if looks else (1.0, 0.0, 0.0))
+            continue
+        v = [cam[j][k] - cam[i][k] for k in range(3)]
+        L = math.sqrt(sum(c * c for c in v)) or 1.0
+        looks.append(tuple(c / L for c in v))
+    frames = []
+    for i in range(n):
+        lo, hi = max(0, i - LOOK_SMOOTH), min(n, i + LOOK_SMOOTH + 1)
+        v = [sum(looks[k][c] for k in range(lo, hi)) for c in range(3)]
+        yaw = math.degrees(math.atan2(v[1], v[0])) % 360.0
+        pitch = -math.degrees(math.atan2(v[2], math.hypot(v[0], v[1]))) + 4.0
+        x, y, z = cam[i]
+        frames.append((x, y, z + EYE, pitch, yaw))
+    hold = int(HOLD * fps)
+    return [frames[0]] * hold + frames + [frames[-1]] * hold
+
+
+def encode(mjpeg, out_video, ffmpeg, fps=FLY_FPS, bitrate="3M"):
+    """Concatenated JPEG frames -> VP8 WebM."""
+    r = subprocess.run(
+        [ffmpeg, "-y", "-loglevel", "error", "-f", "image2pipe", "-c:v", "mjpeg",
+         "-framerate", str(fps), "-i", mjpeg, "-vf", "format=yuv420p",
+         "-c:v", "libvpx", "-b:v", bitrate, "-crf", "8", "-deadline", "good", "-cpu-used", "2",
+         "-auto-alt-ref", "0", out_video], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(f"ffmpeg failed: {r.stderr.strip()[-800:]}")
+
+
+def flythrough(pk3_path, course, warsow, out_video, ffmpeg=None, width=1280, height=720,
+               fps=FLY_FPS, speed=FLY_SPEED, display=":77", log=print, bitrate="3M"):
+    """Film the course from start to finish in the real client and encode it
+    as VP8 WebM. Each frame is a spectator teleport (`position set`) and a
+    JPEG screenshot. The JPEGs are appended to one MJPEG stream next to the
+    video (kept if the encode fails, so the shoot is not lost) and encoded at
+    the end: not piped, because some ffmpeg builds (Playwright's) have no
+    pipe: protocol.
+
+    The client runs the map under the dm gametype: the race script overrides
+    `position` with its own save/load command and has no `set`. The geometry,
+    lightmaps and textures are the same whichever gametype loads the bsp.
+    Needs an ffmpeg that decodes MJPEG and encodes libvpx (Playwright's
+    bundled build is enough)."""
+    ffmpeg = ffmpeg or os.environ.get("FFMPEG") or shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("no ffmpeg: pass --ffmpeg or set FFMPEG")
+    frames = flight_path(course, speed, fps)
+    basewsw = os.path.join(warsow, "basewsw")
+    first = frames[0]
+    names = stage_views(pk3_path, [["fly", [round(first[0]), round(first[1]), round(first[2])],
+                                    round(first[4])]], basewsw)
+    cfg = ["set cg_draw2D 0", "set cg_gun 0", "set r_screenshot_jpeg 1",
+           "set r_screenshot_jpeg_quality 92", "set cg_fov 100",
+           'bind KP_ENTER "screenshot"', 'bind p "exec mapgen_frame.cfg"']
+    os.makedirs(os.path.dirname(os.path.abspath(out_video)), exist_ok=True)
+    stream_path = os.path.splitext(out_video)[0] + ".mjpeg"
+    stream = open(stream_path, "wb")
+    client = None
+    last = None
+    try:
+        client = _Client(warsow, cfg, names[0], gametype="dm", width=width, height=height,
+                         display=display)
+        client.loaded(1)
+        frame_cfg = os.path.join(client.udir, "mapgen_frame.cfg")
+        t_last = 0.0
+        t0 = time.time()
+        for k, (x, y, z, pitch, yaw) in enumerate(frames):
+            if k and frames[k] == frames[k - 1] and last is not None:
+                stream.write(last)             # a held frame: no need to film it again
+                continue
+            with open(frame_cfg, "w") as fh:
+                fh.write(f"position set {x:.1f} {y:.1f} {z:.1f} {pitch:.2f} {yaw:.2f}\n")
+            wait = POSITION_EVERY - (time.time() - t_last)
+            if wait > 0:
+                time.sleep(wait)
+            client.key("p")
+            t_last = time.time()
+            time.sleep(0.12)                   # a few rendered frames at the new spot
+            path = client.shot(f"frame {k}")
+            with open(path, "rb") as fh:
+                last = fh.read()
+            os.remove(path)
+            stream.write(last)
+            if k % 60 == 0:
+                log(f"frame {k}/{len(frames)} ({time.time() - t0:.0f} s)")
+    finally:
+        if client:
+            client.close()
+        for n in names:
+            try:
+                os.remove(os.path.join(basewsw, n + ".pk3"))
+            except OSError:
+                pass
+        stream.close()
+    encode(stream_path, out_video, ffmpeg, fps, bitrate)
+    os.remove(stream_path)
+    log(f"wrote {out_video}: {len(frames)} frames, {len(frames) / fps:.1f} s")
+    return out_video
 
 
 def overview(spec, warsow, out, q3map2=None, width=1280, height=720, log=print):
@@ -381,6 +554,9 @@ def main(argv=None):
     p.add_argument("--overview", action="store_true",
                    help="also film the course from above (needs --spec and q3map2)")
     p.add_argument("--q3map2", help="for --overview (default: $Q3MAP2, then PATH)")
+    p.add_argument("--flythrough", metavar="VIDEO.webm",
+                   help="also film a start-to-finish fly-through (needs --spec and ffmpeg)")
+    p.add_argument("--ffmpeg", help="for --flythrough (default: $FFMPEG, then PATH)")
     args = p.parse_args(argv)
     if args.views:
         with open(args.views) as fh:
@@ -391,12 +567,18 @@ def main(argv=None):
     else:
         p.error("pass --spec or --views")
     w, h = (int(v) for v in args.size.split("x"))
+    if args.flythrough and not args.spec:
+        p.error("--flythrough needs --spec")
     run(args.pk3, views, args.warsow, args.out, w, h)
     if args.overview:
         if not args.spec:
             p.error("--overview needs --spec")
         with open(args.spec) as fh:
             overview(json.load(fh), args.warsow, args.out, args.q3map2, w, h)
+    if args.flythrough:
+        with open(args.spec) as fh:
+            course = layout.build(json.load(fh))
+        flythrough(args.pk3, course, args.warsow, args.flythrough, args.ffmpeg, w, h)
     return 0
 
 

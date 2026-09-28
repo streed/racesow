@@ -161,6 +161,24 @@ real map is untouched. Views are level at eye height, because the engine drops
 spawns to the floor and applies only their yaw; the plan `.svg` is the
 overview. Needs `Xvfb`, `xdotool` and Mesa.
 
+### Fly-through video
+
+```
+screenshots.py build/gen_gordian_knot.pk3 --spec examples/gen_gordian_knot.json \
+    --warsow ~/warsow-2.1.2 --out shots/ --flythrough shots/gen_gordian_knot.webm
+```
+
+This films the course from the start pad to the finish in the same client,
+along its centre line at 1,100 units per second (a strafing racer's pace),
+through slalom gates, over the split's holes and beams, and under every
+overpass. Each frame is a spectator teleport (`position set`) and a JPEG
+screenshot, so it is the engine's own renderer and lighting. The engine allows
+one `position` command per 500 ms, so 30 s of video takes about ten minutes.
+The map loads under the dm gametype for filming, because the race script
+replaces `position` with a version that has no `set`. Needs an ffmpeg that
+reads MJPEG and writes VP8 (`--ffmpeg`, `$FFMPEG`, or PATH); Playwright's
+bundled build is enough.
+
 ## q3map2
 
 Use the Docker image, which builds a pinned netradiant-custom q3map2:

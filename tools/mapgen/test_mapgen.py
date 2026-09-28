@@ -498,6 +498,30 @@ class Describe(unittest.TestCase):
         self.assertEqual(names[0], "start")
         self.assertEqual(names[-1], "finish")
 
+    def test_flight_path_stays_in_the_open(self):
+        def inside(poly, x, y):
+            n = len(poly)
+            return all((poly[(i + 1) % n][0] - poly[i][0]) * (y - poly[i][1])
+                       - (poly[(i + 1) % n][1] - poly[i][1]) * (x - poly[i][0]) >= 0
+                       for i in range(n))
+        examples = os.path.join(HERE, "examples")
+        for fn in sorted(os.listdir(examples)):
+            with open(os.path.join(examples, fn)) as fh:
+                c = layout.build(json.load(fh))
+            frames = screenshots.flight_path(c)
+            hold = int(screenshots.HOLD * screenshots.FLY_FPS)
+            # Start and finish are held; the flight between covers the route
+            # at FLY_SPEED.
+            moving = len(frames) - 2 * hold
+            self.assertAlmostEqual(moving * screenshots.FLY_SPEED / screenshots.FLY_FPS,
+                                   c.length, delta=0.08 * c.length, msg=fn)
+            solid = [p for p in c.world if p.tex not in ("sky", "trigger")]
+            for k, (x, y, z, pitch, yaw) in enumerate(frames):
+                self.assertTrue(-60 < pitch < 60 and 0 <= yaw < 360, (fn, k))
+                for p in solid:
+                    self.assertFalse(p.zmin <= z <= p.top_at(x, y) and inside(p.poly, x, y),
+                                     f"{fn}: frame {k} is inside a {p.tex} brush")
+
     def test_schema_is_what_the_prompt_describes(self):
         self.assertEqual(set(specmod.SEGMENT_SCHEMA["properties"]["type"]["enum"]),
                          set(specmod.SEGMENT_TYPES))
