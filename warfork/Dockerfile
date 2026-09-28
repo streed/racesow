@@ -86,11 +86,23 @@ COPY server/enginepatches/patch-quiet-fakeclient-connect.py /tmp/patch-quiet-fak
 COPY warfork/enginepatches/patch-brushmodel-nonfatal.py /tmp/patch-brushmodel-nonfatal.py
 # Race triggers. Stock multi_trigger FREES a trigger_once / wait -1 trigger after
 # its first touch, and that is how most race maps build their checkpoint and
-# finish volumes -- so the first client through (a player, or a mesh mirror bot)
-# consumed each CP/finish for everyone until the next map. Warsow carries the
+# finish volumes -- so the first player through consumed each CP/finish for
+# everyone (their own next run included) until the next map. Warsow carries the
 # racemod_2.1 fix (keep it alive in race); this is the Warfork half, plus the
 # same tree's target_speaker relay. WARFORK-ONLY, like the brushmodel fix.
 COPY warfork/enginepatches/patch-race-triggers.py /tmp/patch-race-triggers.py
+# The rest of racemod_2.1's race fixes, so Warfork plays like Warsow:
+#  - race-entities: doors/buttons, items, target_push, script spawn precedence,
+#    spawnpoints-in-solid / Q3 floating spawnpoints (defrag map compatibility).
+#  - race-weapons: wires Gelmo's rs_* weapon cvars (RS_Init) into combat and
+#    weapon code exactly as racemod does -- weapon-jump physics parity (D2).
+#  - quad-fix: the SAME script the Warsow image runs; it applies on top of
+#    race-weapons unchanged (rs_quad_fix, default off).
+#  - race-votepower: GT_VotePower weighted callvotes + g_vote_punishtime.
+COPY warfork/enginepatches/patch-race-entities.py  /tmp/patch-race-entities.py
+COPY warfork/enginepatches/patch-race-weapons.py   /tmp/patch-race-weapons.py
+COPY server/enginepatches/patch-quad-fix.py         /tmp/patch-quad-fix.py
+COPY warfork/enginepatches/patch-race-votepower.py /tmp/patch-race-votepower.py
 # demolist split. Warfork's demolist/demoget already read the demos/server root
 # (it never took racemod_2.1's per-map repoint), so here the patch only ADDS
 # racedemolist/racedemoget for the per-map race demos — keeping one meaning for
@@ -116,6 +128,16 @@ RUN cd source \
     && python3 /tmp/patch-brushmodel-nonfatal.py \
     && python3 /tmp/patch-race-triggers.py \
     && grep -q 'ent->wait <= 0 && !GS_RaceGametype()' game/g_trigger.cpp \
+    && python3 /tmp/patch-race-entities.py \
+    && python3 /tmp/patch-race-weapons.py \
+    && python3 /tmp/patch-quad-fix.py \
+    && python3 /tmp/patch-race-votepower.py \
+    && grep -q 'SP_target_push' game/g_spawn.cpp \
+    && grep -q 'RS_Init(); // racesow' game/g_spawn.cpp \
+    && grep -q 'RS_SplashFrac4D( ENTNUM( ent )' game/g_combat.cpp \
+    && grep -q 'rs_quad_fix->integer' game/g_combat.cpp \
+    && grep -q 'rs_rocket_speed->integer' game/g_weapon.cpp \
+    && grep -q 'GT_asCallVotePower' game/g_callvotes.cpp \
     && python3 /tmp/patch-demolist-split.py \
     && grep -q 'racesow-docker: demolist split' server/sv_demos.c \
     && grep -q 'racedemolist' server/sv_client.c \
@@ -164,6 +186,10 @@ RUN export CC=clang CXX=clang++ \
     && strings "$SO" | grep -q 'rs_mirror: configured' \
     && strings "$SO" | grep -q 'RS_SetHideWrGhost' \
     && strings "$SO" | grep -q 'RS_QueryPjState' \
+    # racesow weapon physics are live: RS_Init registers the rs_* cvars.
+    && strings "$SO" | grep -q 'rs_rocket_maxKnockback' \
+    && strings "$SO" | grep -q 'rs_quad_knockback_scale' \
+    && strings "$SO" | grep -q 'GT_VotePower' \
     # The prejump counters must be CALLED, not merely present: `strings` would
     # pass on a build where patch-pjcount-hooks.py silently no-op'd, and the
     # symptom (prejump unenforced) is invisible until a player exploits it.
