@@ -1,0 +1,8 @@
+# /etc/exports.d/racesow.exports on the EU box. Then: exportfs -ra
+# The store is the repo's own server/maps; replace __RACESOW_DIR__ with the
+# checkout path (the same value systemd/install.sh substitutes).
+#   ro          readers never write; only the EU box adds or removes packs
+#   all_squash  the reader is anonymous; packs are world-readable already
+#               (fetch-maps.sh and mapgen both write them 0644)
+#   10.66.0.2   the US box's WireGuard address, and nothing else
+__RACESOW_DIR__/server/maps 10.66.0.2/32(ro,all_squash,no_subtree_check,sec=sys)

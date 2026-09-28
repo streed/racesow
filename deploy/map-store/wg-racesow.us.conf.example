@@ -1,0 +1,15 @@
+# /etc/wireguard/wg-racesow.conf on the US box (reads the map store).
+#   wg genkey | tee us.key | wg pubkey > us.pub      (on US)
+#   systemctl enable --now wg-quick@wg-racesow
+# See docs/shared-maps.md.
+[Interface]
+Address = 10.66.0.2/32
+ListenPort = 51820
+PrivateKey = <contents of us.key>
+
+[Peer]
+# eu.frankfurt.racesow.org
+PublicKey = <contents of eu.pub>
+AllowedIPs = 10.66.0.1/32
+Endpoint = eu.frankfurt.racesow.org:51820
+PersistentKeepalive = 25

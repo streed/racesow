@@ -1,0 +1,16 @@
+# /etc/wireguard/wg-racesow.conf on the EU box (owns the map store).
+# A private point-to-point link to the US box; NFS is served ONLY over it.
+#   wg genkey | tee eu.key | wg pubkey > eu.pub      (on EU)
+#   systemctl enable --now wg-quick@wg-racesow
+# See docs/shared-maps.md.
+[Interface]
+Address = 10.66.0.1/32
+ListenPort = 51820
+PrivateKey = <contents of eu.key>
+
+[Peer]
+# us.east.racesow.org
+PublicKey = <contents of us.pub>
+AllowedIPs = 10.66.0.2/32
+Endpoint = us.east.racesow.org:51820
+PersistentKeepalive = 25

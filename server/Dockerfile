@@ -229,11 +229,22 @@ COPY enginepatches/patch-demolist-split.py /tmp/patch-demolist-split.py
 RUN python3 /tmp/patch-demolist-split.py \
     && grep -q "racesow-docker: demolist split" server/sv_demos.c \
     && grep -q "racedemolist" server/sv_client.c
+# Runtime map-pack rescans: sv_mapscan <seconds> and the `mapscan` command
+# make the server load new .pk3s (a generated map, a pack added to the shared
+# store) without a restart, and clear the flag the stock idle-restart logic
+# would otherwise act on. See the script's header and docs/shared-maps.md.
+COPY enginepatches/patch-mapscan.py /tmp/patch-mapscan.py
+RUN python3 /tmp/patch-mapscan.py \
+    && grep -q "racesow-docker: runtime map-pack rescans" server/sv_main.c \
+    && grep -q "SV_MapScan_Frame(); // racesow-docker" server/sv_main.c
 RUN cmake -DQFUSION_GAME=Warsow -DGAME_MODULES_ONLY=OFF -DCMAKE_BUILD_TYPE=Release . \
     && make wsw_server -j"$(nproc)" \
     && cp build/wsw_server.x86_64 /wsw_server.x86_64 \
     # the patched error string must be embedded in the binary
-    && strings /wsw_server.x86_64 | grep -q 'nextdl message for wrong filename "'
+    && strings /wsw_server.x86_64 | grep -q 'nextdl message for wrong filename "' \
+    # and so must the map rescan (its log line and its cvar name)
+    && strings /wsw_server.x86_64 | grep -q 'mapscan: +%d map(s), %d on the list' \
+    && strings /wsw_server.x86_64 | grep -qx 'sv_mapscan'
 
 # ===========================================================================
 # Stage 2: the Warsow 2.1.2 dedicated race server.

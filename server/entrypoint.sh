@@ -26,6 +26,18 @@ VERSION_NAME="${VERSION_NAME:-wsw 2.1}"     # game version records file under on
 # Console log shipping: tee the engine's stdout to the stats site's admin log
 # view (POST /api/ingest/log). Needs INGEST_URL + INGEST_TOKEN; LOG_SHIP=0 off.
 LOG_SHIP="${LOG_SHIP:-1}"                    # 1 = ship console logs, 0 = disable
+# Shared map store (docs/shared-maps.md). The store is mounted at
+# ${MAP_STORE}/<fs_game>/ and handed to the engine as fs_cdpath, an extra base
+# path it scans for packs, so nothing is copied or symlinked. On the box that
+# owns the store it is local disk. On the others it is an NFS mount, with a
+# periodically refreshed local snapshot at ${MAP_STORE_FALLBACK} used whenever
+# the store cannot be reached.
+MAP_STORE="${MAP_STORE:-${WARSOW_DIR:-/warsow}/shared}"
+MAP_STORE_FALLBACK="${MAP_STORE_FALLBACK:-${WARSOW_DIR:-/warsow}/shared-fallback}"
+MAP_STORE_TIMEOUT="${MAP_STORE_TIMEOUT:-5}"  # seconds to wait on a sick mount
+# Rescan for new map packs this often while a map runs (patched engine,
+# enginepatches/patch-mapscan.py); 0 = only at restart.
+MAPSCAN_SECONDS="${MAPSCAN_SECONDS:-60}"
 LOG_FLUSH_SECS="${LOG_FLUSH_SECS:-5}"       # max seconds a line waits before it is POSTed
 LOG_BATCH_LINES="${LOG_BATCH_LINES:-100}"   # or POST early once this many lines have queued
 # Cross-server player mirroring (UDP mesh between peered race servers).
@@ -108,6 +120,37 @@ if [ -d "${MAPS_EXTRA}" ]; then
     done
 fi
 
+# --- Pick the map store for this launch ----------------------------------------
+# Prints the directory to pass as fs_cdpath: the live store if it answers,
+# else the local snapshot, else nothing. "Answers" means that within
+# MAP_STORE_TIMEOUT it shows the store's sentinel file or at least one pack.
+# A dead `soft` NFS mount fails that check instead of hanging. An NFS mount
+# that never came up leaves an empty mountpoint, which fails it too. So a
+# broken link sends the engine to the snapshot rather than to an empty map list.
+store_answers() {
+    timeout "${MAP_STORE_TIMEOUT}" sh -c '
+        d="$1/$2"
+        [ -e "$d/.racesow-map-store" ] && exit 0
+        for pk in "$d"/*.pk3; do [ -e "$pk" ] && exit 0; done
+        exit 1' _ "$1" "${FS_GAME}" 2>/dev/null
+}
+pick_map_store() {
+    if [ -d "${MAP_STORE}/${FS_GAME}" ] && store_answers "${MAP_STORE}"; then
+        echo "${MAP_STORE}"
+    elif [ -d "${MAP_STORE_FALLBACK}/${FS_GAME}" ] && store_answers "${MAP_STORE_FALLBACK}"; then
+        echo ">> WARNING: map store ${MAP_STORE} is unreachable; using the local snapshot" \
+             "${MAP_STORE_FALLBACK} (maps added since the last snapshot are missing)" >&2
+        echo "${MAP_STORE_FALLBACK}"
+    else
+        [ -d "${MAP_STORE}/${FS_GAME}" ] && \
+            echo ">> WARNING: map store ${MAP_STORE} is unreachable and there is no snapshot;" \
+                 "only the maps inside the image are available" >&2
+        echo ""
+    fi
+}
+STORE_NOW="$(pick_map_store)"
+[ -n "${STORE_NOW}" ] && echo ">> map store: ${STORE_NOW}/${FS_GAME}"
+
 # --- Export downloadable paks for the optional HTTP pak server ---------------
 # When the pakshare volume is mounted (see docker-compose.yml pakserver), copy
 # the mod dir's pk3s there (dereferencing map-pack symlinks) so nginx can serve
@@ -133,9 +176,11 @@ export_pakshare() {
 export_pakshare
 
 # --- Discover every installed map -------------------------------------------
-# A map is playable if a maps/<name>.bsp exists inside a pk3 in one of the two
-# directories the engine actually scans: basewsw and the mod dir.
-INSTALLED="$(for dir in "${WARSOW_DIR}/basewsw" "${WARSOW_DIR}/${FS_GAME}"; do
+# A map is playable if a maps/<name>.bsp exists inside a pk3 in a directory the
+# engine actually scans: basewsw and the mod dir, in the install and in the
+# map store (fs_cdpath).
+INSTALLED="$(for dir in "${WARSOW_DIR}/basewsw" "${WARSOW_DIR}/${FS_GAME}" \
+                    ${STORE_NOW:+"${STORE_NOW}/basewsw" "${STORE_NOW}/${FS_GAME}"}; do
         for pk in "${dir}"/*.pk3; do
             [ -e "${pk}" ] && unzip -Z1 "${pk}" 2>/dev/null
         done
@@ -357,6 +402,8 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     # HTTP pak mirror: when set, the engine redirects pak downloads there
     # instead of the (patched) UDP transfer. Must be reachable by game clients.
     [ -n "${SV_UPLOADS_BASEURL}" ] && echo "set sv_uploads_baseurl \"${SV_UPLOADS_BASEURL}\""
+    # New packs in the map store load without a restart (patch-mapscan.py).
+    echo "set sv_mapscan \"${MAPSCAN_SECONDS}\""
     # Pin the demo output dir so the WR-demo path the mod reconstructs
     # (hrace/demos.as RACE_DemoRelPath) matches what the engine writes:
     # SV_DEMO_DIR resolves to "demos/server" when sv_demodir is empty.
@@ -614,17 +661,21 @@ while true; do
     # quarantined never becomes this node's boot map.
     boot_map="$(cg_pick_map "${FIRST_MAP}")"
     cg_arm "${boot_map}"
+    # Re-decided per launch: a crash caused by the store vanishing mid-map
+    # relaunches onto the snapshot, and the next relaunch returns to the store
+    # once it answers again.
+    store="$(pick_map_store)"
     launched_at="$(date +%s)"
-    echo ">> launching wsw_server.x86_64 $* +map ${boot_map}"
+    echo ">> launching wsw_server.x86_64 $* +set fs_cdpath '${store}' +map ${boot_map}"
     # Force line-buffered stdout/stderr. In a detached container the engine's
     # stdout is a pipe, so glibc block-buffers it and `docker logs` looks frozen
     # mid-startup. stdbuf keeps output flowing even if no TTY is allocated.
     # With shipping on, redirect stdout+stderr into the FIFO (a plain `>` so $!
     # is still the engine); the background shipper echoes it back to docker logs.
     if [ -n "${CONSOLE_FIFO}" ]; then
-        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" +map "${boot_map}" > "${CONSOLE_FIFO}" 2>&1 &
+        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" +set fs_cdpath "${store}" +map "${boot_map}" > "${CONSOLE_FIFO}" 2>&1 &
     else
-        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" +map "${boot_map}" &
+        stdbuf -oL -eL "${WARSOW_DIR}/wsw_server.x86_64" "$@" +set fs_cdpath "${store}" +map "${boot_map}" &
     fi
     server_pid=$!
     # Publish the PID for gamehealth.sh (the Docker healthcheck): when the engine

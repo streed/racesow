@@ -161,4 +161,39 @@ fi
 grep -q 'rs_idle_pool' "${CFG}"  && fail "rs_idle_pool must not be generated (it re-confines the idle map cycle)"
 grep -q 'rs_idle_pool' "${CFG2}" && fail "rs_idle_pool must not be generated (plain case)"
 
+# --- Case 8: the shared map store (docs/shared-maps.md) ----------------------
+# The store goes to the engine as fs_cdpath: the live store when it answers,
+# the local snapshot when it does not, nothing when neither exists. Its maps
+# count as installed, and new packs are picked up by sv_mapscan.
+cdpath_of() { grep -A1 '^fs_cdpath$' "$1/launch-args.txt" | tail -1; }
+grep -qx 'set sv_mapscan "60"' "${CFG}" || fail "sv_mapscan (default 60) missing from env.cfg"
+[ "$(cdpath_of "${BOX}")" = "" ] || fail "no store mounted must launch with an empty fs_cdpath"
+
+BOX8="$(sandbox store)"
+mkdir -p "${BOX8}/shared/racemod" "${BOX8}/shared-fallback/racemod"
+: > "${BOX8}/shared/racemod/.racesow-map-store"
+run_entrypoint "${BOX8}" MAPSCAN_SECONDS=15
+[ "$(cdpath_of "${BOX8}")" = "${BOX8}/shared" ] || fail "a live store must be the fs_cdpath"
+grep -qx 'set sv_mapscan "15"' "${BOX8}/racemod/configs/server/env.cfg" || fail "MAPSCAN_SECONDS not honoured"
+
+# A mount that never came up is an empty directory: fall back to the snapshot.
+BOX9="$(sandbox store-down)"
+mkdir -p "${BOX9}/shared/racemod" "${BOX9}/shared-fallback/racemod"
+: > "${BOX9}/shared-fallback/racemod/.racesow-map-store"
+run_entrypoint "${BOX9}"
+[ "$(cdpath_of "${BOX9}")" = "${BOX9}/shared-fallback" ] || fail "an unreachable store must fall back to the snapshot"
+grep -q 'map store .* is unreachable; using the local snapshot' "${BOX9}/entrypoint.log" || \
+    fail "falling back to the snapshot must be logged"
+
+# Maps in the store are installed maps: the pool may name them.
+if [ -f "${TMP}/pk3/maps/alpha.bsp" ] && command -v zip >/dev/null 2>&1; then
+    BOX10="$(sandbox store-maps)"
+    mkdir -p "${BOX10}/shared/racemod"
+    ( cd "${TMP}/pk3" && zip -qr "${BOX10}/shared/racemod/storepool.pk3" maps ) 2>/dev/null
+    printf '%s\n' bravo > "${BOX10}/racemod/mappool.txt"
+    run_entrypoint "${BOX10}"
+    [ "$(grep -A1 '^+map$' "${BOX10}/launch-args.txt" | tail -1)" = "bravo" ] || \
+        fail "a map that exists only in the store must be bootable from the pool"
+fi
+
 echo "OK: entrypoint contract tests passed"

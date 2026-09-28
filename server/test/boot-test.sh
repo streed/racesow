@@ -25,10 +25,11 @@
 #                            [--timeout <sec>] [--expect-fail] [--keep]
 #                            [--maps-dir <dir>]
 #
-#   --maps-dir     mount <dir> read-only as /warsow/maps_extra, the same mount
-#                  the compose file uses for ./server/maps, so --map can name a
-#                  map from a .pk3 that is not baked into the image (how CI
-#                  boots a tools/mapgen course).
+#   --maps-dir     mount <dir> read-only as the map store
+#                  (/warsow/shared/racemod, handed to the engine as fs_cdpath,
+#                  exactly as the compose file mounts ./server/maps), so --map
+#                  can name a map from a .pk3 that is not baked into the image
+#                  (how CI boots a tools/mapgen course).
 #
 #   --expect-fail  invert the verdict: the run PASSES only if the gametype
 #                  fails to initialise. Used to prove a negative — e.g. that
@@ -64,7 +65,9 @@ echo ">> booting ${IMAGE} on ${MAP} (container ${NAME}, timeout ${TIMEOUT}s)"
 MOUNT=()
 if [ -n "${MAPS_DIR}" ]; then
     [ -d "${MAPS_DIR}" ] || { echo "!! --maps-dir ${MAPS_DIR} is not a directory" >&2; exit 2; }
-    MOUNT=(-v "$(cd "${MAPS_DIR}" && pwd):/warsow/maps_extra:ro")
+    # Mounted as the map store (docs/shared-maps.md), so the boot also proves
+    # the fs_cdpath path the production compose uses.
+    MOUNT=(-v "$(cd "${MAPS_DIR}" && pwd):/warsow/shared/racemod:ro")
 fi
 docker run -d --name "${NAME}" --tty -e SV_PUBLIC=0 ${MOUNT[@]+"${MOUNT[@]}"} \
     --ulimit nofile=16384:16384 "${IMAGE}" +map "${MAP}" >/dev/null || {

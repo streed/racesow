@@ -19,6 +19,9 @@
 #                    q3map2, and the real server boots the Race gametype on it
 #                    (the static checks say it is raceable; this says the
 #                    engine agrees the .pk3 is a map).
+#   runtime maps     that pack, dropped into the map store while the server
+#                    runs, is found by sv_mapscan and loaded over rcon with no
+#                    restart (enginepatches/patch-mapscan.py).
 name: e2e
 
 on:
@@ -84,3 +87,6 @@ jobs:
               racesow-mapgen:ci build examples/gen_first_light.json --out /out
           bash server/test/boot-test.sh warsow-race:2.1.2 \
               --map gen_first_light --maps-dir mapgen-out
+
+      - name: a map added to the store at runtime loads without a restart
+        run: bash e2e/mapscan_run.sh mapgen-out/gen_first_light.pk3

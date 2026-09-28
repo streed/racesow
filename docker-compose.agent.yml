@@ -96,7 +96,15 @@ services:
       # seconds, so a cold start can never be killed as if it were wedged.
       start_period: 240s
     volumes:
-      - ./server/maps:/warsow/maps_extra:ro
+      # The map store, handed to the engine as fs_cdpath (docs/shared-maps.md).
+      # New packs load within MAPSCAN_SECONDS without a restart.
+      - type: bind
+        source: ${MAP_STORE_DIR:-./server/maps}
+        target: /warsow/shared/racemod
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: true
       # Local record files (topscores) + finish-event audit log, persisted
       # across container rebuilds.
       - racelog:/warsow/racemod/racelog

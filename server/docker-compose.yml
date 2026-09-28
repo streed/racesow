@@ -72,6 +72,8 @@ services:
       # Ship the game console to the stats site's admin log view (needs
       # INGEST_URL + INGEST_TOKEN). Set LOG_SHIP=0 to disable.
       LOG_SHIP: "${LOG_SHIP:-1}"
+      # Seconds between rescans for new map packs (0 = only at restart).
+      MAPSCAN_SECONDS: "${MAPSCAN_SECONDS:-60}"
       # Cross-server player mirroring (UDP mesh): peered servers exchange
       # live player positions, chat and join/leave events, so players on one
       # server see the others as ghosts and can chat across servers. Set all
@@ -101,9 +103,28 @@ services:
       # so INGEST_URL can point at the web service directly.
       - stats
     volumes:
-      # Drop extra .pk3 map packs here to expand the rotation (optional).
-      # They are symlinked into the mod dir at startup so the engine loads them.
-      - ./maps:/warsow/maps_extra:ro
+      # The map store (docs/shared-maps.md): every map pack the server can
+      # load, handed to the engine as fs_cdpath (no copies, no symlinks). New
+      # packs load within MAPSCAN_SECONDS without a restart. On the box that
+      # owns the store (EU) this is ./maps on local disk. On the others it is
+      # the store's NFS mount on the host (MAP_STORE_DIR), and rslave
+      # propagation lets a mount that comes back after this container started
+      # still appear inside it.
+      - type: bind
+        source: ${MAP_STORE_DIR:-./maps}
+        target: /warsow/shared/racemod
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: true
+      # The local last-known copy, used only when the store does not answer
+      # (scripts/map-snapshot.sh keeps it current). Empty on the owning box.
+      - type: bind
+        source: ${MAP_STORE_SNAPSHOT_DIR:-./maps-snapshot}
+        target: /warsow/shared-fallback/racemod
+        read_only: true
+        bind:
+          create_host_path: true
       # Records + race-finish event log written by the mod (fs_usehomedir=0 →
       # everything lands under /warsow/racemod). Bind-mounted so they survive
       # rebuilds and so the stats collector (../docker-compose.yml) can read
@@ -138,6 +159,23 @@ services:
       - "${PAK_HTTP_PORT:-44445}:80"
     volumes:
       - pakshare:/usr/share/nginx/html
+      # Map packs are served straight from the map store (and its snapshot),
+      # not from copies: pakserver.conf falls through pakshare -> store ->
+      # snapshot. A pack added to the store is downloadable at once.
+      - type: bind
+        source: ${MAP_STORE_DIR:-./maps}
+        target: /srv/store/racemod
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: true
+      - type: bind
+        source: ${MAP_STORE_SNAPSHOT_DIR:-./maps-snapshot}
+        target: /srv/snapshot/racemod
+        read_only: true
+        bind:
+          create_host_path: true
+      - ./pakserver.conf:/etc/nginx/conf.d/default.conf:ro
     # Chown the share to the game-server user (uid 999) before serving, so the
     # export works even if this container initialized the volume first.
     command: ["/bin/sh", "-c", "printf 'server_tokens off;\\n' > /etc/nginx/conf.d/security.conf; chown -R 999:999 /usr/share/nginx/html 2>/dev/null || true; exec nginx -g 'daemon off;'"]
