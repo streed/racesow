@@ -96,7 +96,12 @@ services:
       # SHARED map pool — identical host dir the Warsow service mounts. Read-only.
       # The entrypoint symlinks these pk3s into the racesow fs_game dir so the
       # engine scans them (zero-copy; no duplicate storage).
-      - ./server/maps:/warfork/maps_extra:ro
+      # WARFORK_MAPS_DIR (this directory's .env) points elsewhere on a box that
+      # reads the shared store over NFS: the Warfork engine has no mapscan
+      # patch and no store fallback, so there it uses the store's local
+      # snapshot (./server/maps-snapshot), which is always present and at most
+      # an hour behind. docs/map-store-runbook.md.
+      - ${WARFORK_MAPS_DIR:-./server/maps}:/warfork/maps_extra:ro
       # Warfork's own record/demo state (separate from Warsow's volumes). Mounted
       # at the real mod write dir /warfork/racesow/... (engine fs_basepath=/warfork
       # + fs_game=racesow) — the same path the RS_Api* native now writes to — so

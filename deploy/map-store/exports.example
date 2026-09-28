@@ -1,8 +1,15 @@
 # /etc/exports.d/racesow.exports on the EU box. Then: exportfs -ra
-# The store is the repo's own server/maps; replace __RACESOW_DIR__ with the
-# checkout path (the same value systemd/install.sh substitutes).
-#   ro          readers never write; only the EU box adds or removes packs
-#   all_squash  the reader is anonymous; packs are world-readable already
-#               (fetch-maps.sh and mapgen both write them 0644)
-#   10.66.0.2   the US box's WireGuard address, and nothing else
-__RACESOW_DIR__/server/maps 10.66.0.2/32(ro,all_squash,no_subtree_check,sec=sys)
+# docs/map-store-runbook.md, step C.
+#
+# The export is the bind mount /srv/racesow/store (fstab.eu.example), not
+# ~/racesow/server/maps itself: with all_squash the reader is the anonymous
+# user, which would need execute permission on the deploy user's home
+# directory (usually 0750) to reach a path under it.
+#
+#   ro              readers never write; only the EU box adds or removes packs
+#   all_squash      the reader is anonymous; packs are world-readable already
+#                   (fetch-maps.sh and the mapgen worker both write them 0644)
+#   no_subtree_check  the export is a whole directory; skip the per-request walk
+#   sec=sys         the tunnel is the authentication; one /32 peer, nothing else
+#   10.66.0.2/32    the US box's WireGuard address, and nothing else
+/srv/racesow/store 10.66.0.2/32(ro,all_squash,no_subtree_check,sec=sys)

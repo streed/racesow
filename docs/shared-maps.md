@@ -16,7 +16,7 @@ once, on EU, and every server can vote for it within a minute.
  │   *.pk3       ◀── mapgen      │   WireGuard   │   ▲ read on every map load       │
  │   .racesow-map-store          │═══ 10.66.0.x ═│   │                              │
  │   │  ClamAV (pakscan)         │   NFSv4.2 ro  │   └─▶ server/maps-snapshot/      │
- │   ▼                           │               │       (rsync every 6 h, the      │
+ │   ▼                           │               │       (rsync hourly, the         │
  │ warsow-race  fs_cdpath=store  │               │        fallback copy)            │
  │ warfork-race, web mappack     │               │ warsow-race  fs_cdpath=store     │
  └───────────────────────────────┘               │        or snapshot if unreachable│
@@ -77,7 +77,7 @@ fallback.
   it being votable at once, block it first: the live blocklist is re-read
   every 30 s.
 - **Only EU writes.** The export is read-only. `fetch-maps.sh` refuses to run
-  on a box whose `server/.env` sets `MAP_STORE_DIR` (`MAPS_DEST_FORCE=1`
+  on a box whose `.env` or `server/.env` sets `MAP_STORE_DIR` (`MAPS_DEST_FORCE=1`
   overrides).
 - **The sentinel stays.** `server/maps/.racesow-map-store` is how every reader
   tells "the store is up" from "the mount is an empty directory". Without it,
@@ -85,54 +85,25 @@ fallback.
 
 ## Setting it up
 
-Templates are in `deploy/map-store/`. Replace `__RACESOW_DIR__` with the
-checkout path on EU.
+Production setup is a step-by-step runbook with a check after every step,
+failure drills, troubleshooting and rollback:
+**[map-store-runbook.md](map-store-runbook.md)**. The templates it installs are
+in `deploy/map-store/`. In outline:
 
-**EU (owns the store)**
-
-```sh
-touch server/maps/.racesow-map-store
-apt install wireguard nfs-kernel-server
-# /etc/wireguard/wg-racesow.conf from wg-racesow.eu.conf.example
-systemctl enable --now wg-quick@wg-racesow
-# /etc/nfs.conf.d/racesow.conf from nfs.conf.example
-# /etc/exports.d/racesow.exports from exports.example
-systemctl restart nfs-server && exportfs -ra
-ufw allow from <US public IP> to any port 51820 proto udp
-ufw allow in on wg-racesow to any port 2049 proto tcp
-```
-
-EU needs no `server/.env` change: `MAP_STORE_DIR` defaults to `./maps`.
-
-**US (reads it)**
-
-```sh
-apt install wireguard nfs-common rsync
-# /etc/wireguard/wg-racesow.conf from wg-racesow.us.conf.example
-systemctl enable --now wg-quick@wg-racesow
-mkdir -p /srv/racesow/maps
-# the line from fstab.us.example, then:
-mount /srv/racesow/maps && ls /srv/racesow/maps/.racesow-map-store
-ufw allow from <EU public IP> to any port 51820 proto udp
-# server/.env
-MAP_STORE_DIR=/srv/racesow/maps
-MAP_STORE_SNAPSHOT_DIR=./maps-snapshot
-scripts/map-snapshot.sh             # first snapshot (hours for ~12.5 GB)
-systemd/install.sh agent            # installs racesow-map-snapshot.timer
-```
-
-## Rollout order
-
-1. Deploy the image with the mapscan patch everywhere. With no store configured
-   it changes nothing: `MAP_STORE_DIR` defaults to `./maps`, the same packs as
-   before, now read through `fs_cdpath` instead of symlinks.
-2. EU: sentinel, WireGuard, NFS export.
-3. US: WireGuard, mount, first snapshot (while its local `server/maps` is still
-   in place).
-4. US: set `MAP_STORE_DIR` and `MAP_STORE_SNAPSHOT_DIR`, restart the game server,
-   and check the log for `>> map store: /warsow/shared/racemod`.
-5. US: once a week has passed without trouble, delete the old local
-   `server/maps`. That's the 12.5 GB this frees.
+1. Ship the code to both boxes. With no store configured nothing changes:
+   `MAP_STORE_DIR` defaults to each box's own `server/maps`, read through
+   `fs_cdpath` instead of symlinks.
+2. WireGuard between the boxes (`10.66.0.1` EU, `10.66.0.2` US).
+3. EU: the sentinel, a bind mount of `server/maps` at `/srv/racesow/store`, and
+   an NFSv4.2-only, read-only export of it on the tunnel address only.
+4. US: the NFS mount at `/srv/racesow/maps`.
+5. US: the store paths in `~/racesow/.env` (the file its compose files read),
+   the first snapshot seeded from its existing pool, and the hourly snapshot
+   timer.
+6. US: recreate both game servers. Warsow reads the store (and falls back to
+   the snapshot), Warfork and the pak mirror read the snapshot and the store.
+7. EU: the mapgen worker publishes into the store.
+8. Failure drills, then, a week later, delete the old US pool.
 
 ## Checking it
 
@@ -150,9 +121,11 @@ CI proves the engine side on every push (`.github/workflows/e2e.yml`):
 
 ## Not covered yet
 
-- **Warfork.** The Warfork server (EU only) reads the same `server/maps` from
-  local disk, so the store changes nothing for it. But its engine has no
-  mapscan patch yet, so it still needs a restart for new maps. Porting
-  `patch-mapscan.py` to `warfork/enginepatches/` is the follow-up.
+- **Warfork.** Both boxes run a Warfork server too. On EU it reads the same
+  `server/maps` from local disk. On US it reads the snapshot
+  (`WARFORK_MAPS_DIR`), because its engine has neither the mapscan patch nor
+  the store fallback: new maps reach it after the next hourly snapshot and
+  its next restart. Porting `patch-mapscan.py` and the fallback to
+  `warfork/enginepatches/` is the follow-up.
 - **The US pak mirror during an outage** serves from the snapshot, so a
   client can download any map the US server can run.

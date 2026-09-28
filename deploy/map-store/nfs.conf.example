@@ -3,6 +3,7 @@
 # nfsd listens on the WireGuard address only, so it is unreachable from the
 # internet even before the firewall.
 #   apt install nfs-kernel-server && systemctl restart nfs-server
+# docs/map-store-runbook.md, step C.
 [nfsd]
 vers3 = n
 vers4.0 = n

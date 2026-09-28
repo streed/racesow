@@ -14,6 +14,9 @@ Wants=network-online.target
 Type=oneshot
 User=__RACESOW_USER__
 WorkingDirectory=__RACESOW_DIR__
+# "+" runs this one step as root: it remounts the store if the box booted
+# while the link was down (the fstab line is nofail, so nothing else retries).
+ExecStartPre=+__RACESOW_DIR__/scripts/map-snapshot.sh --mount
 ExecStart=__RACESOW_DIR__/scripts/map-snapshot.sh
 TimeoutStartSec=4h
 Nice=10

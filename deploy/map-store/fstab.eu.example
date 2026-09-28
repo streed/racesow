@@ -1,0 +1,6 @@
+# /etc/fstab line on the EU box: expose the map store at a neutral path for
+# the NFS export (exports.example). A bind mount is the same directory, so
+# fetch-maps.sh and the mapgen worker keep writing to ~/racesow/server/maps.
+#   mkdir -p /srv/racesow/store && mount /srv/racesow/store
+# Replace __RACESOW_DIR__ with the checkout path (readlink -f ~/racesow).
+__RACESOW_DIR__/server/maps  /srv/racesow/store  none  bind,nofail  0  0
