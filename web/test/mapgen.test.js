@@ -207,8 +207,8 @@ test("map-sync: a published map is asked about, confirmed, and then shown as on 
   const now = Math.floor(Date.now() / 1000);
   const token = "ab".repeat(16);
   await dbQuery(
-    `INSERT INTO mapgen_job (token, description, status, map_name, report, created_at, started_at, finished_at, published_at)
-     VALUES ($1, 'a published one', 'publishing', 'gen_sync_test_ababab', '{}', $2, $2, $2, $2)`,
+    `INSERT INTO mapgen_job (token, description, status, map_name, report, llm_usage, created_at, started_at, finished_at, published_at)
+     VALUES ($1, 'a published one', 'publishing', 'gen_sync_test_ababab', '{}', '{"calls": 1, "est_usd": 0.16}', $2, $2, $2, $2)`,
     [token, now - 60]
   );
   const eu = await enroll("EU");
@@ -227,6 +227,8 @@ test("map-sync: a published map is asked about, confirmed, and then shown as on 
   let job = (await alice.get(`/mapgen/jobs/${token}`)).json;
   assert.equal(job.status, "publishing");
   assert.equal(job.queue, null);
+  // What the plan cost is for the operator, never for the page.
+  assert.ok(!/llm|usage|est_usd/i.test(JSON.stringify(job)), JSON.stringify(job));
   assert.deepEqual(job.servers.map((s) => [s.name, s.seenAt]), [["EU", null], ["US", null]]);
 
   // EU's scan picked it up. Junk and unknown names in the same list are ignored.

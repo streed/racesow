@@ -186,6 +186,39 @@ walking ids. The `mapgen` compose service (profile `mapgen`, needs
    our fault. A failed plan does not, because the model call is the cost being
    bounded.
 
+**What each map cost: `mapgen_job.llm_usage`.** After planning, successful or
+not, the worker stores the job's Claude usage and logs one line
+(`job 12: Claude usage: 2 call(s), ... tokens, ~$0.31`). The JSON has the
+totals (`calls`, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`,
+`cache_read_input_tokens`), the models that answered, a list-price estimate
+`est_usd` (`describe.PRICES`; null for a model it has no price for), and
+`per_call`, one record per API call with its stop reason. When the server-side
+fallback answers a declined request, that call's record says `fallback: true`
+and keeps the API's `usage.iterations`, one entry per attempt. The web never
+serves this column. The estimate is for spotting trends; the Anthropic
+Console's billing is the real figure. To read it:
+
+```sql
+-- Spend per day, and what a finished map costs on average.
+SELECT to_timestamp(created_at)::date AS day, count(*) AS jobs,
+       count(*) FILTER (WHERE status IN ('publishing', 'published')) AS maps,
+       sum((llm_usage->>'output_tokens')::bigint) AS output_tokens,
+       round(sum((llm_usage->>'est_usd')::numeric), 2) AS est_usd,
+       round(sum((llm_usage->>'est_usd')::numeric)
+             / nullif(count(*) FILTER (WHERE status IN ('publishing', 'published')), 0), 3)
+         AS usd_per_map
+  FROM mapgen_job WHERE llm_usage IS NOT NULL
+ GROUP BY 1 ORDER BY 1 DESC LIMIT 14;
+
+-- The most expensive jobs, with how many calls (repair turns) they took.
+SELECT id, status, (llm_usage->>'calls')::int AS calls,
+       llm_usage->>'est_usd' AS est_usd, left(description, 60) AS description
+  FROM mapgen_job WHERE llm_usage IS NOT NULL
+ ORDER BY (llm_usage->>'est_usd')::numeric DESC NULLS LAST LIMIT 20;
+```
+
+`mapgen.py plan` prints the same one-line summary on stderr.
+
 **The pages.** Submitting on `/mapgen` (footer "Make a map") returns the job's
 token and opens `/mapgen/<token>`, the job's own page and the link to share.
 It shows five steps with their times: queued (with the place in line),

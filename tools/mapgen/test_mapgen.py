@@ -411,7 +411,11 @@ class FakeClient:
     def _create(self, **kw):
         self.calls.append(copy.deepcopy(kw["messages"]))
         block = types.SimpleNamespace(type="text", text=json.dumps(self.drafts.pop(0)))
-        return types.SimpleNamespace(stop_reason="end_turn", content=[block])
+        usage = types.SimpleNamespace(input_tokens=2000, output_tokens=6000,
+                                      cache_creation_input_tokens=0,
+                                      cache_read_input_tokens=0, iterations=None)
+        return types.SimpleNamespace(stop_reason="end_turn", content=[block],
+                                     model=kw["model"], usage=usage)
 
 
 def flat(spec):
@@ -621,7 +625,11 @@ class Publish(unittest.TestCase):
         conn = _FakeConn()
         out = os.path.join(self.tmp, "work")
 
-        def planner(description, log):
+        def planner(description, log, usage):
+            usage.append({"model": "claude-opus-5", "stop_reason": "end_turn",
+                          "input_tokens": 2000, "output_tokens": 6000,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                          "est_usd": 0.16})
             return flat(example()), 1
 
         def builder(spec, out_dir, q3map2=None):
@@ -654,6 +662,36 @@ class Publish(unittest.TestCase):
         failed = [p for q, p in log if "status = 'failed'" in q][0]
         self.assertEqual(failed[0], worker.PUBLISH_FAILED)
 
+    def test_every_job_records_its_claude_usage(self):
+        _, log = self._run(self.store)
+        rows = [p for q, p in log if "SET llm_usage" in q]
+        self.assertEqual(len(rows), 1)
+        u = json.loads(rows[0][0])
+        self.assertEqual((u["calls"], u["input_tokens"], u["output_tokens"]), (1, 2000, 6000))
+        self.assertEqual(u["est_usd"], 0.16)
+        self.assertEqual(rows[0][1], 7)
+
+    def test_a_failed_plan_still_records_what_it_cost(self):
+        conn = _FakeConn()
+
+        def planner(description, log, usage):
+            usage.append({"model": "claude-opus-5", "stop_reason": "end_turn",
+                          "input_tokens": 10, "output_tokens": 20,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                          "est_usd": 0.00055})
+            raise RuntimeError("no valid spec")
+
+        job = (8, "cd" * 16, "a map", "2026-09-28", b"x" * 16)
+        outcome = worker.run_job(conn, job, self.tmp, planner, None, store=self.store)
+        self.assertEqual(outcome, "failed")
+        sqls = [q for q, _ in conn.log]
+        usage_at = next(i for i, q in enumerate(sqls) if "SET llm_usage" in q)
+        failed_at = next(i for i, q in enumerate(sqls) if "status = 'failed'" in q)
+        self.assertLess(usage_at, failed_at)
+        self.assertEqual(json.loads(conn.log[usage_at][1][0])["output_tokens"], 20)
+        # A failed plan is not refunded: the model call is the cost.
+        self.assertFalse(any("mapgen_quota" in q for q in sqls))
+
 
 class Describe(unittest.TestCase):
     def test_repair_loop_feeds_problems_back(self):
@@ -670,8 +708,50 @@ class Describe(unittest.TestCase):
     def test_gives_up(self):
         bad = flat(course_of({"type": "ramp", "length": 256, "rise": 250}))
         client = FakeClient([bad] * describe.MAX_ATTEMPTS)
+        calls = []
         with self.assertRaises(RuntimeError):
-            describe.plan("anything", client=client, log=lambda m: None)
+            describe.plan("anything", client=client, log=lambda m: None, usage=calls)
+        # Every attempt is billed, so every attempt is counted.
+        self.assertEqual(len(calls), describe.MAX_ATTEMPTS)
+
+    def test_usage_is_counted_per_call_and_priced(self):
+        bad = flat(course_of({"type": "straight", "length": 512},
+                             {"type": "gap", "length": 400, "drop": 0},
+                             {"type": "straight", "length": 512}))
+        calls = []
+        describe.plan("anything", client=FakeClient([bad, flat(example())]),
+                      log=lambda m: None, usage=calls)
+        u = describe.usage_summary(calls)
+        self.assertEqual((u["calls"], u["input_tokens"], u["output_tokens"]), (2, 4000, 12000))
+        # Opus 5 list price: 2 x (2000 x $5 + 6000 x $25) / 1M
+        self.assertAlmostEqual(u["est_usd"], 0.32)
+        self.assertEqual(u["models"], ["claude-opus-5"])
+
+    def test_cache_tokens_and_unknown_models_are_priced_honestly(self):
+        tokens = {"input_tokens": 1000, "output_tokens": 0,
+                  "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 1000}
+        # 1000 x $5 x (1 + 1.25 + 0.1) / 1M
+        self.assertAlmostEqual(describe.estimate_usd("claude-opus-5", tokens), 0.01175)
+        self.assertIsNone(describe.estimate_usd("claude-something-new", tokens))
+        calls = [{"model": "claude-something-new", "est_usd": None, **tokens}]
+        self.assertIsNone(describe.usage_summary(calls)["est_usd"])
+
+    def test_a_fallback_keeps_every_attempt(self):
+        attempt = types.SimpleNamespace(type="fallback_message",
+                                        model_dump=lambda: {"type": "fallback_message",
+                                                            "model": "claude-opus-4-8"})
+        resp = types.SimpleNamespace(
+            model="claude-opus-4-8", stop_reason="end_turn",
+            usage=types.SimpleNamespace(input_tokens=100, output_tokens=200,
+                                        cache_creation_input_tokens=None,
+                                        cache_read_input_tokens=None,
+                                        iterations=[attempt]))
+        c = describe.call_usage(resp)
+        self.assertEqual(c["model"], "claude-opus-4-8")
+        self.assertTrue(c["fallback"])
+        self.assertEqual(c["iterations"], [{"type": "fallback_message", "model": "claude-opus-4-8"}])
+        self.assertEqual(c["cache_read_input_tokens"], 0)
+        json.dumps(c)
 
     def test_views_show_every_kind_when_there_are_more_than_keys(self):
         segs = [{"type": "straight", "length": 512}]

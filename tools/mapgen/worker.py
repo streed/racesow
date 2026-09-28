@@ -43,6 +43,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import build as buildmod  # noqa: E402
+import describe  # noqa: E402
 import layout  # noqa: E402
 
 log = logging.getLogger("mapgen.worker")
@@ -141,18 +142,37 @@ def fail(cur, job_id, message, detail, refund=None):
         )
 
 
+def record_usage(cur, job_id, calls):
+    """Store what planning this job cost in Claude tokens (llm_usage, never
+    served by the web) and log a one-line summary. Failed plans are recorded
+    too: every call is billed whether or not a map comes out of it."""
+    summary = describe.usage_summary(calls)
+    cur.execute("UPDATE mapgen_job SET llm_usage = %s WHERE id = %s",
+                (json.dumps(summary), job_id))
+    est = summary["est_usd"]
+    log.info("job %s: Claude usage: %d call(s), %d input + %d cache-write + %d cache-read "
+             "+ %d output tokens, ~%s", job_id, summary["calls"], summary["input_tokens"],
+             summary["cache_creation_input_tokens"], summary["cache_read_input_tokens"],
+             summary["output_tokens"], "?" if est is None else f"${est:.4f}")
+
+
 def run_job(conn, job, out_root, planner, builder, q3map2=None, store=None):
     job_id, token, description, quota_day, identity = job
     log.info("job %s: planning %r", job_id, description[:80])
+    calls = []
     try:
-        spec, attempts = planner(description, log=lambda m: log.info("job %s: %s", job_id, m))
+        spec, attempts = planner(description, log=lambda m: log.info("job %s: %s", job_id, m),
+                                 usage=calls)
         spec["name"] = unique_name(spec["name"], token)
         layout.build(spec)   # the name changed; re-check before anything else
     except Exception as e:   # noqa: BLE001 - any planning failure is the same answer
         with conn.cursor() as cur:
+            record_usage(cur, job_id, calls)
             fail(cur, job_id, PLAN_FAILED, f"{type(e).__name__}: {e}")
         conn.commit()
         return "failed"
+    with conn.cursor() as cur:
+        record_usage(cur, job_id, calls)
 
     with conn.cursor() as cur:
         cur.execute(
@@ -214,8 +234,6 @@ def main():
     import psycopg
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    import describe
-
     url = os.environ.get("DATABASE_URL")
     out_root = os.environ.get("MAPGEN_DIR", "/data/mapgen")
     store = os.environ.get("MAPGEN_STORE", "")

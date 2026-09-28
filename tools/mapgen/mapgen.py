@@ -37,7 +37,15 @@ def _emit(args, obj, text):
 
 def cmd_plan(args):
     import describe
-    spec, attempts = describe.plan(args.description, log=lambda m: print(m, file=sys.stderr))
+    calls = []
+    try:
+        spec, attempts = describe.plan(args.description, usage=calls,
+                                       log=lambda m: print(m, file=sys.stderr))
+    finally:
+        u = describe.usage_summary(calls)
+        est = "?" if u["est_usd"] is None else f"${u['est_usd']:.4f}"
+        print(f"Claude usage: {u['calls']} call(s), {u['input_tokens']} in / "
+              f"{u['output_tokens']} out tokens, ~{est}", file=sys.stderr)
     body = json.dumps(spec, indent=2) + "\n"
     if args.output:
         with open(args.output, "w") as fh:

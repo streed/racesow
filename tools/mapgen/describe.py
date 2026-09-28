@@ -19,6 +19,21 @@ import spec as specmod
 MODEL = "claude-opus-5"
 MAX_ATTEMPTS = 4
 
+# List prices, USD per million tokens (input, output), for the models a
+# request can be served by: MODEL, plus whatever the server-side fallback
+# routes a declined request to. Only used to put an estimate next to the
+# token counts; the Anthropic Console's billing is the real figure. A cache
+# write costs 1.25x input and a cache read 0.1x.
+PRICES = {
+    "claude-opus-5": (5.00, 25.00),
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-opus-4-8": (5.00, 25.00),
+    "claude-sonnet-5": (2.00, 10.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+}
+TOKEN_FIELDS = ("input_tokens", "output_tokens",
+                "cache_creation_input_tokens", "cache_read_input_tokens")
+
 
 def system_prompt():
     gaps = ", ".join(f"drop {d}: {int(physics.max_gap(d))}" for d in (0, 64, 128, 256))
@@ -144,8 +159,56 @@ def _request(client, messages):
     )
 
 
-def plan(description, client=None, log=print):
-    """-> (normalized spec, attempts). Raises RuntimeError if no draft passes."""
+def estimate_usd(model, tokens):
+    """List-price estimate for one call's token counts, or None for a model
+    missing from PRICES."""
+    price = PRICES.get(model)
+    if price is None:
+        return None
+    cost_in, cost_out = price
+    return round((tokens["input_tokens"] * cost_in
+                  + tokens["cache_creation_input_tokens"] * cost_in * 1.25
+                  + tokens["cache_read_input_tokens"] * cost_in * 0.1
+                  + tokens["output_tokens"] * cost_out) / 1e6, 6)
+
+
+def call_usage(resp):
+    """One API call's usage as plain JSON: the model that answered (a
+    fallback can answer instead of MODEL), why it stopped, the token counts
+    and a list-price estimate. With a fallback, `usage.iterations` holds each
+    attempt and is kept as-is: the top-level counts cover only the attempt
+    that produced the message."""
+    usage = getattr(resp, "usage", None)
+    tokens = {f: int(getattr(usage, f, None) or 0) for f in TOKEN_FIELDS}
+    model = getattr(resp, "model", None) or MODEL
+    out = {"model": model, "stop_reason": getattr(resp, "stop_reason", None),
+           **tokens, "est_usd": estimate_usd(model, tokens)}
+    iterations = getattr(usage, "iterations", None)
+    if iterations:
+        out["iterations"] = [i.model_dump() if hasattr(i, "model_dump") else i
+                             for i in iterations]
+        out["fallback"] = any((i.get("type") if isinstance(i, dict) else getattr(i, "type", None))
+                              == "fallback_message" for i in iterations)
+    return out
+
+
+def usage_summary(calls):
+    """Per-job totals over call_usage() records; est_usd is None if any call
+    was answered by a model without a list price here."""
+    totals = {f: sum(c[f] for c in calls) for f in TOKEN_FIELDS}
+    costs = [c["est_usd"] for c in calls]
+    return {"calls": len(calls), **totals,
+            "est_usd": None if None in costs else round(sum(costs), 6),
+            "models": sorted({c["model"] for c in calls}),
+            "per_call": calls}
+
+
+def plan(description, client=None, log=print, usage=None):
+    """-> (normalized spec, attempts). Raises RuntimeError if no draft passes.
+
+    Pass a list as `usage` to get one call_usage() record appended per API
+    call, including the calls of a plan that fails in the end: those are
+    billed too."""
     if client is None:
         import anthropic
         client = anthropic.Anthropic()
@@ -154,6 +217,8 @@ def plan(description, client=None, log=print):
     problems = []
     for attempt in range(1, MAX_ATTEMPTS + 1):
         resp = _request(client, messages)
+        if usage is not None:
+            usage.append(call_usage(resp))
         if resp.stop_reason == "refusal":
             raise RuntimeError("the model declined this description")
         if resp.stop_reason == "max_tokens":

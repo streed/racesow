@@ -30,6 +30,10 @@
 --   check is copied into the shared map store (publishing), and it is
 --   published once a game server reports that its map scan loaded it.
 --
+--   llm_usage is what planning the job cost: token counts per API call and a
+--   list-price estimate (tools/mapgen/describe.py usage_summary). Written for
+--   failed plans too. It is for the operator only; the web never serves it.
+--
 -- mapgen_seen: which game server has confirmed which published map, and when.
 --   Game servers poll /api/game/map-sync every ~30 s (hrace/blockedmaps.as);
 --   the reply names the maps they should look for, and the next poll reports
@@ -69,7 +73,8 @@ CREATE TABLE IF NOT EXISTS mapgen_job (
   started_at  BIGINT,
   finished_at BIGINT,
   published_at BIGINT,   -- copied into the map store
-  live_at      BIGINT    -- first game server confirmed it
+  live_at      BIGINT,   -- first game server confirmed it
+  llm_usage    JSONB     -- Claude tokens + list-price estimate for planning it
 );
 
 -- The worker claims the oldest queued job with FOR UPDATE SKIP LOCKED.
