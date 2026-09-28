@@ -55,22 +55,60 @@ install -m 644 "${PK3}" "${STORE}/"
 wait_for "mapscan: \\+1 map\\(s\\)" 60 "the engine to pick up the new pack"
 echo ">> $(logs | grep -o 'mapscan: +1 map(s), [0-9]* on the list' | tail -1)"
 
-before="$(logs | grep -c "Gametype 'Race' initialized" || true)"
 IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${NAME}")"
 echo ">> rcon map ${MAP}"
+# While an rcon command runs, the engine redirects its console output into the
+# rcon reply (qcommon/common.c, Com_BeginRedirect), and "map" spawns the new
+# level inside that command. So "SpawnServer: <map>" and the gametype init come
+# back over UDP and never reach docker logs. Read them from the reply, then
+# confirm with getstatus that the server is running the map afterwards.
 python3 - "${IP}" "${RCON}" "${MAP}" <<'EOF'
-import socket, sys
+import re, socket, sys, time
 ip, pw, m = sys.argv[1:]
+OOB = b"\xff\xff\xff\xff"
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.sendto(b"\xff\xff\xff\xffrcon " + pw.encode() + b" map " + m.encode() + b"\n", (ip, 44400))
+s.sendto(OOB + b"rcon " + pw.encode() + b" map " + m.encode() + b"\n", (ip, 44400))
+reply, deadline = "", time.time() + 60
+s.settimeout(5)
+while time.time() < deadline:
+    try:
+        d = s.recvfrom(65535)[0]
+    except socket.timeout:
+        if reply:
+            break
+        continue
+    if d.startswith(OOB + b"print\n"):
+        reply += d[len(OOB) + 6:].decode("latin1", "replace")
+reply = re.sub(r"\x1b\[[0-9;]*m", "", reply)
+print("   | " + "\n   | ".join(l for l in reply.splitlines()
+                              if "SpawnServer" in l or "initialized" in l or "ERROR" in l or "Couldn't" in l))
+def fail(why):
+    print("!! " + why); print(reply[-3000:]); sys.exit(1)
+if "SpawnServer: " + m not in reply:
+    fail("the rcon reply has no 'SpawnServer: %s'" % m)
+if "Gametype 'Race' initialized" not in reply.split("SpawnServer: " + m, 1)[1]:
+    fail("%s spawned but the gametype never initialised" % m)
+if re.search(r"Couldn't find map|ERROR: .*" + re.escape(m), reply):
+    fail("errors while loading %s" % m)
+
+mapname, deadline = "?", time.time() + 30
+while time.time() < deadline:
+    try:
+        s.sendto(OOB + b"getstatus\n", (ip, 44400))
+        d = s.recvfrom(65535)[0]
+        if not d.startswith(OOB + b"statusResponse"):
+            continue   # a late fragment of the rcon reply
+        kv = d.decode("latin1", "replace").split("\n")[1].split("\\")
+        info = dict(zip(kv[1::2], kv[2::2]))
+        mapname = info.get("mapname", "?")
+        if mapname == m:
+            break
+    except (socket.timeout, IndexError):
+        pass
+    time.sleep(1)
+else:
+    fail("getstatus says the server runs '%s', not %s" % (mapname, m))
+print(">> getstatus: mapname=%s" % mapname)
 EOF
-wait_for "SpawnServer: ${MAP}" 60 "the server to spawn ${MAP}"
-deadline=$(( $(date +%s) + 60 ))
-while [ "$(logs | grep -c "Gametype 'Race' initialized" || true)" -le "${before}" ]; do
-    [ "$(date +%s)" -lt "${deadline}" ] || { echo "!! ${MAP} spawned but the gametype never initialised"; logs | tail -30; exit 1; }
-    sleep 2
-done
-if logs | grep -qE "Couldn't find map|ERROR: .*${MAP}"; then
-    echo "!! errors while loading ${MAP}"; logs | grep -E "Couldn't find map|ERROR" | tail; exit 1
-fi
+[ "$(docker inspect -f '{{.State.Running}}' "${NAME}")" = "true" ] || { echo "!! the server died after the map change"; logs | tail -30; exit 1; }
 echo ">> PASS: ${MAP} was added at runtime and is running, no restart"
