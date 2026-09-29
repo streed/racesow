@@ -1868,7 +1868,7 @@ class RaceDB {
     return body;
   }
 
-  async maps({ q = "", sort = "records", order, limit, offset, weapon = "" } = {}) {
+  async maps({ q = "", sort = "records", order, limit, offset, weapon = "", origin = "" } = {}) {
     const col = MAP_SORTS[sort] || MAP_SORTS.records;
     const direction = dir(order, sort === "name" ? "ASC" : "DESC");
     const lim = clampLimit(limit);
@@ -1902,6 +1902,20 @@ class RaceDB {
       // Same union as the in-game randmap: scanned-strafe OR a "strafe" map name.
       conds.push(
         `(EXISTS (SELECT 1 FROM map_weapon w WHERE w.name = lower(mi.name) AND w.is_strafe) OR mi.name ILIKE '%strafe%')`
+      );
+    }
+    // Generated maps (/mapgen) are identified by the GENERATED_MAP_PREFIX name
+    // prefix, the same test the ratings flag and the standings rebuild use, so
+    // "generated" means one thing everywhere. Deliberately NOT a join on
+    // mapgen_job: a map stays in the pool and on the leaderboards after an
+    // admin hides its job, and it should still filter as generated.
+    //
+    // left()/lower() rather than LIKE: no wildcard escaping to get wrong (the
+    // prefix ends in '_', which LIKE would read as "any one character").
+    if (origin === "gen" || origin === "classic") {
+      const op = origin === "gen" ? "=" : "<>";
+      conds.push(
+        `lower(left(mi.name, ${GENERATED_MAP_PREFIX.length})) ${op} '${GENERATED_MAP_PREFIX}'`
       );
     }
     const where = `WHERE ${conds.join(" AND ")}`;

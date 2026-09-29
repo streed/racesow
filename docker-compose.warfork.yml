@@ -54,6 +54,11 @@ services:
       SV_PUBLIC: "${WF_SV_PUBLIC:-1}"
       SV_PORT: "44410"
       SV_HTTP_PORT: "44411"
+      # How often (seconds) the engine rescans the map pool for new packs
+      # (enginepatches/patch-mapscan.py, now applied to Warfork too). The pool
+      # is handed over as fs_cdpath, so a pack that lands after boot is found.
+      # 0 = only at startup.
+      MAPSCAN_SECONDS: "${MAPSCAN_SECONDS:-60}"
       # The shared RS_Api* native (g_rs_api.cpp) derives its libc write paths from
       # $WARSOW_DIR; on Warfork it must equal the engine base ($WF_DIR=/warfork),
       # else `top` / the live-record refresh write to a dead /warsow path the
@@ -93,9 +98,6 @@ services:
       retries: 6          # ~2 min of unbroken silence before a restart
       start_period: 240s  # cold boot answers nothing for a while
     volumes:
-      # How often (seconds) the engine rescans the pool for new packs
-      # (enginepatches/patch-mapscan.py). 0 = only at startup.
-      MAPSCAN_SECONDS: "${MAPSCAN_SECONDS:-60}"
       # SHARED map pool — identical host dir the Warsow service mounts. Read-only.
       # The entrypoint symlinks these pk3s into the racesow fs_game dir so the
       # engine scans them (zero-copy; no duplicate storage).

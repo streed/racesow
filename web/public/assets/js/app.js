@@ -838,6 +838,14 @@ function th(label, key, state, extraClass = "") {
 const PAGE = 50;
 
 // Weapon tags a map's .bsp was scanned for (see server scan-map-weapons.js);
+// Where a map came from: everything, only the /mapgen-built `gen_` maps, or
+// only the hand-made pool. Server side is maps({ origin }) in web/db.js.
+const ORIGIN_FILTER_OPTS = [
+  ["", "All maps"],
+  ["gen", "Generated only"],
+  ["classic", "Hide generated"],
+];
+
 // mirrors web/weapons.js. Used for the maps-page weapon/strafe filter + badges.
 const WEAPON_LABELS = {
   gb: "Gunblade", mg: "Machinegun", rg: "Riotgun", gl: "Grenade Launcher",
@@ -884,12 +892,13 @@ async function viewMaps(params) {
   const state = {
     q: params.q || "",
     weapon: params.weapon || "",
+    origin: params.origin || "",
     sort: params.sort || "races",
     order: params.order || (params.sort === "name" ? "asc" : "desc"),
     offset: parseInt(params.offset || "0", 10) || 0,
   };
   const data = await api(
-    "/maps" + buildQuery({ q: state.q, weapon: state.weapon, sort: state.sort, order: state.order, limit: PAGE, offset: state.offset })
+    "/maps" + buildQuery({ q: state.q, weapon: state.weapon, origin: state.origin, sort: state.sort, order: state.order, limit: PAGE, offset: state.offset })
   );
 
   app.innerHTML = `
@@ -899,6 +908,9 @@ async function viewMaps(params) {
       <input class="filter" id="mfilter" placeholder="Filter maps by name…" value="${esc(state.q)}">
       <select class="filter version" id="mweapon" title="Filter by weapon or strafe">
         ${WEAPON_FILTER_OPTS.map(([v, l]) => `<option value="${v}"${state.weapon === v ? " selected" : ""}>${esc(l)}</option>`).join("")}
+      </select>
+      <select class="filter version" id="morigin" title="Show only maps built by /mapgen, or only the hand-made pool">
+        ${ORIGIN_FILTER_OPTS.map(([v, l]) => `<option value="${v}"${state.origin === v ? " selected" : ""}>${esc(l)}</option>`).join("")}
       </select>
       <span class="count">${fmtNum(data.total)} maps</span>
     </div>
@@ -932,6 +944,10 @@ async function viewMaps(params) {
   const wsel = document.getElementById("mweapon");
   if (wsel) wsel.addEventListener("change", () => {
     go("#/maps" + buildQuery({ ...pageParams(state), weapon: wsel.value, offset: 0 }));
+  });
+  const osel = document.getElementById("morigin");
+  if (osel) osel.addEventListener("change", () => {
+    go("#/maps" + buildQuery({ ...pageParams(state), origin: osel.value, offset: 0 }));
   });
   wireSort("#/maps", state);
 }
@@ -1278,6 +1294,44 @@ function mapgenPieces(r) {
     .join("");
 }
 
+// A click-to-copy `callvote map <name>`, so nobody retypes a generated map's
+// name (gen_sweep_and_plunge_a4ce1f and friends) into the console. Rendered in
+// several places that re-render on a poll, so the click is handled by ONE
+// delegated listener rather than bound per render.
+function voteCmdBtn(mapName) {
+  const cmd = `callvote map ${mapName}`;
+  return `<button type="button" class="copy-btn vote-cmd" data-vote-cmd="${esc(cmd)}"
+    title="Click to copy, then paste into the Warsow console (~)"><span class="mono">${esc(cmd)}</span></button>`;
+}
+
+let voteCmdWired = false;
+function wireVoteCmd() {
+  if (voteCmdWired) return;
+  voteCmdWired = true;
+  app.addEventListener("click", async (e) => {
+    const btn = e.target.closest("[data-vote-cmd]");
+    if (!btn) return;
+    const cmd = btn.getAttribute("data-vote-cmd");
+    const span = btn.querySelector(".mono") || btn;
+    const prev = span.textContent;
+    try {
+      await navigator.clipboard.writeText(cmd);
+      span.textContent = "copied";
+    } catch (err) {
+      // Non-secure context or an old browser: select it so Ctrl+C still works.
+      const r = document.createRange();
+      r.selectNodeContents(span);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r);
+      span.textContent = prev;
+      return;
+    }
+    btn.classList.add("ok");
+    setTimeout(() => { span.textContent = prev; btn.classList.remove("ok"); }, 1200);
+  });
+}
+
 function mapgenJobCard(j) {
   const [label, blurb] = MAPGEN_STATUS[j.status] || [j.status, ""];
   const r = j.report || {};
@@ -1298,6 +1352,7 @@ function mapgenJobCard(j) {
       ${facts}
       ${j.status === "failed" ? `<p class="mg-err">${esc(j.error || "Something went wrong.")}</p>` : blurb ? `<p class="mg-blurb">${esc(blurb)}</p>` : ""}
       ${plan}
+      ${j.mapName && j.status === "published" ? `<div class="mg-g-vote">${voteCmdBtn(j.mapName)}</div>` : ""}
       <a class="mg-open" href="/mapgen/${esc(j.token)}" data-nav="/mapgen/${esc(j.token)}">Follow this map →</a>
     </article>`;
 }
@@ -1357,7 +1412,7 @@ function mapgenNow(j) {
     case "published": {
       const all = servers.length && on.length === servers.length;
       return `<p class="mg-now"><b>${all ? "On the servers." : `On ${on.length} of ${servers.length} servers.`}</b>
-        Vote for it in game: <span class="mono">callvote map ${esc(j.mapName)}</span></p>${list}`;
+        Vote for it in game: ${voteCmdBtn(j.mapName)}</p>${list}`;
     }
     case "failed":
       return `<p class="mg-now mg-err">${esc(j.error || "Something went wrong.")}</p>`;
@@ -1442,7 +1497,7 @@ function mapgenGalleryCard(m) {
   const races = m.records
     ? `<div class="mg-g-wr">WR <b>${esc(fmtTime(m.wr_time))}</b>${m.wr_name ? ` by ${wname(m.wr_name)}` : ""}
          · ${esc(fmtNum(m.records))} record${m.records === 1 ? "" : "s"}</div>`
-    : `<div class="mg-g-wr mg-g-none">No runs yet · <span class="mono">callvote map ${esc(m.mapName)}</span></div>`;
+    : `<div class="mg-g-wr mg-g-none">No runs yet</div>`;
   return `<article class="panel mg-g-card">
       <a class="mg-g-plan" href="/mapgen/${esc(m.token)}" data-nav="/mapgen/${esc(m.token)}">
         <img alt="Top-down plan of ${esc(m.mapName)}" loading="lazy" src="/api/mapgen/jobs/${esc(m.token)}/plan.svg"></a>
@@ -1451,6 +1506,7 @@ function mapgenGalleryCard(m) {
         <div class="mg-facts">${name}${r.par_seconds ? ` · about ${esc(String(r.par_seconds))} s` : ""}${r.checkpoints ? ` · ${esc(String(r.checkpoints))} checkpoint${r.checkpoints === 1 ? "" : "s"}` : ""}${mapgenPieces(r)}</div>
         <p class="mg-desc mg-g-desc">“${esc(m.description)}”</p>
         ${races}
+        <div class="mg-g-vote">${voteCmdBtn(m.mapName)}</div>
       </div>
     </article>`;
 }
@@ -2580,6 +2636,7 @@ function pageParams(state) {
   const p = {};
   if (state.q) p.q = state.q;
   if (state.weapon) p.weapon = state.weapon;
+  if (state.origin) p.origin = state.origin;
   if (state.sort) p.sort = state.sort;
   if (state.order) p.order = state.order;
   if (state.version) p.version = state.version;
@@ -4348,6 +4405,7 @@ async function router() {
 window.addEventListener("popstate", router);
 window.addEventListener("DOMContentLoaded", async () => {
   initGlobalSearch();
+  wireVoteCmd();   // delegated, so it survives every re-render
   router();
   try {
     const d = await overview();

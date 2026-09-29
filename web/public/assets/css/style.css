@@ -824,6 +824,13 @@ a.replay-badge { text-decoration: none; }
   border: 1px solid var(--line-2); border-radius: 6px; padding: 6px 10px; cursor: pointer; transition: .12s; }
 .copy-btn:hover { color: #fff; border-color: var(--orange); }
 .copy-btn.ok { color: var(--green); border-color: rgba(169,242,106,.5); }
+/* Click-to-copy `callvote map <name>` on the generated-map pages. Wider than a
+   bare copy-btn because it shows the whole command, and it wraps rather than
+   overflowing its card on a narrow screen. */
+.copy-btn.vote-cmd { text-transform: none; letter-spacing: 0; font-family: inherit;
+  max-width: 100%; white-space: normal; word-break: break-all; text-align: left; }
+.copy-btn.vote-cmd .mono { font-size: 12.5px; }
+.mg-g-vote { margin-top: 8px; }
 
 /* Command tables */
 .cmd-groups { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
