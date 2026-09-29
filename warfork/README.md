@@ -34,6 +34,10 @@ map load, api fetch wiring.
 | `entrypoint.sh` | env → `rs_api_*`/`rs_mirror_*` cvars; shared-map symlink + `g_maplist`; launch |
 | `configs/server.cfg` | race gameplay tuning (`sv_pure 0` for v1) |
 | `enginepatches/` | Gelmo racesow natives (`g_racesow.*`, `gs_racesow.*`) + `patch-pjstate-natives.py` + UPSTREAM |
+| `enginepatches/patch-race-triggers.py` | racemod_2.1 parity: `trigger_once`/`wait -1` checkpoint + finish triggers stay alive in race; `target_speaker` relays to its targets |
+| `enginepatches/patch-race-entities.py` | racemod_2.1 parity: doors/buttons, items, `target_push`, script spawn precedence, spawnpoints in solid / Q3 floating spawnpoints |
+| `enginepatches/patch-race-weapons.py` | racemod_2.1 parity: rs_* weapon physics (RS_Init, self-knockback, projectile speeds/prestep, 2-bounce grenades, 850 ms RL reload); `../server/enginepatches/patch-quad-fix.py` applies on top |
+| `enginepatches/patch-race-votepower.py` | racemod_2.1 parity: `GT_VotePower` weighted callvotes + `g_vote_punishtime` |
 | `scriptpatches/patch-scripts-as2024.py` | Warfork-only AS2024 adaptation of the shared scripts |
 | `build-from-source.sh` | standalone local source build (dev iteration) |
 | `../docker-compose.warfork.yml` | additive deploy service (ports 44410/44411/44451, shared maps) |
@@ -48,8 +52,15 @@ then expand the live Warsow `MIRROR_PEERS`+retag and tear down the old
 `warfork-test` spike.
 
 **Deferred** (not launch blockers): client UI pak + `sv_pure 1` delivery, per-client
-demo natives, weapon-def physics parity, public Steam listing (`BUILD_STEAMLIB=1`
+demo natives, public Steam listing (`BUILD_STEAMLIB=1`
 + GSLT).
+
+Weapon-def physics parity is no longer deferred either: `patch-race-weapons.py`
+(2026-09) wires the rs_* cvars in exactly as racemod_2.1 does. Still NOT ported,
+on purpose: racemod's two `gs_pmove.c` movement tweaks (dash speed 451,
+`PM_SnapPosition` keeping velocity) -- Warfork clients predict movement with
+their own stock copy of that code, so a server-only change would cause
+prediction corrections.
 
 The prejump `gs_pmove.c` hooks are no longer deferred — they shipped 2026-07-30
 (`enginepatches/patch-pjcount-hooks.py`). Until then the prejump rule was
