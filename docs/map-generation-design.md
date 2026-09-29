@@ -232,6 +232,17 @@ records the admin's username in `mapgen_job.requested_by`. Otherwise it is an
 ordinary job: same description cleaning, same queue, same job page. Its cost
 still shows in `llm_usage` like any other.
 
+**Gallery.** `/mapgen/gallery` (API `/api/mapgen/gallery`, paged, cached
+30 s) lists every built map, newest first: the plan preview, the course
+title, the pieces, par, the description it was built from, and the world
+record once anyone has raced it. It serves the same public job row as the
+job page (never identity, quota day, spec or `llm_usage`). The descriptions
+are free text from anonymous requesters and nothing moderates them on the way
+in, so an admin can take any map out of the gallery from `/admin/mapgen`
+(`hidden_at` / `hidden_by`); the map, its job page and its records stay. A
+map a moderator blocks from play drops out of the gallery on its own. Title
+and map name go through the site's name word list like every map list.
+
 **Queue: a table, polled.** The same shape as the rest of the site: no broker,
 and atomic claims in Postgres. `mapgen_job` rows carry a random 32-hex
 `token`, the only handle ever handed out, so descriptions cannot be read by
@@ -367,7 +378,7 @@ repair turn, not a failed request.
 | --- | --- | --- |
 | 1 | strafe-only greybox: spec, layout, compile, static checks, CLI, Docker, CI boot | **built** |
 | 2 | headless pmove bot; proof-run demo in the replay viewer | design |
-| 3 | public form with daily identity quota → `mapgen_job` table → worker → automatic publish → per-job page with server confirmations | **built** |
+| 3 | public form with daily identity quota → `mapgen_job` table → worker → automatic publish → per-job page with server confirmations → public gallery | **built** |
 | 4a | strafe-only vocabulary: slalom, beam, split lanes, overpasses | **built** |
 | 4b | special moves: wall climbs, wall-kick gaps, dash drops, open track (checked in the real client) | **built** |
 | 4c | vocabulary growth gated on phase 2: jump pads, themed texture sets | idea |

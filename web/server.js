@@ -668,6 +668,17 @@ api.get("/mapgen/jobs/:token", mapgenNoStore, wrap(async (req, res) => {
   res.json({ ...d.job, queue: d.queue, servers: d.servers });
 }));
 
+// The public gallery of generated maps: built ones only, newest first, paged.
+// Each entry is the same public job row the job page serves (description
+// included: the requester typed it to be shown) plus the map's records. An
+// admin can take one out at /admin/mapgen. Briefly cacheable: nothing in it is
+// per-visitor.
+api.get("/mapgen/gallery", wrap(async (req, res) => {
+  const d = await race.mapgenGallery({ limit: req.query.limit, offset: req.query.offset });
+  res.set("Cache-Control", "public, max-age=30");
+  res.json(d);
+}));
+
 // The worker's top-down plan preview, once planning has finished. Served
 // only for a known token, from a fixed file name: no path comes from the URL.
 api.get("/mapgen/jobs/:token/plan.svg", mapgenNoStore, wrap(async (req, res) => {
@@ -3239,6 +3250,7 @@ admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
     ? `<div class="msg err">Describe the map in ${MAPGEN_DESC_MIN} to ${MAPGEN_DESC_MAX} characters.</div>`
     : "";
   const mine = await race.mapgenAdminJobs({ limit: 10 });
+  const built = await race.mapgenBuiltAdmin({ limit: 50 });
   const recent = mine.length
     ? `<table><tr><th>requested</th><th>by</th><th>status</th><th>description</th></tr>${mine.map((j) =>
         `<tr><td>${fmtWhen(j.createdAt)}</td><td>${escHtml(j.requestedBy)}</td>
@@ -3259,6 +3271,22 @@ admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
     </form>
     <h2>Recent admin requests</h2>
     ${recent}
+    <h2>Gallery</h2>
+    <p class="sub">Every built map is listed on the public <a href="/mapgen/gallery">gallery</a> with
+      its description. Hide one whose description shouldn't be shown; the map, its job page and its
+      records stay. A map blocked from play drops out on its own.</p>
+    ${req.query.hidden ? `<div class="msg ok">Saved.</div>` : ""}
+    ${built.length
+      ? `<table><tr><th>built</th><th>map</th><th>description</th><th></th></tr>${built.map((j) =>
+          `<tr${j.hiddenAt ? ` style="opacity:.6"` : ""}><td>${fmtWhen(j.publishedAt)}</td>
+             <td><a href="/mapgen/${escHtml(j.token)}">${escHtml(j.mapName || "")}</a></td>
+             <td>${escHtml(j.description.slice(0, 120))}${j.hiddenAt ? `<br><span class="sub">hidden ${fmtWhen(j.hiddenAt)}${j.hiddenBy ? ` by ${escHtml(j.hiddenBy)}` : ""}</span>` : ""}</td>
+             <td><form method="post" action="/admin/mapgen/hide" style="margin:0">
+               <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+               <input type="hidden" name="token" value="${escHtml(j.token)}">
+               <input type="hidden" name="hidden" value="${j.hiddenAt ? "0" : "1"}">
+               <button type="submit">${j.hiddenAt ? "Show" : "Hide"}</button></form></td></tr>`).join("")}</table>`
+      : `<p class="sub">No maps built yet.</p>`}
     <h2>Generated maps in ratings</h2>
     <p class="sub">Maps built by the map generator (names starting <span style="font-family:monospace">${escHtml(GENERATED_MAP_PREFIX)}</span>,
       ${count ? count.n : 0} known to the site) · when off, they are left out of Points, Skill Rating and the
@@ -3278,6 +3306,15 @@ admin.post("/mapgen/request", requireAdmin, wrap(async (req, res) => {
   if (description === null) return res.redirect(303, "/admin/mapgen?error=length");
   const token = await race.mapgenSubmitAdmin({ description, by: req.session.username });
   res.redirect(303, `/mapgen/${token}`);
+}));
+
+// Hide a built map from the public gallery, or show it again.
+admin.post("/mapgen/hide", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const hidden = String(req.body && req.body.hidden) === "1";
+  const n = await race.mapgenSetHidden(String((req.body && req.body.token) || ""), hidden, req.session.username);
+  if (!n) return res.status(404).send("no such map request");
+  res.redirect(303, "/admin/mapgen?hidden=1");
 }));
 
 admin.post("/mapgen", requireAdmin, wrap(async (req, res) => {
@@ -5243,6 +5280,7 @@ const SITEMAP_PAGES = [
   ["/achievements", "0.7"],
   ["/live", "0.5"],
   ["/mapgen", "0.5"],
+  ["/mapgen/gallery", "0.6"],
   ["/about", "0.4"],
   ["/colors", "0.4"],
 ];

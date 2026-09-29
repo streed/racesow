@@ -491,6 +491,42 @@ test("admin map requests skip the per-person limit and the site budget", async (
   assert.match(after, new RegExp(`/mapgen/${tokens[3]}`));
 });
 
+test("admin hides a built map from the public gallery and shows it again", async () => {
+  const cookie = await adminCookie();
+  const token = "cd".repeat(16);
+  await db.query(
+    `INSERT INTO mapgen_job (token, description, status, map_name, created_at, published_at)
+     VALUES ($1, 'a course with words nobody should list', 'published', 'gen_gallery_hide_cdcdcd', 1, 2)`,
+    [token]);
+  const listed = async () => (await (await fetch(`${base}/api/mapgen/gallery`)).json()).maps
+    .some((m) => m.token === token);
+  assert.equal(await listed(), true);
+
+  const page = await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text();
+  assert.match(page, /gen_gallery_hide_cdcdcd/);
+  const csrf = page.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
+  const post = (fields) => fetch(`${base}/admin/mapgen/hide`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields),
+  });
+  assert.equal((await post({ token, hidden: "1" })).status, 403, "CSRF required");
+  assert.equal(await listed(), true);
+  assert.equal((await post({ _csrf: csrf, token: "ef".repeat(16), hidden: "1" })).status, 404);
+
+  assert.equal((await post({ _csrf: csrf, token, hidden: "1" })).status, 303);
+  assert.equal(await listed(), false);
+  const row = (await db.query("SELECT hidden_at, hidden_by FROM mapgen_job WHERE token = $1", [token])).rows[0];
+  assert.ok(row.hidden_at && row.hidden_by);
+  // Its own page still works.
+  assert.equal((await fetch(`${base}/api/mapgen/jobs/${token}`)).status, 200);
+  assert.match(await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text(), />Show</);
+
+  assert.equal((await post({ _csrf: csrf, token, hidden: "0" })).status, 303);
+  assert.equal(await listed(), true);
+});
+
 test("admin edits announcements: one per line, sanitized, then served on /api/game/announcements", async () => {
   const cookie = await adminCookie();
 
@@ -592,6 +628,11 @@ test("moderator tier: flags + map-block + restart allowed; admin-only surface is
     headers: { cookie: mod, "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ description: "A moderator's course request" }),
   })).status, 403, "unlimited map requests are admin-only");
+  assert.equal((await fetch(`${base}/admin/mapgen/hide`, {
+    method: "POST", redirect: "manual",
+    headers: { cookie: mod, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ token: "cd".repeat(16), hidden: "1" }),
+  })).status, 403, "moderator cannot hide gallery entries");
 
   // Allowed action: block then unblock a map (CSRF from any moderator page).
   const csrf = flagsHtml.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];

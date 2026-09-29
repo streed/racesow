@@ -125,7 +125,8 @@ The worker plans, builds and checks the map in `MAPGEN_DIR/<token>/`, then
 publishes it: a map that passes every check is copied into the shared map
 store (`MAPGEN_STORE`), where each game server's `sv_mapscan` loads it and
 confirms it over `/api/game/map-sync`. The page says "On the servers" once
-every active server has it.
+every active server has it. Every built map is then listed on
+`/mapgen/gallery` (an admin can hide one from `/admin/mapgen`).
 
 ```
 docker compose --profile mapgen up -d mapgen    # needs ANTHROPIC_API_KEY in .env

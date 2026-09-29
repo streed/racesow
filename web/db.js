@@ -4050,6 +4050,73 @@ class RaceDB {
     return r ? this._mapgenJobRow(r) : null;
   }
 
+  // The public gallery (/mapgen/gallery): every built map, newest first. Built
+  // means copied to the map store (publishing or published). Left out: jobs an
+  // admin hid (mapgenSetHidden) and maps a moderator blocked from play. Each
+  // entry is the public job row plus the map's site id and record stats once
+  // anyone has raced it (map_index is rebuilt by refreshAggregates, so a brand
+  // new map shows no records until the next rebuild).
+  async mapgenGallery({ limit = 24, offset = 0 } = {}) {
+    const lim = Math.max(1, Math.min(60, Math.floor(Number(limit)) || 24));
+    const off = Math.max(0, Math.floor(Number(offset)) || 0);
+    const visible = `j.published_at IS NOT NULL AND j.hidden_at IS NULL AND j.map_name IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM map_block b JOIN map bm ON bm.id = b.map_id
+                       WHERE lower(bm.name) = j.map_name)`;
+    const total = num((await this.one(`SELECT count(*)::int AS n FROM mapgen_job j WHERE ${visible}`)).n);
+    const rows = await this.all(
+      `SELECT j.*, mi.map_id, mi.records, mi.players, mi.wr_time, mi.wr_pid,
+              p.name AS wr_name, p.simplified AS wr_simplified
+         FROM mapgen_job j
+         LEFT JOIN map_index mi ON lower(mi.name) = j.map_name
+         LEFT JOIN player p ON p.id = mi.wr_pid
+        WHERE ${visible}
+        ORDER BY j.published_at DESC, j.id DESC
+        LIMIT $1 OFFSET $2`,
+      [lim, off]
+    );
+    const maps = rows.map((r) => this._censorNamed({
+      ...this._mapgenJobRow(r),
+      // Display only, like every map list: masked by the word list.
+      mapName: this._cnMap(r.map_name, r.map_id),
+      // The course's own title from the plan ("Kickflip"); the word list masks
+      // it like the map name, since Claude wrote it from the requester's text.
+      title: r.spec && typeof r.spec.title === "string" ? this._cnMap(r.spec.title.slice(0, 80), r.map_id) : null,
+      mapId: r.map_id == null ? null : num(r.map_id),
+      records: r.records == null ? 0 : num(r.records),
+      players: r.players == null ? 0 : num(r.players),
+      wr_time: r.wr_time == null ? null : num(r.wr_time),
+      wr_pid: r.wr_pid == null ? null : num(r.wr_pid),
+      wr_name: r.wr_name ?? null,
+      wr_simplified: r.wr_simplified ?? null,
+    }, r.wr_pid, "wr_name", "wr_simplified"));
+    return { total, limit: lim, offset: off, maps };
+  }
+
+  // Take a job out of the gallery (hidden = true) or put it back. By token, so
+  // the admin page needs no internal id. Returns rows changed (0 = no such job).
+  async mapgenSetHidden(token, hidden, by, now = Math.floor(Date.now() / 1000)) {
+    if (typeof token !== "string" || !/^[0-9a-f]{32}$/.test(token)) return 0;
+    const r = hidden
+      ? await this.pool.query(
+          "UPDATE mapgen_job SET hidden_at = $2, hidden_by = $3 WHERE token = $1", [token, now, by || null])
+      : await this.pool.query(
+          "UPDATE mapgen_job SET hidden_at = NULL, hidden_by = NULL WHERE token = $1", [token]);
+    return r.rowCount;
+  }
+
+  // Built maps for the admin gallery table, hidden ones included.
+  async mapgenBuiltAdmin({ limit = 50 } = {}) {
+    const rows = await this.all(
+      `SELECT * FROM mapgen_job WHERE published_at IS NOT NULL ORDER BY published_at DESC, id DESC LIMIT $1`,
+      [limit]
+    );
+    return rows.map((r) => ({
+      ...this._mapgenJobRow(r),
+      hiddenAt: r.hidden_at == null ? null : num(r.hidden_at),
+      hiddenBy: r.hidden_by || null,
+    }));
+  }
+
   async mapgenJobsFor({ identity, day }) {
     const rows = await this.all(
       "SELECT * FROM mapgen_job WHERE quota_day = $1 AND identity = $2 ORDER BY id DESC",

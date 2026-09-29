@@ -34,6 +34,11 @@
 --   those have no identity or quota day, skip both limits and are never
 --   refunded, and the column says who made them.
 --
+--   hidden_at / hidden_by: an admin took the job out of the public gallery
+--   (/mapgen/gallery) from /admin/mapgen, because its description (free text
+--   from an anonymous requester) should not be listed. The map itself, its job
+--   page and its records are unaffected. NULL = listed.
+--
 --   llm_usage is what planning the job cost: token counts per API call and a
 --   list-price estimate (tools/mapgen/describe.py usage_summary). Written for
 --   failed plans too. It is for the operator only; the web never serves it.
@@ -79,7 +84,9 @@ CREATE TABLE IF NOT EXISTS mapgen_job (
   published_at BIGINT,   -- copied into the map store
   live_at      BIGINT,   -- first game server confirmed it
   llm_usage    JSONB,    -- Claude tokens + list-price estimate for planning it
-  requested_by TEXT      -- admin username for an admin request (no quota, no budget)
+  requested_by TEXT,     -- admin username for an admin request (no quota, no budget)
+  hidden_at    BIGINT,   -- taken out of the public gallery by an admin
+  hidden_by    TEXT
 );
 
 -- The worker claims the oldest queued job with FOR UPDATE SKIP LOCKED.
@@ -91,6 +98,10 @@ CREATE INDEX IF NOT EXISTS mapgen_job_identity ON mapgen_job (quota_day, identit
 -- Maps a game server should be asked about: recently copied to the store.
 CREATE INDEX IF NOT EXISTS mapgen_job_published ON mapgen_job (published_at)
   WHERE published_at IS NOT NULL;
+
+-- The gallery: built maps, newest first.
+CREATE INDEX IF NOT EXISTS mapgen_job_gallery ON mapgen_job (published_at DESC, id DESC)
+  WHERE published_at IS NOT NULL AND hidden_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS mapgen_seen (
   job_id      BIGINT NOT NULL REFERENCES mapgen_job (id) ON DELETE CASCADE,

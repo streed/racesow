@@ -270,3 +270,27 @@ test("a description is stored without control or bidi characters", async () => {
   assert.equal(r.status, 202);
   assert.equal(r.json.job.description, "A long eulb course with two big drops and a finish");
 });
+
+test("the gallery lists built maps with nothing private, and is briefly cacheable", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const token = "9f".repeat(16);
+  await dbQuery(
+    `INSERT INTO mapgen_job (token, description, status, map_name, spec, report, llm_usage, identity, quota_day,
+                             created_at, published_at)
+     VALUES ($1, 'a gallery course with two hairpins', 'published', 'gen_gallery_api_9f9f9f',
+             '{"title": "Hairpin Heaven"}', '{"par_seconds": 25}', '{"est_usd": 0.16}', $2, current_date, $3, $3)`,
+    [token, crypto.randomBytes(16), now]
+  );
+  const r = await fetch(`${base}/api/mapgen/gallery?limit=5`);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("cache-control"), /public, max-age=30/);
+  const d = await r.json();
+  assert.equal(d.limit, 5);
+  const m = d.maps.find((x) => x.token === token);
+  assert.ok(m, JSON.stringify(d));
+  assert.equal(m.title, "Hairpin Heaven");
+  assert.equal(m.description, "a gallery course with two hairpins");
+  assert.ok(!/identity|quota|llm|usage|est_usd|spec/i.test(JSON.stringify(m)), JSON.stringify(m));
+  // Queued and failed jobs never appear.
+  assert.ok(d.maps.every((x) => x.status === "published" || x.status === "publishing"));
+});

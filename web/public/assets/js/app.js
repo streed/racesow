@@ -1429,6 +1429,47 @@ async function viewMapgenJob(token) {
   if (!settled(j)) mapgenTimer = setTimeout(tick, 3000);
 }
 
+// The gallery: every map the generator has built, newest first, each with the
+// description it was built from, its plan, and its records once raced.
+const GALLERY_PAGE = 24;
+function mapgenGalleryCard(m) {
+  const r = m.report || {};
+  const when = m.publishedAt ? new Date(m.publishedAt * 1000).toISOString().slice(0, 10) : "";
+  const title = m.title || m.mapName;
+  const name = m.mapId != null
+    ? `<a href="/map/${esc(String(m.mapId))}" data-nav="/map/${esc(String(m.mapId))}">${esc(m.mapName)}</a>`
+    : esc(m.mapName);
+  const races = m.records
+    ? `<div class="mg-g-wr">WR <b>${esc(fmtTime(m.wr_time))}</b>${m.wr_name ? ` by ${wname(m.wr_name)}` : ""}
+         · ${esc(fmtNum(m.records))} record${m.records === 1 ? "" : "s"}</div>`
+    : `<div class="mg-g-wr mg-g-none">No runs yet · <span class="mono">callvote map ${esc(m.mapName)}</span></div>`;
+  return `<article class="panel mg-g-card">
+      <a class="mg-g-plan" href="/mapgen/${esc(m.token)}" data-nav="/mapgen/${esc(m.token)}">
+        <img alt="Top-down plan of ${esc(m.mapName)}" loading="lazy" src="/api/mapgen/jobs/${esc(m.token)}/plan.svg"></a>
+      <div class="mg-g-body">
+        <div class="mg-g-head"><b>${esc(title)}</b>${when ? `<time datetime="${esc(when)}">${esc(when)}</time>` : ""}</div>
+        <div class="mg-facts">${name}${r.par_seconds ? ` · about ${esc(String(r.par_seconds))} s` : ""}${r.checkpoints ? ` · ${esc(String(r.checkpoints))} checkpoint${r.checkpoints === 1 ? "" : "s"}` : ""}${mapgenPieces(r)}</div>
+        <p class="mg-desc mg-g-desc">“${esc(m.description)}”</p>
+        ${races}
+      </div>
+    </article>`;
+}
+
+async function viewMapgenGallery(params) {
+  loading();
+  const state = { offset: Math.max(0, parseInt(params.offset, 10) || 0) };
+  const d = await api("/mapgen/gallery" + buildQuery({ limit: GALLERY_PAGE, offset: state.offset || "" }));
+  app.innerHTML = `
+    <div class="page-title"><span class="accent">GENERATED</span> MAPS</div>
+    <p class="page-sub">${d.total ? `${esc(fmtNum(d.total))} course${d.total === 1 ? "" : "s"} built from players' descriptions,` : "Courses built from players' descriptions,"}
+      newest first. Every one passed the generator's checks and is on the game servers.
+      <a href="/mapgen" data-nav="/mapgen">Make your own →</a></p>
+    ${d.maps.length
+      ? `<div class="mg-gallery">${d.maps.map(mapgenGalleryCard).join("")}</div>`
+      : `<div class="empty">No generated maps yet. <a href="/mapgen" data-nav="/mapgen">Be the first →</a></div>`}
+    ${pager(state, d, "/mapgen/gallery")}`;
+}
+
 function mapgenQuotaLine(q) {
   if (!q.open && q.remaining > 0) return "The generator has made all the maps it can today. Back after 00:00 UTC.";
   if (q.remaining === 0)
@@ -1442,7 +1483,8 @@ async function viewMapgen() {
     <div class="page-title"><span class="accent">MAKE</span> A MAP</div>
     <p class="page-sub">Describe a race course and the generator builds it: a strafe course with
       turns, ramps, gaps, slaloms, beams, split lanes and open track, with wall jumps and dashes if you ask for them, and it can even cross over itself. Every jump is checked against the game's own movement before anyone sees it.
-      A map that passes every check goes straight onto the game servers.</p>
+      A map that passes every check goes straight onto the game servers.
+      <a href="/mapgen/gallery" data-nav="/mapgen/gallery">See every generated map →</a></p>
     <form class="panel mg-form" id="mg-form">
       <label class="flag-label" for="mg-desc">Your map</label>
       <textarea id="mg-desc" class="mg-input" rows="4" maxlength="500"
@@ -4289,6 +4331,7 @@ async function router() {
     else if (path.startsWith("/tournaments/")) await viewTournament(decodeURIComponent(path.slice(13)));
     else if (path === "/live") await viewLive();
     else if (path === "/mapgen") await viewMapgen();
+    else if (path === "/mapgen/gallery") await viewMapgenGallery(params);
     else if (path.startsWith("/mapgen/")) await viewMapgenJob(path.slice(8));
     else if (path === "/about") await viewAbout();
     else if (path === "/colors") viewColors();
