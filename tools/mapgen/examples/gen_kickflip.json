@@ -11,63 +11,53 @@
       "type": "turn",
       "direction": "right",
       "angle": 45,
-      "radius": 224,
-      "open": true
+      "radius": 224
     },
     {
       "type": "straight",
-      "length": 128,
-      "open": true
+      "length": 128
     },
     {
       "type": "turn",
       "direction": "left",
       "angle": 90,
-      "radius": 224,
-      "open": true
+      "radius": 224
     },
     {
       "type": "straight",
-      "length": 128,
-      "open": true
+      "length": 128
     },
     {
       "type": "turn",
       "direction": "right",
       "angle": 90,
-      "radius": 224,
-      "open": true
+      "radius": 224
     },
     {
       "type": "straight",
-      "length": 128,
-      "open": true
+      "length": 128
     },
     {
       "type": "turn",
       "direction": "left",
       "angle": 45,
-      "radius": 224,
-      "open": true
+      "radius": 224
     },
     {
       "type": "turn",
       "direction": "left",
       "angle": 90,
-      "radius": 224,
-      "open": true
+      "radius": 224
     },
     {
       "type": "straight",
-      "length": 256,
-      "open": true
+      "length": 256
     },
     {
       "type": "turn",
       "direction": "right",
       "angle": 135,
-      "radius": 224,
-      "open": true
+      "radius": 224
     },
     {
       "type": "straight",
@@ -87,8 +77,7 @@
     },
     {
       "type": "straight",
-      "length": 384,
-      "open": true
+      "length": 384
     },
     {
       "type": "turn",
@@ -134,13 +123,12 @@
       "type": "turn",
       "direction": "right",
       "angle": 90,
-      "radius": 224,
-      "open": true
+      "radius": 224
     },
     {
       "type": "slalom",
       "length": 1024,
-      "count": 3
+      "count": 2
     },
     {
       "type": "turn",
@@ -162,20 +150,13 @@
       "type": "turn",
       "direction": "right",
       "angle": 45,
-      "radius": 224,
-      "open": true
-    },
-    {
-      "type": "straight",
-      "length": 256,
-      "open": true
+      "radius": 224
     },
     {
       "type": "turn",
       "direction": "left",
       "angle": 90,
-      "radius": 224,
-      "open": true
+      "radius": 224
     },
     {
       "type": "straight",
@@ -195,8 +176,7 @@
     },
     {
       "type": "straight",
-      "length": 256,
-      "open": true
+      "length": 256
     },
     {
       "type": "dash",
@@ -221,8 +201,7 @@
     {
       "type": "ramp",
       "length": 768,
-      "rise": 384,
-      "open": true
+      "rise": 384
     },
     {
       "type": "straight",
@@ -312,15 +291,13 @@
     },
     {
       "type": "straight",
-      "length": 128,
-      "open": true
+      "length": 128
     },
     {
       "type": "turn",
       "direction": "right",
       "angle": 45,
-      "radius": 224,
-      "open": true
+      "radius": 224
     },
     {
       "type": "straight",

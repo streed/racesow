@@ -134,6 +134,99 @@ class Layout(unittest.TestCase):
                {"type": "turn", "direction": "left", "angle": 180, "radius": 512}]
         layout.build(course_of({"type": "straight", "length": 512}, *lap, *lap))
 
+    # -- unintended cuts ---------------------------------------------------
+    #
+    # A cut is a way to leave the route and rejoin it further along. A walled
+    # target gets roofed so the fall is worthless; an open one cannot be
+    # roofed and the plan is rejected.
+
+    def spiral_down(self, open_top=False, open_bottom=False, laps=2):
+        """A course that folds back UNDER itself: lap two runs below lap one,
+        so a player on lap one is above a later piece."""
+        segs = [{"type": "straight", "length": 1024}]
+        for lap in range(laps):
+            top = dict(type="straight", length=2048)
+            if open_top and lap == 0:
+                top["open"] = True
+            if open_bottom and lap == 1:
+                top["open"] = True
+            segs += [top,
+                     {"type": "turn", "direction": "left", "angle": 180, "radius": 384},
+                     {"type": "ramp", "length": 1024, "rise": -512},
+                     {"type": "ramp", "length": 1024, "rise": -512}]
+        return course_of(*segs)
+
+    def test_a_walled_piece_cannot_be_left_so_it_is_no_cut(self):
+        # Every piece walled: 256-unit walls hold the player in whatever the
+        # course does underneath, so nothing is flagged and nothing is roofed.
+        c = layout.build(self.spiral_down())
+        self.assertEqual([x for x in c.cuts if not x.get("fixed")], [])
+
+    def test_dropping_from_an_open_piece_onto_a_later_one_is_roofed(self):
+        c = layout.build(self.spiral_down(open_top=True))
+        roofed = [x for x in c.cuts if x.get("fixed") == "roofed"]
+        self.assertTrue(roofed, f"expected a roofed crossing, got {c.cuts}")
+        # The roof is real geometry, not just a note.
+        self.assertTrue(any(p.tex == "wall" for p in c.world))
+
+    def test_an_open_target_cannot_be_roofed_and_is_rejected(self):
+        self.assertLayoutRejects(self.spiral_down(open_top=True, open_bottom=True),
+                                 "unintended shortcut")
+
+    def test_a_cut_backwards_along_the_route_is_ignored(self):
+        # Spiralling UP puts the later piece above the earlier one, so the only
+        # fall available goes back towards the start: not a shortcut.
+        segs = [{"type": "straight", "length": 1024}]
+        for _ in range(2):
+            segs += [{"type": "straight", "length": 2048, "open": True},
+                     {"type": "turn", "direction": "left", "angle": 180, "radius": 384},
+                     {"type": "ramp", "length": 1024, "rise": 512},
+                     {"type": "ramp", "length": 1024, "rise": 512}]
+        c = layout.build(course_of(*segs))
+        self.assertEqual([x for x in c.cuts if not x.get("fixed")], [])
+
+    def test_a_trimmed_corner_is_not_a_cut(self):
+        # Two open straights either side of one wide turn: a player can trim
+        # the corner, which every race map allows. On a long course that trim
+        # is a few percent of the route, under CUT_MIN_FRACTION, so it must
+        # not be reported. (Make the turn tight instead and the same geometry
+        # skips 13% of the course — which IS reported, by design.)
+        long_leg = [{"type": "straight", "length": 4096}] * 2   # 4096 is the per-piece cap
+        c = layout.build(course_of(
+            *long_leg,
+            {"type": "straight", "length": 512, "open": True},
+            {"type": "turn", "direction": "left", "angle": 180, "radius": 768},
+            {"type": "straight", "length": 512, "open": True},
+            *long_leg))
+        self.assertEqual([x for x in c.cuts if not x.get("fixed")], [])
+
+    def test_the_declared_shortcut_is_not_reported_as_a_cut(self):
+        c = layout.build(self.s_course())
+        self.assertTrue(c.shortcuts, "expected a declared shortcut")
+        self.assertEqual([x for x in c.cuts if not x.get("fixed")], [])
+
+    def test_the_shortcut_exemption_is_only_the_hop_across_it(self):
+        # Narrow on purpose: a course with a shortcut must still have its other
+        # cuts found. Exempting everything that spans a shortcut turn hid three
+        # real cuts on the corkscrew example.
+        w = layout._Walker(specmod.normalize(self.s_course()))
+        try:
+            w.run()
+        except layout.LayoutError:
+            pass
+        self.assertTrue(w._declared_shortcut(0, 2))
+        self.assertFalse(w._declared_shortcut(0, 5))
+        self.assertFalse(w._declared_shortcut(1, 3))
+
+    def test_every_example_has_no_unfixable_cut(self):
+        examples = os.path.join(HERE, "examples")
+        for fn in sorted(os.listdir(examples)):
+            if not fn.endswith(".json"):
+                continue
+            with open(os.path.join(examples, fn)) as fh:
+                c = layout.build(specmod.normalize(json.load(fh)))
+            self.assertEqual([x for x in c.cuts if not x.get("fixed")], [], fn)
+
     def s_course(self, radius=768, leg=1024, angle=180):
         return course_of({"type": "straight", "length": leg},
                          {"type": "turn", "direction": "left", "angle": angle, "radius": radius,

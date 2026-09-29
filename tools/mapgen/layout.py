@@ -32,6 +32,40 @@ SHELL_MARGIN = 512      # sky shell distance from the course bounds
 PIT_DEPTH = 384         # how far below the lowest floor the kill volume sits
 WEDGE_DEG = 11.25       # turn tessellation; 8 wedges per 90 degrees
 
+# Unintended cuts: a place a player can leave the route and rejoin it further
+# along, skipping part of the course. A DECLARED shortcut (turn.shortcut) is a
+# designed one with its own stepping stones; these are the accidents, and they
+# are what makes a generated map's records meaningless.
+#
+# CUT_MIN_SKIP is how much route a cut has to save before it is worth
+# rejecting a plan over: below it the "cut" is a corner trimmed at a turn,
+# which every race map has and which no record depends on.
+CUT_MIN_SKIP = 1024.0
+# ...and at least this share of the whole course. An open switchback lets a
+# player trim the inside of its corner, which every race map allows and no
+# record depends on; those trims measure a few percent, while a fold that
+# lands somewhere else entirely measures 15-40%. Without the share, a long
+# twisty course reports a dozen corner trims and a short one reports none.
+CUT_MIN_FRACTION = 0.10
+# A roof slab over a crossed-under piece (see _roof).
+ROOF_THICK = 16
+# There is deliberately no cap on how many crossings get roofed. A corkscrew
+# stacks its coils over each other by design -- the example needs 23 -- and the
+# cost of roofing is brushes, which _size_limits already bounds with a message
+# that says so. A second, arbitrary limit here only rejected good courses.
+# A cut is judged by the SPEED it needs, not by whether some fixed reach
+# covers it. physics.py promises only what run speed (320) clears, because
+# that is what makes a course raceable by everyone; a cut has to be ruled out
+# for a fast player instead.
+#
+# At or above this speed a cut is left in place. Reaching 1000 ups takes a long
+# committed strafe run, and a player who can do that on demand has earned the
+# line — every real race map has such routes and they are part of the craft.
+# Below it the cut is something anyone stumbles into, which is what makes a
+# map's records meaningless. A straight drop needs no speed at all, so it is
+# always caught.
+CUT_SPEED_OK = 1000.0
+
 # Shortcuts across the inside of a 180-degree turn (spec: turn.shortcut).
 # A window is cut in the inner wall of both legs, SHORTCUT_BACK from the turn,
 # and a line of PLATFORM-sized stepping stones crosses the drop between them.
@@ -137,6 +171,10 @@ class Course:
         self.shortcuts = []   # one dict per turn.shortcut: platforms, gap, distance saved
         self.features = []    # one dict per slalom / beam / split
         self.overpasses = []  # (lower seg, upper seg, clearance): where the course crosses itself
+        self.seg_dist = []    # route distance at the START of each segment, for cut sizes
+        self.open_segs = set()  # segments built without side walls (spec: open)
+        self.falloff_segs = set()  # segments a player can leave downwards from
+        self.cuts = []        # unintended shortcuts found by _cuts(), reported with the map
         self.auto_checkpoints = []  # (segment, distance into it) of each checkpoint the generator added
         self.length = 0.0     # centre-line length, start trigger -> finish trigger
 
@@ -256,6 +294,44 @@ def _sat_overlap(a, b, eps=1.0):
     return True
 
 
+def _seg_gap(p1, p2, q1, q2):
+    """Shortest distance between two line segments in 2-D."""
+    def point_seg(px, py, ax, ay, bx, by):
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        if L2 == 0.0:
+            return math.dist((px, py), (ax, ay))
+        t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+        return math.dist((px, py), (ax + t * dx, ay + t * dy))
+    # Segments that cross are zero apart; otherwise the minimum is reached at
+    # one of the four endpoints against the other segment.
+    d1x, d1y = p2[0] - p1[0], p2[1] - p1[1]
+    d2x, d2y = q2[0] - q1[0], q2[1] - q1[1]
+    den = d1x * d2y - d1y * d2x
+    if den != 0.0:
+        t = ((q1[0] - p1[0]) * d2y - (q1[1] - p1[1]) * d2x) / den
+        u = ((q1[0] - p1[0]) * d1y - (q1[1] - p1[1]) * d1x) / den
+        if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0:
+            return 0.0
+    return min(point_seg(*p1, *q1, *q2), point_seg(*p2, *q1, *q2),
+               point_seg(*q1, *p1, *p2), point_seg(*q2, *p1, *p2))
+
+
+def _poly_gap(a, b):
+    """Shortest distance between the edges of two convex polygons; 0 if they
+    overlap. Used to ask how far a player would have to jump to get from one
+    piece to another."""
+    if _sat_overlap(a, b):
+        return 0.0
+    best = float("inf")
+    for i in range(len(a)):
+        p1, p2 = a[i], a[(i + 1) % len(a)]
+        for j in range(len(b)):
+            q1, q2 = b[j], b[(j + 1) % len(b)]
+            best = min(best, _seg_gap(p1, p2, q1, q2))
+    return best
+
+
 class _Walker:
     def __init__(self, spec, camera_pads=()):
         self.camera_pads = camera_pads
@@ -266,6 +342,7 @@ class _Walker:
         self.heading = 0.0
         self.runup = 0.0
         self.problems = []
+        self._roofed = set()   # hull indices already capped by _roof()
         self.seg = -1          # index of the segment being laid (-1 = start room)
         self.tn = 0
         self.walls = {}        # seg -> the frame and world indexes of a straight's walls
@@ -604,8 +681,24 @@ class _Walker:
             auto.setdefault(i, []).append(a)
         for i, seg in enumerate(segs):
             self.seg = i
+            # Route distance so far, so a cut's size can be measured in the
+            # units of course it skips rather than in segment counts.
+            self.c.seg_dist.append(self.c.length)
             t = seg["type"]
             sides = () if seg.get("open") else (1, -1)
+            if not sides:
+                self.c.open_segs.add(i)
+            # Where a player can leave a piece DOWNWARDS. An ordinary walled
+            # piece cannot be left at all: WALL_HEIGHT is 256 and the tallest
+            # climb in the game is about 94, so the corridor holds the player
+            # whatever the plan does above or below it. These can be left: an
+            # open piece has no walls to stop a step sideways, and the rest
+            # have a hole in the floor by construction — the pit under a gap
+            # or a dash drop, the sides of a beam, the holes in a split's fast
+            # lane. Falling there is normally punished by the pit's
+            # trigger_hurt; it is only a cut when a later piece is underneath.
+            if not sides or t in ("gap", "wallgap", "dash", "beam", "split"):
+                self.c.falloff_segs.add(i)
             if t == "straight":
                 o, f, _ = self.frame()
                 self.box_run(seg["length"], walls=sides)
@@ -657,6 +750,7 @@ class _Walker:
         self.seg = len(segs)
         self._finish_room()
         self._self_intersections()
+        self._cuts()
         self._size_limits()
         if self.problems:
             raise LayoutError(self.problems)
@@ -835,6 +929,150 @@ class _Walker:
             if any(abs(lo - p["lower"]) <= 1 and abs(hi - p["upper"]) <= 1 for p in self.c.overpasses):
                 continue
             self.c.overpasses.append({"lower": lo, "upper": hi, "clearance": round(clear)})
+
+    def _cuts(self):
+        """Reject or repair plans a player can short-circuit.
+
+        A cut is any way to leave the route and rejoin it further along. The
+        generator designs one kind on purpose (turn.shortcut, with its stepping
+        stones and its own checkpoint rules); everything else is an accident of
+        the plan folding back on itself, and it matters because it makes the
+        map's records meaningless -- the fast line stops being the course.
+
+        One rule covers every shape of it. For each piece a player can leave
+        (`open`, or with a hole in its floor by construction: a gap, a dash
+        drop, a beam, a split) ask whether the floor of a LATER piece is
+        within reach:
+
+        * How fast you would have to be going. The horizontal distance
+          between the two footprints, divided by the air time a jump from that
+          height gives, is the speed the cut needs. At CUT_SPEED_OK or more it
+          is left alone -- that is a line a player earns. Footprints that
+          overlap are zero apart, a straight fall needing no speed at all, and
+          are always caught.
+        * Whether the player can get IN. An open piece has nothing in the way.
+          A walled one is enterable only from above its walls, because
+          WALL_HEIGHT is 256 and the tallest climb in the game is about 94: a
+          player level with a walled corridor bounces off it, and a player
+          above its wall top drops straight in. Walls stop a player leaving a
+          corridor, never entering one.
+
+        Where the target is walled the fix is geometric: cap it with a roof
+        (_roof), so the fall lands on the roof and the only way off a roof is
+        into the pit, which respawns the player at the start. That keeps the
+        crossing -- usually the best part of the design -- and costs no model
+        call. An open target cannot be roofed, so that one is rejected and the
+        repair loop gets a specific complaint.
+
+        Climbing UP into a later piece is not checked: it needs 256 units of
+        climb and the game's best is about 94.
+        """
+        walk = self._walk_surfaces()
+        for src in sorted(self.c.falloff_segs):
+            if src not in walk:
+                continue
+            zs, polys_s = walk[src]
+            for tgt in sorted(walk):
+                if tgt - src <= 1:
+                    continue  # the route's own next piece
+                if self._declared_shortcut(src, tgt):
+                    continue
+                saved = self._cut_skip(src, tgt)
+                if saved < max(CUT_MIN_SKIP, CUT_MIN_FRACTION * self.c.length):
+                    continue
+                zt, polys_t = walk[tgt]
+                drop = zs - zt
+                if drop < 0:
+                    continue  # the target is higher: no move in the game gets there
+                # Walls stop a player entering from the side, not from above.
+                if tgt not in self.c.open_segs and drop <= WALL_HEIGHT:
+                    continue
+                gap = min(_poly_gap(a, b) for a in polys_s for b in polys_t)
+                # The speed a player would need to cover `gap` in the air time
+                # a jump from this height gives. No margin either way: this is
+                # a capability question, not a "can everyone do it" one.
+                flight = physics.air_time(drop)
+                if flight is None or flight <= 0.0:
+                    continue
+                needed = gap / flight
+                if needed >= CUT_SPEED_OK:
+                    continue
+                reach = CUT_SPEED_OK * flight
+                if tgt not in self.c.open_segs and self._roof(tgt, polys_s, reach):
+                    self.c.cuts.append({"kind": "drop", "from": src, "to": tgt,
+                                        "saves": round(saved), "gap": round(gap),
+                                        "needs_ups": round(needed), "fixed": "roofed"})
+                    continue
+                self.c.cuts.append({"kind": "jump" if gap else "drop", "from": src, "to": tgt,
+                                    "saves": round(saved), "gap": round(gap),
+                                    "needs_ups": round(needed)})
+                how = (f"drop straight down onto {_segname(tgt)}" if gap <= 1.0
+                       else f"jump the {int(gap)} units to {_segname(tgt)} at only "
+                            f"{int(needed)} ups")
+                self.problems.append(
+                    f"unintended shortcut: from {_segname(src)} a player can {how}, skipping "
+                    f"about {int(saved)} units of the course. Both are open, so there is "
+                    "nothing in the way — give the later one walls (drop its \"open\": "
+                    "true), or bend the course so the two do not pass so close")
+
+    def _walk_surfaces(self):
+        """Per segment: (lowest walking surface, [footprints]).
+
+        The hull's zlo is the underside of the floor slab, so the surface a
+        player stands on is FLOOR_THICK above it.
+        """
+        out = {}
+        for h in self.c.hulls:
+            top = h.zlo + FLOOR_THICK
+            cur = out.get(h.seg)
+            if cur is None:
+                out[h.seg] = (top, [h.poly])
+            else:
+                out[h.seg] = (min(cur[0], top), cur[1] + [h.poly])
+        return out
+
+    def _roof(self, seg, src_polys, reach):
+        """Cap a walled piece where a player could land on it from above, so
+        the fall lands on a roof rather than on the course.
+
+        Only the parts within `reach` of the source footprint are capped: a
+        turn is many hull slices, and roofing all of them for a crossing that
+        covers two would spend brushes the budget needs elsewhere (it put the
+        kickflip example over its limit). Returns False if nothing could be
+        capped, so the caller falls back to rejecting the plan. Idempotent per
+        (piece, slice).
+        """
+        done = False
+        for idx, h in enumerate(self.c.hulls):
+            if h.seg != seg or idx in self._roofed:
+                continue
+            if min(_poly_gap(sp, h.poly) for sp in src_polys) > reach:
+                continue
+            # The hull's top IS the wall top (box_run builds the hull to
+            # floor + WALL_HEIGHT), so the slab lands flush on the walls.
+            self.c.world.append(Prism.flat(h.poly, h.zhi - ROOF_THICK, h.zhi, "wall"))
+            self._roofed.add(idx)
+            done = True
+        # Already capped by an earlier crossing counts as capped.
+        return done or any(h.seg == seg and i in self._roofed
+                           for i, h in enumerate(self.c.hulls))
+
+    def _cut_skip(self, a, b):
+        """Route distance between the starts of segments a and b."""
+        d = self.c.seg_dist
+        if a >= len(d) or b >= len(d):
+            return 0.0
+        return abs(d[b] - d[a])
+
+    def _declared_shortcut(self, a, b):
+        """True if a-to-b is exactly the stepping-stone hop across a shortcut
+        turn: the straight before it to the straight after it.
+
+        Narrow on purpose. Exempting every pair that merely SPANS a shortcut
+        turn would mask real cuts on any course that has one — on the
+        corkscrew that hid three of them.
+        """
+        return b == a + 2 and any(s["turn"] == a + 1 for s in self.c.shortcuts)
 
     def _shell(self):
         """Seal the course in a sky box and put a kill volume in the pit.

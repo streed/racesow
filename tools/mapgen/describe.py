@@ -147,6 +147,16 @@ crosses an earlier part, the higher floor must be at least
 {layout.WALL_HEIGHT} high). Ramps are the way to gain that height. Around a gap, beam or
 split the walls also reach {layout.VOID_DEPTH} units lower, so give those more clearance.
 
+Do not hand the player a way to skip part of the course. A piece with
+"open": true has no walls, and neither does a gap, dash, beam or split, so a
+player standing on one can leave it sideways or downwards. If a LATER part of
+the route is within a jump of such a piece, the course can be cut there and
+its records stop meaning anything. The generator measures every one of these
+and rejects the plan when a cut needs less than {int(layout.CUT_SPEED_OK)} ups to make
+(it caps a walled piece with a roof where it can, but an open one it cannot).
+So: keep open pieces away from the parts of the route that come later, and
+where the course folds back beside itself, leave the walls on.
+
 Aim for a run of roughly 20-60 seconds at 320 ups (the sum of lengths / 320).
 Hard limits, so no map is too heavy for the servers: the route at most
 {specmod.ROUTE_MAX} units long, at most {specmod.MAX_SEGMENTS} segments, a footprint at most

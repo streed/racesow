@@ -1,15 +1,23 @@
-# Keep the map-store snapshot close to the store: every hour, plus once
-# shortly after boot. New maps reach the game server through the NFS mount
-# straight away; the snapshot only has to be fresh enough to be a good
-# fallback when the store is unreachable. An unchanged sync is only a
-# directory listing. Each run first remounts the store if it is missing.
+# Keep the map-store snapshot close to the store: every five minutes, plus
+# once shortly after boot. Each run first remounts the store if it is missing.
+#
+# Five minutes, not an hour, because on a reader box the snapshot is not just
+# a fallback -- it is what the game servers actually read. Pointing them at
+# the NFS mount instead costs a ~7 minute boot: a plain readdir of the store
+# is instant, but one stat per pack is 4,600 round trips (measured at 415 s
+# EU->US), and the engine then opens every pack itself. Reading local disk and
+# syncing often is strictly better, and the sync is cheap: rsync compares the
+# two directories in bulk, so an unchanged run measures about 1 second.
+#
+# A map generated on EU therefore reaches a reader box within about five
+# minutes, plus the up-to-60 s the engine's own sv_mapscan takes to notice it.
 [Unit]
 Description=Refresh the Racesow map store snapshot
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=1h
-RandomizedDelaySec=5m
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=45s
 Persistent=true
 
 [Install]
