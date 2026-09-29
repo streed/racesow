@@ -117,8 +117,9 @@ an empty leaderboard.
 ## Worker: player requests from the website
 
 `worker.py` serves the `/mapgen` page. The web queues a request only after
-checking the requester's daily identity quota (2 maps a day by default, see
-`web/mapgen-identity.js`) and the site's daily budget, and returns the job's
+checking the requester's daily identity quota (1 map a day by default, see
+`web/mapgen-identity.js`) and the site's daily budget (admins requesting from
+`/admin/mapgen` skip both), and returns the job's
 token; the requester lands on `/mapgen/<token>`, which follows the job live.
 The worker plans, builds and checks the map in `MAPGEN_DIR/<token>/`, then
 publishes it: a map that passes every check is copied into the shared map

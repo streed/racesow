@@ -1,5 +1,5 @@
 // /api/mapgen end to end: the real server.js on a throwaway database, with the
-// daily identity (mapgen-identity.js) deciding who has used their two maps.
+// daily identity (mapgen-identity.js) deciding who has used their map for the day.
 // No REDIS_URL, so the server uses its in-process salt, exactly one process.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -12,7 +12,7 @@ import { ADMIN_URL } from "./pg-util.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_JS = path.join(__dirname, "..", "server.js");
-const BUDGET = 5;
+const BUDGET = 4;
 
 const CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.80 Safari/537.36";
 const FIREFOX = "Mozilla/5.0 (X11; Linux x86_64; rv:143.0) Gecko/20100101 Firefox/143.0";
@@ -82,12 +82,12 @@ function as(ip, ua) {
 const alice = as("203.0.113.10", CHROME);
 const DESC = "A fast flowing course with two big drops and a long finishing straight";
 
-test("a fresh identity has two maps today", async () => {
+test("a fresh identity has one map today (the default)", async () => {
   const r = await alice.get("/mapgen/quota");
   assert.equal(r.status, 200);
-  assert.equal(r.json.limit, 2);
+  assert.equal(r.json.limit, 1);
   assert.equal(r.json.used, 0);
-  assert.equal(r.json.remaining, 2);
+  assert.equal(r.json.remaining, 1);
   assert.equal(r.json.open, true);
   assert.equal(r.headers.get("cache-control"), "no-store");
   // Resets at the next UTC midnight.
@@ -103,19 +103,17 @@ test("descriptions must be 10-500 characters", async () => {
   assert.equal((await alice.get("/mapgen/quota")).json.used, 0);
 });
 
-test("two maps, then the third is refused until midnight", async () => {
+test("one map, then the second is refused until midnight", async () => {
   const a = await alice.submit(DESC);
   assert.equal(a.status, 202);
   assert.equal(a.json.job.status, "queued");
   assert.match(a.json.job.token, /^[0-9a-f]{32}$/);
-  assert.equal(a.json.quota.remaining, 1);
+  assert.equal(a.json.quota.remaining, 0);
   const b = await alice.submit(DESC + " and a checkpoint");
-  assert.equal(b.status, 202);
-  assert.equal(b.json.quota.remaining, 0);
-  const c = await alice.submit(DESC + " again");
-  assert.equal(c.status, 429);
-  assert.equal(c.json.reason, "identity");
-  assert.ok(Number(c.headers.get("retry-after")) > 0);
+  assert.equal(b.status, 429);
+  assert.equal(b.json.reason, "identity");
+  assert.equal(b.json.error, "You've used today's map. New ones open at 00:00 UTC.");
+  assert.ok(Number(b.headers.get("retry-after")) > 0);
 });
 
 test("a point release of the same browser is the same person", async () => {
@@ -133,11 +131,12 @@ test("IPv6 privacy addresses on one /64 share a quota", async () => {
   const one = as("2001:db8:aa:1::1", CHROME);
   const two = as("2001:db8:aa:1:ffff:1234:5678:9abc", CHROME);
   assert.equal((await one.submit(DESC)).status, 202);
-  // Budget is 5: alice 2 + firefox 1 + other network 1 + this 1. The site is
-  // now full, so the /64's second request hits the site ceiling, and says so.
+  // The other address on the same /64 is the same person, whose one map for
+  // the day is spent. (Budget is 4: alice, firefox, the other network and
+  // this one, so the site is now full as well.)
   const r = await two.submit(DESC);
   assert.equal(r.status, 429);
-  assert.equal(r.json.reason, "budget");
+  assert.equal(r.json.reason, "identity");
   assert.equal((await two.get("/mapgen/quota")).json.used, 1, "same /64, same identity");
   assert.equal((await two.get("/mapgen/quota")).json.open, false);
 });
@@ -153,7 +152,7 @@ test("the site ceiling holds even for a brand-new identity", async () => {
 test("'mine' lists only the asker's jobs, and a job is readable by its token", async () => {
   const mine = await alice.get("/mapgen/mine");
   assert.equal(mine.status, 200);
-  assert.equal(mine.json.jobs.length, 2);
+  assert.equal(mine.json.jobs.length, 1);
   assert.equal(mine.json.quota.remaining, 0);
   const job = mine.json.jobs[0];
   assert.equal(job.identity, undefined);

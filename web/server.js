@@ -103,14 +103,15 @@ const MAPPACK_DIR = process.env.MAPPACK_DIR || "/mappack";
 // degrade to "absent" until the sidecar has rendered a map.
 const HEATMAP_DIR = process.env.HEATMAP_DIR || "/data/heatmaps";
 // Generated-map requests (/mapgen). Each daily identity gets
-// MAPGEN_DAILY_PER_IDENTITY maps; the whole site gets MAPGEN_DAILY_BUDGET,
-// which is the hard cost ceiling (0 turns requests off). The worker
+// MAPGEN_DAILY_PER_IDENTITY maps (default 1); the whole site gets
+// MAPGEN_DAILY_BUDGET, which is the hard cost ceiling for the public (0 turns
+// public requests off). Admins request from /admin/mapgen with neither limit. The worker
 // (tools/mapgen/worker.py) writes each job's files under MAPGEN_DIR/<token>/.
 const intEnv = (name, dflt) => {
   const v = parseInt(process.env[name] ?? "", 10);
   return Number.isFinite(v) && v >= 0 ? v : dflt;
 };
-const MAPGEN_PER_IDENTITY = intEnv("MAPGEN_DAILY_PER_IDENTITY", 2);
+const MAPGEN_PER_IDENTITY = intEnv("MAPGEN_DAILY_PER_IDENTITY", 1);
 const MAPGEN_BUDGET = intEnv("MAPGEN_DAILY_BUDGET", 40);
 const MAPGEN_DIR = process.env.MAPGEN_DIR || "/data/mapgen";
 const MAPGEN_DESC_MIN = 10;
@@ -610,18 +611,25 @@ api.get("/mapgen/mine", mapgenNoStore, wrap(async (req, res) => {
   res.json({ jobs, quota: mapgenQuota(who, used, budgetUsed) });
 }));
 
-api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (req, res) => {
-  const raw = req.body && typeof req.body.description === "string" ? req.body.description : "";
-  // Drop control and invisible formatting characters (including the
-  // bidirectional overrides that can make text read differently from what it
-  // says), then collapse whitespace so the length limits measure words, not
-  // padding. The worker cleans and fences the text again before the model
-  // sees it (tools/mapgen/describe.py), and the page always escapes it.
-  const description = raw
+// Drop control and invisible formatting characters (including the
+// bidirectional overrides that can make text read differently from what it
+// says), then collapse whitespace so the length limits measure words, not
+// padding. The worker cleans and fences the text again before the model sees
+// it (tools/mapgen/describe.py), and every page escapes it. Returns null when
+// the result is outside the length limits.
+function cleanMapgenDescription(raw) {
+  const description = String(typeof raw === "string" ? raw : "")
     .replace(/[\p{Cc}\p{Cf}]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (description.length < MAPGEN_DESC_MIN || description.length > MAPGEN_DESC_MAX) {
+  return description.length < MAPGEN_DESC_MIN || description.length > MAPGEN_DESC_MAX
+    ? null
+    : description;
+}
+
+api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (req, res) => {
+  const description = cleanMapgenDescription(req.body && req.body.description);
+  if (description === null) {
     return res.status(400).json({
       error: `Describe the map in ${MAPGEN_DESC_MIN} to ${MAPGEN_DESC_MAX} characters.`,
     });
@@ -641,7 +649,7 @@ api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (r
   if (!r.ok) {
     res.set("Retry-After", String(Math.max(1, who.resetsAt - Math.floor(Date.now() / 1000))));
     const error = r.reason === "identity"
-      ? `You've used today's ${MAPGEN_PER_IDENTITY} maps. New ones open at 00:00 UTC.`
+      ? `You've used today's ${MAPGEN_PER_IDENTITY === 1 ? "map" : `${MAPGEN_PER_IDENTITY} maps`}. New ones open at 00:00 UTC.`
       : "The map generator has made all the maps it can today. Try again after 00:00 UTC.";
     return res.status(429).json({ error, reason: r.reason, resetsAt: who.resetsAt });
   }
@@ -3227,8 +3235,31 @@ admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
   const meta = s && s.updated_at
     ? `<p class="sub">last changed ${fmtWhen(s.updated_at)}${s.updated_by ? ` by ${escHtml(s.updated_by)}` : ""}</p>`
     : `<p class="sub">never changed: the default applies</p>`;
+  const reqError = req.query.error === "length"
+    ? `<div class="msg err">Describe the map in ${MAPGEN_DESC_MIN} to ${MAPGEN_DESC_MAX} characters.</div>`
+    : "";
+  const mine = await race.mapgenAdminJobs({ limit: 10 });
+  const recent = mine.length
+    ? `<table><tr><th>requested</th><th>by</th><th>status</th><th>description</th></tr>${mine.map((j) =>
+        `<tr><td>${fmtWhen(j.createdAt)}</td><td>${escHtml(j.requestedBy)}</td>
+             <td><a href="/mapgen/${escHtml(j.token)}">${escHtml(j.status)}</a></td>
+             <td>${escHtml(j.description.slice(0, 80))}</td></tr>`).join("")}</table>`
+    : `<p class="sub">No admin requests yet.</p>`;
   sendAdmin(res, "Generated maps", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
-    <h1>Generated maps in ratings</h1>
+    <h1>Request a map</h1>
+    <p class="sub">Admin requests skip the per-person limit (${MAPGEN_PER_IDENTITY} a day) and the
+      daily site budget. They are queued like any other and recorded under your name.</p>
+    ${reqError}
+    <form class="card" method="post" action="/admin/mapgen/request" style="max-width:640px">
+      <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+      <label for="description">Describe the course (${MAPGEN_DESC_MIN}-${MAPGEN_DESC_MAX} characters)</label>
+      <textarea id="description" name="description" rows="4" maxlength="${MAPGEN_DESC_MAX}"
+        style="width:100%;box-sizing:border-box"></textarea>
+      <div class="actions"><button class="primary" type="submit">Request map</button></div>
+    </form>
+    <h2>Recent admin requests</h2>
+    ${recent}
+    <h2>Generated maps in ratings</h2>
     <p class="sub">Maps built by the map generator (names starting <span style="font-family:monospace">${escHtml(GENERATED_MAP_PREFIX)}</span>,
       ${count ? count.n : 0} known to the site) · when off, they are left out of Points, Skill Rating and the
       maps / WR / podium totals · their records and map pages are unaffected either way</p>
@@ -3239,6 +3270,14 @@ admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
       <input type="hidden" name="rated" value="${on ? "0" : "1"}">
       <div class="actions"><button class="primary" type="submit">${on ? "Stop counting them" : "Count them"}</button></div>
     </form>`, req.session);
+}));
+
+admin.post("/mapgen/request", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const description = cleanMapgenDescription(req.body && req.body.description);
+  if (description === null) return res.redirect(303, "/admin/mapgen?error=length");
+  const token = await race.mapgenSubmitAdmin({ description, by: req.session.username });
+  res.redirect(303, `/mapgen/${token}`);
 }));
 
 admin.post("/mapgen", requireAdmin, wrap(async (req, res) => {

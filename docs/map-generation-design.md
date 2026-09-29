@@ -215,7 +215,7 @@ identity = HMAC-SHA256(daily_salt, "mapgen" ‖ ip ‖ coarse browser profile)[0
   would be a small follow-up.
 
 **Two limits, in one transaction.** `mapgen_quota` gives each identity
-`MAPGEN_DAILY_PER_IDENTITY` maps (default 2). `mapgen_budget` gives the site
+`MAPGEN_DAILY_PER_IDENTITY` maps (default 1). `mapgen_budget` gives the site
 `MAPGEN_DAILY_BUDGET` (default 40; 0 switches requests off). Each is a single
 conditional upsert (`ON CONFLICT DO UPDATE ... WHERE used < limit
 RETURNING`) that returns no row at the limit, so the two replicas cannot
@@ -223,6 +223,14 @@ over-grant. The per-identity limit is a courtesy: like Tastatur's visitor
 count, it treats one IP plus one browser as one person, so a new browser or
 network gets a new quota, and a shared IP with the same browser shares one.
 The site budget is the cost ceiling that no requester can get around.
+
+**Admins have no limit.** An admin requests maps from `/admin/mapgen`, where
+the admin session lives (its cookie is scoped to `/admin`, so the public
+`/api/mapgen` never sees it, and that stays so). An admin request skips both
+the per-person quota and the site budget, has no identity to refund, and
+records the admin's username in `mapgen_job.requested_by`. Otherwise it is an
+ordinary job: same description cleaning, same queue, same job page. Its cost
+still shows in `llm_usage` like any other.
 
 **Queue: a table, polled.** The same shape as the rest of the site: no broker,
 and atomic claims in Postgres. `mapgen_job` rows carry a random 32-hex

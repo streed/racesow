@@ -30,6 +30,10 @@
 --   check is copied into the shared map store (publishing), and it is
 --   published once a game server reports that its map scan loaded it.
 --
+--   requested_by is set only for a request an admin made from /admin/mapgen:
+--   those have no identity or quota day, skip both limits and are never
+--   refunded, and the column says who made them.
+--
 --   llm_usage is what planning the job cost: token counts per API call and a
 --   list-price estimate (tools/mapgen/describe.py usage_summary). Written for
 --   failed plans too. It is for the operator only; the web never serves it.
@@ -74,7 +78,8 @@ CREATE TABLE IF NOT EXISTS mapgen_job (
   finished_at BIGINT,
   published_at BIGINT,   -- copied into the map store
   live_at      BIGINT,   -- first game server confirmed it
-  llm_usage    JSONB     -- Claude tokens + list-price estimate for planning it
+  llm_usage    JSONB,    -- Claude tokens + list-price estimate for planning it
+  requested_by TEXT      -- admin username for an admin request (no quota, no budget)
 );
 
 -- The worker claims the oldest queued job with FOR UPDATE SKIP LOCKED.

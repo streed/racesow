@@ -3873,6 +3873,27 @@ class RaceDB {
   // transaction: either all three happen or none do. Each claim is a single
   // conditional upsert that returns no row once its limit is reached, so two
   // replicas racing on someone's last map cannot both win it.
+  // An admin's request (/admin/mapgen): no daily identity, no per-person
+  // quota and no site budget, so it can never be refused or refunded. The
+  // admin's username is kept on the job instead.
+  async mapgenSubmitAdmin({ description, by, now = Math.floor(Date.now() / 1000) }) {
+    const token = crypto.randomBytes(16).toString("hex");
+    await this.pool.query(
+      `INSERT INTO mapgen_job (token, description, requested_by, created_at) VALUES ($1, $2, $3, $4)`,
+      [token, description, by, now]
+    );
+    return token;
+  }
+
+  // The most recent admin requests, newest first, for the admin page.
+  async mapgenAdminJobs({ limit = 10 } = {}) {
+    const rows = await this.all(
+      `SELECT * FROM mapgen_job WHERE requested_by IS NOT NULL ORDER BY id DESC LIMIT $1`,
+      [limit]
+    );
+    return rows.map((r) => ({ ...this._mapgenJobRow(r), requestedBy: r.requested_by }));
+  }
+
   async mapgenSubmit({ identity, day, description, perIdentity, budget, now = Math.floor(Date.now() / 1000) }) {
     const client = await this.pool.connect();
     try {

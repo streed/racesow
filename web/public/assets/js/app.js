@@ -1244,7 +1244,7 @@ function wireFlag(id) {
 }
 
 /* ------------------------------ make a map ------------------------------ */
-// Describe a course; tools/mapgen builds it. Each person gets a few maps a day.
+// Describe a course; tools/mapgen builds it. Each person gets one map a day by default.
 // "Person" is a daily identity the server computes from the request itself
 // (web/mapgen-identity.js), so this page keeps no state of its own: it asks
 // /mapgen/mine, and the same browser on the same network on the same day gets
@@ -1431,7 +1431,8 @@ async function viewMapgenJob(token) {
 
 function mapgenQuotaLine(q) {
   if (!q.open && q.remaining > 0) return "The generator has made all the maps it can today. Back after 00:00 UTC.";
-  if (q.remaining === 0) return `You've used today's ${q.limit} maps. New ones open at 00:00 UTC.`;
+  if (q.remaining === 0)
+    return `You've used today's ${q.limit === 1 ? "map" : q.limit + " maps"}. New ones open at 00:00 UTC.`;
   return `${q.remaining} of ${q.limit} map${q.limit === 1 ? "" : "s"} left today · resets 00:00 UTC`;
 }
 
