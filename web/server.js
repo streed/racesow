@@ -23,6 +23,8 @@ import {
   RUN_ACTIVITY_BUCKETS,
   urlSlug,
   isSafeMapName,
+  SETTING_MAPGEN_RATED,
+  GENERATED_MAP_PREFIX,
 } from "./db.js";
 import { createLivePoller, parseAddress } from "./live.js";
 import { createMapPack } from "./mappack.js";
@@ -30,6 +32,7 @@ import { createStreamRegistry } from "./streams.js";
 import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js";
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
 import { cache, invalidate } from "./cache.js";
+import { createSaltStore, identify, SaltUnavailableError } from "./mapgen-identity.js";
 import {
   BLOG_TAGS,
   isBlogTag,
@@ -99,6 +102,21 @@ const MAPPACK_DIR = process.env.MAPPACK_DIR || "/mappack";
 // /api/maps/:id/heatmap.png and its metadata is folded into /api/maps/:id; both
 // degrade to "absent" until the sidecar has rendered a map.
 const HEATMAP_DIR = process.env.HEATMAP_DIR || "/data/heatmaps";
+// Generated-map requests (/mapgen). Each daily identity gets
+// MAPGEN_DAILY_PER_IDENTITY maps (default 1); the whole site gets
+// MAPGEN_DAILY_BUDGET, which is the hard cost ceiling for the public (0 turns
+// public requests off). Admins request from /admin/mapgen with neither limit. The worker
+// (tools/mapgen/worker.py) writes each job's files under MAPGEN_DIR/<token>/.
+const intEnv = (name, dflt) => {
+  const v = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(v) && v >= 0 ? v : dflt;
+};
+const MAPGEN_PER_IDENTITY = intEnv("MAPGEN_DAILY_PER_IDENTITY", 1);
+const MAPGEN_BUDGET = intEnv("MAPGEN_DAILY_BUDGET", 40);
+const MAPGEN_DIR = process.env.MAPGEN_DIR || "/data/mapgen";
+const MAPGEN_DESC_MIN = 10;
+const MAPGEN_DESC_MAX = 500;
+const mapgenSalts = createSaltStore();
 
 // Legacy single-server token (optional). Per-server tokens live in the DB
 // `server` table and are the recommended path for multi-server deploys.
@@ -531,6 +549,148 @@ api.post(
 );
 
 
+/* --------------------------- generated maps ------------------------------ *
+ * Anyone can describe a map; each daily identity gets MAPGEN_PER_IDENTITY.
+ * The identity is computed per request from the IP and coarse browser
+ * profile under a salt that lives only in Redis (mapgen-identity.js). There
+ * is no cookie and no login, and nothing here stores the IP. Every response
+ * depends on who asks, so none of it may be cached (no cache() middleware,
+ * and no-store for the edge). */
+const mapgenNoStore = (_req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+};
+
+async function mapgenWho(req) {
+  return identify(mapgenSalts, { ip: req.ip, userAgent: req.get("user-agent") });
+}
+
+function mapgenQuota(who, used, budgetUsed) {
+  return {
+    limit: MAPGEN_PER_IDENTITY,
+    used,
+    remaining: Math.max(0, MAPGEN_PER_IDENTITY - used),
+    resetsAt: who.resetsAt,
+    // Whether the site as a whole can take more today. The count itself is not
+    // published.
+    open: MAPGEN_BUDGET > 0 && budgetUsed < MAPGEN_BUDGET,
+  };
+}
+
+// Refuse rather than guess. Without the salt there is no identity, and
+// falling back to an unsalted hash of the IP would quietly break the one
+// promise this feature makes.
+function mapgenFail(res, e) {
+  if (e instanceof SaltUnavailableError) {
+    return res.status(503).json({ error: "Map requests are unavailable right now. Try again in a minute." });
+  }
+  throw e;
+}
+
+api.get("/mapgen/quota", mapgenNoStore, wrap(async (req, res) => {
+  let who;
+  try { who = await mapgenWho(req); } catch (e) { return mapgenFail(res, e); }
+  const [used, budgetUsed] = await Promise.all([
+    race.mapgenUsed({ identity: who.id, day: who.day }),
+    race.mapgenBudgetUsed(who.day),
+  ]);
+  res.json(mapgenQuota(who, used, budgetUsed));
+}));
+
+// Today's requests from whoever is asking. This is how the page remembers
+// them across a reload without a cookie: it simply asks again, and the same
+// person on the same day computes the same identity.
+api.get("/mapgen/mine", mapgenNoStore, wrap(async (req, res) => {
+  let who;
+  try { who = await mapgenWho(req); } catch (e) { return mapgenFail(res, e); }
+  const [jobs, used, budgetUsed] = await Promise.all([
+    race.mapgenJobsFor({ identity: who.id, day: who.day }),
+    race.mapgenUsed({ identity: who.id, day: who.day }),
+    race.mapgenBudgetUsed(who.day),
+  ]);
+  res.json({ jobs, quota: mapgenQuota(who, used, budgetUsed) });
+}));
+
+// Drop control and invisible formatting characters (including the
+// bidirectional overrides that can make text read differently from what it
+// says), then collapse whitespace so the length limits measure words, not
+// padding. The worker cleans and fences the text again before the model sees
+// it (tools/mapgen/describe.py), and every page escapes it. Returns null when
+// the result is outside the length limits.
+function cleanMapgenDescription(raw) {
+  const description = String(typeof raw === "string" ? raw : "")
+    .replace(/[\p{Cc}\p{Cf}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return description.length < MAPGEN_DESC_MIN || description.length > MAPGEN_DESC_MAX
+    ? null
+    : description;
+}
+
+api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (req, res) => {
+  const description = cleanMapgenDescription(req.body && req.body.description);
+  if (description === null) {
+    return res.status(400).json({
+      error: `Describe the map in ${MAPGEN_DESC_MIN} to ${MAPGEN_DESC_MAX} characters.`,
+    });
+  }
+  let who;
+  try { who = await mapgenWho(req); } catch (e) { return mapgenFail(res, e); }
+  if (MAPGEN_BUDGET === 0) {
+    return res.status(503).json({ error: "Map requests are switched off right now." });
+  }
+  const r = await race.mapgenSubmit({
+    identity: who.id,
+    day: who.day,
+    description,
+    perIdentity: MAPGEN_PER_IDENTITY,
+    budget: MAPGEN_BUDGET,
+  });
+  if (!r.ok) {
+    res.set("Retry-After", String(Math.max(1, who.resetsAt - Math.floor(Date.now() / 1000))));
+    const error = r.reason === "identity"
+      ? `You've used today's ${MAPGEN_PER_IDENTITY === 1 ? "map" : `${MAPGEN_PER_IDENTITY} maps`}. New ones open at 00:00 UTC.`
+      : "The map generator has made all the maps it can today. Try again after 00:00 UTC.";
+    return res.status(429).json({ error, reason: r.reason, resetsAt: who.resetsAt });
+  }
+  const job = await race.mapgenJob(r.token);
+  const budgetUsed = await race.mapgenBudgetUsed(who.day);
+  res.status(202).json({ job, quota: mapgenQuota(who, r.used, budgetUsed) });
+}));
+
+// A job by its random token. Anyone holding the token can see the job, which
+// is what lets a requester share "my map is building" as a link. Alongside the
+// job: its place in the queue while it waits, and each active game server with
+// the time it confirmed the published map (null until it has).
+api.get("/mapgen/jobs/:token", mapgenNoStore, wrap(async (req, res) => {
+  const d = await race.mapgenJobDetail(req.params.token);
+  if (!d) return res.status(404).json({ error: "no such request" });
+  res.json({ ...d.job, queue: d.queue, servers: d.servers });
+}));
+
+// The public gallery of generated maps: built ones only, newest first, paged.
+// Each entry is the same public job row the job page serves (description
+// included: the requester typed it to be shown) plus the map's records. An
+// admin can take one out at /admin/mapgen. Briefly cacheable: nothing in it is
+// per-visitor.
+api.get("/mapgen/gallery", wrap(async (req, res) => {
+  const d = await race.mapgenGallery({ limit: req.query.limit, offset: req.query.offset });
+  res.set("Cache-Control", "public, max-age=30");
+  res.json(d);
+}));
+
+// The worker's top-down plan preview, once planning has finished. Served
+// only for a known token, from a fixed file name: no path comes from the URL.
+api.get("/mapgen/jobs/:token/plan.svg", mapgenNoStore, wrap(async (req, res) => {
+  const job = await race.mapgenJob(req.params.token);
+  if (!job || !job.mapName) return res.status(404).json({ error: "no plan yet" });
+  res.sendFile(path.join(MAPGEN_DIR, req.params.token, "plan.svg"), {
+    headers: { "Content-Type": "image/svg+xml", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'" },
+  }, (err) => {
+    if (err && !res.headersSent) res.status(404).json({ error: "no plan yet" });
+  });
+}));
+
 /* ------------------------------- blog ------------------------------------ *
  * Short site-update posts. Two reads: the paginated list (teasers only) and one
  * post (rendered). Both are public and cacheable; drafts are excluded at the DB
@@ -940,6 +1100,38 @@ api.get("/game/blocked-maps", cache(30), wrap(async (_req, res) => {
   const names = await race.blockedMapNames();
   res.type("text/plain").send(names.length ? names.join("\n") + "\n" : "");
 }));
+
+// The gametype's live map sync (hrace/blockedmaps.as), polled every ~30 s with
+// the server's own token. The reply is the blocked-maps list, plus one
+// "?<map>" line per recently published generated map this server has not yet
+// confirmed. The next poll's ?have=a,b,c names the ones the engine's map list
+// now holds (sv_mapscan loads new packs from the shared store), which is how a
+// generated map's page learns it is on the servers. A "?" token can never be
+// a map name, so an older gametype that reads this as a plain blocklist is
+// unaffected. Not cached: the reply depends on who is asking.
+api.get(
+  "/game/map-sync",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).type("text/plain").send("unauthorized\n");
+    if (ident.revoked) return res.status(403).type("text/plain").send("server revoked\n");
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  wrap(async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    const have = typeof req.query.have === "string"
+      ? req.query.have.toLowerCase().split(",").map((s) => s.trim()).filter(Boolean)
+      : [];
+    const [blocked, ask] = await Promise.all([
+      race.blockedMapNames(),
+      race.mapgenSync({ serverName: req.ingest.serverName, have }),
+    ]);
+    const lines = [...blocked, ...ask.map((n) => "?" + n)];
+    res.type("text/plain").send(lines.length ? lines.join("\n") + "\n" : "");
+  })
+);
 
 // Out-of-band ops channel for a game box's healthcheck watchdog
 // (server/gamehealth.sh), polled every healthcheck interval.
@@ -2640,7 +2832,7 @@ admin.get("/flags", requireAuth, wrap(async (req, res) => {
     ${quarSection}
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
-      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a> · <a href="/admin/tournaments">tournaments</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a> · <a href="/admin/blog">blog</a>` : ""} · <a href="/admin/account">account</a></p>
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a> · <a href="/admin/tournaments">tournaments</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/mapgen">generated maps</a> · <a href="/admin/announcements">announcements</a> · <a href="/admin/blog">blog</a>` : ""} · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
 }));
 
@@ -3036,6 +3228,101 @@ admin.post("/motd", requireAdmin, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   await race.setSetting("motd", sanitizeMotd(req.body && req.body.motd), req.session.username);
   res.redirect(303, "/admin/motd?ok=1");
+}));
+
+// Whether generated maps (gen_*) count toward Points and Skill Rating. One
+// site-wide flag (db.js GENERATED_MAP_PREFIX); saving it rebuilds the standings
+// straight away so the leaderboards reflect the new rule within seconds.
+admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
+  const done = req.query.ok
+    ? `<div class="msg ok">Saved. The standings are being rebuilt with the new rule; leaderboards and profiles show it within a minute.</div>`
+    : "";
+  const s = await race.getSetting(SETTING_MAPGEN_RATED);
+  const on = await race.mapgenRated();
+  const count = await race.one(
+    "SELECT COUNT(*)::int AS n FROM map WHERE lower(left(name, $1)) = $2",
+    [GENERATED_MAP_PREFIX.length, GENERATED_MAP_PREFIX]
+  );
+  const meta = s && s.updated_at
+    ? `<p class="sub">last changed ${fmtWhen(s.updated_at)}${s.updated_by ? ` by ${escHtml(s.updated_by)}` : ""}</p>`
+    : `<p class="sub">never changed: the default applies</p>`;
+  const reqError = req.query.error === "length"
+    ? `<div class="msg err">Describe the map in ${MAPGEN_DESC_MIN} to ${MAPGEN_DESC_MAX} characters.</div>`
+    : "";
+  const mine = await race.mapgenAdminJobs({ limit: 10 });
+  const built = await race.mapgenBuiltAdmin({ limit: 50 });
+  const recent = mine.length
+    ? `<table><tr><th>requested</th><th>by</th><th>status</th><th>description</th></tr>${mine.map((j) =>
+        `<tr><td>${fmtWhen(j.createdAt)}</td><td>${escHtml(j.requestedBy)}</td>
+             <td><a href="/mapgen/${escHtml(j.token)}">${escHtml(j.status)}</a></td>
+             <td>${escHtml(j.description.slice(0, 80))}</td></tr>`).join("")}</table>`
+    : `<p class="sub">No admin requests yet.</p>`;
+  sendAdmin(res, "Generated maps", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Request a map</h1>
+    <p class="sub">Admin requests skip the per-person limit (${MAPGEN_PER_IDENTITY} a day) and the
+      daily site budget. They are queued like any other and recorded under your name.</p>
+    ${reqError}
+    <form class="card" method="post" action="/admin/mapgen/request" style="max-width:640px">
+      <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+      <label for="description">Describe the course (${MAPGEN_DESC_MIN}-${MAPGEN_DESC_MAX} characters)</label>
+      <textarea id="description" name="description" rows="4" maxlength="${MAPGEN_DESC_MAX}"
+        style="width:100%;box-sizing:border-box"></textarea>
+      <div class="actions"><button class="primary" type="submit">Request map</button></div>
+    </form>
+    <h2>Recent admin requests</h2>
+    ${recent}
+    <h2>Gallery</h2>
+    <p class="sub">Every built map is listed on the public <a href="/mapgen/gallery">gallery</a> with
+      its description. Hide one whose description shouldn't be shown; the map, its job page and its
+      records stay. A map blocked from play drops out on its own.</p>
+    ${req.query.hidden ? `<div class="msg ok">Saved.</div>` : ""}
+    ${built.length
+      ? `<table><tr><th>built</th><th>map</th><th>description</th><th></th></tr>${built.map((j) =>
+          `<tr${j.hiddenAt ? ` style="opacity:.6"` : ""}><td>${fmtWhen(j.publishedAt)}</td>
+             <td><a href="/mapgen/${escHtml(j.token)}">${escHtml(j.mapName || "")}</a></td>
+             <td>${escHtml(j.description.slice(0, 120))}${j.hiddenAt ? `<br><span class="sub">hidden ${fmtWhen(j.hiddenAt)}${j.hiddenBy ? ` by ${escHtml(j.hiddenBy)}` : ""}</span>` : ""}</td>
+             <td><form method="post" action="/admin/mapgen/hide" style="margin:0">
+               <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+               <input type="hidden" name="token" value="${escHtml(j.token)}">
+               <input type="hidden" name="hidden" value="${j.hiddenAt ? "0" : "1"}">
+               <button type="submit">${j.hiddenAt ? "Show" : "Hide"}</button></form></td></tr>`).join("")}</table>`
+      : `<p class="sub">No maps built yet.</p>`}
+    <h2>Generated maps in ratings</h2>
+    <p class="sub">Maps built by the map generator (names starting <span style="font-family:monospace">${escHtml(GENERATED_MAP_PREFIX)}</span>,
+      ${count ? count.n : 0} known to the site) · when off, they are left out of Points, Skill Rating and the
+      maps / WR / podium totals · their records and map pages are unaffected either way</p>
+    ${done}${meta}
+    <form class="card" method="post" action="/admin/mapgen" style="max-width:640px">
+      <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+      <p>Generated maps currently <b>${on ? "count" : "do not count"}</b> toward ratings.</p>
+      <input type="hidden" name="rated" value="${on ? "0" : "1"}">
+      <div class="actions"><button class="primary" type="submit">${on ? "Stop counting them" : "Count them"}</button></div>
+    </form>`, req.session);
+}));
+
+admin.post("/mapgen/request", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const description = cleanMapgenDescription(req.body && req.body.description);
+  if (description === null) return res.redirect(303, "/admin/mapgen?error=length");
+  const token = await race.mapgenSubmitAdmin({ description, by: req.session.username });
+  res.redirect(303, `/mapgen/${token}`);
+}));
+
+// Hide a built map from the public gallery, or show it again.
+admin.post("/mapgen/hide", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const hidden = String(req.body && req.body.hidden) === "1";
+  const n = await race.mapgenSetHidden(String((req.body && req.body.token) || ""), hidden, req.session.username);
+  if (!n) return res.status(404).send("no such map request");
+  res.redirect(303, "/admin/mapgen?hidden=1");
+}));
+
+admin.post("/mapgen", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const rated = String(req.body && req.body.rated) === "1" ? "1" : "0";
+  await race.setSetting(SETTING_MAPGEN_RATED, rated, req.session.username);
+  doRefresh();   // not awaited: a full rebuild can take seconds
+  res.redirect(303, "/admin/mapgen?ok=1");
 }));
 
 // Rotating in-game announcements: one message per line. Normalise newlines,
@@ -4992,6 +5279,8 @@ const SITEMAP_PAGES = [
   ["/demo", "0.7"],
   ["/achievements", "0.7"],
   ["/live", "0.5"],
+  ["/mapgen", "0.5"],
+  ["/mapgen/gallery", "0.6"],
   ["/about", "0.4"],
   ["/colors", "0.4"],
 ];

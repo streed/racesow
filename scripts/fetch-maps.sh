@@ -100,6 +100,26 @@ say "found ${total} unique pk3 pack(s)"
 # --- Claim the destination ------------------------------------------------------
 mkdir -p "${DEST}"
 DEST="$(cd -- "${DEST}" && pwd -P)"      # canonical, so the live-dir check works
+
+# A box that READS the shared map store (docs/map-store-runbook.md:
+# MAP_STORE_DIR in .env or server/.env points at an NFS mount) must not grow
+# its own pool: maps are added once, on the box that owns the store, and
+# reach every server from there. Downloading here would just rebuild the
+# per-box copy the store exists to replace.
+reads_store() {
+    local f
+    for f in "${REPO_ROOT}/.env" "${REPO_ROOT}/server/.env"; do
+        [ -f "${f}" ] && grep -qE '^MAP_STORE_DIR="?/' "${f}" && return 0
+    done
+    return 1
+}
+if [ -z "${MAPS_DEST_FORCE:-}" ] && reads_store && \
+   [ "${DEST}" = "$(cd -- "${REPO_ROOT}/server/maps" 2>/dev/null && pwd -P)" ]; then
+    echo "fetch-maps: this box reads the shared map store (MAP_STORE_DIR in .env or server/.env)." >&2
+    echo "fetch-maps: run fetch-maps.sh on the box that owns the store instead." >&2
+    echo "fetch-maps: (MAPS_DEST_FORCE=1 overrides.)" >&2
+    exit 2
+fi
 LIVE_MAPS="$(cd -- "${REPO_ROOT}/server/maps" 2>/dev/null && pwd -P || true)"
 
 # One run per destination: parallel invocations would race on temp files and

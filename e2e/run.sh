@@ -275,5 +275,36 @@ WARSOW_DIR="${TMP}/wsw" FS_GAME="racemod" \
 [ ! -e "${TMP}/wsw/racemod/topscores/race/ghostmap.txt" ] \
     || { echo "FAIL: file written despite unreachable API" >&2; exit 1; }
 
+step "phase D: compiling map-sync harness (real g_rs_api.cpp)"
+g++ -std=c++11 -Wall -Wextra -o "${TMP}/mapsync" \
+    "${HERE}/mapsync_harness.cpp" \
+    "${ROOT}/server/enginepatches/g_rs_api.cpp" \
+    -lcurl -lpthread
+
+step "phase D: a freshly published generated map is asked about through the native"
+NOW="$(date +%s)"
+psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -qtA -c "INSERT INTO mapgen_job
+    (token, description, status, map_name, report, created_at, started_at, finished_at, published_at)
+    VALUES ('$(printf 'cd%.0s' $(seq 16))', 'e2e', 'publishing', 'gen_e2e_sync_cdcdcd', '{}',
+            ${NOW}, ${NOW}, ${NOW}, ${NOW})"
+LIST="$("${TMP}/mapsync" "${BASE}/api/game/map-sync" "${TOKEN}" 15)" \
+    || { echo "FAIL: map-sync fetch did not land: ${LIST}" >&2; exit 1; }
+printf '%s\n' "${LIST}" | grep -qx '?gen_e2e_sync_cdcdcd' \
+    || { echo "FAIL: the published map was not asked about:" >&2; printf '%s\n' "${LIST}" >&2; exit 1; }
+
+step "phase D: the server's have= confirms it, and the job is published"
+"${TMP}/mapsync" "${BASE}/api/game/map-sync?have=gen_e2e_sync_cdcdcd" "${TOKEN}" 15 > "${TMP}/sync2" \
+    || { echo "FAIL: confirming poll did not land" >&2; exit 1; }
+grep -q 'gen_e2e_sync_cdcdcd' "${TMP}/sync2" \
+    && { echo "FAIL: a confirmed map was asked about again" >&2; exit 1; }
+STATUS="$(psql "${DATABASE_URL}" -qtA -c "SELECT status || ' ' || (live_at IS NOT NULL) FROM mapgen_job WHERE map_name = 'gen_e2e_sync_cdcdcd'")"
+[ "${STATUS}" = "published true" ] \
+    || { echo "FAIL: expected 'published true', got '${STATUS}'" >&2; exit 1; }
+
+step "phase D: without the server's token the poll fails for good (the gametype falls back)"
+rc=0
+"${TMP}/mapsync" "${BASE}/api/game/map-sync" "" 15 >/dev/null || rc=$?
+[ "${rc}" = "2" ] || { echo "FAIL: expected a hard failure (exit 2), got rc=${rc}" >&2; exit 1; }
+
 echo ""
 echo "OK: end-to-end pipeline test passed"

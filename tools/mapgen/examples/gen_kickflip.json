@@ -1,0 +1,330 @@
+{
+  "name": "gen_kickflip",
+  "title": "Kickflip",
+  "width": 320,
+  "segments": [
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 45,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 128,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 90,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 128,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 90,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 128,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 45,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 90,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 256,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 135,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 256
+    },
+    {
+      "type": "wallclimb",
+      "length": 512,
+      "rise": 80,
+      "direction": "left"
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 90,
+      "radius": 224
+    },
+    {
+      "type": "straight",
+      "length": 384,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 45,
+      "radius": 320
+    },
+    {
+      "type": "straight",
+      "length": 256
+    },
+    {
+      "type": "wallgap",
+      "length": 240,
+      "drop": -88,
+      "direction": "right"
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 180,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 256
+    },
+    {
+      "type": "dash",
+      "length": 520,
+      "drop": 512
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 90,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "slalom",
+      "length": 1024,
+      "count": 3
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 135,
+      "radius": 224
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "type": "wallclimb",
+      "length": 448,
+      "rise": 94,
+      "direction": "right"
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 45,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 256,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 90,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "type": "wallgap",
+      "length": 200,
+      "drop": -94,
+      "direction": "left"
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 90,
+      "radius": 224
+    },
+    {
+      "type": "straight",
+      "length": 256,
+      "open": true
+    },
+    {
+      "type": "dash",
+      "length": 600,
+      "drop": 768
+    },
+    {
+      "type": "straight",
+      "length": 320
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 180,
+      "radius": 320,
+      "shortcut": true
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "type": "ramp",
+      "length": 768,
+      "rise": 384,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 90,
+      "radius": 224
+    },
+    {
+      "type": "wallclimb",
+      "length": 512,
+      "rise": 88,
+      "direction": "left"
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 90,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 512,
+      "open": true
+    },
+    {
+      "type": "checkpoint"
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 135,
+      "radius": 224
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "type": "wallgap",
+      "length": 260,
+      "drop": -72,
+      "direction": "right"
+    },
+    {
+      "type": "straight",
+      "length": 256
+    },
+    {
+      "type": "dash",
+      "length": 470,
+      "drop": 384
+    },
+    {
+      "type": "straight",
+      "length": 384
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 90,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 90,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 128,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 135,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 128,
+      "open": true
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 45,
+      "radius": 224,
+      "open": true
+    },
+    {
+      "type": "straight",
+      "length": 512
+    }
+  ]
+}

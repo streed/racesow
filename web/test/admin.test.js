@@ -408,6 +408,125 @@ test("admin edits the MOTD: sanitized, then served on /api/game/motd", async () 
   assert.equal(await (await fetch(`${base}/api/game/motd`)).text(), "RSMOTD\n");
 });
 
+test("admin toggles whether generated maps count toward ratings", async () => {
+  const cookie = await adminCookie();
+  const anon = await fetch(`${base}/admin/mapgen`, { redirect: "manual" });
+  assert.equal(anon.status, 302);
+
+  // Default: off, and the page says so.
+  const page = await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text();
+  assert.match(page, /Generated maps currently <b>do not count<\/b>/);
+  assert.match(page, /never changed: the default applies/);
+  const csrf = page.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
+  assert.ok(csrf);
+
+  const post = (fields) => fetch(`${base}/admin/mapgen`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields),
+  });
+  // Missing CSRF -> 403, nothing saved.
+  assert.equal((await post({ rated: "1" })).status, 403);
+  assert.equal((await db.query("SELECT value FROM site_setting WHERE key = 'mapgen_rated'")).rows.length, 0);
+
+  // Turn it on: stored as "1", attributed, and the page flips.
+  assert.equal((await post({ _csrf: csrf, rated: "1" })).status, 303);
+  const row = (await db.query("SELECT value, updated_by FROM site_setting WHERE key = 'mapgen_rated'")).rows[0];
+  assert.equal(row.value, "1");
+  assert.ok(row.updated_by);
+  const on = await (await fetch(`${base}/admin/mapgen?ok=1`, { headers: { cookie } })).text();
+  assert.match(on, /Generated maps currently <b>count<\/b>/);
+  assert.match(on, /The standings are being rebuilt/);
+
+  // Anything but "1" means off.
+  assert.equal((await post({ _csrf: csrf, rated: "yes" })).status, 303);
+  assert.equal(
+    (await db.query("SELECT value FROM site_setting WHERE key = 'mapgen_rated'")).rows[0].value, "0");
+});
+
+test("admin map requests skip the per-person limit and the site budget", async () => {
+  const cookie = await adminCookie();
+  const page = await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text();
+  assert.match(page, /Request a map/);
+  assert.match(page, /No admin requests yet/);
+  const csrf = page.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
+  const post = (fields) => fetch(`${base}/admin/mapgen/request`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields),
+  });
+
+  assert.equal((await post({ description: "No token on this one, so refused" })).status, 403);
+  const short = await post({ _csrf: csrf, description: "tiny" });
+  assert.equal(short.status, 303);
+  assert.match(short.headers.get("location"), /\/admin\/mapgen\?error=length/);
+
+  // Well past the public default of one a day: every request is queued and
+  // opens its public job page.
+  const tokens = [];
+  for (let i = 0; i < 4; i++) {
+    const r = await post({ _csrf: csrf, description: `An admin test course number ${i} with \u202etricks` });
+    assert.equal(r.status, 303);
+    const m = r.headers.get("location").match(/^\/mapgen\/([0-9a-f]{32})$/);
+    assert.ok(m, r.headers.get("location"));
+    tokens.push(m[1]);
+  }
+  const jobs = (await db.query(
+    "SELECT * FROM mapgen_job WHERE token = ANY($1) ORDER BY id", [tokens])).rows;
+  assert.equal(jobs.length, 4);
+  for (const j of jobs) {
+    assert.equal(j.status, "queued");
+    assert.equal(j.identity, null);
+    assert.equal(j.quota_day, null);
+    assert.ok(j.requested_by, "attributed to the admin");
+    assert.ok(!/[\u202e]/.test(j.description), "cleaned like a public request");
+  }
+  // Neither limit moved.
+  assert.equal((await db.query("SELECT COALESCE(SUM(used), 0)::int AS n FROM mapgen_quota")).rows[0].n, 0);
+  assert.equal((await db.query("SELECT COALESCE(SUM(used), 0)::int AS n FROM mapgen_budget")).rows[0].n, 0);
+
+  const after = await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text();
+  assert.match(after, new RegExp(`/mapgen/${tokens[3]}`));
+});
+
+test("admin hides a built map from the public gallery and shows it again", async () => {
+  const cookie = await adminCookie();
+  const token = "cd".repeat(16);
+  await db.query(
+    `INSERT INTO mapgen_job (token, description, status, map_name, created_at, published_at)
+     VALUES ($1, 'a course with words nobody should list', 'published', 'gen_gallery_hide_cdcdcd', 1, 2)`,
+    [token]);
+  const listed = async () => (await (await fetch(`${base}/api/mapgen/gallery`)).json()).maps
+    .some((m) => m.token === token);
+  assert.equal(await listed(), true);
+
+  const page = await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text();
+  assert.match(page, /gen_gallery_hide_cdcdcd/);
+  const csrf = page.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
+  const post = (fields) => fetch(`${base}/admin/mapgen/hide`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields),
+  });
+  assert.equal((await post({ token, hidden: "1" })).status, 403, "CSRF required");
+  assert.equal(await listed(), true);
+  assert.equal((await post({ _csrf: csrf, token: "ef".repeat(16), hidden: "1" })).status, 404);
+
+  assert.equal((await post({ _csrf: csrf, token, hidden: "1" })).status, 303);
+  assert.equal(await listed(), false);
+  const row = (await db.query("SELECT hidden_at, hidden_by FROM mapgen_job WHERE token = $1", [token])).rows[0];
+  assert.ok(row.hidden_at && row.hidden_by);
+  // Its own page still works.
+  assert.equal((await fetch(`${base}/api/mapgen/jobs/${token}`)).status, 200);
+  assert.match(await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text(), />Show</);
+
+  assert.equal((await post({ _csrf: csrf, token, hidden: "0" })).status, 303);
+  assert.equal(await listed(), true);
+});
+
 test("admin edits announcements: one per line, sanitized, then served on /api/game/announcements", async () => {
   const cookie = await adminCookie();
 
@@ -500,6 +619,20 @@ test("moderator tier: flags + map-block + restart allowed; admin-only surface is
   assert.ok(!/href="\/admin\/motd"/.test(flagsHtml), "no MOTD link for moderator");
   assert.ok(!/href="\/admin\/announcements"/.test(flagsHtml), "no announcements link for moderator");
   assert.ok(!/href="\/admin\/logs"/.test(flagsHtml), "no logs link for moderator");
+  assert.ok(!/href="\/admin\/mapgen"/.test(flagsHtml), "no generated-maps link for moderator");
+  assert.equal((await fetch(`${base}/admin/mapgen`, { headers: { cookie: mod } })).status, 403,
+    "the rating flag is admin-only");
+  assert.equal((await fetch(`${base}/admin/mapgen/request`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie: mod, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ description: "A moderator's course request" }),
+  })).status, 403, "unlimited map requests are admin-only");
+  assert.equal((await fetch(`${base}/admin/mapgen/hide`, {
+    method: "POST", redirect: "manual",
+    headers: { cookie: mod, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ token: "cd".repeat(16), hidden: "1" }),
+  })).status, 403, "moderator cannot hide gallery entries");
 
   // Allowed action: block then unblock a map (CSRF from any moderator page).
   const csrf = flagsHtml.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];

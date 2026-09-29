@@ -58,6 +58,9 @@ services:
       LOG_SHIP: "${LOG_SHIP:-1}"
       # Client-reachable HTTP pak mirror (optional; see server/docker-compose.yml).
       SV_UPLOADS_BASEURL: "${SV_UPLOADS_BASEURL:-}"
+      # How often (seconds) the engine rescans the map store for new packs
+      # (enginepatches/patch-mapscan.py). 0 = only at map change / `mapscan`.
+      MAPSCAN_SECONDS: "${MAPSCAN_SECONDS:-60}"
       # Cross-server player mirroring (UDP mesh). Peers exchange live player
       # positions + chat so players on one server see the others as ghosts.
       # Set all of these in .env; empty MIRROR_PEERS = feature off.
@@ -96,7 +99,26 @@ services:
       # seconds, so a cold start can never be killed as if it were wedged.
       start_period: 240s
     volumes:
-      - ./server/maps:/warsow/maps_extra:ro
+      # The map store, handed to the engine as fs_cdpath (docs/shared-maps.md).
+      # New packs load within MAPSCAN_SECONDS without a restart. On a box that
+      # reads the store over NFS, MAP_STORE_DIR (in this directory's .env) is
+      # the host mountpoint, and rslave lets a remount after a link drop reach
+      # the running container.
+      - type: bind
+        source: ${MAP_STORE_DIR:-./server/maps}
+        target: /warsow/shared/racemod
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: true
+      # The store's last-known local copy (scripts/map-snapshot.sh, hourly).
+      # The entrypoint uses it when the store does not answer at launch.
+      - type: bind
+        source: ${MAP_STORE_SNAPSHOT_DIR:-./server/maps-snapshot}
+        target: /warsow/shared-fallback/racemod
+        read_only: true
+        bind:
+          create_host_path: true
       # Local record files (topscores) + finish-event audit log, persisted
       # across container rebuilds.
       - racelog:/warsow/racemod/racelog
@@ -126,6 +148,23 @@ services:
       - "${PAK_HTTP_PORT:-44445}:80"
     volumes:
       - pakshare:/usr/share/nginx/html
+      # Map packs are served straight from the map store, then its local
+      # snapshot (server/pakserver.conf: pakshare -> store -> snapshot), so a
+      # pack added to the store on EU is downloadable here at once.
+      - type: bind
+        source: ${MAP_STORE_DIR:-./server/maps}
+        target: /srv/store/racemod
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: true
+      - type: bind
+        source: ${MAP_STORE_SNAPSHOT_DIR:-./server/maps-snapshot}
+        target: /srv/snapshot/racemod
+        read_only: true
+        bind:
+          create_host_path: true
+      - ./server/pakserver.conf:/etc/nginx/conf.d/default.conf:ro
     # On start: (1) hide the nginx version in the Server header — this port is
     # internet-facing (server_tokens off, dropped into the http-context
     # conf.d include); (2) chown the share to the game-server user (uid 999)

@@ -1,0 +1,16 @@
+# /etc/fstab line on the US box: the map store over the WireGuard link.
+#   apt install nfs-common rsync && mkdir -p /srv/racesow/maps
+# Then add us.env.example's lines to ~/racesow/.env on the US box.
+# docs/map-store-runbook.md, step D.
+#
+# ro,soft,timeo=50,retrans=2   a dead link becomes an I/O error after ~15 s,
+#                              never a hung game-server thread (the engine
+#                              rescans on its main thread). soft is safe here
+#                              because the mount is read-only.
+# actimeo=30                   directory listings may be up to 30 s stale;
+#                              sv_mapscan runs every 60 s anyway.
+# nofail,_netdev,x-systemd...  boot does not wait on, or fail because of, the
+#                              link; the game server falls back to the snapshot,
+#                              and racesow-map-snapshot.service remounts it
+#                              within the hour once the link is back.
+10.66.0.1:/srv/racesow/store  /srv/racesow/maps  nfs4  ro,soft,timeo=50,retrans=2,noatime,nodev,nosuid,noexec,actimeo=30,_netdev,nofail,x-systemd.requires=wg-quick@wg-racesow.service,x-systemd.mount-timeout=30  0  0

@@ -1,0 +1,40 @@
+{
+  "name": "gen_serpent_cut",
+  "title": "Serpent Cut",
+  "width": 448,
+  "segments": [
+    {
+      "type": "straight",
+      "length": 1280
+    },
+    {
+      "type": "turn",
+      "direction": "left",
+      "angle": 180,
+      "radius": 1024,
+      "shortcut": true
+    },
+    {
+      "type": "straight",
+      "length": 896
+    },
+    {
+      "type": "checkpoint"
+    },
+    {
+      "type": "straight",
+      "length": 896
+    },
+    {
+      "type": "turn",
+      "direction": "right",
+      "angle": 180,
+      "radius": 1024,
+      "shortcut": true
+    },
+    {
+      "type": "straight",
+      "length": 1280
+    }
+  ]
+}

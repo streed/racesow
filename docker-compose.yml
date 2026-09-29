@@ -266,6 +266,46 @@ services:
       retries: 3
       start_period: 600s
 
+  # Player-requested map generation (/mapgen). The web only queues requests,
+  # after checking the requester's daily identity quota and the site's daily
+  # budget (web/mapgen-identity.js, MAPGEN_DAILY_PER_IDENTITY /
+  # MAPGEN_DAILY_BUDGET on web+web2). This worker plans each one with Claude,
+  # builds it with the pinned q3map2, and checks the compiled map. A map that
+  # passes every check is copied straight into the shared map store
+  # (server/maps on this box, docs/shared-maps.md), where every game server's
+  # sv_mapscan loads it within a minute and confirms it over
+  # /api/game/map-sync. A moderator can still pull a map with the blocklist.
+  # Working files stay in ./data/mapgen/<token>/. Opt-in because it needs an
+  # API key:
+  #   ANTHROPIC_API_KEY=... docker compose --profile mapgen up -d mapgen
+  mapgen:
+    build:
+      context: ./tools
+      dockerfile: mapgen/Dockerfile
+    image: racesow-mapgen:latest
+    container_name: racesow-mapgen
+    restart: unless-stopped
+    logging: *default-logging
+    profiles: ["mapgen"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://racesow:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/racesow"
+      # Optional here (":-", not ":?"): compose interpolates every service even
+      # when its profile is off, so a required variable would break every
+      # compose command on a box that never runs this. worker.py refuses to
+      # start without it instead.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      MAPGEN_DIR: "/data/mapgen"
+      MAPGEN_STORE: "/srv/store"
+    volumes:
+      - ./data:/data
+      # The map store the game servers read (MAP_STORE_DIR in server/.env,
+      # ./maps by default). Only the box that owns the store runs this worker.
+      - ${MAP_STORE_DIR_FROM_ROOT:-./server/maps}:/srv/store
+    entrypoint: ["python3", "/opt/tools/mapgen/worker.py"]
+
   discord:
     build: ./discord
     image: racesow-discord:latest

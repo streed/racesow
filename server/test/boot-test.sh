@@ -23,6 +23,13 @@
 # Usage:
 #   server/test/boot-test.sh <image> [--map <map>] [--name <container>]
 #                            [--timeout <sec>] [--expect-fail] [--keep]
+#                            [--maps-dir <dir>]
+#
+#   --maps-dir     mount <dir> read-only as the map store
+#                  (/warsow/shared/racemod, handed to the engine as fs_cdpath,
+#                  exactly as the compose file mounts ./server/maps), so --map
+#                  can name a map from a .pk3 that is not baked into the image
+#                  (how CI boots a tools/mapgen course).
 #
 #   --expect-fail  invert the verdict: the run PASSES only if the gametype
 #                  fails to initialise. Used to prove a negative — e.g. that
@@ -32,7 +39,7 @@
 # Exit: 0 = gametype initialised with no script diagnostics, 1 = otherwise.
 set -uo pipefail
 
-IMAGE="" MAP="wbomb1" NAME="" TIMEOUT=240 EXPECT_FAIL=0 KEEP=0
+IMAGE="" MAP="wbomb1" NAME="" TIMEOUT=240 EXPECT_FAIL=0 KEEP=0 MAPS_DIR=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --map)     MAP="$2"; shift 2 ;;
@@ -40,6 +47,7 @@ while [ $# -gt 0 ]; do
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --expect-fail) EXPECT_FAIL=1; shift ;;
         --keep)    KEEP=1; shift ;;
+        --maps-dir) MAPS_DIR="$2"; shift 2 ;;
         -*)        echo "unknown flag: $1" >&2; exit 2 ;;
         *)         IMAGE="$1"; shift ;;
     esac
@@ -54,7 +62,14 @@ echo ">> booting ${IMAGE} on ${MAP} (container ${NAME}, timeout ${TIMEOUT}s)"
 # --tty so the engine line-buffers stdout (same reason docker-compose.yml sets
 # it); without it the logs arrive in blocks and the poll below reads nothing.
 # SV_PUBLIC=0 keeps a test container off the master server list.
-docker run -d --name "${NAME}" --tty -e SV_PUBLIC=0 \
+MOUNT=()
+if [ -n "${MAPS_DIR}" ]; then
+    [ -d "${MAPS_DIR}" ] || { echo "!! --maps-dir ${MAPS_DIR} is not a directory" >&2; exit 2; }
+    # Mounted as the map store (docs/shared-maps.md), so the boot also proves
+    # the fs_cdpath path the production compose uses.
+    MOUNT=(-v "$(cd "${MAPS_DIR}" && pwd):/warsow/shared/racemod:ro")
+fi
+docker run -d --name "${NAME}" --tty -e SV_PUBLIC=0 ${MOUNT[@]+"${MOUNT[@]}"} \
     --ulimit nofile=16384:16384 "${IMAGE}" +map "${MAP}" >/dev/null || {
     echo "!! docker run failed"; exit 1; }
 

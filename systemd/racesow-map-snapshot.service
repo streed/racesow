@@ -1,0 +1,23 @@
+# Refresh the local last-known copy of the shared map store (reader boxes).
+# See scripts/map-snapshot.sh and docs/shared-maps.md. On the box that owns
+# the store it exits 0 without doing anything, so it is safe to install
+# everywhere. A non-zero exit means the snapshot was deliberately left as it
+# was (store unreachable, or a listing that shrank suspiciously).
+# Template: __RACESOW_DIR__ / __RACESOW_USER__ are substituted by
+# systemd/install.sh. Needs rsync.
+[Unit]
+Description=Racesow map store snapshot (last-known copy)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__RACESOW_USER__
+WorkingDirectory=__RACESOW_DIR__
+# "+" runs this one step as root: it remounts the store if the box booted
+# while the link was down (the fstab line is nofail, so nothing else retries).
+ExecStartPre=+__RACESOW_DIR__/scripts/map-snapshot.sh --mount
+ExecStart=__RACESOW_DIR__/scripts/map-snapshot.sh
+TimeoutStartSec=4h
+Nice=10
+IOSchedulingClass=idle

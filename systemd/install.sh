@@ -57,8 +57,13 @@ if [ "${MODE}" = "full" ]; then
     ENABLE="racesow-web.service racesow-server.service racesow-db-backup.timer racesow-pakscan.timer racesow-restart.timer racesow-xpiry-heartbeat.timer racesow-demo-sync.timer"
     RESTART_TZ="${RESTART_TZ:-Europe/Berlin}"
 else
-    UNITS="racesow-agent.service racesow-pakscan.service racesow-pakscan.timer racesow-restart.service racesow-restart.timer ${XPIRY} ${DEMOSYNC}"
-    ENABLE="racesow-agent.service racesow-pakscan.timer racesow-restart.timer racesow-xpiry-heartbeat.timer racesow-demo-sync.timer"
+    # Game-only boxes may read the shared map store over NFS; the snapshot timer
+    # keeps their last-known copy (docs/shared-maps.md). It exits cleanly doing
+    # nothing when MAP_STORE_DIR is not set, so it is harmless on a box that
+    # keeps its own maps.
+    MAPSNAP="racesow-map-snapshot.service racesow-map-snapshot.timer"
+    UNITS="racesow-agent.service racesow-pakscan.service racesow-pakscan.timer racesow-restart.service racesow-restart.timer ${XPIRY} ${DEMOSYNC} ${MAPSNAP}"
+    ENABLE="racesow-agent.service racesow-pakscan.timer racesow-restart.timer racesow-xpiry-heartbeat.timer racesow-demo-sync.timer racesow-map-snapshot.timer"
     RESTART_TZ="${RESTART_TZ:-America/New_York}"
 fi
 

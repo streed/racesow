@@ -1,0 +1,20 @@
+{
+  "name": "gen_first_light",
+  "title": "First Light",
+  "width": 384,
+  "segments": [
+    {"type": "straight", "length": 1024},
+    {"type": "turn", "direction": "left", "angle": 90, "radius": 512},
+    {"type": "straight", "length": 512},
+    {"type": "gap", "length": 128, "drop": 32},
+    {"type": "straight", "length": 768},
+    {"type": "checkpoint"},
+    {"type": "ramp", "length": 768, "rise": -256},
+    {"type": "straight", "length": 256},
+    {"type": "turn", "direction": "right", "angle": 135, "radius": 640},
+    {"type": "straight", "length": 1024},
+    {"type": "gap", "length": 160, "drop": 96},
+    {"type": "turn", "direction": "right", "angle": 45, "radius": 512},
+    {"type": "straight", "length": 1536}
+  ]
+}

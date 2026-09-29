@@ -1,0 +1,16 @@
+# Keep the map-store snapshot close to the store: every hour, plus once
+# shortly after boot. New maps reach the game server through the NFS mount
+# straight away; the snapshot only has to be fresh enough to be a good
+# fallback when the store is unreachable. An unchanged sync is only a
+# directory listing. Each run first remounts the store if it is missing.
+[Unit]
+Description=Refresh the Racesow map store snapshot
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

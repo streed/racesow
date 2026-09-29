@@ -190,6 +190,25 @@ export function srIsRanked(maps) {
   return num(maps) >= SR_MIN_MAPS;
 }
 
+// Generated maps (tools/mapgen) are all named gen_*: the generator enforces the
+// prefix (spec.NAME_RE) precisely so they can be treated as a class. Whether
+// they count toward the standings (Points, Skill Rating and the maps / WR /
+// podium totals) is a site-wide flag an admin toggles at /admin/mapgen, stored
+// in site_setting. Off by default: a generated map is new and unvetted, so it
+// stays out of everyone's rating until an admin decides the class has earned
+// it. Records, leaderboards and map pages are unaffected either way; this only
+// decides what the rating sums over.
+export const GENERATED_MAP_PREFIX = "gen_";
+export const SETTING_MAPGEN_RATED = "mapgen_rated";
+export function isGeneratedMap(name) {
+  return String(name || "").toLowerCase().startsWith(GENERATED_MAP_PREFIX);
+}
+// The stored value is "1" (count) or "0"; anything else, or no row at all,
+// means the default: don't count.
+export function mapgenRatedValue(value) {
+  return value === "1";
+}
+
 // How many days of per-player Skill Rating history to retain (rolling window).
 // One SR value is snapshotted per player per UTC day at the tail of an aggregate
 // refresh (snapshotSrHistory), and anything older than this many days is pruned
@@ -527,7 +546,14 @@ export async function rebuildCanonical(pool) {
 // UNLOGGED: they are derived data, rebuilt at startup and after ingests —
 // crash-safety would only add WAL cost. The whole rebuild runs in ONE
 // transaction, so readers see the old tables until the swap commits.
-async function buildAggregates(client) {
+async function buildAggregates(client, { rateGenerated = false } = {}) {
+  // What the standings sum over: every PB, or every PB except those on
+  // generated maps (see GENERATED_MAP_PREFIX). `best` itself always keeps
+  // them: records and map pages are not ratings.
+  const rated = rateGenerated
+    ? "SELECT * FROM best_new"
+    : `SELECT b.* FROM best_new b JOIN map m ON m.id = b.map_id
+        WHERE lower(left(m.name, ${GENERATED_MAP_PREFIX.length})) <> '${GENERATED_MAP_PREFIX}'`;
   await client.query(`
     DROP TABLE IF EXISTS best_new, standings_new, map_index_new;
 
@@ -546,13 +572,15 @@ async function buildAggregates(client) {
       -- field weight, ranked best-first; the player's SR is the Bayesian
       -- weighted mean over SR_TOP_K slots — the top K qualifying maps plus a
       -- prior-valued placeholder for every slot they haven't filled, so every
-      -- player is measured on the same sample size.
-      WITH mm AS (
+      -- player is measured on the same sample size. Everything below reads
+      -- \`rated\`: the PBs that count (generated maps only when the flag is on).
+      WITH rated AS (${rated}),
+      mm AS (
         SELECT map_id,
                MIN(time)                                AS wr_time,
                COUNT(*)::int                            AS n,
                log(2.0, (1 + COUNT(*))::numeric)::float AS fw
-        FROM best_new GROUP BY map_id
+        FROM rated GROUP BY map_id
       ),
       contrib AS (
         SELECT b.player_id,
@@ -563,7 +591,7 @@ async function buildAggregates(client) {
                  ORDER BY power(mm.wr_time::float / b.time, ${SR_GAMMA}) DESC,
                           mm.fw DESC, b.map_id
                ) AS rn
-        FROM best_new b JOIN mm ON mm.map_id = b.map_id
+        FROM rated b JOIN mm ON mm.map_id = b.map_id
         WHERE mm.n >= ${SR_MIN_FIELD} AND b.time > 0
       ),
       skill AS (
@@ -591,7 +619,7 @@ async function buildAggregates(client) {
                -- Most recent attempt-or-finish across all of this canonical
                -- player's maps; NULL (never active) when no tally exists yet.
                MAX(la.last_active)                            AS last_active
-        FROM best_new b
+        FROM rated b
         LEFT JOIN skill sk ON sk.player_id = b.player_id
         LEFT JOIN (
           SELECT pl.canonical_id AS player_id,
@@ -733,6 +761,12 @@ const nextUtcDay = (day) => {
   d.setUTCDate(d.getUTCDate() + 1);
   return d.toISOString().slice(0, 10);
 };
+// Generated maps: a game server that polled map-sync this recently counts as
+// active (it polls every ~30 s), and servers are asked about a published map
+// for this long after it was published.
+const MAPGEN_ACTIVE_S = 5 * 60;
+const MAPGEN_ASK_S = 7 * 24 * 3600;
+
 // The Monday of `day`'s ISO week. getUTCDay() is 0 for Sunday, which belongs to
 // the week that STARTED six days earlier, not the one about to start.
 const isoWeekStart = (day) => {
@@ -2227,6 +2261,8 @@ class RaceDB {
       finishes: idx ? idx.finishes : 0,
       recentFinishes: await this.recentFinishes({ limit: 20, mapId: num(map.id) }),
       players: idx ? idx.players : leaderboard.length,
+      // Whether PBs here count toward Points and Skill Rating.
+      rated: !isGeneratedMap(map.name) || (await this.mapgenRated()),
       wr,
       perfect: await this.perfectRun(num(map.id), wr),
       leaderboard,
@@ -3024,8 +3060,9 @@ class RaceDB {
         finishes: finFrom && w.day >= finFrom ? w.finishes : null,
         attempts: attFrom && w.day >= attFrom ? w.attempts : null,
         // The current week is genuinely incomplete; the page dashes it rather
-        // than letting it read as a collapse in activity.
-        partial: w.n < 7,
+        // than letting it read as a collapse in activity. On a Sunday it already
+        // has all 7 days, but today is one of them and is still accumulating.
+        partial: w.n < 7 || w.day === isoWeekStart(today),
       }));
     }
 
@@ -3310,9 +3347,15 @@ class RaceDB {
 
     // COUNT(*) OVER () is evaluated before LIMIT, so `contested` is the full
     // number of qualifying maps even though only the top K rows come back.
+    // Same maps as the standings: generated ones only when the flag is on, so
+    // the breakdown always adds up to the published number.
+    const rateGenerated = await this.mapgenRated();
     const raw = await this.all(
       `WITH mine AS (
-         SELECT map_id, time, rank, version_id FROM best WHERE player_id = $1 AND time > 0
+         SELECT b.map_id, b.time, b.rank, b.version_id
+         FROM best b JOIN map gm ON gm.id = b.map_id
+         WHERE b.player_id = $1 AND b.time > 0
+           AND ($2::boolean OR lower(left(gm.name, ${GENERATED_MAP_PREFIX.length})) <> '${GENERATED_MAP_PREFIX}')
        ),
        mm AS (
          SELECT map_id,
@@ -3332,7 +3375,7 @@ class RaceDB {
        WHERE mm.n >= ${SR_MIN_FIELD}
        ORDER BY p DESC, mm.fw DESC, mine.map_id
        LIMIT ${SR_TOP_K}`,
-      [canonId]
+      [canonId, rateGenerated]
     );
 
     // Accumulate the weighted mean row by row, each step padded out to SR_TOP_K
@@ -3587,7 +3630,12 @@ class RaceDB {
     try {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock(727411001)"); // arbitrary fixed key
-      await buildAggregates(client);
+      // Read inside the lock, so a toggle that lands mid-rebuild is picked up
+      // by the rebuild it queues rather than lost.
+      const flag = await client.query("SELECT value FROM site_setting WHERE key = $1", [
+        SETTING_MAPGEN_RATED,
+      ]);
+      await buildAggregates(client, { rateGenerated: mapgenRatedValue(flag.rows[0]?.value) });
       await client.query("COMMIT");
     } catch (e) {
       try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
@@ -3815,6 +3863,266 @@ class RaceDB {
       [keep]
     );
     return r.rowCount;
+  }
+
+  // --- Generated-map requests (migration 20260928000000000_mapgen) ------------
+  // `identity` is the 16-byte daily identity from web/mapgen-identity.js and
+  // `day` its UTC day ("YYYY-MM-DD"). Neither is ever derived here.
+
+  // Claim one map for this identity and the site, and queue the job, all in one
+  // transaction: either all three happen or none do. Each claim is a single
+  // conditional upsert that returns no row once its limit is reached, so two
+  // replicas racing on someone's last map cannot both win it.
+  // An admin's request (/admin/mapgen): no daily identity, no per-person
+  // quota and no site budget, so it can never be refused or refunded. The
+  // admin's username is kept on the job instead.
+  async mapgenSubmitAdmin({ description, by, now = Math.floor(Date.now() / 1000) }) {
+    const token = crypto.randomBytes(16).toString("hex");
+    await this.pool.query(
+      `INSERT INTO mapgen_job (token, description, requested_by, created_at) VALUES ($1, $2, $3, $4)`,
+      [token, description, by, now]
+    );
+    return token;
+  }
+
+  // The most recent admin requests, newest first, for the admin page.
+  async mapgenAdminJobs({ limit = 10 } = {}) {
+    const rows = await this.all(
+      `SELECT * FROM mapgen_job WHERE requested_by IS NOT NULL ORDER BY id DESC LIMIT $1`,
+      [limit]
+    );
+    return rows.map((r) => ({ ...this._mapgenJobRow(r), requestedBy: r.requested_by }));
+  }
+
+  async mapgenSubmit({ identity, day, description, perIdentity, budget, now = Math.floor(Date.now() / 1000) }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Housekeeping first, on the same connection: nothing older than
+      // yesterday needs an identity, and the day's salt that could have given
+      // it meaning is already gone.
+      await client.query("DELETE FROM mapgen_quota WHERE day < $1::date - 1", [day]);
+      await client.query(
+        "UPDATE mapgen_job SET identity = NULL WHERE identity IS NOT NULL AND quota_day < $1::date - 1",
+        [day]
+      );
+      const mine = await client.query(
+        `INSERT INTO mapgen_quota (day, identity, used) VALUES ($1, $2, 1)
+         ON CONFLICT (day, identity) DO UPDATE SET used = mapgen_quota.used + 1
+         WHERE mapgen_quota.used < $3
+         RETURNING used`,
+        [day, identity, perIdentity]
+      );
+      if (!mine.rows.length) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "identity" };
+      }
+      const site = await client.query(
+        `INSERT INTO mapgen_budget (day, used) VALUES ($1, 1)
+         ON CONFLICT (day) DO UPDATE SET used = mapgen_budget.used + 1
+         WHERE mapgen_budget.used < $2
+         RETURNING used`,
+        [day, budget]
+      );
+      if (!site.rows.length) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "budget" };
+      }
+      const token = crypto.randomBytes(16).toString("hex");
+      await client.query(
+        `INSERT INTO mapgen_job (token, description, quota_day, identity, created_at)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [token, description, day, identity, now]
+      );
+      await client.query("COMMIT");
+      return { ok: true, token, used: num(mine.rows[0].used) };
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  async mapgenUsed({ identity, day }) {
+    const r = await this.one("SELECT used FROM mapgen_quota WHERE day = $1 AND identity = $2", [day, identity]);
+    return r ? num(r.used) : 0;
+  }
+
+  async mapgenBudgetUsed(day) {
+    const r = await this.one("SELECT used FROM mapgen_budget WHERE day = $1", [day]);
+    return r ? num(r.used) : 0;
+  }
+
+  // The public face of a job. Never the identity, the day or the internal id.
+  _mapgenJobRow(r) {
+    return {
+      token: r.token,
+      description: r.description,
+      status: r.status,
+      mapName: r.map_name || null,
+      report: r.report || null,
+      error: r.error || null,
+      createdAt: num(r.created_at),
+      startedAt: r.started_at == null ? null : num(r.started_at),
+      finishedAt: r.finished_at == null ? null : num(r.finished_at),
+      publishedAt: r.published_at == null ? null : num(r.published_at),
+      liveAt: r.live_at == null ? null : num(r.live_at),
+    };
+  }
+
+  // Everything the job page shows: the job, its place in the queue while it
+  // waits, and each active game server with the time it confirmed the map (or
+  // null while it has not yet). A server is active if it polled map-sync in
+  // the last `activeWithin` seconds; a server that confirmed the map is listed
+  // even if it has since gone quiet.
+  async mapgenJobDetail(token, { now = Math.floor(Date.now() / 1000), activeWithin = MAPGEN_ACTIVE_S } = {}) {
+    if (typeof token !== "string" || !/^[0-9a-f]{32}$/.test(token)) return null;
+    const r = await this.one("SELECT * FROM mapgen_job WHERE token = $1", [token]);
+    if (!r) return null;
+    const job = this._mapgenJobRow(r);
+    let queue = null;
+    if (r.status === "queued") {
+      const q = await this.one(
+        "SELECT count(*)::int AS ahead FROM mapgen_job WHERE status = 'queued' AND id < $1",
+        [r.id]
+      );
+      const busy = await this.one(
+        "SELECT count(*)::int AS n FROM mapgen_job WHERE status IN ('planning', 'building')"
+      );
+      queue = { position: num(q.ahead) + 1, ahead: num(q.ahead), building: num(busy.n) };
+    }
+    const rows = await this.all(
+      `SELECT s.server_name, seen.seen_at
+         FROM mapgen_server s
+         LEFT JOIN mapgen_seen seen ON seen.server_name = s.server_name AND seen.job_id = $1
+        WHERE s.last_sync >= $2 OR seen.seen_at IS NOT NULL
+        ORDER BY s.server_name`,
+      [r.id, now - activeWithin]
+    );
+    const servers = rows.map((x) => ({
+      name: x.server_name,
+      seenAt: x.seen_at == null ? null : num(x.seen_at),
+    }));
+    return { job, queue, servers };
+  }
+
+  // One game server's map-sync poll (hrace/blockedmaps.as). `have` is the
+  // generated maps its engine's map list now holds, out of the ones it was
+  // asked about last time. Records each confirmation, flips a job to
+  // published on its first one, notes that the server is active, and returns
+  // the maps this server has not confirmed yet: recently published ones only,
+  // so the list stays a handful long.
+  async mapgenSync({ serverName, have = [], now = Math.floor(Date.now() / 1000), horizon = MAPGEN_ASK_S }) {
+    const names = [...new Set(have)].filter((n) => /^gen_[a-z0-9_]{2,60}$/.test(n)).slice(0, 64);
+    await this.pool.query(
+      `INSERT INTO mapgen_server (server_name, last_sync) VALUES ($1, $2)
+       ON CONFLICT (server_name) DO UPDATE SET last_sync = EXCLUDED.last_sync`,
+      [serverName, now]
+    );
+    if (names.length) {
+      await this.pool.query(
+        `INSERT INTO mapgen_seen (job_id, server_name, seen_at)
+         SELECT id, $2, $3 FROM mapgen_job
+          WHERE map_name = ANY($1) AND status IN ('publishing', 'published')
+         ON CONFLICT (job_id, server_name) DO NOTHING`,
+        [names, serverName, now]
+      );
+      await this.pool.query(
+        `UPDATE mapgen_job SET status = 'published', live_at = $2
+          WHERE map_name = ANY($1) AND status = 'publishing'`,
+        [names, now]
+      );
+    }
+    const rows = await this.all(
+      `SELECT j.map_name FROM mapgen_job j
+        WHERE j.status IN ('publishing', 'published') AND j.published_at >= $1
+          AND NOT EXISTS (SELECT 1 FROM mapgen_seen s WHERE s.job_id = j.id AND s.server_name = $2)
+        ORDER BY j.published_at`,
+      [now - horizon, serverName]
+    );
+    return rows.map((x) => x.map_name);
+  }
+
+  async mapgenJob(token) {
+    if (typeof token !== "string" || !/^[0-9a-f]{32}$/.test(token)) return null;
+    const r = await this.one("SELECT * FROM mapgen_job WHERE token = $1", [token]);
+    return r ? this._mapgenJobRow(r) : null;
+  }
+
+  // The public gallery (/mapgen/gallery): every built map, newest first. Built
+  // means copied to the map store (publishing or published). Left out: jobs an
+  // admin hid (mapgenSetHidden) and maps a moderator blocked from play. Each
+  // entry is the public job row plus the map's site id and record stats once
+  // anyone has raced it (map_index is rebuilt by refreshAggregates, so a brand
+  // new map shows no records until the next rebuild).
+  async mapgenGallery({ limit = 24, offset = 0 } = {}) {
+    const lim = Math.max(1, Math.min(60, Math.floor(Number(limit)) || 24));
+    const off = Math.max(0, Math.floor(Number(offset)) || 0);
+    const visible = `j.published_at IS NOT NULL AND j.hidden_at IS NULL AND j.map_name IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM map_block b JOIN map bm ON bm.id = b.map_id
+                       WHERE lower(bm.name) = j.map_name)`;
+    const total = num((await this.one(`SELECT count(*)::int AS n FROM mapgen_job j WHERE ${visible}`)).n);
+    const rows = await this.all(
+      `SELECT j.*, mi.map_id, mi.records, mi.players, mi.wr_time, mi.wr_pid,
+              p.name AS wr_name, p.simplified AS wr_simplified
+         FROM mapgen_job j
+         LEFT JOIN map_index mi ON lower(mi.name) = j.map_name
+         LEFT JOIN player p ON p.id = mi.wr_pid
+        WHERE ${visible}
+        ORDER BY j.published_at DESC, j.id DESC
+        LIMIT $1 OFFSET $2`,
+      [lim, off]
+    );
+    const maps = rows.map((r) => this._censorNamed({
+      ...this._mapgenJobRow(r),
+      // Display only, like every map list: masked by the word list.
+      mapName: this._cnMap(r.map_name, r.map_id),
+      // The course's own title from the plan ("Kickflip"); the word list masks
+      // it like the map name, since Claude wrote it from the requester's text.
+      title: r.spec && typeof r.spec.title === "string" ? this._cnMap(r.spec.title.slice(0, 80), r.map_id) : null,
+      mapId: r.map_id == null ? null : num(r.map_id),
+      records: r.records == null ? 0 : num(r.records),
+      players: r.players == null ? 0 : num(r.players),
+      wr_time: r.wr_time == null ? null : num(r.wr_time),
+      wr_pid: r.wr_pid == null ? null : num(r.wr_pid),
+      wr_name: r.wr_name ?? null,
+      wr_simplified: r.wr_simplified ?? null,
+    }, r.wr_pid, "wr_name", "wr_simplified"));
+    return { total, limit: lim, offset: off, maps };
+  }
+
+  // Take a job out of the gallery (hidden = true) or put it back. By token, so
+  // the admin page needs no internal id. Returns rows changed (0 = no such job).
+  async mapgenSetHidden(token, hidden, by, now = Math.floor(Date.now() / 1000)) {
+    if (typeof token !== "string" || !/^[0-9a-f]{32}$/.test(token)) return 0;
+    const r = hidden
+      ? await this.pool.query(
+          "UPDATE mapgen_job SET hidden_at = $2, hidden_by = $3 WHERE token = $1", [token, now, by || null])
+      : await this.pool.query(
+          "UPDATE mapgen_job SET hidden_at = NULL, hidden_by = NULL WHERE token = $1", [token]);
+    return r.rowCount;
+  }
+
+  // Built maps for the admin gallery table, hidden ones included.
+  async mapgenBuiltAdmin({ limit = 50 } = {}) {
+    const rows = await this.all(
+      `SELECT * FROM mapgen_job WHERE published_at IS NOT NULL ORDER BY published_at DESC, id DESC LIMIT $1`,
+      [limit]
+    );
+    return rows.map((r) => ({
+      ...this._mapgenJobRow(r),
+      hiddenAt: r.hidden_at == null ? null : num(r.hidden_at),
+      hiddenBy: r.hidden_by || null,
+    }));
+  }
+
+  async mapgenJobsFor({ identity, day }) {
+    const rows = await this.all(
+      "SELECT * FROM mapgen_job WHERE quota_day = $1 AND identity = $2 ORDER BY id DESC",
+      [day, identity]
+    );
+    return rows.map((r) => this._mapgenJobRow(r));
   }
 
   // --- Map review flags ------------------------------------------------------
@@ -4366,6 +4674,12 @@ class RaceDB {
         LIMIT 10`
     );
     return rows.map((r) => this._cnMap(String(r.name).toLowerCase(), num(r.map_id))).join("\n");
+  }
+
+  // Do generated maps count toward the standings? (GENERATED_MAP_PREFIX)
+  async mapgenRated() {
+    const s = await this.getSetting(SETTING_MAPGEN_RATED);
+    return mapgenRatedValue(s && s.value);
   }
 
   // --- Site settings (admin-edited key/value, e.g. the game-server MOTD) -----

@@ -1120,6 +1120,7 @@ async function viewMap(id) {
 
   app.innerHTML = `
     <div class="crumbs"><a data-nav="#/maps">Maps</a> / ${esc(baseMapName(d.name))}${isReversedMap(d.name) ? " (reverse)" : ""}</div>
+    ${d.rated === false ? `<p class="page-sub unrated-note">A generated map: records here don't count toward Points or Skill Rating for now.</p>` : ""}
     ${wr ? `
       <div class="wr-banner">
         <div class="kicker">◆ World Record</div>
@@ -1240,6 +1241,318 @@ function wireFlag(id) {
       submit.disabled = false;
     }
   });
+}
+
+/* ------------------------------ make a map ------------------------------ */
+// Describe a course; tools/mapgen builds it. Each person gets one map a day by default.
+// "Person" is a daily identity the server computes from the request itself
+// (web/mapgen-identity.js), so this page keeps no state of its own: it asks
+// /mapgen/mine, and the same browser on the same network on the same day gets
+// the same answer, with no cookie and no localStorage.
+let mapgenTimer = null;
+function stopMapgenPoll() {
+  if (mapgenTimer) clearTimeout(mapgenTimer);
+  mapgenTimer = null;
+}
+
+const MAPGEN_STATUS = {
+  queued: ["Queued", "Waiting for the generator."],
+  planning: ["Planning", "Turning your description into a course."],
+  building: ["Building", "Compiling and checking the map."],
+  publishing: ["Publishing", "Built and checked. Waiting for the game servers to load it."],
+  published: ["On the servers", "Vote for it in game."],
+  failed: ["Failed", ""],
+};
+const MAPGEN_DONE = new Set(["published", "failed"]);
+
+// " · 2 slaloms · 1 beam · 3 shortcuts · 4 overpasses" from a build report.
+function mapgenPieces(r) {
+  const n = {};
+  for (const f of Array.isArray(r.features) ? r.features : []) n[f.type] = (n[f.type] || 0) + 1;
+  if (Array.isArray(r.shortcuts) && r.shortcuts.length) n.shortcut = r.shortcuts.length;
+  if (Array.isArray(r.overpasses) && r.overpasses.length) n.overpass = r.overpasses.length;
+  const names = { wallclimb: "wall climb", wallgap: "wall-kick gap", dash: "dash drop" };
+  const plural = (w, k) => (k === 1 ? w : w === "overpass" ? "overpasses" : w + "s");
+  return Object.entries(n)
+    .map(([w, k]) => ` · ${esc(String(k))} ${esc(plural(names[w] || w, k))}`)
+    .join("");
+}
+
+function mapgenJobCard(j) {
+  const [label, blurb] = MAPGEN_STATUS[j.status] || [j.status, ""];
+  const r = j.report || {};
+  const facts = j.mapName
+    ? `<div class="mg-facts"><b>${esc(j.mapName)}</b>${r.par_seconds ? ` · about ${esc(String(r.par_seconds))} s at run speed` : ""}${r.checkpoints ? ` · ${esc(String(r.checkpoints))} checkpoint${r.checkpoints === 1 ? "" : "s"}` : ""}${mapgenPieces(r)}</div>`
+    : "";
+  // Only a built map has a plan file; a failed build may still carry a name.
+  const plan = j.mapName && (j.status === "publishing" || j.status === "published")
+    ? `<img class="mg-plan" alt="Top-down plan of ${esc(j.mapName)}" loading="lazy"
+         src="/api/mapgen/jobs/${esc(j.token)}/plan.svg">`
+    : "";
+  return `<article class="panel mg-job">
+      <div class="mg-job-head">
+        <span class="pill mg-status ${esc(j.status)}">${esc(label)}</span>
+        <time datetime="${esc(new Date(j.createdAt * 1000).toISOString())}">${esc(new Date(j.createdAt * 1000).toISOString().slice(11, 16))} UTC</time>
+      </div>
+      <p class="mg-desc">${esc(j.description)}</p>
+      ${facts}
+      ${j.status === "failed" ? `<p class="mg-err">${esc(j.error || "Something went wrong.")}</p>` : blurb ? `<p class="mg-blurb">${esc(blurb)}</p>` : ""}
+      ${plan}
+      <a class="mg-open" href="/mapgen/${esc(j.token)}" data-nav="/mapgen/${esc(j.token)}">Follow this map →</a>
+    </article>`;
+}
+
+// One request, by its token: the page a request opens on, and the link to
+// share. It shows where the job is (its place in the queue while it waits),
+// what was built, and each game server as it confirms it loaded the map.
+const MAPGEN_STEPS = [
+  ["queued", "Queued"],
+  ["planning", "Planning"],
+  ["building", "Building and checking"],
+  ["publishing", "Publishing"],
+  ["published", "On the servers"],
+];
+
+function mapgenClock(t) {
+  return t ? new Date(t * 1000).toISOString().slice(11, 19) + " UTC" : "";
+}
+
+function mapgenStepper(j) {
+  const at = MAPGEN_STEPS.findIndex(([k]) => k === j.status);
+  const failed = j.status === "failed";
+  // A failed job stopped in planning if it never got a map name, else in building.
+  const stop = failed ? (j.mapName ? 2 : 1) : at;
+  return `<ol class="mg-steps">${MAPGEN_STEPS.map(([k, label], i) => {
+    // "On the servers" stays in progress until every active server has it.
+    const everywhere = (j.servers || []).length > 0 && j.servers.every((s) => s.seenAt);
+    const state = failed ? (i < stop ? "done" : i === stop ? "failed" : "todo")
+      : i < at ? "done" : i === at ? (k === "published" && everywhere ? "done" : "now") : "todo";
+    const t = i === 0 ? j.createdAt : i === 1 ? j.startedAt : i === 3 ? j.publishedAt : i === 4 ? j.liveAt : null;
+    return `<li class="mg-step ${state}"><span class="mg-dot" aria-hidden="true"></span>
+      <span class="mg-step-label">${esc(label)}</span>
+      ${t && state !== "todo" ? `<time>${esc(mapgenClock(t))}</time>` : ""}</li>`;
+  }).join("")}</ol>`;
+}
+
+function mapgenNow(j) {
+  const servers = Array.isArray(j.servers) ? j.servers : [];
+  const on = servers.filter((s) => s.seenAt);
+  const list = servers.length
+    ? `<ul class="mg-servers">${servers.map((s) => `<li class="${s.seenAt ? "ok" : "wait"}">
+         <span class="mg-srv">${esc(s.name)}</span>
+         <span>${s.seenAt ? `loaded ${esc(mapgenClock(s.seenAt))}` : "waiting for its next map scan"}</span></li>`).join("")}</ul>`
+    : "";
+  switch (j.status) {
+    case "queued": {
+      const q = j.queue || { position: 1, ahead: 0, building: 0 };
+      return `<p class="mg-now"><b>Number ${esc(String(q.position))} in line.</b>
+        ${q.ahead ? `${esc(String(q.ahead))} request${q.ahead === 1 ? "" : "s"} ahead of yours` : "Yours is next"}${q.building ? `, and one is being built now.` : "."}</p>`;
+    }
+    case "planning":
+      return `<p class="mg-now"><b>Planning.</b> Claude is turning your description into a course plan, and every piece is being checked against the game's movement physics.</p>`;
+    case "building":
+      return `<p class="mg-now"><b>Building and checking.</b> The course is being compiled into a map, then checked: every jump clearable, one start and finish, working checkpoints.</p>`;
+    case "publishing":
+      return `<p class="mg-now"><b>Passed every check and published.</b> The game servers pick up new maps within about a minute.</p>${list}`;
+    case "published": {
+      const all = servers.length && on.length === servers.length;
+      return `<p class="mg-now"><b>${all ? "On the servers." : `On ${on.length} of ${servers.length} servers.`}</b>
+        Vote for it in game: <span class="mono">callvote map ${esc(j.mapName)}</span></p>${list}`;
+    }
+    case "failed":
+      return `<p class="mg-now mg-err">${esc(j.error || "Something went wrong.")}</p>`;
+    default:
+      return "";
+  }
+}
+
+async function viewMapgenJob(token) {
+  loading();
+  let j;
+  try {
+    j = await api(`/mapgen/jobs/${encodeURIComponent(token)}`);
+  } catch (err) {
+    app.innerHTML = `<div class="page-title"><span class="accent">MAP</span> REQUEST</div>
+      <div class="empty">No map request with that link. Links look like /mapgen/ followed by 32 letters and digits.</div>
+      <p><a href="/mapgen" data-nav="/mapgen">Make a map →</a></p>`;
+    return;
+  }
+  const url = `${location.origin}/mapgen/${token}`;
+  app.innerHTML = `
+    <div class="page-title"><span class="accent">YOUR</span> MAP</div>
+    <p class="mg-desc mg-desc-lg">${esc(j.description)}</p>
+    <div class="panel mg-track" id="mg-track"></div>
+    <div class="mg-share">
+      <span class="mono mg-url">${esc(url)}</span>
+      <button class="btn" type="button" id="mg-copy">Copy link</button>
+      <span class="flag-msg" id="mg-copied" role="status" aria-live="polite"></span>
+    </div>
+    <p class="mg-privacy"><a href="/mapgen" data-nav="/mapgen">← Make another map</a></p>`;
+  const track = document.getElementById("mg-track");
+  const copied = document.getElementById("mg-copied");
+  document.getElementById("mg-copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      copied.textContent = "Copied.";
+    } catch (e) {
+      const r = document.createRange();
+      r.selectNodeContents(document.querySelector(".mg-url"));
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r);
+      copied.textContent = "Selected. Copy it with Ctrl+C.";
+    }
+  });
+
+  const draw = (j) => {
+    const r = j.report || {};
+    const built = j.mapName && (j.status === "publishing" || j.status === "published");
+    const facts = j.mapName
+      ? `<div class="mg-facts"><b>${esc(j.mapName)}</b>${r.par_seconds ? ` · about ${esc(String(r.par_seconds))} s at run speed` : ""}${r.checkpoints ? ` · ${esc(String(r.checkpoints))} checkpoint${r.checkpoints === 1 ? "" : "s"}` : ""}${mapgenPieces(r)}</div>`
+      : "";
+    track.innerHTML = `${mapgenStepper(j)}${mapgenNow(j)}${facts}
+      ${built ? `<img class="mg-plan" alt="Top-down plan of ${esc(j.mapName)}" src="/api/mapgen/jobs/${esc(j.token)}/plan.svg">` : ""}`;
+  };
+  // Poll while anything can still change: the job's own steps, then each
+  // active server's confirmation.
+  const settled = (j) => j.status === "failed"
+    || (j.status === "published" && (j.servers || []).length > 0 && j.servers.every((s) => s.seenAt));
+  const tick = async () => {
+    try {
+      j = await api(`/mapgen/jobs/${encodeURIComponent(token)}`);
+      draw(j);
+    } catch (e) { /* keep the last state; try again on the next tick */ }
+    if (!settled(j)) mapgenTimer = setTimeout(tick, j.status === "queued" ? 5000 : 3000);
+  };
+  stopMapgenPoll();
+  draw(j);
+  if (!settled(j)) mapgenTimer = setTimeout(tick, 3000);
+}
+
+// The gallery: every map the generator has built, newest first, each with the
+// description it was built from, its plan, and its records once raced.
+const GALLERY_PAGE = 24;
+function mapgenGalleryCard(m) {
+  const r = m.report || {};
+  const when = m.publishedAt ? new Date(m.publishedAt * 1000).toISOString().slice(0, 10) : "";
+  const title = m.title || m.mapName;
+  const name = m.mapId != null
+    ? `<a href="/map/${esc(String(m.mapId))}" data-nav="/map/${esc(String(m.mapId))}">${esc(m.mapName)}</a>`
+    : esc(m.mapName);
+  const races = m.records
+    ? `<div class="mg-g-wr">WR <b>${esc(fmtTime(m.wr_time))}</b>${m.wr_name ? ` by ${wname(m.wr_name)}` : ""}
+         · ${esc(fmtNum(m.records))} record${m.records === 1 ? "" : "s"}</div>`
+    : `<div class="mg-g-wr mg-g-none">No runs yet · <span class="mono">callvote map ${esc(m.mapName)}</span></div>`;
+  return `<article class="panel mg-g-card">
+      <a class="mg-g-plan" href="/mapgen/${esc(m.token)}" data-nav="/mapgen/${esc(m.token)}">
+        <img alt="Top-down plan of ${esc(m.mapName)}" loading="lazy" src="/api/mapgen/jobs/${esc(m.token)}/plan.svg"></a>
+      <div class="mg-g-body">
+        <div class="mg-g-head"><b>${esc(title)}</b>${when ? `<time datetime="${esc(when)}">${esc(when)}</time>` : ""}</div>
+        <div class="mg-facts">${name}${r.par_seconds ? ` · about ${esc(String(r.par_seconds))} s` : ""}${r.checkpoints ? ` · ${esc(String(r.checkpoints))} checkpoint${r.checkpoints === 1 ? "" : "s"}` : ""}${mapgenPieces(r)}</div>
+        <p class="mg-desc mg-g-desc">“${esc(m.description)}”</p>
+        ${races}
+      </div>
+    </article>`;
+}
+
+async function viewMapgenGallery(params) {
+  loading();
+  const state = { offset: Math.max(0, parseInt(params.offset, 10) || 0) };
+  const d = await api("/mapgen/gallery" + buildQuery({ limit: GALLERY_PAGE, offset: state.offset || "" }));
+  app.innerHTML = `
+    <div class="page-title"><span class="accent">GENERATED</span> MAPS</div>
+    <p class="page-sub">${d.total ? `${esc(fmtNum(d.total))} course${d.total === 1 ? "" : "s"} built from players' descriptions,` : "Courses built from players' descriptions,"}
+      newest first. Every one passed the generator's checks and is on the game servers.
+      <a href="/mapgen" data-nav="/mapgen">Make your own →</a></p>
+    ${d.maps.length
+      ? `<div class="mg-gallery">${d.maps.map(mapgenGalleryCard).join("")}</div>`
+      : `<div class="empty">No generated maps yet. <a href="/mapgen" data-nav="/mapgen">Be the first →</a></div>`}
+    ${pager(state, d, "/mapgen/gallery")}`;
+}
+
+function mapgenQuotaLine(q) {
+  if (!q.open && q.remaining > 0) return "The generator has made all the maps it can today. Back after 00:00 UTC.";
+  if (q.remaining === 0)
+    return `You've used today's ${q.limit === 1 ? "map" : q.limit + " maps"}. New ones open at 00:00 UTC.`;
+  return `${q.remaining} of ${q.limit} map${q.limit === 1 ? "" : "s"} left today · resets 00:00 UTC`;
+}
+
+async function viewMapgen() {
+  loading();
+  app.innerHTML = `
+    <div class="page-title"><span class="accent">MAKE</span> A MAP</div>
+    <p class="page-sub">Describe a race course and the generator builds it: a strafe course with
+      turns, ramps, gaps, slaloms, beams, split lanes and open track, with wall jumps and dashes if you ask for them, and it can even cross over itself. Every jump is checked against the game's own movement before anyone sees it.
+      A map that passes every check goes straight onto the game servers.
+      <a href="/mapgen/gallery" data-nav="/mapgen/gallery">See every generated map →</a></p>
+    <form class="panel mg-form" id="mg-form">
+      <label class="flag-label" for="mg-desc">Your map</label>
+      <textarea id="mg-desc" class="mg-input" rows="4" maxlength="500"
+        placeholder="e.g. a fast flowing course with two big drops, a tight hairpin and a long finishing straight"></textarea>
+      <div class="flag-actions">
+        <button class="btn mg-submit" type="submit">Build it</button>
+        <span class="mg-count">0 / 500</span>
+        <span class="flag-msg mg-msg" role="status" aria-live="polite"></span>
+      </div>
+      <p class="mg-quota" id="mg-quota"></p>
+    </form>
+    <div class="page-title" style="font-size:20px">YOUR MAPS <span class="accent">·</span> today</div>
+    <div id="mg-jobs"><div class="empty">Loading…</div></div>
+    <p class="mg-privacy">No account and no cookie. The server recognises you for the day from a
+      one-way hash of your network address and browser type, under a key it throws away at
+      midnight UTC. Your address is never stored.</p>`;
+
+  const form = document.getElementById("mg-form");
+  const input = document.getElementById("mg-desc");
+  const count = form.querySelector(".mg-count");
+  const msg = form.querySelector(".mg-msg");
+  const submit = form.querySelector(".mg-submit");
+  const quotaEl = document.getElementById("mg-quota");
+  const jobsEl = document.getElementById("mg-jobs");
+
+  const render = (d) => {
+    quotaEl.textContent = mapgenQuotaLine(d.quota);
+    submit.disabled = d.quota.remaining === 0 || !d.quota.open;
+    jobsEl.innerHTML = d.jobs.length
+      ? d.jobs.map(mapgenJobCard).join("")
+      : `<div class="empty">Nothing yet today.</div>`;
+    stopMapgenPoll();
+    if (d.jobs.some((j) => !MAPGEN_DONE.has(j.status))) {
+      mapgenTimer = setTimeout(refresh, 5000);
+    }
+  };
+  const refresh = async () => {
+    try {
+      render(await api("/mapgen/mine"));
+    } catch (err) {
+      jobsEl.innerHTML = `<div class="empty">Map requests are unavailable right now.</div>`;
+      submit.disabled = true;
+    }
+  };
+
+  input.addEventListener("input", () => { count.textContent = `${input.value.length} / 500`; });
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    submit.disabled = true;
+    msg.className = "flag-msg mg-msg";
+    msg.textContent = "Sending…";
+    try {
+      const r = await apiPost("/mapgen", { description: input.value });
+      if (r && r.job && r.job.token) {
+        go(`/mapgen/${r.job.token}`);
+        return;
+      }
+      msg.textContent = "Queued. It shows up below.";
+      msg.classList.add("ok");
+      input.value = "";
+      count.textContent = "0 / 500";
+    } catch (err) {
+      msg.classList.add("err");
+      msg.textContent = String((err && err.message) || "Couldn't send. Please try again.");
+    }
+    await refresh();
+  });
+  await refresh();
 }
 
 /* ------------------------------ replay view ------------------------------ */
@@ -3986,6 +4299,7 @@ async function viewBlogPost(slug) {
 
 async function router() {
   stopLiveRefresh();
+  stopMapgenPoll();
   stopReplay();
   stopServerStream();
   // Legacy "#/…" URL (old shared link / bookmark): rewrite to the clean path
@@ -4016,6 +4330,9 @@ async function router() {
     else if (path === "/tournaments") await viewTournaments();
     else if (path.startsWith("/tournaments/")) await viewTournament(decodeURIComponent(path.slice(13)));
     else if (path === "/live") await viewLive();
+    else if (path === "/mapgen") await viewMapgen();
+    else if (path === "/mapgen/gallery") await viewMapgenGallery(params);
+    else if (path.startsWith("/mapgen/")) await viewMapgenJob(path.slice(8));
     else if (path === "/about") await viewAbout();
     else if (path === "/colors") viewColors();
     else if (path.startsWith("/server/")) await viewServer(parseInt(path.split("/")[2], 10));
