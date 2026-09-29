@@ -381,6 +381,15 @@ repair turn, not a failed request.
   banner blanked. So "did the generator change this map?" is a byte compare.
 - **`gen_` prefix.** Generated maps are recognisable in the pool, in votes and
   on the site. They can be filtered, blocked or retired as a class.
+- **Generated maps stay out of ratings until an admin says otherwise.** One
+  site-wide flag, `/admin/mapgen` (admins only; stored as `site_setting`
+  `mapgen_rated`), decides whether `gen_*` maps count toward Points, Skill
+  Rating and the maps / WR / podium totals. It is off by default: a generated
+  map is new and unvetted, and a handful of them could otherwise hand out
+  cheap WRs. When off, the standings rebuild (`buildAggregates`) and the
+  profile's SR breakdown both skip `gen_*` PBs, so the two always agree; the
+  maps' records, leaderboards and pages are untouched, and the map page says
+  its records don't count yet. Saving the flag rebuilds the standings at once.
 - **Claude Opus 5 with adaptive thinking, structured output and server-side
   refusal fallback.** Structured output fixes the JSON shape. The repair loop
   (at most 4 attempts) fixes the sense.

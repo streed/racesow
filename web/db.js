@@ -190,6 +190,25 @@ export function srIsRanked(maps) {
   return num(maps) >= SR_MIN_MAPS;
 }
 
+// Generated maps (tools/mapgen) are all named gen_*: the generator enforces the
+// prefix (spec.NAME_RE) precisely so they can be treated as a class. Whether
+// they count toward the standings (Points, Skill Rating and the maps / WR /
+// podium totals) is a site-wide flag an admin toggles at /admin/mapgen, stored
+// in site_setting. Off by default: a generated map is new and unvetted, so it
+// stays out of everyone's rating until an admin decides the class has earned
+// it. Records, leaderboards and map pages are unaffected either way; this only
+// decides what the rating sums over.
+export const GENERATED_MAP_PREFIX = "gen_";
+export const SETTING_MAPGEN_RATED = "mapgen_rated";
+export function isGeneratedMap(name) {
+  return String(name || "").toLowerCase().startsWith(GENERATED_MAP_PREFIX);
+}
+// The stored value is "1" (count) or "0"; anything else, or no row at all,
+// means the default: don't count.
+export function mapgenRatedValue(value) {
+  return value === "1";
+}
+
 // How many days of per-player Skill Rating history to retain (rolling window).
 // One SR value is snapshotted per player per UTC day at the tail of an aggregate
 // refresh (snapshotSrHistory), and anything older than this many days is pruned
@@ -527,7 +546,14 @@ export async function rebuildCanonical(pool) {
 // UNLOGGED: they are derived data, rebuilt at startup and after ingests —
 // crash-safety would only add WAL cost. The whole rebuild runs in ONE
 // transaction, so readers see the old tables until the swap commits.
-async function buildAggregates(client) {
+async function buildAggregates(client, { rateGenerated = false } = {}) {
+  // What the standings sum over: every PB, or every PB except those on
+  // generated maps (see GENERATED_MAP_PREFIX). `best` itself always keeps
+  // them: records and map pages are not ratings.
+  const rated = rateGenerated
+    ? "SELECT * FROM best_new"
+    : `SELECT b.* FROM best_new b JOIN map m ON m.id = b.map_id
+        WHERE lower(left(m.name, ${GENERATED_MAP_PREFIX.length})) <> '${GENERATED_MAP_PREFIX}'`;
   await client.query(`
     DROP TABLE IF EXISTS best_new, standings_new, map_index_new;
 
@@ -546,13 +572,15 @@ async function buildAggregates(client) {
       -- field weight, ranked best-first; the player's SR is the Bayesian
       -- weighted mean over SR_TOP_K slots — the top K qualifying maps plus a
       -- prior-valued placeholder for every slot they haven't filled, so every
-      -- player is measured on the same sample size.
-      WITH mm AS (
+      -- player is measured on the same sample size. Everything below reads
+      -- \`rated\`: the PBs that count (generated maps only when the flag is on).
+      WITH rated AS (${rated}),
+      mm AS (
         SELECT map_id,
                MIN(time)                                AS wr_time,
                COUNT(*)::int                            AS n,
                log(2.0, (1 + COUNT(*))::numeric)::float AS fw
-        FROM best_new GROUP BY map_id
+        FROM rated GROUP BY map_id
       ),
       contrib AS (
         SELECT b.player_id,
@@ -563,7 +591,7 @@ async function buildAggregates(client) {
                  ORDER BY power(mm.wr_time::float / b.time, ${SR_GAMMA}) DESC,
                           mm.fw DESC, b.map_id
                ) AS rn
-        FROM best_new b JOIN mm ON mm.map_id = b.map_id
+        FROM rated b JOIN mm ON mm.map_id = b.map_id
         WHERE mm.n >= ${SR_MIN_FIELD} AND b.time > 0
       ),
       skill AS (
@@ -591,7 +619,7 @@ async function buildAggregates(client) {
                -- Most recent attempt-or-finish across all of this canonical
                -- player's maps; NULL (never active) when no tally exists yet.
                MAX(la.last_active)                            AS last_active
-        FROM best_new b
+        FROM rated b
         LEFT JOIN skill sk ON sk.player_id = b.player_id
         LEFT JOIN (
           SELECT pl.canonical_id AS player_id,
@@ -2233,6 +2261,8 @@ class RaceDB {
       finishes: idx ? idx.finishes : 0,
       recentFinishes: await this.recentFinishes({ limit: 20, mapId: num(map.id) }),
       players: idx ? idx.players : leaderboard.length,
+      // Whether PBs here count toward Points and Skill Rating.
+      rated: !isGeneratedMap(map.name) || (await this.mapgenRated()),
       wr,
       perfect: await this.perfectRun(num(map.id), wr),
       leaderboard,
@@ -3317,9 +3347,15 @@ class RaceDB {
 
     // COUNT(*) OVER () is evaluated before LIMIT, so `contested` is the full
     // number of qualifying maps even though only the top K rows come back.
+    // Same maps as the standings: generated ones only when the flag is on, so
+    // the breakdown always adds up to the published number.
+    const rateGenerated = await this.mapgenRated();
     const raw = await this.all(
       `WITH mine AS (
-         SELECT map_id, time, rank, version_id FROM best WHERE player_id = $1 AND time > 0
+         SELECT b.map_id, b.time, b.rank, b.version_id
+         FROM best b JOIN map gm ON gm.id = b.map_id
+         WHERE b.player_id = $1 AND b.time > 0
+           AND ($2::boolean OR lower(left(gm.name, ${GENERATED_MAP_PREFIX.length})) <> '${GENERATED_MAP_PREFIX}')
        ),
        mm AS (
          SELECT map_id,
@@ -3339,7 +3375,7 @@ class RaceDB {
        WHERE mm.n >= ${SR_MIN_FIELD}
        ORDER BY p DESC, mm.fw DESC, mine.map_id
        LIMIT ${SR_TOP_K}`,
-      [canonId]
+      [canonId, rateGenerated]
     );
 
     // Accumulate the weighted mean row by row, each step padded out to SR_TOP_K
@@ -3594,7 +3630,12 @@ class RaceDB {
     try {
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock(727411001)"); // arbitrary fixed key
-      await buildAggregates(client);
+      // Read inside the lock, so a toggle that lands mid-rebuild is picked up
+      // by the rebuild it queues rather than lost.
+      const flag = await client.query("SELECT value FROM site_setting WHERE key = $1", [
+        SETTING_MAPGEN_RATED,
+      ]);
+      await buildAggregates(client, { rateGenerated: mapgenRatedValue(flag.rows[0]?.value) });
       await client.query("COMMIT");
     } catch (e) {
       try { await client.query("ROLLBACK"); } catch { /* connection may be dead */ }
@@ -4545,6 +4586,12 @@ class RaceDB {
         LIMIT 10`
     );
     return rows.map((r) => this._cnMap(String(r.name).toLowerCase(), num(r.map_id))).join("\n");
+  }
+
+  // Do generated maps count toward the standings? (GENERATED_MAP_PREFIX)
+  async mapgenRated() {
+    const s = await this.getSetting(SETTING_MAPGEN_RATED);
+    return mapgenRatedValue(s && s.value);
   }
 
   // --- Site settings (admin-edited key/value, e.g. the game-server MOTD) -----

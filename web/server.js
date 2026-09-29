@@ -23,6 +23,8 @@ import {
   RUN_ACTIVITY_BUCKETS,
   urlSlug,
   isSafeMapName,
+  SETTING_MAPGEN_RATED,
+  GENERATED_MAP_PREFIX,
 } from "./db.js";
 import { createLivePoller, parseAddress } from "./live.js";
 import { createMapPack } from "./mappack.js";
@@ -2811,7 +2813,7 @@ admin.get("/flags", requireAuth, wrap(async (req, res) => {
     ${quarSection}
     <h1>Open map flags</h1>
     <p class="sub">${groups.length} map${groups.length === 1 ? "" : "s"} with open reports ·
-      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a> · <a href="/admin/tournaments">tournaments</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/announcements">announcements</a> · <a href="/admin/blog">blog</a>` : ""} · <a href="/admin/account">account</a></p>
+      <a href="/admin/flags/all">history</a> · <a href="/admin/servers">servers</a>${isAdminSession(req.session) ? ` · <a href="/admin/logs">logs</a>` : ""} · <a href="/admin/blocked">blocked maps</a> · <a href="/admin/achievements">achievements</a> · <a href="/admin/tournaments">tournaments</a>${isAdminSession(req.session) ? ` · <a href="/admin/names">names</a> · <a href="/admin/motd">motd</a> · <a href="/admin/mapgen">generated maps</a> · <a href="/admin/announcements">announcements</a> · <a href="/admin/blog">blog</a>` : ""} · <a href="/admin/account">account</a></p>
     ${done}${body}`, req.session);
 }));
 
@@ -3207,6 +3209,44 @@ admin.post("/motd", requireAdmin, wrap(async (req, res) => {
   if (!checkCsrf(req, res)) return;
   await race.setSetting("motd", sanitizeMotd(req.body && req.body.motd), req.session.username);
   res.redirect(303, "/admin/motd?ok=1");
+}));
+
+// Whether generated maps (gen_*) count toward Points and Skill Rating. One
+// site-wide flag (db.js GENERATED_MAP_PREFIX); saving it rebuilds the standings
+// straight away so the leaderboards reflect the new rule within seconds.
+admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
+  const done = req.query.ok
+    ? `<div class="msg ok">Saved. The standings are being rebuilt with the new rule; leaderboards and profiles show it within a minute.</div>`
+    : "";
+  const s = await race.getSetting(SETTING_MAPGEN_RATED);
+  const on = await race.mapgenRated();
+  const count = await race.one(
+    "SELECT COUNT(*)::int AS n FROM map WHERE lower(left(name, $1)) = $2",
+    [GENERATED_MAP_PREFIX.length, GENERATED_MAP_PREFIX]
+  );
+  const meta = s && s.updated_at
+    ? `<p class="sub">last changed ${fmtWhen(s.updated_at)}${s.updated_by ? ` by ${escHtml(s.updated_by)}` : ""}</p>`
+    : `<p class="sub">never changed: the default applies</p>`;
+  sendAdmin(res, "Generated maps", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    <h1>Generated maps in ratings</h1>
+    <p class="sub">Maps built by the map generator (names starting <span style="font-family:monospace">${escHtml(GENERATED_MAP_PREFIX)}</span>,
+      ${count ? count.n : 0} known to the site) · when off, they are left out of Points, Skill Rating and the
+      maps / WR / podium totals · their records and map pages are unaffected either way</p>
+    ${done}${meta}
+    <form class="card" method="post" action="/admin/mapgen" style="max-width:640px">
+      <input type="hidden" name="_csrf" value="${escHtml(req.session.csrf)}">
+      <p>Generated maps currently <b>${on ? "count" : "do not count"}</b> toward ratings.</p>
+      <input type="hidden" name="rated" value="${on ? "0" : "1"}">
+      <div class="actions"><button class="primary" type="submit">${on ? "Stop counting them" : "Count them"}</button></div>
+    </form>`, req.session);
+}));
+
+admin.post("/mapgen", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const rated = String(req.body && req.body.rated) === "1" ? "1" : "0";
+  await race.setSetting(SETTING_MAPGEN_RATED, rated, req.session.username);
+  doRefresh();   // not awaited: a full rebuild can take seconds
+  res.redirect(303, "/admin/mapgen?ok=1");
 }));
 
 // Rotating in-game announcements: one message per line. Normalise newlines,

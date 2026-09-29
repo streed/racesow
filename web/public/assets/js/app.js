@@ -1120,6 +1120,7 @@ async function viewMap(id) {
 
   app.innerHTML = `
     <div class="crumbs"><a data-nav="#/maps">Maps</a> / ${esc(baseMapName(d.name))}${isReversedMap(d.name) ? " (reverse)" : ""}</div>
+    ${d.rated === false ? `<p class="page-sub unrated-note">A generated map: records here don't count toward Points or Skill Rating for now.</p>` : ""}
     ${wr ? `
       <div class="wr-banner">
         <div class="kicker">◆ World Record</div>

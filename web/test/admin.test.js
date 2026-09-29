@@ -408,6 +408,43 @@ test("admin edits the MOTD: sanitized, then served on /api/game/motd", async () 
   assert.equal(await (await fetch(`${base}/api/game/motd`)).text(), "RSMOTD\n");
 });
 
+test("admin toggles whether generated maps count toward ratings", async () => {
+  const cookie = await adminCookie();
+  const anon = await fetch(`${base}/admin/mapgen`, { redirect: "manual" });
+  assert.equal(anon.status, 302);
+
+  // Default: off, and the page says so.
+  const page = await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text();
+  assert.match(page, /Generated maps currently <b>do not count<\/b>/);
+  assert.match(page, /never changed: the default applies/);
+  const csrf = page.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
+  assert.ok(csrf);
+
+  const post = (fields) => fetch(`${base}/admin/mapgen`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields),
+  });
+  // Missing CSRF -> 403, nothing saved.
+  assert.equal((await post({ rated: "1" })).status, 403);
+  assert.equal((await db.query("SELECT value FROM site_setting WHERE key = 'mapgen_rated'")).rows.length, 0);
+
+  // Turn it on: stored as "1", attributed, and the page flips.
+  assert.equal((await post({ _csrf: csrf, rated: "1" })).status, 303);
+  const row = (await db.query("SELECT value, updated_by FROM site_setting WHERE key = 'mapgen_rated'")).rows[0];
+  assert.equal(row.value, "1");
+  assert.ok(row.updated_by);
+  const on = await (await fetch(`${base}/admin/mapgen?ok=1`, { headers: { cookie } })).text();
+  assert.match(on, /Generated maps currently <b>count<\/b>/);
+  assert.match(on, /The standings are being rebuilt/);
+
+  // Anything but "1" means off.
+  assert.equal((await post({ _csrf: csrf, rated: "yes" })).status, 303);
+  assert.equal(
+    (await db.query("SELECT value FROM site_setting WHERE key = 'mapgen_rated'")).rows[0].value, "0");
+});
+
 test("admin edits announcements: one per line, sanitized, then served on /api/game/announcements", async () => {
   const cookie = await adminCookie();
 
@@ -500,6 +537,9 @@ test("moderator tier: flags + map-block + restart allowed; admin-only surface is
   assert.ok(!/href="\/admin\/motd"/.test(flagsHtml), "no MOTD link for moderator");
   assert.ok(!/href="\/admin\/announcements"/.test(flagsHtml), "no announcements link for moderator");
   assert.ok(!/href="\/admin\/logs"/.test(flagsHtml), "no logs link for moderator");
+  assert.ok(!/href="\/admin\/mapgen"/.test(flagsHtml), "no generated-maps link for moderator");
+  assert.equal((await fetch(`${base}/admin/mapgen`, { headers: { cookie: mod } })).status, 403,
+    "the rating flag is admin-only");
 
   // Allowed action: block then unblock a map (CSRF from any moderator page).
   const csrf = flagsHtml.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
