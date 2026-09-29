@@ -447,6 +447,37 @@ Worth alerting on, if you wire up monitoring:
 - `>> WARNING: map store ... is unreachable` in a US game server's log (it
   started from the snapshot).
 
+## How far the store can reach
+
+The store is the one place maps are added, but it is not always the place the
+game should READ. Two costs decide that, both measured EU->US over the
+WireGuard link with 4,588 packs:
+
+| | cost |
+|---|---|
+| `readdir` of the store | 0 s |
+| one `stat` per pack (what `find -printf '%s'` does) | 415 s |
+| the engine opening every pack to build its pak list | did not finish inside 10 min |
+
+The first two are the entrypoint's problem and are solved: the pack cache is
+keyed on the pack NAME, so a warm cache lists the pool without touching a
+single file (`server/mapscan-lib.sh`). The third is not solvable from here —
+the engine does it itself, before any of our code runs again — and it is what
+decides the answer.
+
+So on a box whose store is a mount across a link like this one, set
+**`MAP_STORE_READ=snapshot`** in that box's `.env`. The game then reads the
+local snapshot (a 72 s boot) while `MAP_STORE_DIR` stays pointed at the mount,
+which is what `map-snapshot.sh` syncs from. With the timer at five minutes, a
+map published on EU is playable on the far box inside about six minutes: five
+for the sync, up to one for the engine's own `sv_mapscan`.
+
+Leave `MAP_STORE_READ` at `auto` where the store is local disk, or across a
+link fast enough that the engine's scan is not a problem — then a new pack is
+votable within the minute, with no sync in the path at all. If you are unsure,
+time it: `time find -H /srv/racesow/maps -maxdepth 1 -name '*.pk3' -printf '%s\n' | wc -l`
+against the same command without `-printf '%s'`.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

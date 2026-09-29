@@ -134,8 +134,28 @@ store_answers() {
         for pk in "$d"/*.pk3; do [ -e "$pk" ] && exit 0; done
         exit 1' _ "$1" "${FS_GAME}" 2>/dev/null
 }
+# Which copy the ENGINE reads. "auto" (the default) prefers the store and
+# falls back to the snapshot; "snapshot" reads the local copy even when the
+# store answers.
+#
+# Set it to snapshot on a box whose store is a mount across a slow link. The
+# pack cache made the entrypoint's own scan affordable there, but the engine
+# then opens all ~4,600 packs itself to build its pak list, and over the
+# EU->US mount that alone left the server unhealthy past ten minutes -- longer
+# than the healthcheck's start_period, so the watchdog would restart it into a
+# loop. Local disk boots in 72 s. The snapshot is at most one sync behind
+# (racesow-map-snapshot.timer, every five minutes), and the engine's own
+# sv_mapscan then picks a new pack up within the minute.
+#
+# The sync still pulls FROM the store: MAP_STORE_DIR stays the mount, which is
+# also what map-snapshot.sh reads, so the two do not have to agree.
+MAP_STORE_READ="${MAP_STORE_READ:-auto}"
+
 pick_map_store() {
-    if [ -d "${MAP_STORE}/${FS_GAME}" ] && store_answers "${MAP_STORE}"; then
+    if [ "${MAP_STORE_READ}" = "snapshot" ] && [ -d "${MAP_STORE_FALLBACK}/${FS_GAME}" ] \
+       && store_answers "${MAP_STORE_FALLBACK}"; then
+        echo "${MAP_STORE_FALLBACK}"
+    elif [ -d "${MAP_STORE}/${FS_GAME}" ] && store_answers "${MAP_STORE}"; then
         echo "${MAP_STORE}"
     elif [ -d "${MAP_STORE_FALLBACK}/${FS_GAME}" ] && store_answers "${MAP_STORE_FALLBACK}"; then
         echo ">> WARNING: map store ${MAP_STORE} is unreachable; using the local snapshot" \

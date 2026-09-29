@@ -104,8 +104,17 @@ pool_answers() {
         for pk in "$d"/*.pk3; do [ -e "$pk" ] && exit 0; done
         exit 1' _ "$1" 2>/dev/null
 }
+# Which copy the ENGINE reads: "auto" prefers the store, "snapshot" takes the
+# local copy even when the store answers. See the same knob in
+# server/entrypoint.sh for why a slow-link box wants the snapshot: the engine
+# opens every pack itself, and that is not something a cache can help with.
+MAP_STORE_READ="${MAP_STORE_READ:-auto}"
+
 POOL_NOW=""
-if [ -d "${MAPS_EXTRA}" ] && pool_answers "${MAPS_EXTRA}"; then
+if [ "${MAP_STORE_READ}" = "snapshot" ] && [ -d "${MAPS_FALLBACK}" ] \
+   && pool_answers "${MAPS_FALLBACK}"; then
+    POOL_NOW="${MAPS_FALLBACK}"
+elif [ -d "${MAPS_EXTRA}" ] && pool_answers "${MAPS_EXTRA}"; then
     POOL_NOW="${MAPS_EXTRA}"
 elif [ -d "${MAPS_FALLBACK}" ] && pool_answers "${MAPS_FALLBACK}"; then
     echo ">> WARNING: map store ${MAPS_EXTRA} is unreachable; using the local snapshot" \

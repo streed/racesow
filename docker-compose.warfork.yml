@@ -59,6 +59,11 @@ services:
       # is handed over as fs_cdpath, so a pack that lands after boot is found.
       # 0 = only at startup.
       MAPSCAN_SECONDS: "${MAPSCAN_SECONDS:-60}"
+      # Which copy the engine reads: "auto" prefers the store, "snapshot"
+      # takes the local copy even when the store answers. A box whose store is
+      # a mount across a slow link wants snapshot: the engine opens every pack
+      # itself, which no cache helps with (docs/map-store-runbook.md).
+      MAP_STORE_READ: "${MAP_STORE_READ:-auto}"
       # The shared RS_Api* native (g_rs_api.cpp) derives its libc write paths from
       # $WARSOW_DIR; on Warfork it must equal the engine base ($WF_DIR=/warfork),
       # else `top` / the live-record refresh write to a dead /warsow path the

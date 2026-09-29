@@ -61,6 +61,11 @@ services:
       # How often (seconds) the engine rescans the map store for new packs
       # (enginepatches/patch-mapscan.py). 0 = only at map change / `mapscan`.
       MAPSCAN_SECONDS: "${MAPSCAN_SECONDS:-60}"
+      # Which copy the engine reads: "auto" prefers the store, "snapshot"
+      # takes the local copy even when the store answers. A box whose store is
+      # a mount across a slow link wants snapshot: the engine opens every pack
+      # itself, which no cache helps with (docs/map-store-runbook.md).
+      MAP_STORE_READ: "${MAP_STORE_READ:-auto}"
       # Cross-server player mirroring (UDP mesh). Peers exchange live player
       # positions + chat so players on one server see the others as ghosts.
       # Set all of these in .env; empty MIRROR_PEERS = feature off.
