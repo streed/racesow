@@ -41,6 +41,8 @@ jobs:
         run: cd web && npm install && npm test
       - name: entrypoint contract test
         run: sh server/test/entrypoint.test.sh
+      - name: warfork map pool + installed-map scan contract test
+        run: bash server/test/warfork-mapscan.test.sh
       - name: end-to-end pipeline (real natives -> real API)
         run: sh e2e/run.sh
       - name: mesh parser fuzz (ASan + UBSan)

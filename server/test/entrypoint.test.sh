@@ -197,4 +197,56 @@ if [ -f "${TMP}/pk3/maps/alpha.bsp" ] && command -v zip >/dev/null 2>&1; then
         fail "a map that exists only in the store must be bootable from the pool"
 fi
 
+# --- Case 9: the installed-map scan caches pack contents ---------------------
+# server/mapscan-lib.sh, shared with the Warfork entrypoint. Reading the
+# central directory of every pack is the expensive part of a boot: tens of
+# seconds on local disk and over twenty minutes against the NFS map store. A
+# pack is identified by size+name (they are never rewritten in place), so an
+# unchanged pool must cost one directory listing and zero archive reads.
+if [ -f "${TMP}/pk3/maps/alpha.bsp" ] && command -v zip >/dev/null 2>&1; then
+    BOX11="$(sandbox scan-cache)"
+    mkdir -p "${BOX11}/shared/racemod"
+    ( cd "${TMP}/pk3" && zip -qr "${BOX11}/shared/racemod/storepool.pk3" maps ) 2>/dev/null
+    run_entrypoint "${BOX11}"
+    grep -q '>> map scan: 1 pack(s), 0 from cache, 1 read' "${BOX11}/entrypoint.log" || {
+        grep '>> map scan' "${BOX11}/entrypoint.log" >&2 || true
+        fail "the first boot must read the pack and say so"
+    }
+    [ -s "${BOX11}/racemod/racelog/.installed-maps.cache" ] || \
+        fail "the pack cache must be written under racelog (a persisted mount)"
+    run_entrypoint "${BOX11}"
+    grep -q '>> map scan: 1 pack(s), 1 from cache, 0 read' "${BOX11}/entrypoint.log" || {
+        grep '>> map scan' "${BOX11}/entrypoint.log" >&2 || true
+        fail "an unchanged pool must be served entirely from the cache"
+    }
+
+    # --- Case 10: the snapshot warms the cache for the store -----------------
+    # The cache is keyed on size+name, not path, so the identical pack read
+    # from the local snapshot answers for the one in the NFS store. That is
+    # what keeps a cold cache off the twenty-minute scan; only the packs added
+    # since the last hourly sync are read over the wire.
+    BOX12="$(sandbox scan-warm)"
+    mkdir -p "${BOX12}/shared/racemod" "${BOX12}/shared-fallback/racemod"
+    ( cd "${TMP}/pk3" && zip -qr "${TMP}/shared-pool.pk3" maps ) 2>/dev/null
+    cp "${TMP}/shared-pool.pk3" "${BOX12}/shared-fallback/racemod/pool.pk3"
+    cp "${TMP}/shared-pool.pk3" "${BOX12}/shared/racemod/pool.pk3"
+    # ...plus one pack only the store has: a map added since the last sync.
+    mkdir -p "${TMP}/pk3b/maps"; : > "${TMP}/pk3b/maps/delta.bsp"
+    ( cd "${TMP}/pk3b" && zip -qr "${BOX12}/shared/racemod/fresh.pk3" maps ) 2>/dev/null
+    run_entrypoint "${BOX12}"
+    grep -q '>> map scan (warming the cache from .*shared-fallback/racemod): 1 pack(s), 0 from cache, 1 read' \
+        "${BOX12}/entrypoint.log" || {
+        grep '>> map scan' "${BOX12}/entrypoint.log" >&2 || true
+        fail "the warming pass must read the snapshot's packs from local disk"
+    }
+    grep -q '>> map scan: 2 pack(s), 1 from cache, 1 read' "${BOX12}/entrypoint.log" || {
+        grep '>> map scan' "${BOX12}/entrypoint.log" >&2 || true
+        fail "the store scan must reuse the warmed cache and read only what is new"
+    }
+    printf '%s\n' delta > "${BOX12}/racemod/mappool.txt"
+    run_entrypoint "${BOX12}"
+    [ "$(grep -A1 '^+map$' "${BOX12}/launch-args.txt" | tail -1)" = "delta" ] || \
+        fail "a store-only map must be installed and bootable"
+fi
+
 echo "OK: entrypoint contract tests passed"

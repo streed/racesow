@@ -378,6 +378,9 @@ COPY entrypoint.sh       /entrypoint.sh
 # Bad-map crash recovery, sourced by the entrypoint from its own directory.
 # Must sit beside /entrypoint.sh or the entrypoint falls back to inert stubs.
 COPY crashguard.sh       /crashguard.sh
+# Cached installed-map scan, shared verbatim with the Warfork image. Sourced by
+# the entrypoint from its own directory, so it must sit beside /entrypoint.sh.
+COPY mapscan-lib.sh      /mapscan-lib.sh
 # Docker HEALTHCHECK + wedged-engine watchdog (compose wires it up; see the
 # header in gamehealth.sh for why "process alive" is not a useful health signal
 # for this engine).

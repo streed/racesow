@@ -44,7 +44,7 @@ with the usual notice.
 | NFS | nfsd on `10.66.0.1:2049` (TCP), NFSv4.2 only | client |
 | Export | `/srv/racesow/store` (bind mount of `server/maps`) | — |
 | Warsow reads | `server/maps` as `fs_cdpath` | the NFS mount as `fs_cdpath`; the snapshot if it does not answer at launch |
-| Warfork reads | `server/maps` | the snapshot (`WARFORK_MAPS_DIR`) |
+| Warfork reads | `server/maps` as `fs_cdpath` | the NFS mount as `fs_cdpath`; the snapshot if it does not answer at launch |
 | Game compose | `server/docker-compose.yml`, reads `server/.env` | `docker-compose.agent.yml` + `docker-compose.warfork.yml`, read `~/racesow/.env` |
 | Who adds maps | `scripts/fetch-maps.sh`, the mapgen worker | nobody (`fetch-maps.sh` refuses) |
 
@@ -320,13 +320,21 @@ docker logs warsow-race 2>&1 | grep -E '>> (map store|WARNING: map store)|mapsca
 #  ">> WARNING: map store /warsow/shared is unreachable; using the local snapshot"
 #  followed by ">> map store: /warsow/shared-fallback/racemod" means it fell back:
 #  see Troubleshooting
-docker exec warsow-race sh -c 'ls /warsow/shared/racemod/*.pk3 | wc -l'           # the store's count
-docker exec warfork-race sh -c 'ls /warfork/maps_extra/*.pk3 | wc -l'             # the snapshot's count
+docker logs warfork-race 2>&1 | grep -E '>> (shared map pool|WARNING: map store)'
+#  >> shared map pool: /warfork/maps_extra mounted as fs_cdpath ... (N pk3s, rescan every 60s)
+docker exec warsow-race  sh -c 'ls /warsow/shared/racemod/*.pk3 | wc -l'          # the store's count
+docker exec warfork-race sh -c 'ls /warfork/maps_extra/*.pk3   | wc -l'           # the same store
 curl -sI http://127.0.0.1:${PAK_HTTP_PORT:-44445}/racemod/$(ls /srv/racesow/maps | grep pk3 | head -1) | head -1
 #  HTTP/1.1 200 OK                                             <- downloads come from the store
 ```
 
-Warsow boots in 60 to 90 s with the full pool. Then vote a map in game, and
+Both engines boot in 60 to 90 s with the full pool. The first boot after the
+switch reads the local snapshot to warm its pack cache (`>> map scan (warming
+the cache from ...)`) and then reads over NFS only the packs the snapshot did
+not have. Without that cache the boot reads all ~4,600 packs across the
+Atlantic at about 52 RPCs/sec and the server is unreachable for twenty
+minutes — which is exactly what happened on 2026-09-28 and is why the cache
+exists (`server/mapscan-lib.sh`). Then vote a map in game, and
 confirm that a player without the map downloads it.
 
 **The live test.** Add a pack on EU and watch US pick it up without a restart.
@@ -335,10 +343,16 @@ Any pack not yet in the pool will do; a generated one is the easiest:
 ```bash
 # EU
 cp some_new_map.pk3 ~/racesow/server/maps/ && chmod 644 ~/racesow/server/maps/some_new_map.pk3
-# US, within MAPSCAN_SECONDS (60 s):
-docker logs --since 2m warsow-race 2>&1 | grep 'mapscan: +'
+# US, within MAPSCAN_SECONDS (60 s) — BOTH games, they share the schedule:
+docker logs --since 2m warsow-race  2>&1 | grep 'mapscan: +'
+docker logs --since 2m warfork-race 2>&1 | grep 'mapscan: +'
 #  mapscan: +1 map(s), 4613 on the list
 ```
+
+A steady run of `mapscan: +0 map(s), <N> on the list` with `N` never moving
+means the rescan is healthy but its source is not changing. Check the hourly
+sync before you touch the engine — see "the snapshot stops growing" under
+[Troubleshooting](#troubleshooting).
 
 ## G. Generated maps publish into the store (EU)
 
@@ -449,7 +463,9 @@ Worth alerting on, if you wire up monitoring:
 | Snapshot refuses: "does not show .racesow-map-store" | The store is unreachable, or the sentinel was deleted on EU | Fix the link, or `touch server/maps/.racesow-map-store` on EU. |
 | Snapshot refuses: "refusing to delete more than half" | A partial listing from a sick mount, or a real mass deletion on EU | If the deletion was real, run it once with the store checked by hand and move the old snapshot aside first. Otherwise fix the mount. |
 | New map not votable on US after a minute | `MAPSCAN_SECONDS` is 0, the pack is not world-readable, or it is blocked | `rcon mapscan`; check the pack's permissions on EU; check the admin blocklist. |
-| Warfork on US is missing new maps | Expected: it reads the snapshot and has no rescan | It sees them after the next snapshot run plus its daily restart. |
+| Warfork on US is missing new maps | It is pointed at the snapshot instead of the store | `WARFORK_MAPS_DIR` must be the mountpoint, the same value as `MAP_STORE_DIR` (step E). Warfork has read the store with a 60 s rescan since 2026-09-29. |
+| **The snapshot stops growing.** `map-snapshot` logs `done: N packs` every hour with `N` frozen, and both engines tick `mapscan: +0 map(s)` forever | `MAP_STORE_DIR` is set to the snapshot, so the sync has nothing to copy from and rsyncs the directory onto itself | Point `MAP_STORE_DIR` at `/srv/racesow/maps` (step E). Recent versions refuse to run at all in this state; if the log reads `syncing N packs from X to X`, this is it. Compare the counts to be sure: `ls /srv/racesow/maps/*.pk3 \| wc -l` against `ls ~/racesow/server/maps-snapshot/*.pk3 \| wc -l`. |
+| Boot hangs for many minutes with the server unreachable | The pack cache is cold and the scan is reading ~4,600 packs over NFS | Expect it once per lost `racelog`/`wf_racelog` volume; the snapshot normally warms the cache first (`>> map scan (warming the cache from ...)`). Confirm the snapshot is populated — an empty one warms nothing. |
 | `fetch-maps: this box reads the shared map store` on US | Correct: US never grows its own pool | Run `fetch-maps.sh` on EU. `MAPS_DEST_FORCE=1` overrides only if you really mean it. |
 
 ## Rollback

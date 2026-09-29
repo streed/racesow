@@ -98,15 +98,34 @@ services:
       retries: 6          # ~2 min of unbroken silence before a restart
       start_period: 240s  # cold boot answers nothing for a while
     volumes:
-      # SHARED map pool — identical host dir the Warsow service mounts. Read-only.
-      # The entrypoint symlinks these pk3s into the racesow fs_game dir so the
-      # engine scans them (zero-copy; no duplicate storage).
-      # WARFORK_MAPS_DIR (this directory's .env) points elsewhere on a box that
-      # reads the shared store over NFS: the Warfork engine has no mapscan
-      # patch and no store fallback, so there it uses the store's local
-      # snapshot (./server/maps-snapshot), which is always present and at most
-      # an hour behind. docs/map-store-runbook.md.
-      - ${WARFORK_MAPS_DIR:-./server/maps}:/warfork/maps_extra:ro
+      # SHARED map pool — the identical host dir the Warsow service mounts,
+      # read-only. The entrypoint hands it to the engine as fs_cdpath (ONE
+      # symlink, not one per pack), so a pack that lands afterwards is found by
+      # the next sv_mapscan sweep without a restart — zero-copy, no duplicate
+      # storage. On a box that reads the shared store over NFS, WARFORK_MAPS_DIR
+      # (this directory's .env) is the host mountpoint, exactly as MAP_STORE_DIR
+      # is for the Warsow service, and rslave lets a remount after a link drop
+      # reach the running container. docs/map-store-runbook.md.
+      - type: bind
+        source: ${WARFORK_MAPS_DIR:-./server/maps}
+        target: /warfork/maps_extra
+        read_only: true
+        bind:
+          propagation: rslave
+          create_host_path: true
+      # The store's last-known local copy (scripts/map-snapshot.sh, hourly).
+      # The entrypoint uses it when the store does not answer at launch, and
+      # reads it first to warm the pack cache — the cache is keyed on pack
+      # size+name, so a pack read from local disk answers for the same pack in
+      # the store and a cold boot costs seconds instead of a twenty-minute NFS
+      # scan. On the box that owns the store this is the same pool as above
+      # and both are local disk, so it costs nothing there.
+      - type: bind
+        source: ${MAP_STORE_SNAPSHOT_DIR:-./server/maps-snapshot}
+        target: /warfork/maps_fallback
+        read_only: true
+        bind:
+          create_host_path: true
       # Warfork's own record/demo state (separate from Warsow's volumes). Mounted
       # at the real mod write dir /warfork/racesow/... (engine fs_basepath=/warfork
       # + fs_game=racesow) — the same path the RS_Api* native now writes to — so

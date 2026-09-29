@@ -274,6 +274,11 @@ COPY warfork/entrypoint.sh /entrypoint.sh
 # and reads only MAPLIST/INSTALLED/INGEST_*), so both games get the same
 # quarantine semantics from one file. Must sit beside /entrypoint.sh.
 COPY server/crashguard.sh  /crashguard.sh
+# Cached installed-map scan, shared verbatim with the Warsow image. Sourced by
+# the entrypoint from its own directory, so it must sit beside /entrypoint.sh.
+# Without it the boot reads every one of ~4,600 packs, which against the NFS
+# map store takes over twenty minutes with the server unreachable.
+COPY server/mapscan-lib.sh /mapscan-lib.sh
 # Same watchdog as the Warsow image — one script, both games (it reads SV_PORT).
 COPY server/gamehealth.sh /usr/local/bin/gamehealth.sh
 RUN chmod +x /entrypoint.sh /crashguard.sh /usr/local/bin/gamehealth.sh

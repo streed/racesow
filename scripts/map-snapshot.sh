@@ -75,6 +75,21 @@ if [ -z "${STORE}" ] || [ "${STORE}" = "./maps" ] || \
 fi
 case "${STORE}" in /*) ;; *) log "MAP_STORE_DIR must be an absolute path, got '${STORE}'"; exit 2 ;; esac
 
+# A store that IS the snapshot has no source to copy from. rsync would happily
+# "sync" the directory onto itself, delete nothing, and report success, so the
+# box silently stops receiving maps for good while every log line says the run
+# worked -- exactly how the US box sat two packs behind the store with the
+# engine's 60-second mapscan reporting "+0 map(s)" forever. This is a
+# configuration mistake, not a transient one, so it is fatal and loud: either
+# MAP_STORE_DIR is meant to be the mount (the usual fix) or this box has no
+# store to read and both keys should be unset.
+if [ "$(cd -- "${STORE}" 2>/dev/null && pwd -P)" = "$(cd -- "${SNAPSHOT}" 2>/dev/null && pwd -P)" ]; then
+    log "MAP_STORE_DIR and MAP_STORE_SNAPSHOT_DIR are the same directory (${STORE})."
+    log "There is nothing to sync from: point MAP_STORE_DIR at the store's mount" \
+        "(docs/map-store-runbook.md), or unset both on a box that keeps its own maps."
+    exit 2
+fi
+
 # --mount (run as root by the service's ExecStartPre=+): a store that is an
 # fstab entry but not mounted is mounted. The fstab line is nofail, so a box
 # that booted while the link was down comes up without the mount, and nothing

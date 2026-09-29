@@ -178,115 +178,25 @@ export_pakshare
 # --- Discover every installed map -------------------------------------------
 # A map is playable if a maps/<name>.bsp exists inside a pk3 in a directory the
 # engine actually scans: basewsw and the mod dir, in the install and in the
-# map store (fs_cdpath).
-#
-# Reading the central directory of every pack is the expensive part. With a
-# 4,600-pack pool that is fine on local disk (~30 s) and ruinous on an NFS
-# store: measured at ~52 RPCs/sec it hung a boot for over 20 minutes with the
-# server unreachable the whole time, and every restart paid it again.
-#
-# Packs are never rewritten in place — fetch-maps.sh and the mapgen worker
-# always write a new file — so a pack's size and name identify its contents.
-# Cache "<size> <name><TAB><maps>" and re-read only packs the cache has never
-# seen. A restart with an unchanged pool then costs one directory listing per
-# directory instead of one archive read per pack. The cache lives on the
-# persisted racelog mount; if it cannot be written the scan still works, just
-# without the saving.
+# map store (fs_cdpath). The scan and its pack cache live in mapscan-lib.sh,
+# shared with the Warfork entrypoint; the cache sits on the persisted racelog
+# mount so a container recreate does not throw it away.
+MAPSCAN_LIB="${MAPSCAN_LIB:-$(dirname "$0")/mapscan-lib.sh}"
+if [ -r "${MAPSCAN_LIB}" ]; then
+    # shellcheck disable=SC1090
+    . "${MAPSCAN_LIB}"
+else
+    # Never boot with a silently empty map list: an entrypoint that cannot find
+    # its own library is a broken image, not a degraded one.
+    echo ">> FATAL: ${MAPSCAN_LIB} is missing; cannot enumerate installed maps" >&2
+    exit 1
+fi
 INSTALLED_CACHE="${INSTALLED_CACHE:-${MOD_DIR}/racelog/.installed-maps.cache}"
 
-# The map names inside one pack, one per line.
-pack_maps() {
-    unzip -Z1 "$1" 2>/dev/null | sed -n 's#^maps/\([^/]*\)\.bsp$#\1#p'
-}
-
-# Print every installed map name, using and refreshing INSTALLED_CACHE.
-# Arguments are the directories to scan. Fields are TAB-separated throughout,
-# so a pack filename containing spaces cannot split a record (map names
-# themselves cannot: see RACE_MAPNAME_CHARS in the gametype).
-installed_maps() {
-    _tmp="${TMPDIR:-/tmp}/installed.$$"
-    _idx="${_tmp}.idx"; _hit="${_tmp}.hit"; _miss="${_tmp}.miss"; _new="${_tmp}.new"
-    rm -f "${_idx}" "${_hit}" "${_miss}" "${_new}"
-    : > "${_idx}"
-    # One listing per directory: over NFS this is a readdir with attributes,
-    # not a stat per file.
-    for _dir in "$@"; do
-        [ -d "${_dir}" ] || continue
-        find "${_dir}" -maxdepth 1 -name '*.pk3' -printf '%s\t%f\t%p\n' 2>/dev/null >> "${_idx}"
-    done
-    [ -s "${_idx}" ] || { rm -f "${_idx}"; return 0; }
-
-    # Join the pool against the cache in ONE pass. Hits come out ready to
-    # reuse; misses carry the path the archive read needs. A missing, empty or
-    # truncated cache simply makes every pack a miss.
-    #
-    # The cache is read in BEGIN rather than as awk's first input file on
-    # purpose. The usual "NR == FNR" two-file idiom breaks silently when the
-    # first file is EMPTY -- a first boot, or /dev/null -- because NR == FNR
-    # then stays true while reading the SECOND file, so every pack is mistaken
-    # for a cache line and the scan reports zero maps installed.
-    _cache_src="${INSTALLED_CACHE}"
-    [ -f "${_cache_src}" ] || _cache_src=""
-    : > "${_hit}"; : > "${_miss}"
-    awk -F'\t' -v hit="${_hit}" -v miss="${_miss}" -v cachefile="${_cache_src}" '
-        BEGIN {
-            while (cachefile != "" && (getline line < cachefile) > 0) {
-                t1 = index(line, "\t"); if (t1 == 0) continue
-                rest = substr(line, t1 + 1)
-                t2 = index(rest, "\t"); if (t2 == 0) continue
-                cache[substr(line, 1, t1 - 1) "\t" substr(rest, 1, t2 - 1)] = substr(rest, t2 + 1)
-            }
-            if (cachefile != "") close(cachefile)
-        }
-        {
-            key = $1 "\t" $2
-            if (key in cache) print key "\t" cache[key] > hit
-            else              print key "\t" $3        > miss
-        }
-    ' "${_idx}"
-
-    # Read only the packs the cache had never seen.
-    cp "${_hit}" "${_new}"
-    while IFS="$(printf '\t')" read -r _size _name _path; do
-        [ -n "${_path}" ] || continue
-        _maps="$(pack_maps "${_path}" | tr '\n' ' ')"
-        printf '%s\t%s\t%s\n' "${_size}" "${_name}" "${_maps% }" >> "${_new}"
-    done < "${_miss}"
-
-    # wc -l, not grep -c: grep exits 1 on a zero count AND prints "0", so the
-    # usual "|| echo 0" fallback appends a second 0 and the arithmetic below
-    # dies on an empty hit or miss list.
-    _hits=$(wc -l < "${_hit}" 2>/dev/null || echo 0)
-    _misses=$(wc -l < "${_miss}" 2>/dev/null || echo 0)
-
-    # Write back exactly the packs present now, so deleted packs stop being
-    # carried forever. A failed write costs the saving, never the boot.
-    # The line-count comparison is what catches a pure DELETION: that has no
-    # misses at all, so keying the write on misses alone would leave the
-    # removed pack in the cache for good.
-    if [ -f "${INSTALLED_CACHE}" ]; then
-        _cached_lines=$(wc -l < "${INSTALLED_CACHE}")
-    else
-        _cached_lines=-1
-    fi
-    _new_lines=$(wc -l < "${_new}")
-    if [ "${_misses}" -gt 0 ] || [ "${_cached_lines}" != "${_new_lines}" ] \
-       || [ ! -f "${INSTALLED_CACHE}" ]; then
-        if mkdir -p "$(dirname "${INSTALLED_CACHE}")" 2>/dev/null \
-           && cp "${_new}" "${INSTALLED_CACHE}.new" 2>/dev/null \
-           && mv "${INSTALLED_CACHE}.new" "${INSTALLED_CACHE}" 2>/dev/null; then
-            :
-        else
-            rm -f "${INSTALLED_CACHE}.new" 2>/dev/null || true
-            echo ">> note: could not write ${INSTALLED_CACHE}; every boot re-reads each pack" >&2
-        fi
-    fi
-    echo ">> map scan: $((_hits + _misses)) pack(s), ${_hits} from cache, ${_misses} read" >&2
-
-    # Third field of every record is the space-separated map list.
-    cut -d"$(printf '\t')" -f3 "${_new}" | tr ' ' '\n' | grep -v '^$' | sort -u
-    rm -f "${_idx}" "${_hit}" "${_miss}" "${_new}"
-}
+# Read the local snapshot first when the store is remote: the cache is keyed on
+# pack size+name, so a pack read from local disk answers for the same pack in
+# the store, and a cold cache costs seconds instead of a twenty-minute NFS scan.
+[ -n "${STORE_NOW}" ] && warm_installed_cache "${MAP_STORE_FALLBACK}/${FS_GAME}" "${STORE_NOW}/${FS_GAME}"
 
 INSTALLED="$(installed_maps "${WARSOW_DIR}/basewsw" "${WARSOW_DIR}/${FS_GAME}" \
                     ${STORE_NOW:+"${STORE_NOW}/basewsw" "${STORE_NOW}/${FS_GAME}"})"

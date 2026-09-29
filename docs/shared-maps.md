@@ -19,7 +19,8 @@ once, on EU, and every server can vote for it within a minute.
  │   ▼                           │               │       (rsync hourly, the         │
  │ warsow-race  fs_cdpath=store  │               │        fallback copy)            │
  │ warfork-race, web mappack     │               │ warsow-race  fs_cdpath=store     │
- └───────────────────────────────┘               │        or snapshot if unreachable│
+ └───────────────────────────────┘               │ warfork-race fs_cdpath=store     │
+                                                 │        or snapshot if unreachable│
                                                  └──────────────────────────────────┘
 ```
 
@@ -27,6 +28,24 @@ once, on EU, and every server can vote for it within a minute.
 at `/warsow/shared/racemod` and passed as `fs_cdpath`, an extra base path the
 engine scans for each game directory's packs (`qcommon/files.c`, `FS_Init` →
 `FS_AddBasePath`). No packs are copied or symlinked into the mod dir any more.
+
+**Both games, one schedule.** Warfork does the same thing through one symlink
+(`/warfork/shared/racesow` → the pool), because its `fs_game` layout wants the
+base path a level up. Both engines carry `patch-mapscan.py` and read the same
+`MAPSCAN_SECONDS` (60), so a pack that lands in the store is votable on all
+four servers within a minute, with no restart anywhere.
+
+**Enumerating the pool is cached.** Separately from the engine's rescan, each
+entrypoint lists every installed map at boot to build the rotation and the
+vote pool, and the only way to know what a pack contains is to read its
+central directory. Against the NFS store that ran at about 52 RPCs/sec across
+4,588 packs and hung a US boot for over twenty minutes, every restart paying
+it again. Packs are never rewritten in place, so `server/mapscan-lib.sh`
+(shared by both entrypoints) caches `<size> <name> → <maps>` on the persisted
+racelog mount and re-reads only packs it has never seen. Because the key is
+size and name rather than path, the *local snapshot* warms the cache for the
+identical packs in the store: a cold boot reads local disk once and then
+fetches only the handful of packs added since the last hourly sync.
 
 **New packs load without a restart.** `enginepatches/patch-mapscan.py` adds:
 - `sv_mapscan <seconds>`: while a map runs, rescan the base paths this often.
@@ -100,8 +119,8 @@ in `deploy/map-store/`. In outline:
 5. US: the store paths in `~/racesow/.env` (the file its compose files read),
    the first snapshot seeded from its existing pool, and the hourly snapshot
    timer.
-6. US: recreate both game servers. Warsow reads the store (and falls back to
-   the snapshot), Warfork and the pak mirror read the snapshot and the store.
+6. US: recreate both game servers. Both read the store and fall back to the
+   snapshot; the pak mirror serves from the store, then the snapshot.
 7. EU: the mapgen worker publishes into the store.
 8. Failure drills, then, a week later, delete the old US pool.
 
@@ -121,11 +140,5 @@ CI proves the engine side on every push (`.github/workflows/e2e.yml`):
 
 ## Not covered yet
 
-- **Warfork.** Both boxes run a Warfork server too. On EU it reads the same
-  `server/maps` from local disk. On US it reads the snapshot
-  (`WARFORK_MAPS_DIR`), because its engine has neither the mapscan patch nor
-  the store fallback: new maps reach it after the next hourly snapshot and
-  its next restart. Porting `patch-mapscan.py` and the fallback to
-  `warfork/enginepatches/` is the follow-up.
 - **The US pak mirror during an outage** serves from the snapshot, so a
   client can download any map the US server can run.

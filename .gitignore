@@ -14,6 +14,10 @@ web/_shots.mjs
 
 # Map packs (large; provided by the user at runtime)
 server/maps/*.pk3
+# The local last-known copy of the shared map store on a reader box
+# (scripts/map-snapshot.sh). Compose creates the directory even where it stays
+# empty, so it shows up on every box.
+server/maps-snapshot/
 # fetch-maps.sh working files (lock, failure list, in-flight temps)
 server/maps/.fetch-*
 server/maps/.part-*

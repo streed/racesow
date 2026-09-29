@@ -71,65 +71,107 @@ EXTRA_ARGS=${EXTRA_ARGS:-}
 
 # --- Shared map pool ---------------------------------------------------------
 # The engine only scans pk3s that live directly inside a game dir (basewf / the
-# mod dir), so symlink the read-only shared pool (the SAME ./server/maps the
-# Warsow server uses, mounted at ${WF_DIR}/maps_extra) into the racesow fs_game
-# dir. Zero-copy: no duplicate storage. Warfork loads both IBSP + FBSP Warsow
-# map pk3s (verified). sv_pure 0 (server.cfg) so loose/symlinked paks load.
+# mod dir), so the read-only shared pool is handed over as an extra BASE path
+# (fs_cdpath) and the engine scans ${MAP_STORE}/<fs_game>/ itself. That is what
+# lets a rescan see a pack that appeared after boot: the old per-pack symlink
+# mirror was built once at startup, so anything added later stayed invisible
+# until the next restart. Zero-copy either way: no duplicate storage. Warfork
+# loads both IBSP + FBSP Warsow map pk3s (verified). sv_pure 0 (server.cfg) so
+# loose/symlinked paks load.
 # Rescan the map pool this often while a map runs, so a pack added to the pool
 # becomes votable with no restart (enginepatches/patch-mapscan.py, the same
 # patch the Warsow image applies). 0 = only at startup.
 MAPSCAN_SECONDS="${MAPSCAN_SECONDS:-60}"
-# The pool is handed to the engine as an extra BASE path (fs_cdpath), so it
-# scans ${MAP_STORE}/<fs_game>/ itself. That is what lets a rescan see a pack
-# that appeared after boot: the old per-pack symlink mirror was built once at
-# startup, so anything added later stayed invisible until the next restart.
 MAP_STORE="${MAP_STORE:-${WF_DIR}/shared}"
-MAPS_EXTRA="${WF_DIR}/maps_extra"
+# The pool as the box presents it. On the box that owns the store this is local
+# disk; on a box that reads the store over NFS it is the mount, and
+# MAPS_FALLBACK is the hourly local snapshot (scripts/map-snapshot.sh) used
+# whenever the mount does not answer. Same two directories, and the same
+# store-or-snapshot rule, as the Warsow tier — docs/shared-maps.md.
+MAPS_EXTRA="${MAPS_EXTRA:-${WF_DIR}/maps_extra}"
+MAPS_FALLBACK="${MAPS_FALLBACK:-${WF_DIR}/maps_fallback}"
+MAP_STORE_TIMEOUT="${MAP_STORE_TIMEOUT:-5}"  # seconds to wait on a sick mount
+
+# "Answers" means that within MAP_STORE_TIMEOUT the directory shows the store's
+# sentinel file or at least one pack. A dead `soft` NFS mount fails that check
+# instead of hanging, and a mount that never came up leaves an empty directory,
+# which fails it too — so a broken link sends the engine to the snapshot rather
+# than to an empty map list.
+pool_answers() {
+    timeout "${MAP_STORE_TIMEOUT}" sh -c '
+        d="$1"
+        [ -e "$d/.racesow-map-store" ] && exit 0
+        for pk in "$d"/*.pk3; do [ -e "$pk" ] && exit 0; done
+        exit 1' _ "$1" 2>/dev/null
+}
+POOL_NOW=""
+if [ -d "${MAPS_EXTRA}" ] && pool_answers "${MAPS_EXTRA}"; then
+    POOL_NOW="${MAPS_EXTRA}"
+elif [ -d "${MAPS_FALLBACK}" ] && pool_answers "${MAPS_FALLBACK}"; then
+    echo ">> WARNING: map store ${MAPS_EXTRA} is unreachable; using the local snapshot" \
+         "${MAPS_FALLBACK} (maps added since the last snapshot are missing)" >&2
+    POOL_NOW="${MAPS_FALLBACK}"
+elif [ -d "${MAPS_EXTRA}" ]; then
+    echo ">> WARNING: map store ${MAPS_EXTRA} is unreachable and there is no snapshot;" \
+         "only the maps inside the image are available" >&2
+fi
+
 STORE_NOW=""
-if [ -d "${MAPS_EXTRA}" ]; then
+if [ -n "${POOL_NOW}" ]; then
     # ONE symlink, not one per pack: fs_cdpath takes a base directory, and the
     # engine re-reads that directory on every rescan. Pointing it at the pool
     # means a pack dropped in later is found without re-linking anything.
     if mkdir -p "${MAP_STORE}" 2>/dev/null \
-       && ln -sfn "${MAPS_EXTRA}" "${MAP_STORE}/${FS_GAME}" 2>/dev/null; then
+       && ln -sfn "${POOL_NOW}" "${MAP_STORE}/${FS_GAME}" 2>/dev/null; then
         STORE_NOW="${MAP_STORE}"
-        echo ">> shared map pool: ${MAPS_EXTRA} mounted as fs_cdpath ${MAP_STORE}/${FS_GAME}" \
-             "($(ls "${MAPS_EXTRA}"/*.pk3 2>/dev/null | wc -l) pk3s, rescan every ${MAPSCAN_SECONDS}s)"
+        echo ">> shared map pool: ${POOL_NOW} mounted as fs_cdpath ${MAP_STORE}/${FS_GAME}" \
+             "($(ls "${POOL_NOW}"/*.pk3 2>/dev/null | wc -l) pk3s, rescan every ${MAPSCAN_SECONDS}s)"
     else
         # Could not build the base path (read-only /warfork?): fall back to the
         # historic per-pack mirror so the pool is at least loadable at boot.
         n=0
-        for pk in "${MAPS_EXTRA}"/*.pk3; do
+        for pk in "${POOL_NOW}"/*.pk3; do
             [ -e "${pk}" ] || continue
             ln -sf "${pk}" "${MOD_DIR}/$(basename "${pk}")" 2>/dev/null && n=$((n+1)) || true
         done
-        echo ">> shared map pool: linked ${n} pk3s from ${MAPS_EXTRA} (no fs_cdpath)" >&2
+        echo ">> shared map pool: linked ${n} pk3s from ${POOL_NOW} (no fs_cdpath)" >&2
     fi
 fi
 
 # --- Discover installed maps + build the rotation ----------------------------
-# A map is playable if maps/<name>.bsp exists in a pk3 in a scanned dir.
-#
-# `|| continue` rather than `[ -e ] && unzip`: this script runs under
-# `set -euo pipefail`, and with the && form a game dir holding NO pk3s leaves the
-# inner loop's status at 1, which pipefail promotes to a failed pipeline, which
-# fails the assignment, which aborts the entrypoint before it launches anything.
-# The container then exits and `restart: unless-stopped` retries it forever — a
-# silent bootloop with no engine and no error message, one level ABOVE the
-# bootloop crashguard.sh exists to break. (The Warsow entrypoint is `set -eu`
-# with no pipefail, so the pipeline takes `sort -u`'s status and it never bit
-# there.) Production always has the symlinked mirror in the mod dir, so this
-# only fires on an empty or mis-mounted install — exactly when a clear message
-# matters most.
-INSTALLED="$(for dir in "${WF_DIR}/basewf" "${MOD_DIR}" \
-                    ${STORE_NOW:+"${STORE_NOW}/${FS_GAME}"}; do
-        for pk in "${dir}"/*.pk3; do
-            [ -e "${pk}" ] || continue
-            unzip -Z1 "${pk}" 2>/dev/null || true
-        done
-    done | sed -n 's#^maps/\([^/]*\)\.bsp$#\1#p' | sort -u)"
+# A map is playable if maps/<name>.bsp exists in a pk3 in a scanned dir. The
+# scan and its pack cache live in ../server/mapscan-lib.sh, shared verbatim
+# with the Warsow entrypoint (and copied into this image the same way
+# crashguard.sh is). Reading the central directory of all ~4,600 packs on every
+# boot is tens of seconds on local disk and over twenty minutes against the NFS
+# map store; the cache makes a restart with an unchanged pool one directory
+# listing. It lives on the persisted wf_racelog mount.
+# Beside the entrypoint in the image; ../server/ in a repo checkout, which is
+# where the test harness and anyone running this script by hand will find it.
+MAPSCAN_LIB="${MAPSCAN_LIB:-$(dirname "$0")/mapscan-lib.sh}"
+[ -r "${MAPSCAN_LIB}" ] || MAPSCAN_LIB="$(dirname "$0")/../server/mapscan-lib.sh"
+if [ -r "${MAPSCAN_LIB}" ]; then
+    # shellcheck disable=SC1090
+    . "${MAPSCAN_LIB}"
+else
+    # An entrypoint that cannot find its own library is a broken image, not a
+    # degraded one: booting on with an empty map list would leave the rotation
+    # empty and every vote failing, which is far worse than not starting.
+    echo ">> FATAL: ${MAPSCAN_LIB} is missing; cannot enumerate installed maps" >&2
+    exit 1
+fi
+INSTALLED_CACHE="${INSTALLED_CACHE:-${MOD_DIR}/racelog/.installed-maps.cache}"
+
+# Read the local snapshot first when the pool is the remote store: the cache is
+# keyed on pack size+name, not path, so a pack read from local disk answers for
+# the identical pack in the store and a cold cache costs seconds instead of a
+# twenty-minute NFS scan with the server unreachable throughout.
+[ -n "${POOL_NOW}" ] && warm_installed_cache "${MAPS_FALLBACK}" "${POOL_NOW}"
+
+INSTALLED="$(installed_maps "${WF_DIR}/basewf" "${MOD_DIR}" \
+                    ${STORE_NOW:+"${STORE_NOW}/${FS_GAME}"})"
 if [ -z "${INSTALLED}" ]; then
-    echo ">> WARNING: no maps found in ${WF_DIR}/basewf or ${MOD_DIR}." >&2
+    echo ">> WARNING: no maps found in ${WF_DIR}/basewf, ${MOD_DIR}${POOL_NOW:+ or ${POOL_NOW}}." >&2
     echo ">>          Is the shared map pool mounted? The server will start on" >&2
     echo ">>          '${MAP}' and the rotation will be empty." >&2
 fi
