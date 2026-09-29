@@ -93,6 +93,9 @@ services:
       retries: 6          # ~2 min of unbroken silence before a restart
       start_period: 240s  # cold boot answers nothing for a while
     volumes:
+      # How often (seconds) the engine rescans the pool for new packs
+      # (enginepatches/patch-mapscan.py). 0 = only at startup.
+      MAPSCAN_SECONDS: "${MAPSCAN_SECONDS:-60}"
       # SHARED map pool — identical host dir the Warsow service mounts. Read-only.
       # The entrypoint symlinks these pk3s into the racesow fs_game dir so the
       # engine scans them (zero-copy; no duplicate storage).

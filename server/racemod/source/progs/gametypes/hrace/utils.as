@@ -22,9 +22,63 @@ enum Wildcard {
     Wildcard_Yes,
 };
 
+// Classic two-pointer wildcard match: '*' stands for any run of characters
+// (including none), everything else must match exactly, and the whole string
+// must be consumed. Iterative with a single backtrack point, so a pattern like
+// "*a*a*a*" can neither recurse nor blow up exponentially.
+//
+// No char literals in Warsow's AngelScript, hence substr(i,1) throughout.
+bool GlobMatch( const String &in str, const String &in pattern )
+{
+    uint s = 0, p = 0;
+    uint star = pattern.length();   // == length means "no '*' seen yet"
+    uint mark = 0;                  // how much of str that '*' had eaten
+    while ( s < str.length() )
+    {
+        if ( p < pattern.length() && pattern.substr( p, 1 ) == "*" )
+        {
+            star = p++;
+            mark = s;
+        }
+        else if ( p < pattern.length() && pattern.substr( p, 1 ) == str.substr( s, 1 ) )
+        {
+            p++;
+            s++;
+        }
+        else if ( star < pattern.length() )
+        {
+            // Let the most recent '*' swallow one more character and retry.
+            p = star + 1;
+            s = ++mark;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    // Trailing '*'s may match nothing at all.
+    while ( p < pattern.length() && pattern.substr( p, 1 ) == "*" )
+        p++;
+    return p == pattern.length();
+}
+
 bool PatternMatch( String str, String pattern, Wildcard wildcard = Wildcard_No )
 {
     if ( wildcard == Wildcard_Yes && ( pattern == "*" || pattern == "" ) ) return true;
+    // A map pattern carrying a '*' is a glob anchored at both ends, so
+    // "gen*" means "starts with gen". Before this, '*' was matched as a
+    // LITERAL character: "randmap gen*" searched for the text "gen*" inside
+    // map names and could never match anything, which is exactly what players
+    // typed. A pattern with no '*' keeps the historic substring behaviour, so
+    // "randmap pornstar" still matches every pornstar-* map.
+    //
+    // Gated on Wildcard_Yes, which only the map-selection paths pass
+    // (GetMapsByPattern -> randmap / prerandmap / meshvote / the "/maps"
+    // listing). Name matching for players, duels and mirrors passes
+    // Wildcard_No and is deliberately untouched: a player name may contain a
+    // literal '*', and map names may not (RACE_MAPNAME_CHARS excludes it).
+    if ( wildcard == Wildcard_Yes && pattern.locate( "*", 0 ) < pattern.length() )
+        return GlobMatch( str, pattern );
     return str.locate( pattern, 0 ) < str.length();
 }
 

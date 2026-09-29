@@ -75,14 +75,36 @@ EXTRA_ARGS=${EXTRA_ARGS:-}
 # Warsow server uses, mounted at ${WF_DIR}/maps_extra) into the racesow fs_game
 # dir. Zero-copy: no duplicate storage. Warfork loads both IBSP + FBSP Warsow
 # map pk3s (verified). sv_pure 0 (server.cfg) so loose/symlinked paks load.
+# Rescan the map pool this often while a map runs, so a pack added to the pool
+# becomes votable with no restart (enginepatches/patch-mapscan.py, the same
+# patch the Warsow image applies). 0 = only at startup.
+MAPSCAN_SECONDS="${MAPSCAN_SECONDS:-60}"
+# The pool is handed to the engine as an extra BASE path (fs_cdpath), so it
+# scans ${MAP_STORE}/<fs_game>/ itself. That is what lets a rescan see a pack
+# that appeared after boot: the old per-pack symlink mirror was built once at
+# startup, so anything added later stayed invisible until the next restart.
+MAP_STORE="${MAP_STORE:-${WF_DIR}/shared}"
 MAPS_EXTRA="${WF_DIR}/maps_extra"
+STORE_NOW=""
 if [ -d "${MAPS_EXTRA}" ]; then
-    n=0
-    for pk in "${MAPS_EXTRA}"/*.pk3; do
-        [ -e "${pk}" ] || continue
-        ln -sf "${pk}" "${MOD_DIR}/$(basename "${pk}")" 2>/dev/null && n=$((n+1)) || true
-    done
-    echo ">> shared map pool: linked ${n} pk3s from ${MAPS_EXTRA}"
+    # ONE symlink, not one per pack: fs_cdpath takes a base directory, and the
+    # engine re-reads that directory on every rescan. Pointing it at the pool
+    # means a pack dropped in later is found without re-linking anything.
+    if mkdir -p "${MAP_STORE}" 2>/dev/null \
+       && ln -sfn "${MAPS_EXTRA}" "${MAP_STORE}/${FS_GAME}" 2>/dev/null; then
+        STORE_NOW="${MAP_STORE}"
+        echo ">> shared map pool: ${MAPS_EXTRA} mounted as fs_cdpath ${MAP_STORE}/${FS_GAME}" \
+             "($(ls "${MAPS_EXTRA}"/*.pk3 2>/dev/null | wc -l) pk3s, rescan every ${MAPSCAN_SECONDS}s)"
+    else
+        # Could not build the base path (read-only /warfork?): fall back to the
+        # historic per-pack mirror so the pool is at least loadable at boot.
+        n=0
+        for pk in "${MAPS_EXTRA}"/*.pk3; do
+            [ -e "${pk}" ] || continue
+            ln -sf "${pk}" "${MOD_DIR}/$(basename "${pk}")" 2>/dev/null && n=$((n+1)) || true
+        done
+        echo ">> shared map pool: linked ${n} pk3s from ${MAPS_EXTRA} (no fs_cdpath)" >&2
+    fi
 fi
 
 # --- Discover installed maps + build the rotation ----------------------------
@@ -99,7 +121,8 @@ fi
 # there.) Production always has the symlinked mirror in the mod dir, so this
 # only fires on an empty or mis-mounted install — exactly when a clear message
 # matters most.
-INSTALLED="$(for dir in "${WF_DIR}/basewf" "${MOD_DIR}"; do
+INSTALLED="$(for dir in "${WF_DIR}/basewf" "${MOD_DIR}" \
+                    ${STORE_NOW:+"${STORE_NOW}/${FS_GAME}"}; do
         for pk in "${dir}"/*.pk3; do
             [ -e "${pk}" ] || continue
             unzip -Z1 "${pk}" 2>/dev/null || true
@@ -166,6 +189,8 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
     echo "set sv_public \"${SV_PUBLIC}\""
     echo "set g_gametype \"${G_GAMETYPE}\""
     echo "set g_maprotation \"${MAP_ROTATION}\""
+    # New packs in the pool load without a restart (patch-mapscan.py).
+    echo "set sv_mapscan \"${MAPSCAN_SECONDS}\""
     [ -n "${MAPLIST}" ]            && echo "set g_maplist \"${MAPLIST}\""
     # Idle map rotation (hrace/maprotate.as) deliberately does NOT read MAPLIST:
     # an empty server cycles every installed, non-blocked map — the same pool a
@@ -365,14 +390,14 @@ while true; do
     boot_map="$(cg_pick_map "${FIRST_MAP}")"
     cg_arm "${boot_map}"
     launched_at="$(date +%s)"
-    echo ">> launching wf_server.x86_64 $* +map ${boot_map}"
+    echo ">> launching wf_server.x86_64 $*${STORE_NOW:+ +set fs_cdpath ${STORE_NOW}} +map ${boot_map}"
     # Line-buffer so `docker logs` isn't frozen mid-startup by glibc pipe buffering.
     # With the tap up, stdout+stderr go through the FIFO (a plain `>` redirect, so
     # $! is still the ENGINE — the TERM trap and `wait` must target it directly).
     if [ -n "${CONSOLE_FIFO}" ]; then
-        stdbuf -oL -eL "${WF_DIR}/wf_server.x86_64" "$@" +map "${boot_map}" > "${CONSOLE_FIFO}" 2>&1 &
+        stdbuf -oL -eL "${WF_DIR}/wf_server.x86_64" "$@" ${STORE_NOW:+ +set fs_cdpath "${STORE_NOW}"} +map "${boot_map}" > "${CONSOLE_FIFO}" 2>&1 &
     else
-        stdbuf -oL -eL "${WF_DIR}/wf_server.x86_64" "$@" +map "${boot_map}" &
+        stdbuf -oL -eL "${WF_DIR}/wf_server.x86_64" "$@" ${STORE_NOW:+ +set fs_cdpath "${STORE_NOW}"} +map "${boot_map}" &
     fi
     server_pid=$!
     echo "${server_pid}" > "${ENGINE_PIDFILE}" 2>/dev/null || true

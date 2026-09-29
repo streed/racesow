@@ -118,6 +118,11 @@ COPY server/enginepatches/patch-demolist-split.py /tmp/patch-demolist-split.py
 COPY warfork/enginepatches/sv_racedemos.c source/server/sv_racedemos.c
 COPY warfork/enginepatches/patch-racedemo-subsystem.py /tmp/patch-racedemo-subsystem.py
 COPY warfork/enginepatches/patch-racedemo-natives.py   /tmp/patch-racedemo-natives.py
+# Runtime map-pack rescans: sv_mapscan <seconds> plus a `mapscan` command, so a
+# pack added to the map pool becomes votable without restarting the server. The
+# SAME script the Warsow image runs: the only difference between the two trees
+# is sv_defaultmap's default ("wdm1" vs "wfdm1"), which it detects.
+COPY server/enginepatches/patch-mapscan.py /tmp/patch-mapscan.py
 RUN cd source \
     && python3 /tmp/patch-api-natives.py \
     && python3 /tmp/patch-mirror-natives.py \
@@ -165,7 +170,10 @@ RUN cd source \
     && grep -q 'rs_isWrGhost'             qcommon/snap_write.c \
     && grep -q 'racesow-docker: mirror-bot ghosts' server/sv_oob.c \
     && grep -q 'racesow-docker: live MOTD' server/sv_motd.c \
-    && grep -q 'racesow-docker: fake clients' game/p_client.cpp
+    && grep -q 'racesow-docker: fake clients' game/p_client.cpp \
+    && python3 /tmp/patch-mapscan.py \
+    && grep -q 'SV_MapScan_Frame(); // racesow-docker' server/sv_main.c \
+    && grep -q 'sv_mapscan = Cvar_Get' server/sv_main.c
 
 # --- build wf_server + game module (2.15.1: plain cmake, no preset/submodules) -
 RUN export CC=clang CXX=clang++ \
@@ -195,6 +203,10 @@ RUN export CC=clang CXX=clang++ \
     # symptom (prejump unenforced) is invisible until a player exploits it.
     # Call-site COUNT is not asserted — clang tail-merges PM_Jump's two
     # increments into one call — only that each is reached at least once.
+    # Runtime map rescans are in the SERVER binary (patch-mapscan.py), not the
+    # game module, so it needs its own assertion.
+    && strings source/build/wf_server.x86_64 | grep -qx 'sv_mapscan' \
+    && strings source/build/wf_server.x86_64 | grep -q 'mapscan: +%d map(s), %d on the list' \
     && objdump -d "$SO" > /tmp/libgame.dis \
     && grep -q 'call.*<RS_IncrementJumps>'     /tmp/libgame.dis \
     && grep -q 'call.*<RS_IncrementDashes>'    /tmp/libgame.dis \

@@ -120,7 +120,16 @@ src = patch(src, TAIL_ANCHOR,
             "SV_MapScan_Frame call")
 
 # --- 3. register the cvar and the command -------------------------------------
-INIT_ANCHOR = '\tsv_defaultmap =\t\t    Cvar_Get( "sv_defaultmap", "wdm1", CVAR_ARCHIVE );\n'
+# Warsow defaults this to "wdm1" and Warfork to "wfdm1"; the line is otherwise
+# byte-identical, so one patch serves both engines (as patch-demolist-split.py
+# already does). Pick whichever spelling this tree actually has.
+INIT_CANDIDATES = [
+    '\tsv_defaultmap =\t\t    Cvar_Get( "sv_defaultmap", "%s", CVAR_ARCHIVE );\n' % d
+    for d in ("wdm1", "wfdm1")
+]
+INIT_ANCHOR = next((a for a in INIT_CANDIDATES if src.count(a) == 1), None)
+if INIT_ANCHOR is None:
+    sys.exit("FATAL: sv_defaultmap registration anchor not found exactly once in %s" % PATH)
 src = patch(src, INIT_ANCHOR, INIT_ANCHOR +
             '\t// racesow-docker: runtime map-pack rescans (patch-mapscan.py)\n'
             '\tsv_mapscan = Cvar_Get( "sv_mapscan", "0", 0 );\n'
