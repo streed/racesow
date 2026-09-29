@@ -48,8 +48,24 @@ installed_maps() {
     _idx="${_tmp}.idx"; _hit="${_tmp}.hit"; _miss="${_tmp}.miss"; _new="${_tmp}.new"
     rm -f "${_idx}" "${_hit}" "${_miss}" "${_new}"
     : > "${_idx}"
-    # One listing per directory: over NFS this is a readdir with attributes,
-    # not a stat per file.
+    # Names and paths only -- NO per-file size. Both come straight from the
+    # directory read, so this is one round trip per directory however many
+    # packs are in it.
+    #
+    # Asking find for the size instead (-printf '%s') costs one stat per pack,
+    # and over the EU->US NFS mount that is 4,600 round trips: measured at 415
+    # seconds against 0 for the listing alone. That is what made a reader box
+    # take seven minutes to boot even with a fully warm cache, which is longer
+    # than the healthcheck's start_period and so a bootloop waiting to happen.
+    # The cache is therefore keyed on the pack's NAME, and only packs it has
+    # never seen are touched at all.
+    #
+    # The premise is the one the whole cache rests on and the runbook states:
+    # a pack is never rewritten in place -- fetch-maps.sh and the mapgen
+    # worker both write a new filename. If one ever is, its cached map list
+    # goes stale; delete INSTALLED_CACHE to force a full re-read. The cost of
+    # being wrong is small (the rotation list names a map the engine does not
+    # have, or misses one it does; the engine builds its own list either way).
     #
     # -H dereferences the directory NAMED here, and only that. The Warfork
     # entrypoint hands the engine its pool as a single symlink into fs_cdpath,
@@ -58,7 +74,7 @@ installed_maps() {
     # every vote failing, with no error anywhere to say why.
     for _dir in "$@"; do
         [ -d "${_dir}" ] || continue
-        find -H "${_dir}" -maxdepth 1 -name '*.pk3' -printf '%s\t%f\t%p\n' 2>/dev/null >> "${_idx}" || true
+        find -H "${_dir}" -maxdepth 1 -name '*.pk3' -printf '%f\t%p\n' 2>/dev/null >> "${_idx}" || true
     done
     [ -s "${_idx}" ] || { rm -f "${_idx}"; return 0; }
 
@@ -74,27 +90,34 @@ installed_maps() {
     _cache_src="${INSTALLED_CACHE}"
     [ -f "${_cache_src}" ] || _cache_src=""
     : > "${_hit}"; : > "${_miss}"
+    # Cache lines stay "<size>\t<name>\t<maps>" so a cache written by an
+    # earlier version still reads; the LOOKUP is on the name, field 2.
     awk -F'\t' -v hit="${_hit}" -v miss="${_miss}" -v cachefile="${_cache_src}" '
         BEGIN {
             while (cachefile != "" && (getline line < cachefile) > 0) {
                 t1 = index(line, "\t"); if (t1 == 0) continue
                 rest = substr(line, t1 + 1)
                 t2 = index(rest, "\t"); if (t2 == 0) continue
-                cache[substr(line, 1, t1 - 1) "\t" substr(rest, 1, t2 - 1)] = substr(rest, t2 + 1)
+                name = substr(rest, 1, t2 - 1)
+                size[name] = substr(line, 1, t1 - 1)
+                cache[name] = substr(rest, t2 + 1)
             }
             if (cachefile != "") close(cachefile)
         }
         {
-            key = $1 "\t" $2
-            if (key in cache) print key "\t" cache[key] > hit
-            else              print key "\t" $3        > miss
+            # index line: "<name>\t<path>"
+            if ($1 in cache) print size[$1] "\t" $1 "\t" cache[$1] > hit
+            else             print $1 "\t" $2                       > miss
         }
     ' "${_idx}"
 
     # Read only the packs the cache had never seen.
     cp "${_hit}" "${_new}"
-    while IFS="$(printf '\t')" read -r _size _name _path; do
+    while IFS="$(printf '\t')" read -r _name _path; do
         [ -n "${_path}" ] || continue
+        # This pack is about to be opened and read anyway, so one stat for the
+        # record costs nothing. Recorded for diagnosis only; nothing keys on it.
+        _size="$(stat -c %s "${_path}" 2>/dev/null || echo 0)"
         _maps="$(pack_maps "${_path}" | tr '\n' ' ')"
         printf '%s\t%s\t%s\n' "${_size}" "${_name}" "${_maps% }" >> "${_new}"
     done < "${_miss}"

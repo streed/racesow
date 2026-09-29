@@ -150,4 +150,36 @@ BOX6="$(sandbox nopool)"
 run_entrypoint "${BOX6}"
 [ "$(cdpath_of "${BOX6}")" = "" ] || fail "no pool must launch with no fs_cdpath"
 
+# --- Case 7: a cached pool is listed without touching a single pack ----------
+# This is what makes a store over NFS affordable. Asking find for each pack's
+# size costs one stat per pack -- 4,600 round trips, measured at 415 s EU->US
+# against 0 for the listing alone -- so the cache is keyed on the pack NAME and
+# a hit reads nothing. Proven by making every pack unopenable after the cache
+# is warm: the scan must still name its maps.
+BOX7="$(sandbox cachedonly)"
+mkdir -p "${BOX7}/maps_extra"
+: > "${BOX7}/maps_extra/.racesow-map-store"
+mkpak "${BOX7}/maps_extra/golf.pk3" golf
+mkpak "${BOX7}/maps_extra/hotel.pk3" hotel
+printf '%s\n' golf > "${BOX7}/racesow/mappool.txt"
+run_entrypoint "${BOX7}"
+grep -q '>> map scan: 2 pack(s), 0 from cache, 2 read' "${BOX7}/entrypoint.log" || {
+    grep '>> map scan' "${BOX7}/entrypoint.log" >&2 || true
+    fail "the first scan must read both packs"
+}
+
+chmod 000 "${BOX7}/maps_extra/golf.pk3" "${BOX7}/maps_extra/hotel.pk3"
+run_entrypoint "${BOX7}"
+chmod 644 "${BOX7}/maps_extra/golf.pk3" "${BOX7}/maps_extra/hotel.pk3"
+grep -q '>> map scan: 2 pack(s), 2 from cache, 0 read' "${BOX7}/entrypoint.log" || {
+    grep '>> map scan' "${BOX7}/entrypoint.log" >&2 || true
+    fail "a warm cache must not open any pack"
+}
+[ "$(grep -A1 '^+map$' "${BOX7}/launch-args.txt" | tail -1)" = "golf" ] || \
+    fail "a map known only from the cache must still be bootable"
+
+# And the listing itself must never ask for the size: that is the stat.
+grep -q "printf '%f" "$(dirname "$0")/../mapscan-lib.sh" || \
+    fail "the pool listing must ask find for names and paths only"
+
 echo "OK: warfork map pool + scan contract tests passed"
