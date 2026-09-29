@@ -91,6 +91,11 @@ services:
       # index the same directory and share the same persisted index.
       MAPPACK_DIR: "/mappack"
       MAPPACK_INDEX: "/data/mappack-index.json"
+      # Map generation quotas — must match `web` exactly (parity preflight).
+      # Budget 0 = public /mapgen requests off; only raise it when the mapgen
+      # worker (profile "mapgen", needs an API key) is actually running.
+      MAPGEN_DAILY_PER_IDENTITY: "${MAPGEN_DAILY_PER_IDENTITY:-1}"
+      MAPGEN_DAILY_BUDGET: "${MAPGEN_DAILY_BUDGET:-0}"
       # Sentry — MUST match the base `web` service in docker-compose.yml exactly
       # (same ${...} defaults → identical resolved values): rolling-deploy.sh
       # fails the parity preflight on any env drift between web and web2.

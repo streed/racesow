@@ -160,6 +160,13 @@ services:
       # /data so a restart does not re-read the whole mirror and so both
       # replicas share one hashing pass.
       MAPPACK_INDEX: "/data/mappack-index.json"
+      # Player-requested map generation (/mapgen). The site only QUEUES jobs;
+      # the worker (profile "mapgen") builds them and needs an API key, so the
+      # budget defaults to 0 = public requests off. Set MAPGEN_DAILY_BUDGET>0
+      # in .env only when that worker is running, or requests queue forever.
+      # Keep in exact lockstep with the web2 replica (parity preflight).
+      MAPGEN_DAILY_PER_IDENTITY: "${MAPGEN_DAILY_PER_IDENTITY:-1}"
+      MAPGEN_DAILY_BUDGET: "${MAPGEN_DAILY_BUDGET:-0}"
       # Sentry error + performance reporting (web/instrument.mjs). Empty DSN =
       # disabled/no-op. Keep these in exact lockstep with the web2 replica in
       # docker-compose.override.yml (rolling-deploy.sh fails on env drift).
