@@ -49,6 +49,7 @@ hrace/mirror.as;
 hrace/meshvote.as;
 hrace/serverhop.as;
 hrace/checkpoint.as;
+hrace/metamap.as;
 hrace/table.as;
 hrace/announcement.as;
 hrace/maprotate.as;

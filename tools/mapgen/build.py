@@ -17,11 +17,13 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 import assets
 import layout
 import mapfile
+import tiles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "mapfix"))
@@ -70,7 +72,7 @@ BSP_MAX_BYTES = 16 * 1024 * 1024
 PK3_MAX_BYTES = 4 * 1024 * 1024
 
 
-def compile_map(q3map2, work, map_path, fast=True, log=None):
+def compile_map(q3map2, work, map_path, fast=True, log=None, bsp_extra=()):
     # Stage flag first, then the common options: q3map2 reads anything before
     # the stage as noise ("Unknown option -light") and quietly skips it.
     common = ["-game", "qfusion", "-fs_basepath", work, "-fs_home", work]
@@ -79,7 +81,7 @@ def compile_map(q3map2, work, map_path, fast=True, log=None):
     # course lights in about a second either way.
     light = ["-fast", "-samples", "2"] if fast else ["-samples", "3", "-bounce", "2"]
     stages = [
-        ["-bsp"] + common + ["-meta"],
+        ["-bsp"] + common + ["-meta"] + list(bsp_extra),
         ["-vis"] + common + (["-fast"] if fast else []),
         ["-light"] + common + ["-threads", "1"] + light,
     ]
@@ -123,11 +125,13 @@ def strip_timestamp(bsp_bytes):
     return bsp_bytes[:on + 4] + b"-" * (end - on - 4) + bsp_bytes[end:]
 
 
-def pack(name, bsp_bytes, out_dir):
+def pack(name, bsp_bytes, out_dir, extra=None):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name + ".pk3")
     members = {f"maps/{name}.bsp": bsp_bytes}
     members.update(assets.files())
+    if extra:
+        members.update(extra)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         for rel in sorted(members):
             info = zipfile.ZipInfo(rel, ZIP_TIME)
@@ -185,7 +189,6 @@ def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, cam
                          "tools/mapgen/Dockerfile")
     own_work = work is None
     if own_work:
-        import tempfile
         work = tempfile.mkdtemp(prefix="mapgen-")
     try:
         map_path = stage(course, work)
@@ -228,6 +231,113 @@ def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, cam
             "overpasses": course.overpasses,
         }
         return pk3, report
+    finally:
+        if own_work and not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+# The deck ships once but every player downloads it, so it gets its own
+# ceilings rather than a course's.
+DECK_BSP_MAX_BYTES = 8 * 1024 * 1024
+DECK_PK3_MAX_BYTES = 2 * 1024 * 1024
+
+# --- the tile deck (tools/mapgen/tiles.py, dealt by hrace/metamap.as) --------
+#
+# A deck is compiled like a course, but what is checked afterwards is almost
+# the opposite. A course must have a finish line; a deck must NOT — its finish
+# is a tile the dealer places when the route is long enough. What a deck must
+# have is an inline model per tile, because a tile whose brushes the compiler
+# folded into worldspawn is a tile the dealer cannot place (and would leave
+# visible, in the compile grid, forever).
+
+def deck_models(bsp_bytes):
+    """name -> inline model index, read out of the COMPILED entity lump.
+
+    q3map2 assigns submodel numbers itself, so they are read back rather than
+    predicted from the order tiles.py wrote the entities in.
+    """
+    _, lump, _, _ = mapfix.analyse(bsp_bytes, 0.9)
+    out = {}
+    for e in lump.entities:
+        name = e.get("mg_name")
+        model = e.get("model", "")
+        if name and model.startswith("*"):
+            out[name] = int(model[1:])
+    return out
+
+
+def check_deck_bsp(bsp_bytes, deck):
+    problems = []
+    try:
+        bsp, lump, findings, _ = mapfix.analyse(bsp_bytes, 0.9)
+    except mapfix.BspError as e:
+        return [f"compiled bsp does not parse: {e}"]
+    if bsp.magic != b"FBSP":
+        problems.append(f"compiled as {bsp.magic!r}, expected FBSP (q3map2 -game qfusion)")
+    for f in findings:
+        if f.severity is mapfix.BROKEN:
+            problems.append(f"mapfix: {f}")
+
+    by_class = {}
+    for e in lump.entities:
+        by_class.setdefault(e.classname, []).append(e)
+    if not by_class.get("info_player_deathmatch"):
+        problems.append("no info_player_deathmatch: players would spawn at the origin")
+    if not by_class.get("trigger_hurt"):
+        problems.append("no trigger_hurt: falling off a dealt route would never respawn")
+    for cls in ("target_starttimer", "target_stoptimer"):
+        if by_class.get(cls):
+            problems.append(f"a deck must not carry a {cls}: the dealer owns the clock, "
+                            "and a map-placed timer would fire for whichever lane "
+                            "happened to be built over it")
+
+    models = deck_models(bsp_bytes)
+    want = [t.name for t in deck.tiles] + [tiles.GATE_NAME]
+    lost = [n for n in want if n not in models]
+    if lost:
+        problems.append(f"{len(lost)} of {len(want)} pieces lost their brush model "
+                        f"(the compiler folded them into worldspawn): "
+                        + ", ".join(lost[:6]) + ("..." if len(lost) > 6 else ""))
+    # The engine only accepts 0 < index < CM_NumInlineModels (ISBRUSHMODEL,
+    # game/g_local.h:680), and the count comes from the models lump.
+    n = bsp.model_count()
+    over = sorted(k for k, v in models.items() if not 0 < v < n)
+    if over:
+        problems.append(f"inline model index out of range for: {', '.join(over[:6])} "
+                        f"(the bsp has {n} models)")
+    return problems
+
+
+def build_deck(name, title, out_dir, q3map2=None, work=None, fast=True, keep_work=False):
+    """tiles.catalogue() -> compiled, packed, checked deck .pk3.
+
+    Returns (pk3_path, deck, problems, log).
+    """
+    deck = tiles.build_deck(name, title)
+    q3 = find_q3map2(q3map2)
+    if not q3:
+        raise BuildError("q3map2 not found: pass --q3map2, set Q3MAP2, or build "
+                         "the tools/mapgen Docker image")
+    own_work = work is None
+    work = work or tempfile.mkdtemp(prefix="mapgen-deck-")
+    try:
+        map_path = stage(deck.course, work)
+        with open(os.path.join(work, "q3map2.log"), "w") as log:
+            bsp_path, out = compile_map(q3, work, map_path, fast=fast, log=log)
+        with open(bsp_path, "rb") as fh:
+            bsp_bytes = strip_timestamp(fh.read())
+        if len(bsp_bytes) > DECK_BSP_MAX_BYTES:
+            raise BuildError(f"the compiled deck is {len(bsp_bytes) // 1024} KB; "
+                             f"at most {DECK_BSP_MAX_BYTES // 1024} KB (tiles.LIGHTMAP_SCALE "
+                             "is what keeps the lightmap small)")
+        deck.models = deck_models(bsp_bytes)
+        problems = check_deck_bsp(bsp_bytes, deck)
+        if problems:
+            return None, deck, problems, out
+        text = tiles.manifest(deck)
+        pk3 = pack(name, bsp_bytes, out_dir,
+                   extra={f"maps/{name}.deck": text.encode()})
+        return pk3, deck, [], out
     finally:
         if own_work and not keep_work:
             shutil.rmtree(work, ignore_errors=True)

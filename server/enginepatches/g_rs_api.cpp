@@ -1712,6 +1712,54 @@ void RS_ApiReportDuel( const char *url, const char *token, const char *version,
 }
 
 /*
+ * RS_ApiReportRandomRun
+ *
+ * Queue a finished run on the meta map (hrace/metamap.as) for POSTing to
+ * <url> — the central /api/game/random. This is NOT a record and deliberately
+ * does not go through /api/ingest: the course was dealt from <seed> a minute
+ * ago and a time on it means nothing without the seed that produced it. The
+ * pair is what the seed board keeps, so anyone reading it can deal the same
+ * course and race the same run.
+ *
+ * <pieces> and <route> describe the course the time was set on, so a board can
+ * show how long a seed's route actually was rather than implying every seed is
+ * the same length.
+ *
+ * Fire-and-forget, same posture as the finish, flag and duel reports: nothing
+ * reads the reply, and a dropped run is one row missing from a board rather
+ * than anything a player can act on. No-op when url or name is empty, or when
+ * the seed is not a real one.
+ */
+void RS_ApiReportRandomRun( const char *url, const char *token, const char *version,
+	int seed, int timeMs, const char *name, const char *login, int pieces, int route )
+{
+	if( !url || !url[0] || !name || !name[0] )
+		return;
+	if( seed <= 0 || timeMs <= 0 )
+		return;
+
+	std::string body;
+	body.reserve( 256 );
+	body += "{\"version\":\"";
+	jsonEscapeInto( body, version ? version : "" );
+	body += "\",\"seed\":";
+	body += std::to_string( seed );
+	body += ",\"time\":";
+	body += std::to_string( timeMs );
+	body += ",\"pieces\":";
+	body += std::to_string( pieces > 0 ? pieces : 0 );
+	body += ",\"route\":";
+	body += std::to_string( route > 0 ? route : 0 );
+	body += ",\"player\":\"";
+	jsonEscapeInto( body, name );
+	body += "\",\"login\":\"";
+	jsonEscapeInto( body, login ? login : "" );
+	body += "\"}";
+
+	rsQueuePost( url, token, std::move( body ) );
+}
+
+/*
  * RS_ApiFetchTop
  *
  * Fetch the map's live top scores from <url> (the central

@@ -7,7 +7,14 @@ mapgen.py plan  "a fast flowing course, two big drops, finish on a long straight
 mapgen.py check spec.json --svg plan.svg     # layout rules only, instant, offline
 mapgen.py build spec.json --out build/       # q3map2 -> FBSP -> pk3 -> checks
 mapgen.py generate "..." --out build/        # plan + build
+mapgen.py deck --out build/                  # the random_map tile deck
 ```
+
+`deck` builds the **meta map**: one `.pk3` holding every course piece as a
+dormant inline model plus a manifest, which the gametype deals into a route at
+runtime, a few pieces ahead of the player. It takes no spec — the deck *is* the
+catalogue in `tiles.py`. See
+[docs/meta-map-design.md](../../docs/meta-map-design.md).
 
 This is the first slice of [docs/map-generation-design.md](../../docs/map-generation-design.md).
 It supports **strafe-only greybox courses**: straights, curves, ramps, jumpable

@@ -5,8 +5,14 @@
     mapgen.py check spec.json [--svg plan.svg]
     mapgen.py build spec.json --out build/ [--q3map2 PATH] [--final]
     mapgen.py generate "..." --out build/           # plan + build
+    mapgen.py deck --out build/                     # the random_map tile deck
 
 `plan` needs Anthropic credentials (ANTHROPIC_API_KEY or `ant auth login`).
+`deck` builds the meta map: one .pk3 holding every course piece as a dormant
+inline model plus a manifest, which the gametype deals into a route at runtime
+(tools/mapgen/tiles.py, server/racemod/.../hrace/metamap.as). It takes no spec
+— the deck IS the catalogue in tiles.py.
+
 `check` and `build` are offline and deterministic: the same spec always
 yields the same .pk3, so a spec is what to store, review and diff.
 
@@ -119,6 +125,24 @@ def cmd_generate(args):
     return _build(args, spec)
 
 
+def cmd_deck(args):
+    """Compile the meta map's tile deck."""
+    pk3, deck, problems, _ = buildmod.build_deck(
+        args.name, args.title, args.out, q3map2=args.q3map2,
+        fast=not args.final, keep_work=args.keep_work)
+    if problems:
+        _emit(args, {"ok": False, "problems": problems},
+              "deck rejected:\n" + "\n".join("  - " + p for p in problems))
+        return 1
+    kinds = {}
+    for t in deck.tiles:
+        kinds[t.kind] = kinds.get(t.kind, 0) + 1
+    _emit(args, {"ok": True, "pk3": pk3, "tiles": len(deck.tiles), "kinds": kinds},
+          f"{pk3}\n  {len(deck.tiles)} pieces: "
+          + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items(), key=lambda x: -x[1])))
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -148,9 +172,16 @@ def main(argv=None):
     sg.add_argument("description")
     build_opts(sg)
 
+    sd = sub.add_parser("deck", help="the meta map's tile deck -> .pk3 (no spec)")
+    sd.add_argument("--name", default="random_map",
+                    help="bsp name; must match META_MAP_NAME in hrace/metamap.as")
+    sd.add_argument("--title", default="Random Map")
+    build_opts(sd)
+
     args = p.parse_args(argv)
     run = {"plan": lambda a: (cmd_plan(a), 0)[1], "check": cmd_check,
-           "build": cmd_build, "generate": cmd_generate}[args.cmd]
+           "build": cmd_build, "generate": cmd_generate,
+           "deck": cmd_deck}[args.cmd]
     try:
         return run(args)
     except ImportError as e:

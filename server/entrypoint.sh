@@ -525,6 +525,12 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # the match-up and its result show on both players' profiles. Empty url
         # = duels still work in-game, they are just never recorded.
         echo "set rs_api_duel_url \"${INGEST_URL%/api/ingest}/api/game/duel\""
+        # Finished runs on the meta map (hrace/metamap.as). Its own endpoint,
+        # never /api/ingest: a time on a course dealt from a seed a minute ago
+        # belongs on the seed board beside that seed, not on a leaderboard
+        # pooling thousands of different courses. Empty url = random_map still
+        # plays, the times are just never kept.
+        echo "set rs_api_random_url \"${INGEST_URL%/api/ingest}/api/game/random\""
     fi
     # Cross-server player mirroring: the gametype reads these and drives the
     # RS_Mirror* natives (hrace/mirror.as). Empty peers = feature off.

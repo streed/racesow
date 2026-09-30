@@ -325,6 +325,9 @@ ENV_CFG="${MOD_DIR}/configs/server/env.cfg"
         # Concluded 1v1 duels (hrace/duel.as): one POST when a duel ends, so
         # the match-up and its result show on both players' profiles.
         echo "set rs_api_duel_url \"${base}/api/game/duel\""
+        # Finished runs on the meta map (hrace/metamap.as): the seed board, not
+        # a leaderboard. See server/entrypoint.sh for why it is its own endpoint.
+        echo "set rs_api_random_url \"${base}/api/game/random\""
     fi
     # Cross-server (cross-GAME) player mesh. Empty peers/tag = off. Uses the same
     # RS_Mirror* natives + wire protocol as the Warsow servers, so a Warfork node

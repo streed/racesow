@@ -174,6 +174,7 @@ class Course:
         self.seg_dist = []    # route distance at the START of each segment, for cut sizes
         self.open_segs = set()  # segments built without side walls (spec: open)
         self.falloff_segs = set()  # segments a player can leave downwards from
+        self.worldspawn = {}  # extra worldspawn keys for the compiler (tiles.py)
         self.cuts = []        # unintended shortcuts found by _cuts(), reported with the map
         self.auto_checkpoints = []  # (segment, distance into it) of each checkpoint the generator added
         self.length = 0.0     # centre-line length, start trigger -> finish trigger
@@ -670,6 +671,65 @@ class _Walker:
                                 "gate": SPLIT_GATE})
 
     # -- the walk -----------------------------------------------------------
+    def _lay_segment(self, i, seg, segs, auto):
+        """Lay one spec segment at the cursor.
+
+        Split out of run(), which stays the only caller that matters: it has
+        already set self.seg and the open/falloff bookkeeping this needs. tiles.py
+        calls it directly to lay a tile's pieces in the tile's own local frame,
+        which is how a tile deck gets every piece kind the spec language has
+        without a second geometry writer.
+        """
+        t = seg["type"]
+        sides = () if seg.get("open") else (1, -1)
+        if t == "straight":
+            o, f, _ = self.frame()
+            self.box_run(seg["length"], walls=sides)
+            self.runup += seg["length"]
+            if self.pending and self.pending["turn"] == i - 1:
+                self._shortcut(i)
+            # After the shortcut, so landmarks stay in course order: a
+            # checkpoint on a shortcut's exit leg is past its window.
+            for a in auto.get(i, ()):
+                self.checkpoint_at(o, f, a)
+                self.c.auto_checkpoints.append((i, a))
+        elif t == "ramp":
+            self.box_run(seg["length"], seg["rise"], walls=sides)
+            self.runup = 0.0
+        elif t == "turn":
+            if seg.get("shortcut"):
+                o, f, l = self.frame()
+                self.pending = {"turn": i, "origin": o, "f": f, "l": l, "z": self.z,
+                                "sign": 1 if seg["direction"] == "left" else -1,
+                                "radius": seg["radius"]}
+            self.turn(seg["direction"], seg["angle"], seg["radius"], walls=bool(sides))
+            self.runup += math.radians(seg["angle"]) * seg["radius"]
+        elif t == "checkpoint":
+            self.checkpoint()
+        elif t == "gap":
+            self._gap(i, seg, segs)
+        elif t == "slalom":
+            self.runup = self.slalom(seg["length"], seg["count"])
+        elif t == "beam":
+            self.beam(seg["length"], seg["beam_width"])
+            self.runup += seg["length"]
+        elif t == "split":
+            self.split(seg["length"], seg["direction"], seg["count"])
+            self.runup = float(specmod.SPLIT_MOUTH)
+        elif t == "wallclimb":
+            if self.runup + seg["length"] / 2.0 < specmod.WALL_RUNUP:
+                self.problems.append(
+                    f"segment {i} (wallclimb): only {int(self.runup + seg['length'] / 2)} "
+                    f"units of flat floor before its ledge; it needs {specmod.WALL_RUNUP} "
+                    "(a ramp resets it, because a jump off a ramp flies high enough "
+                    "to skip the kick). Lengthen it or put a straight before it")
+            self.wallclimb(seg["length"], seg["rise"], seg["direction"])
+            self.runup = seg["length"] / 2.0
+        elif t == "wallgap":
+            self._gap(i, seg, segs, kick=seg["direction"])
+        elif t == "dash":
+            self._dash(i, seg, segs)
+
     def run(self):
         s = self.c.spec
         # Start room: back wall, spawn, then the start trigger at its far end.
@@ -699,53 +759,7 @@ class _Walker:
             # trigger_hurt; it is only a cut when a later piece is underneath.
             if not sides or t in ("gap", "wallgap", "dash", "beam", "split"):
                 self.c.falloff_segs.add(i)
-            if t == "straight":
-                o, f, _ = self.frame()
-                self.box_run(seg["length"], walls=sides)
-                self.runup += seg["length"]
-                if self.pending and self.pending["turn"] == i - 1:
-                    self._shortcut(i)
-                # After the shortcut, so landmarks stay in course order: a
-                # checkpoint on a shortcut's exit leg is past its window.
-                for a in auto.get(i, ()):
-                    self.checkpoint_at(o, f, a)
-                    self.c.auto_checkpoints.append((i, a))
-            elif t == "ramp":
-                self.box_run(seg["length"], seg["rise"], walls=sides)
-                self.runup = 0.0
-            elif t == "turn":
-                if seg.get("shortcut"):
-                    o, f, l = self.frame()
-                    self.pending = {"turn": i, "origin": o, "f": f, "l": l, "z": self.z,
-                                    "sign": 1 if seg["direction"] == "left" else -1,
-                                    "radius": seg["radius"]}
-                self.turn(seg["direction"], seg["angle"], seg["radius"], walls=bool(sides))
-                self.runup += math.radians(seg["angle"]) * seg["radius"]
-            elif t == "checkpoint":
-                self.checkpoint()
-            elif t == "gap":
-                self._gap(i, seg, segs)
-            elif t == "slalom":
-                self.runup = self.slalom(seg["length"], seg["count"])
-            elif t == "beam":
-                self.beam(seg["length"], seg["beam_width"])
-                self.runup += seg["length"]
-            elif t == "split":
-                self.split(seg["length"], seg["direction"], seg["count"])
-                self.runup = float(specmod.SPLIT_MOUTH)
-            elif t == "wallclimb":
-                if self.runup + seg["length"] / 2.0 < specmod.WALL_RUNUP:
-                    self.problems.append(
-                        f"segment {i} (wallclimb): only {int(self.runup + seg['length'] / 2)} "
-                        f"units of flat floor before its ledge; it needs {specmod.WALL_RUNUP} "
-                        "(a ramp resets it, because a jump off a ramp flies high enough "
-                        "to skip the kick). Lengthen it or put a straight before it")
-                self.wallclimb(seg["length"], seg["rise"], seg["direction"])
-                self.runup = seg["length"] / 2.0
-            elif t == "wallgap":
-                self._gap(i, seg, segs, kick=seg["direction"])
-            elif t == "dash":
-                self._dash(i, seg, segs)
+            self._lay_segment(i, seg, segs, auto)
 
         self.seg = len(segs)
         self._finish_room()

@@ -2665,6 +2665,29 @@ class Player
 
         if ( !this.practicing )
         {
+            // The meta map keeps no records. Its course was dealt from a seed
+            // a minute ago, so a time on it is meaningless without that seed
+            // and comparing it to a time on any other course is nonsense: no
+            // top-scores row, no personal best, no demo, no ghost, nothing to
+            // /api/ingest. What IS worth keeping is the time and the seed
+            // together, and that pair goes to the seed board (metamap.as).
+            if ( RACE_IsMetaMap() )
+            {
+                // Nothing started a recording this life (hrace.as gates
+                // demoStart the same way); cancel anyway so a stray one from
+                // an earlier map can never be filed under this run.
+                if ( rsRecordDemos.boolean )
+                    this.client.demoCancel();
+
+                RACE_MetaFinish( this, finishTime );
+
+                Entity@ respawner = G_SpawnEntity( "race_respawner" );
+                respawner.nextThink = levelTime + 5000;
+                @respawner.think = race_respawner_think;
+                respawner.count = this.client.playerNum;
+                return;
+            }
+
             RACE_LogFinish( this );
 
             // Score this finish against a live duel, if this player is in one

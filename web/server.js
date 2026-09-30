@@ -2214,6 +2214,79 @@ api.post(
   })
 );
 
+// The meta map's seed board.
+//
+// random_map is not a map in the usual sense: hrace's dealer builds a course
+// out of compiled tiles from a seed, so the "map" is different every time. A
+// time there is deliberately NOT a record and never goes through /ingest — it
+// would land on a leaderboard mixing thousands of different courses. It comes
+// here instead, keeping the one thing that makes it meaningful: the seed, so
+// anyone can deal the identical course and race the same run.
+//
+// Server-token authed and keyed by NAME like /ingest and /game/duel. No map
+// row is minted or touched, so there is no trusted-server gate to apply: the
+// only thing a compromised box could do here is put a fake time under a seed,
+// which is the same exposure as /ingest and bounded the same way.
+api.post(
+  "/game/random",
+  wrap(async (req, res, next) => {
+    const ident = await authenticateIngest(req);
+    if (!ident) return res.status(401).json({ error: "unauthorized" });
+    if (ident.revoked) return res.status(403).json({ error: "server revoked" });
+    req.ingest = ident;
+    next();
+  }),
+  ingestLimiter,
+  express.json({ limit: "8kb" }),
+  wrap(async (req, res) => {
+    const body = req.body || {};
+    const seed = Math.floor(Number(body.seed));
+    const time = Math.floor(Number(body.time));
+    const player = typeof body.player === "string" ? body.player.slice(0, MAX_NAME_LEN) : "";
+    if (!Number.isFinite(seed) || seed <= 0) return res.status(400).json({ error: "seed required" });
+    if (!Number.isFinite(time) || time <= 0) return res.status(400).json({ error: "time required" });
+    if (!player.trim()) return res.status(400).json({ error: "player required" });
+
+    let r;
+    try {
+      r = await race.recordRandomRun({
+        version: typeof body.version === "string" ? body.version.slice(0, 64) : "",
+        seed,
+        player,
+        login: typeof body.login === "string" ? body.login.slice(0, MAX_NAME_LEN) : "",
+        timeMs: time,
+        pieces: Number(body.pieces) || 0,
+        routeUnits: Number(body.route) || 0,
+        serverId: req.ingest.serverId,
+      });
+    } catch (e) {
+      console.error("random-run ingest failed:", e);
+      return res.status(500).json({ error: "ingest failed" });
+    }
+    if (!r.ok) return res.status(400).json({ error: r.error || "bad run" });
+    res.json({ ok: true, improved: r.improved, seed: r.seed });
+  })
+);
+
+// The seed board itself: recent seeds, each with its own small ladder.
+api.get(
+  "/random",
+  cache(30),
+  wrap(async (req, res) => {
+    const seed = req.query.seed != null && String(req.query.seed).trim() !== ""
+      ? Math.floor(Number(req.query.seed))
+      : null;
+    if (seed != null && (!Number.isFinite(seed) || seed <= 0))
+      return res.status(400).json({ error: "bad seed" });
+    const board = await race.randomBoard({
+      limit: Math.min(50, Math.max(1, Math.floor(Number(req.query.limit) || 20))),
+      perSeed: Math.min(25, Math.max(1, Math.floor(Number(req.query.per) || 10))),
+      seed,
+    });
+    res.json({ seeds: board });
+  })
+);
+
 // In-game "/duel" result target: a game server reports one CONCLUDED 1v1 duel
 // on behalf of the two players who raced it (hrace/duel.as -> RS_ApiReportDuel).
 //
@@ -5274,6 +5347,7 @@ const SITEMAP_PAGES = [
   ["/players", "0.9"],
   ["/stats", "0.8"],
   ["/runs", "0.7"],
+  ["/random", "0.6"],
   ["/blog", "0.8"],
   ["/tournaments", "0.7"],
   ["/demo", "0.7"],

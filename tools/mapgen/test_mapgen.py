@@ -28,6 +28,7 @@ import describe  # noqa: E402
 import layout  # noqa: E402
 import mapfile  # noqa: E402
 import physics  # noqa: E402
+import tiles  # noqa: E402
 import screenshots  # noqa: E402
 import worker  # noqa: E402
 import spec as specmod  # noqa: E402
@@ -1067,6 +1068,130 @@ class Describe(unittest.TestCase):
             self.assertIn(t, describe.system_prompt())
 
 
+class Tiles(unittest.TestCase):
+    """The tile deck the meta map deals at runtime (tiles.py).
+
+    The tests here are all about the MATING CONTRACT, because that is the one
+    thing the dealer cannot check for itself: every tile enters at its local
+    origin running along +X and leaves on level, full-width floor, so any tile
+    can follow any other. A tile that breaks it produces a route with a step or
+    a seam in it, on a map nobody can reproduce without the seed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tiles = [tiles.lay(r) for r in tiles.catalogue()]
+
+    def test_every_recipe_lays_cleanly(self):
+        # layout's own rules (run-up before a gap, a gap that lands on floor, a
+        # piece that does not run through itself) apply to a tile too.
+        for recipe in tiles.catalogue():
+            with self.subTest(recipe["name"]):
+                tiles.lay(recipe)
+
+    def test_turns_are_whole_45_degree_steps(self):
+        # metamap.as carries the heading as an index into an exact table rather
+        # than an accumulating float; a tile turning by anything else would put
+        # the route off the lattice and open a seam at every join after it.
+        for t in self.tiles:
+            with self.subTest(t.name):
+                self.assertAlmostEqual(t.yaw / 45.0, round(t.yaw / 45.0), places=6)
+
+    def test_entry_is_inside_the_tile(self):
+        # The entry is the local origin and the dealer places the tile BY that
+        # point: a tile whose brushes did not reach it would float.
+        #
+        # The tolerance is for the turn tessellation, whose wedge corners land a
+        # few 1e-14 off the axis. mapfile writes coordinates rounded to three
+        # decimals, so anything under that is not in the compiled map at all.
+        eps = 0.001
+        for t in self.tiles:
+            with self.subTest(t.name):
+                self.assertLessEqual(t.mins[0], eps)
+                self.assertGreaterEqual(t.maxs[0], -eps)
+                self.assertLessEqual(t.mins[1], eps)
+                self.assertGreaterEqual(t.maxs[1], -eps)
+
+    def test_deck_has_one_start_and_a_finish(self):
+        starts = [t for t in self.tiles if t.flags & tiles.F_START]
+        finishes = [t for t in self.tiles if t.flags & tiles.F_FINISH]
+        self.assertEqual(len(starts), 1)
+        self.assertGreaterEqual(len(finishes), 2,
+                                "a small finish is the fallback when the roomy one will not fit")
+        for t in starts + finishes:
+            self.assertEqual(t.weight, 0, "the ends are placed by hand, never drawn")
+
+    def test_drawable_tiles_carry_a_weight(self):
+        for t in self.tiles:
+            if t.flags & (tiles.F_START | tiles.F_FINISH):
+                continue
+            with self.subTest(t.name):
+                self.assertGreater(t.weight, 0)
+                self.assertGreater(t.route, 0.0)
+
+    def test_special_move_tiles_are_flagged(self):
+        # The flags are what would let a server offer an easier deck later; a
+        # wall-kick piece that was not flagged would silently stay in it.
+        by_kind = {}
+        for t in self.tiles:
+            by_kind.setdefault(t.kind, []).append(t)
+        for kind in ("wallclimb", "wallgap"):
+            for t in by_kind[kind]:
+                self.assertTrue(t.flags & tiles.F_WALLJUMP, t.name)
+        for t in by_kind["dash"]:
+            self.assertTrue(t.flags & tiles.F_DASH, t.name)
+
+    def test_tiles_fit_the_compile_grid(self):
+        widest = max(t.span() for t in self.tiles)
+        self.assertLess(widest + 512, tiles.SLOT_PITCH,
+                        "a tile wider than its cell would shadow its neighbour")
+
+    def test_deck_places_every_tile_at_its_own_origin(self):
+        deck = tiles.build_deck("random_map", "Random Map")
+        placed = [(k, b) for k, b in deck.course.entities if k["classname"] == "mg_tile"]
+        self.assertEqual(len(placed), len(deck.tiles) + 1)   # the tiles plus the gate
+        names = {k["mg_name"] for k, _ in placed}
+        self.assertEqual(len(names), len(placed),
+                         "mg_name must be unique: it is the read-back key")
+        self.assertIn(tiles.GATE_NAME, names)
+        for k, brushes in placed:
+            self.assertTrue(brushes, k["mg_name"])
+            # The origin key is what makes the compiler bake the brushes in the
+            # tile's own frame, which is what makes ent.angles turn it about its
+            # entry. Without it a dealt tile would swing thousands of units away.
+            self.assertIn("origin", k)
+
+    def test_manifest_refuses_a_tile_the_compiler_dropped(self):
+        deck = tiles.build_deck("random_map", "Random Map")
+        deck.models = {t.name: i + 1 for i, t in enumerate(deck.tiles)}
+        deck.models[tiles.GATE_NAME] = len(deck.tiles) + 1
+        tiles.manifest(deck)                      # complete: fine
+        del deck.models[deck.tiles[3].name]
+        with self.assertRaises(layout.LayoutError):
+            tiles.manifest(deck)
+
+    def test_manifest_reads_back_the_way_the_dealer_reads_it(self):
+        deck = tiles.build_deck("random_map", "Random Map")
+        deck.models = {t.name: i + 1 for i, t in enumerate(deck.tiles)}
+        deck.models[tiles.GATE_NAME] = len(deck.tiles) + 1
+        text = tiles.manifest(deck)
+        rows = [ln.split() for ln in text.split("\n") if ln and not ln.startswith("//")]
+        self.assertEqual({r[0] for r in rows}, {"deck", "play", "gate", "tile"})
+        tile_rows = [r for r in rows if r[0] == "tile"]
+        self.assertEqual(len(tile_rows), len(deck.tiles))
+        for r, t in zip(tile_rows, deck.tiles):
+            # tile <model> <flags> <weight> <fwd> <lat> <rise> <yaw>
+            #      <mins x3> <maxs x3> <route> <kind> <name>
+            self.assertEqual(len(r), 17, r)
+            self.assertEqual(r[-1], t.name)
+            self.assertEqual(r[-2], t.kind)
+            self.assertEqual(int(r[2]), t.flags)
+        # No token may contain a space: metamap.as splits the line on whitespace.
+        for r in rows:
+            for tok in r:
+                self.assertNotIn(" ", tok)
+
+
 @unittest.skipUnless(build.find_q3map2(), "q3map2 not available (set Q3MAP2)")
 class Compile(unittest.TestCase):
     def test_example_compiles_and_passes_checks(self):
@@ -1136,6 +1261,42 @@ class Compile(unittest.TestCase):
         b = Bsp(data)
         b.set_entity_text(b.entity_text().replace("target_stoptimer", "info_null"))
         problems = build.check_bsp(b.bytes())
+        self.assertTrue(any("target_stoptimer" in p for p in problems), problems)
+
+
+@unittest.skipUnless(build.find_q3map2(), "q3map2 not available (set Q3MAP2)")
+class CompileDeck(unittest.TestCase):
+    def test_deck_compiles_and_every_piece_keeps_a_brush_model(self):
+        # The deck is only useful if the compiler kept a submodel per piece: a
+        # tile folded into worldspawn is one the dealer cannot place AND one
+        # that stays visible, sitting in the compile grid, forever.
+        with tempfile.TemporaryDirectory() as out:
+            pk3, deck, problems, _ = build.build_deck("random_map", "Random Map", out)
+            self.assertEqual(problems, [])
+            self.assertIsNotNone(pk3)
+            with zipfile.ZipFile(pk3) as zf:
+                names = zf.namelist()
+                manifest = zf.read("maps/random_map.deck").decode()
+            self.assertIn("maps/random_map.bsp", names)
+            self.assertEqual(len(deck.models), len(deck.tiles) + 1)
+            for t in deck.tiles:
+                self.assertIn(t.name, deck.models, t.name)
+            self.assertIn(tiles.GATE_NAME, deck.models)
+            self.assertTrue(manifest.startswith("//"))
+            self.assertIn("\ndeck 1 ", manifest)
+
+    def test_deck_check_rejects_a_map_placed_timer(self):
+        # A deck must not carry a start or stop timer: it would fire for
+        # whatever part of whatever route happened to be dealt over it.
+        from bsp import Bsp
+        with tempfile.TemporaryDirectory() as out:
+            pk3, deck, problems, _ = build.build_deck("random_map", "Random Map", out)
+            self.assertEqual(problems, [])
+            with zipfile.ZipFile(pk3) as zf:
+                data = zf.read("maps/random_map.bsp")
+        b = Bsp(data)
+        b.set_entity_text(b.entity_text().replace("trigger_hurt", "target_stoptimer", 1))
+        problems = build.check_deck_bsp(b.bytes(), deck)
         self.assertTrue(any("target_stoptimer" in p for p in problems), problems)
 
 

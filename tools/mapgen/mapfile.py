@@ -108,6 +108,10 @@ def write(course):
            # _minlight keeps shadowed corners readable.
            _kv("_minlight", 16),
            _kv("_color", "1 1 1")]
+    # Anything the layout needs to tell the compiler about the world itself
+    # (tiles.py sets _blocksize and _lightgridsize; a course sets nothing).
+    for k, v in sorted(getattr(course, "worldspawn", {}).items()):
+        out.append(_kv(k, v))
     for b, prism in enumerate(course.world):
         out.append(f"// brush {b}")
         out += brush_lines(prism)

@@ -165,6 +165,14 @@ String[] GetMapsByPattern( String@ pattern, String@ ignore = null )
         // that twice more for each of the ~4,600 maps this loop visits.
         if ( RACE_IsMapBlockedClean( clean_map ) )
             continue;
+        // The meta map is a destination, not a draw. An empty pattern is the
+        // "any map at all" case — a bare `randmap`, the idle rotation's cycle,
+        // a meshvote wildcard — and a course that does not exist until it is
+        // dealt, keeps no records and has an empty /top has no business turning
+        // up there by chance. Naming it still works, by vote or by pattern, so
+        // it stays discoverable and stays listable in /maps.
+        if ( pattern == "" && RACE_IsMetaMapName( clean_map ) )
+            continue;
         if ( PatternMatch( clean_map, pattern, Wildcard_Yes ) )
         {
             maps.insertLast( map );

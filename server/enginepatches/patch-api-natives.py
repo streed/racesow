@@ -883,6 +883,46 @@ DUEL_ENTRY = ANCHOR_ENTRY + (
 )
 patch("game/g_ascript.cpp", ANCHOR_ENTRY, DUEL_ENTRY, "asGlobFuncs duel entry")
 
+# --- 1p. the meta map: report a finished run on a dealt course ---------------
+# Adds RS_ApiReportRandomRun (impl in g_rs_api.cpp). hrace/metamap.as calls it
+# when a run on random_map finishes. Deliberately its own endpoint rather than
+# /api/ingest: a time on a course that was invented a minute ago is only
+# meaningful beside the seed that produced it, so it goes to the seed board and
+# never to a map leaderboard. Anchors re-emitted so they stay unique. The
+# Dockerfile asserts on "asFunc_RS_ApiReportRandomRun".
+RANDOM_WRAPPER = (
+    "// racesow-docker: the meta map - POSTs a finished run on a dealt course\n"
+    "// (the seed, the time, and how long that seed's route was) to the central\n"
+    "// /api/game/random, which is a seed board and not a leaderboard.\n"
+    "void RS_ApiReportRandomRun( const char *url, const char *token, const char *version,\n"
+    "\tint seed, int timeMs, const char *name, const char *login, int pieces, int route );\n"
+    "\n"
+    "static void asFunc_RS_ApiReportRandomRun( asstring_t *url, asstring_t *token,\n"
+    "\tasstring_t *version, int seed, int timeMs, asstring_t *name, asstring_t *login,\n"
+    "\tint pieces, int route )\n"
+    "{\n"
+    "\tif( !url || !url->buffer || !name || !name->buffer )\n"
+    "\t\treturn;\n"
+    "\tRS_ApiReportRandomRun( url->buffer,\n"
+    "\t\ttoken && token->buffer ? token->buffer : \"\",\n"
+    "\t\tversion && version->buffer ? version->buffer : \"\",\n"
+    "\t\tseed, timeMs,\n"
+    "\t\tname->buffer,\n"
+    "\t\tlogin && login->buffer ? login->buffer : \"\",\n"
+    "\t\tpieces, route );\n"
+    "}\n"
+    "\n"
+) + ANCHOR_TABLE
+patch("game/g_ascript.cpp", ANCHOR_TABLE, RANDOM_WRAPPER, "asFunc random-run wrapper")
+
+RANDOM_ENTRY = ANCHOR_ENTRY + (
+    "\t{ \"void RS_ApiReportRandomRun( const String &in url, const String &in token, "
+    "const String &in version, int seed, int timeMs, const String &in name, "
+    "const String &in login, int pieces, int route )\", "
+    "asFUNCTION(asFunc_RS_ApiReportRandomRun), NULL },\n"
+)
+patch("game/g_ascript.cpp", ANCHOR_ENTRY, RANDOM_ENTRY, "asGlobFuncs random-run entry")
+
 # --- 2. link libcurl + pthread into the game module --------------------------
 ANCHOR_LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY})"
 LINK = "target_link_libraries(game PRIVATE ${ANGELSCRIPT_LIBRARY} curl pthread)"

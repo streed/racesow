@@ -4,6 +4,9 @@ npm-debug.log*
 package-lock.json
 
 # Local state / scratch
+# Compiled map output from tools/mapgen (a .pk3 goes to the map store,
+# never into git — see docs/shared-maps.md).
+/build/
 **/announcer.json
 discord/announcer.json
 web/_shots.mjs

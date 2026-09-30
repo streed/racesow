@@ -228,6 +228,8 @@ bool GT_Command( Client@ client, const String &cmdString, const String &argsStri
         return Cmd_RaceRestart( client, cmdString, argsString, argc );
     else if ( cmdString == "practicemode" )
         return Cmd_Practicemode( client, cmdString, argsString, argc );
+    else if ( cmdString == "seed" || cmdString == "newseed" )
+        return RACE_MetaCommand( client, cmdString, argsString, argc );
     else if ( cmdString == "noclip" )
         return Cmd_Noclip( client, cmdString, argsString, argc );
     else if ( cmdString == "reverse" )
@@ -592,7 +594,10 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     // clears any leftover recording from a previous life. The engine's race-demo
     // subsystem skips bots internally and no-ops when the cvar is off; mirror
     // bots already returned above.
-    if ( rsRecordDemos.boolean )
+    // ...except on the meta map, which records nothing: its runs are not
+    // records (see metamap.as), so there is no personal best for a demo to be
+    // kept against and nothing on the site would ever link one.
+    if ( rsRecordDemos.boolean && !RACE_IsMetaMap() )
     {
         ent.client.demoCancel();
         ent.client.demoStart( RACE_DemoName( ent.client ) );
@@ -616,6 +621,11 @@ void GT_PlayerRespawn( Entity@ ent, int old_team, int new_team )
     RS_ResetPjState( ent.client.playerNum );
 
     player.loadPosition( "", Verbosity_Silent );
+
+    // ...and on the meta map, override it: the route is dealt fresh, so a
+    // position saved against an older one points into empty air. Everyone
+    // starts on the start pad (metamap.as). No-op on every other map.
+    RACE_MetaPlayerSpawn( player );
 
     // noclip-spawn (from /noclip while dead or spectating): put the fresh body
     // into noclip and clear any recall-freeze so checkRelease can't yank it back
@@ -681,6 +691,10 @@ void GT_ThinkRules()
     // before the postmatch early-return, so cross-server chat/ghosts keep
     // flowing while the scoreboard is up
     RACE_MirrorThink();
+
+    // The meta map's dealer: keeps the route built a few pieces ahead of
+    // whoever is furthest along. No-op on every other map (metamap.as).
+    RACE_MetaThink();
 
     // live top scores from the central API (no-op when rs_api_top_url is
     // empty); also before the early-return so records stay current postmatch
@@ -1339,6 +1353,10 @@ void GT_SpawnGametype()
 
     RACE_MirrorSpawnGametype();
     RACE_GhostSpawnGametype();
+
+    // The meta map: read the tile deck packed beside the .bsp and deal the
+    // first route. No-op on every other map (metamap.as).
+    RACE_MetaInit();
 }
 
 float GT_VotePower( Client@ client, String& votename, bool voted, bool yes )
@@ -1493,6 +1511,8 @@ void GT_InitGametype()
     G_RegisterCommand( "tourneyvote" );
     G_RegisterCommand( "tvote" );
     G_RegisterCommand( "duel" );
+    G_RegisterCommand( "seed" );
+    G_RegisterCommand( "newseed" );
     G_RegisterCommand( "accept" );
     G_RegisterCommand( "decline" );
     G_RegisterCommand( "forfeit" );

@@ -6023,6 +6023,163 @@ class RaceDB {
     }
   }
 
+  // --- the meta map's seed board -------------------------------------------
+  //
+  // A run on random_map is not a record and never touches `race`, `finish` or
+  // `run_tally`: the course was dealt from a seed minutes earlier, so the time
+  // only means anything beside that seed. See migrations/*_random_runs.sql.
+  //
+  // One row per (seed, player), keeping their BEST time on that seed, so a
+  // seed's rows read as a race between people rather than a log of attempts.
+  async recordRandomRun({
+    version = "",
+    seed,
+    player,
+    login = "",
+    timeMs,
+    pieces = 0,
+    routeUnits = 0,
+    serverId = null,
+    createdAt = null,
+  }) {
+    const s = Math.floor(Number(seed));
+    const t = Math.floor(Number(timeMs));
+    if (!Number.isFinite(s) || s <= 0) return { ok: false, error: "invalid seed" };
+    if (!Number.isFinite(t) || t <= 0) return { ok: false, error: "invalid time" };
+    if (!String(player || "").trim()) return { ok: false, error: "player required" };
+
+    const at = createdAt != null ? Math.floor(Number(createdAt)) : Math.floor(Date.now() / 1000);
+    const countOf = (v) => {
+      const n = Math.floor(Number(v));
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    };
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const q1 = async (sql, params) => (await client.query(sql, params)).rows[0];
+
+      let versionId = null;
+      if (String(version || "")) {
+        const vRow = await q1(
+          `INSERT INTO version (name) VALUES ($1)
+           ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`,
+          [String(version)]
+        );
+        versionId = num(vRow.id);
+      }
+
+      // The canonical representative, like the duel and replay paths.
+      const rawId = await this._resolvePlayer(client, { name: String(player), login: String(login || "") });
+      const c = (await client.query("SELECT canonical_id FROM player WHERE id = $1", [rawId])).rows[0];
+      const playerId = c && c.canonical_id != null ? num(c.canonical_id) : rawId;
+
+      // Faster-only. A slower re-run on the same seed is not news, and
+      // overwriting with it would make the board drift upwards over an evening.
+      const row = await q1(
+        `INSERT INTO random_run
+           (seed, player_id, time_ms, pieces, route_units, version_id, server_id, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (seed, player_id) DO UPDATE SET
+           time_ms     = EXCLUDED.time_ms,
+           pieces      = EXCLUDED.pieces,
+           route_units = EXCLUDED.route_units,
+           version_id  = EXCLUDED.version_id,
+           server_id   = EXCLUDED.server_id,
+           created_at  = EXCLUDED.created_at
+         WHERE random_run.time_ms > EXCLUDED.time_ms
+         RETURNING id`,
+        [s, playerId, t, countOf(pieces), countOf(routeUnits), versionId,
+         serverId == null ? null : num(serverId), at]
+      );
+
+      await client.query("COMMIT");
+      // No row back means the conflict target existed and the stored time was
+      // already faster: a legitimate, common outcome, not a failure.
+      return { ok: true, id: row ? num(row.id) : null, improved: !!row, playerId, seed: s };
+    } catch (e) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* connection may be dead */
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // The seed board: the most recently raced seeds, each with its own ladder.
+  //
+  // Grouped by SEED rather than flattened into one list of times, because two
+  // times on different seeds were set on different courses and putting them in
+  // one column would invite exactly the comparison this whole feature avoids.
+  async randomBoard({ limit = 20, perSeed = 10, seed = null } = {}) {
+    const lim = Math.min(50, Math.max(1, Math.floor(Number(limit) || 20)));
+    const per = Math.min(50, Math.max(1, Math.floor(Number(perSeed) || 10)));
+    const one = seed != null && Number.isFinite(Math.floor(Number(seed))) ? Math.floor(Number(seed)) : null;
+
+    const seeds = one != null
+      ? await this.all(
+          `SELECT seed, COUNT(*)::int AS runs, MIN(time_ms)::int AS best,
+                  MAX(created_at) AS last_at, MAX(pieces)::int AS pieces,
+                  MAX(route_units)::int AS route_units
+             FROM random_run WHERE seed = $1 GROUP BY seed`,
+          [one]
+        )
+      : await this.all(
+          `SELECT seed, COUNT(*)::int AS runs, MIN(time_ms)::int AS best,
+                  MAX(created_at) AS last_at, MAX(pieces)::int AS pieces,
+                  MAX(route_units)::int AS route_units
+             FROM random_run GROUP BY seed
+            ORDER BY MAX(created_at) DESC LIMIT $1`,
+          [lim]
+        );
+    if (!seeds.length) return [];
+
+    const list = seeds.map((r) => num(r.seed));
+    const rows = await this.all(
+      `SELECT r.seed, r.time_ms, r.created_at, r.pieces, r.route_units,
+              p.id AS player_id, p.name AS player_name
+         FROM random_run r
+         JOIN player p ON p.id = r.player_id
+        WHERE r.seed = ANY($1::bigint[])
+        ORDER BY r.seed, r.time_ms ASC, r.created_at ASC`,
+      [list]
+    );
+
+    const bySeed = new Map();
+    for (const row of rows) {
+      const k = num(row.seed);
+      const arr = bySeed.get(k) || [];
+      if (arr.length < per) {
+        // Names go out through the one censoring choke-point, like every other
+        // player-facing list here.
+        const named = this._censorNamed(
+          { name: row.player_name }, num(row.player_id)
+        );
+        arr.push({
+          rank: arr.length + 1,
+          playerId: num(row.player_id),
+          player: named.name,
+          time: num(row.time_ms),
+          at: num(row.created_at),
+        });
+      }
+      bySeed.set(k, arr);
+    }
+
+    return seeds.map((r) => ({
+      seed: num(r.seed),
+      runs: num(r.runs),
+      best: num(r.best),
+      lastAt: num(r.last_at),
+      pieces: num(r.pieces),
+      routeUnits: num(r.route_units),
+      runsList: bySeed.get(num(r.seed)) || [],
+    }));
+  }
+
   // This player's duels, newest first, plus their overall record.
   //
   // Every row is rewritten from the stored a/b pair into "you vs them", so the

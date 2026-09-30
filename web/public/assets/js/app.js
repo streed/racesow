@@ -2356,6 +2356,16 @@ const ABOUT_CMDS = [
     ],
   },
   {
+    title: "Random map — a course that builds itself",
+    note:
+      "Vote to <span class=\"mono\">random_map</span> and the server deals a course instead of loading one: it places a piece of track at a time, a few pieces ahead of whoever is furthest along, and stops once the route is long enough. Everyone on the server gets the same route, because it all comes from one number — the seed. These runs are deliberately kept off the leaderboards: a time on a course that was invented a minute ago cannot be compared with a time on a real map, or even with a time on a different seed. They go to the seed board on this site instead, where the time and the seed sit together so anyone can go and race the same course.",
+    rows: [
+      ["/seed", "Show the seed the current course was dealt from, how many pieces it has and how long it is."],
+      ["/seed <number>", "Deal that course, for everyone. Refused while someone else is mid-run, so the ground never changes under them."],
+      ["/newseed", "Deal a fresh random course."],
+    ],
+  },
+  {
     title: "Cross-server mesh",
     note: "The servers above are linked. On the same map you'll see players from the other server as translucent ghosts, and their chat arrives with a [TAG] prefix.",
     rows: [
@@ -2397,6 +2407,8 @@ const ABOUT_FAQ = [
     "Two scores, side by side. <b>Points</b> is the classic board: you earn points for a top-15 finish on each map (100 for a WR down to 32 for 15th), and your overall rank is the <b>sum</b> across every map you've raced — so it rewards showing up on a lot of maps. <b>SR (Skill Rating)</b> is the skill board: on each map it measures how close your time is to the world record, weighted by how many players you beat, and your rating is the average across <b>50 map slots</b> on a 0–1000 scale, filled by your strongest maps. Everyone is measured on the same 50, so a deep catalog and a short one are compared like for like — but that also means all 50 count: a slow run inside them pulls the number down, and it's worth going back to improve your weakest. Any slot you haven't filled yet sits at the starting rating, so a short catalog climbs as you race more maps. Because every run is measured against the current world record, your SR can also drift down even when you haven't raced. If someone lowers a record on one of your best maps, you sit a little further from the top. Only contested maps count (you and at least two other players with a time on it). Any profile's Skill Rating card has a <b>“Which maps make up this rating?”</b> dropdown that lists exactly which maps went into the number, in order, and a <b>“where you stand”</b> chart underneath that plots every ranked player's rating so you can see which percentile yours falls in. World records and podium finishes are tracked separately on your profile."],
   ["How do duels work?",
     "A duel is a 1v1 on the map you're both standing on. Type <span class=\"mono\">/duel &lt;player&gt;</span> to challenge someone — the name matches on any part of it with colour codes ignored, so <span class=\"mono\">/duel tud</span> finds <span class=\"mono\">tudduf</span> — and they have 60 seconds to <span class=\"mono\">/accept</span> or <span class=\"mono\">/decline</span>. Once it's on, <b>every finish either of you records on that map counts</b>: your fastest is your time, and whoever is faster leads. Beat your own best and you might take the lead; the server tells you both, and nobody else. It ends on whichever comes first — the map changes, someone types <span class=\"mono\">/forfeit</span> (a loss however fast they were), or one of you leaves and doesn't return within five minutes. The faster time wins at that moment. Practice runs never count, and neither do runs in the other direction: a duel is fixed to the direction it was accepted in, because <span class=\"mono\">/reverse</span> is a separate leaderboard. If neither of you ever finishes, nothing is recorded. Everything else lands on both your profiles as a win-loss record and the recent match-ups. Type <span class=\"mono\">/duel</span> on its own at any time for the live score."],
+  ["What is random_map?",
+    "A map that doesn't exist until you play it. Vote to <span class=\"mono\">random_map</span> and the server <b>deals</b> a course out of pre-built pieces — straights, turns, ramps, gaps, slaloms, beams, wall climbs, dashes — laying down the next few pieces ahead of whoever is furthest along, so the track really does appear in front of you as you run it. When the route is long enough it deals a finish and the run ends. Everything comes from one number, the <b>seed</b>: the same seed always builds the same course, so everyone on the server races an identical route and you can hand a seed to a friend. Type <span class=\"mono\">/seed</span> in game to see the current one, <span class=\"mono\">/seed &lt;number&gt;</span> to deal someone else's, or <span class=\"mono\">/newseed</span> for a fresh one. These runs are <b>not records</b> and never touch a map leaderboard, your personal bests, your rating or your demos — a time is only meaningful beside the seed that produced its course. They land on the <a data-nav=\"#/random\" href=\"/random\">seed board</a> instead, one small ladder per seed."],
   ["A map is broken or shouldn't be here — what do I do?",
     "Flag it for review. In-game, type <span class=\"mono\">/flag</span> while you're on the map (add a reason if you like, e.g. <span class=\"mono\">/flag broken</span>). Or open the map on this site and hit <b>⚑ Flag this map for review</b>. Moderators check flagged maps and can pull a bad one from the vote pool and map cycle."],
 ];
@@ -3876,6 +3888,70 @@ async function viewAchievements() {
       : `<div class="empty">No achievements have been defined yet — check back soon.</div>`}`;
 }
 
+/* ============================== the seed board ============================ */
+/* random_map is a course that does not exist until a server deals it: the
+ * gametype builds a route out of compiled pieces from a seed, and everyone on
+ * that server races the same route. So this is NOT a leaderboard and is kept
+ * well away from one — a time is only comparable to other times on the SAME
+ * seed, and every row carries the seed that produced its course so anyone can
+ * go and race it.
+ *
+ * Hence the shape: one small ladder per seed, newest seed first, rather than
+ * one list of times. Flattening them would invite exactly the comparison the
+ * whole feature is built to avoid. */
+async function viewRandom(params) {
+  loading();
+  const one = String(params.seed || "").trim();
+  const d = await api("/random" + buildQuery(one ? { seed: one } : {}));
+  const seeds = d.seeds || [];
+
+  const head = `
+    <div class="page-title">RANDOM MAP</div>
+    <p class="page-sub">
+      <code>random_map</code> builds itself as you run it: the server deals a course out of
+      compiled pieces, a few pieces ahead of whoever is furthest along, and stops when the route
+      is long enough. Everyone on the server races the same route.
+      These times are <strong>not records</strong> — a time only means something next to the seed
+      that produced its course. Type <code>seed &lt;number&gt;</code> in game to race any of these.
+    </p>`;
+
+  if (!seeds.length) {
+    app.innerHTML = `${head}<div class="empty">${
+      one ? `Nobody has finished seed ${esc(one)} yet.` : "Nobody has finished a random course yet."
+    }</div>`;
+    return;
+  }
+
+  const ladder = (sd) => sd.runsList
+    .map(
+      (r) => `<tr>
+        <td class="rank">${r.rank}</td>
+        <td><a data-nav="#/player/${r.playerId}" href="/player/${r.playerId}">${wname(r.player)}</a></td>
+        <td class="num">${fmtTime(r.time)}</td>
+        <td class="num muted">${fmtAgo(r.at)}</td>
+      </tr>`
+    )
+    .join("");
+
+  app.innerHTML = `${head}
+    ${one ? `<p><a data-nav="#/random" href="/random">&larr; every seed</a></p>` : ""}
+    ${seeds
+      .map(
+        (sd) => `<div class="panel">
+        <h3><span class="dot"></span>Seed ${sd.seed}</h3>
+        <div class="muted" style="margin-bottom:8px">
+          ${fmtNum(sd.runs)} ${sd.runs === 1 ? "finish" : "finishes"}
+          ${sd.pieces ? ` · ${fmtNum(sd.pieces)} pieces · ${fmtNum(sd.routeUnits)} units of route` : ""}
+          · last raced ${fmtAgo(sd.lastAt)}
+          ${one ? "" : ` · <a data-nav="#/random?seed=${sd.seed}" href="/random?seed=${sd.seed}">this seed only</a>`}
+        </div>
+        <table class="tbl"><thead><tr><th>#</th><th>Player</th><th class="num">Time</th><th class="num">When</th></tr></thead>
+        <tbody>${ladder(sd)}</tbody></table>
+      </div>`
+      )
+      .join("")}`;
+}
+
 /* ============================== tournaments ============================== */
 /* A tournament is a time window plus a map pool; a registered entrant's
  * finishes on those maps inside that window score for its board as well as the
@@ -4377,6 +4453,7 @@ async function router() {
     else if (path === "/achievements") await viewAchievements();
     else if (path === "/stats") await viewStats(params);
     else if (path === "/runs") await viewRuns(params);
+    else if (path === "/random") await viewRandom(params);
     // Exact match first, same as /tournaments: "/blog" is the index,
     // "/blog/<slug>" one post.
     else if (path === "/blog") await viewBlog(params);
