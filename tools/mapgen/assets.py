@@ -63,6 +63,25 @@ textures/{VERSION}/trigger
 	surfaceparm nomarks
 	surfaceparm trans
 }}
+
+// An origin brush: the ONLY thing that gives a brush entity its own coordinate
+// frame. q3map2 takes the centre of a brush wearing this shader as the
+// entity's origin, subtracts it from the entity's other brushes and drops the
+// brush itself, so the compiled inline model is expressed around that point.
+// An "origin" KEY does not do this — measured, not assumed: a key alone leaves
+// the submodel at its world position, which puts a dealt tile wherever it
+// happened to be compiled instead of where it is placed. Setting both is worse
+// than either, because q3map2 ADDS the key to the brush-derived origin.
+// Used by tiles.py; a written course has no brush entity that needs a frame.
+textures/{VERSION}/origin
+{{
+	qer_trans 0.3
+	surfaceparm origin
+	surfaceparm nodraw
+	surfaceparm nolightmap
+	surfaceparm nomarks
+	surfaceparm trans
+}}
 """
 
 # 5x7 bitmap font, only the glyphs the textures use. Rows top to bottom.

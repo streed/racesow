@@ -115,6 +115,10 @@ SHELL_MARGIN = 768
 # Luxels per tile surface, indirectly: q3map2's default is one per 16 units,
 # and this multiplies that. See _place for why coarse is free here.
 LIGHTMAP_SCALE = 8
+# Half-extent of the origin brush that marks a tile's entry. Small enough to
+# sit inside the entry apron's floor slab, big enough that no snapping moves
+# its centre off the entry point.
+ORIGIN_BRUSH = 16
 GATE_HEIGHT = layout.TRIGGER_HEIGHT
 GATE_DEPTH = 32
 
@@ -412,13 +416,25 @@ def _slab(cx, cy, hx, hy, zlo, zhi, tex, heading=None):
 
 
 def _place(deck, name, prisms, dx, dy, dz, extra=None):
-    """Emit one brush entity holding `prisms` moved by (dx, dy, dz).
+    """Emit one brush entity holding `prisms` moved by (dx, dy, dz), with an
+    ORIGIN BRUSH marking the tile's entry.
 
-    The "origin" key is the point the tile's LOCAL origin lands on. q3map2
-    subtracts it from every brush, so the compiled inline model is expressed in
-    the tile's own frame — which is what makes `ent.origin = somewhere` place
-    the tile's entry there, and `ent.angles` turn it about its entry rather than
-    about a point thousands of units away.
+    That brush is the whole trick, and it is the one thing here that had to be
+    measured rather than reasoned about. q3map2 takes the centre of a brush
+    wearing the origin shader as the entity's origin, subtracts it from the
+    entity's other brushes and drops it, so the compiled inline model comes out
+    expressed around the tile's own entry point. THAT is what makes
+    `ent.origin = somewhere` put the tile's entry there and `ent.angles` turn
+    the tile about its entry instead of about a point thousands of units away.
+
+    An "origin" KEY does not do this. The first version of this file set the
+    key and no brush, on the strength of func_bobbing entities in the map pool
+    whose submodels are plainly relative — but those carry origin brushes, and
+    q3map2 WRITES the key from them. A key alone left every tile's collision
+    and geometry parked in the compile grid, 4,600 units up, so the dealer
+    built routes nobody could reach. Setting both is worse than either: q3map2
+    adds the key to the brush-derived origin and the tile lands at double the
+    offset.
 
     _castShadows / _receiveShadows are off so a tile's lightmap does not depend
     on which slot it happened to be compiled in: a dealt tile has to look the
@@ -430,12 +446,14 @@ def _place(deck, name, prisms, dx, dy, dz, extra=None):
     brushes compile to a 21 MB lightmap that every player would download.
     """
     keys = {"classname": "mg_tile", "mg_name": name,
-            "origin": (dx, dy, dz),
             "_castShadows": 0, "_receiveShadows": 0,
             "_lightmapscale": LIGHTMAP_SCALE}
     if extra:
         keys.update(extra)
-    deck.course.entities.append((keys, [translate(p, dx, dy, dz) for p in prisms]))
+    brushes = [translate(p, dx, dy, dz) for p in prisms]
+    brushes.append(_slab(dx, dy, ORIGIN_BRUSH, ORIGIN_BRUSH,
+                         dz - ORIGIN_BRUSH, dz + ORIGIN_BRUSH, "origin"))
+    deck.course.entities.append((keys, brushes))
 
 
 def build_deck(name, title):

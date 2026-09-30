@@ -704,7 +704,7 @@ class Assets(unittest.TestCase):
     def test_every_texture_layout_uses_exists(self):
         for name in layout.TEX.values():
             kind = name.split("/", 1)[1]
-            self.assertTrue(kind in assets.TEXTURES or kind in ("sky", "trigger"), name)
+            self.assertTrue(kind in assets.TEXTURES or kind in ("sky", "trigger", "origin"), name)
 
     def test_walls_are_darker_than_floors(self):
         def luma(c):
@@ -1156,10 +1156,13 @@ class Tiles(unittest.TestCase):
         self.assertIn(tiles.GATE_NAME, names)
         for k, brushes in placed:
             self.assertTrue(brushes, k["mg_name"])
-            # The origin key is what makes the compiler bake the brushes in the
-            # tile's own frame, which is what makes ent.angles turn it about its
-            # entry. Without it a dealt tile would swing thousands of units away.
-            self.assertIn("origin", k)
+            # An origin BRUSH is what makes the compiler express the submodel in
+            # the tile's own frame, which is what makes ent.angles turn it about
+            # its entry. Without one a dealt tile stays at its compile slot.
+            # (An "origin" key looks like it would do this and does not — see
+            # tiles._place and test_no_piece_carries_an_origin_key.)
+            self.assertTrue(any(b.tex == "origin" for b in brushes), k["mg_name"])
+            self.assertNotIn("origin", k)
 
     def test_manifest_refuses_a_tile_the_compiler_dropped(self):
         deck = tiles.build_deck("random_map", "Random Map")
@@ -1284,6 +1287,64 @@ class CompileDeck(unittest.TestCase):
             self.assertIn(tiles.GATE_NAME, deck.models)
             self.assertTrue(manifest.startswith("//"))
             self.assertIn("\ndeck 1 ", manifest)
+
+    def test_every_piece_compiles_into_its_own_frame(self):
+        """The load-bearing one.
+
+        A tile is placed by its ENTRY: the dealer sets ent.origin to where the
+        entry should go and ent.angles to turn the tile about it. Both only work
+        if the compiled inline model is expressed around that entry, which is
+        what the origin brush in _place buys.
+
+        The first version of tiles.py used an "origin" KEY instead, which does
+        nothing of the sort — every submodel stayed parked at its compile slot,
+        4,600 units up, and the dealer built routes in mid-air that no player
+        could reach. Nothing caught it until someone stood on the map, because
+        the manifest, the deck checks and the gametype were all internally
+        consistent and all wrong together.
+
+        So this compares the two independent sources: the bounds the LAYOUT
+        computed (which is what the manifest publishes and the dealer reasons
+        with) against the bounds the COMPILER wrote. They have to agree.
+        """
+        from bsp import Bsp
+        import struct
+        with tempfile.TemporaryDirectory() as out:
+            pk3, deck, problems, _ = build.build_deck("random_map", "Random Map", out)
+            self.assertEqual(problems, [])
+            with zipfile.ZipFile(pk3) as zf:
+                data = zf.read("maps/random_map.bsp")
+        blob = Bsp(data).lump(7)            # LUMP_MODELS
+        for t in deck.tiles:
+            n = deck.models[t.name]
+            v = struct.unpack_from("<6f", blob, n * 40)
+            mins, maxs = v[:3], v[3:]
+            with self.subTest(t.name):
+                for i, axis in enumerate("xyz"):
+                    # 1 unit of slack: the compiler snaps plane points.
+                    self.assertAlmostEqual(mins[i], t.mins[i], delta=1.0,
+                                           msg=f"{t.name} mins.{axis}")
+                    self.assertAlmostEqual(maxs[i], t.maxs[i], delta=1.0,
+                                           msg=f"{t.name} maxs.{axis}")
+                # ...and the entry itself is inside the compiled box, which is
+                # the property the dealer actually depends on.
+                self.assertLessEqual(mins[0], 1.0)
+                self.assertGreaterEqual(maxs[0], -1.0)
+                self.assertLessEqual(mins[1], 1.0)
+                self.assertGreaterEqual(maxs[1], -1.0)
+
+    def test_no_piece_carries_an_origin_key(self):
+        """q3map2 ADDS an "origin" key to the origin brush's own offset, so a
+        tile carrying both lands at double the offset. The key is the
+        compiler's to write, never ours."""
+        deck = tiles.build_deck("random_map", "Random Map")
+        for keys, brushes in deck.course.entities:
+            if keys.get("classname") != "mg_tile":
+                continue
+            with self.subTest(keys.get("mg_name")):
+                self.assertNotIn("origin", keys)
+                self.assertTrue(any(b.tex == "origin" for b in brushes),
+                                "every placed piece needs an origin brush")
 
     def test_deck_check_rejects_a_map_placed_timer(self):
         # A deck must not carry a start or stop timer: it would fire for

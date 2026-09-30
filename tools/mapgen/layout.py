@@ -119,6 +119,7 @@ TEX = {
     "kick": "mapgen_v1/kick",
     "sky": "mapgen_v1/sky",
     "trigger": "mapgen_v1/trigger",
+    "origin": "mapgen_v1/origin",
 }
 
 
