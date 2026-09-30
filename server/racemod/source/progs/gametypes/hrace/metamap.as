@@ -799,6 +799,7 @@ void RACE_MetaInit()
     {
         G_Print( "^1metamap: " + metaLoadError + " — " + META_MAP_NAME
                 + " will have no route.\n" );
+        RACE_MetaSetStatus( "FAIL_no_deck" );
         return;
     }
 
@@ -809,6 +810,23 @@ void RACE_MetaInit()
     G_Print( "^2metamap: " + metaDeck.length() + " tiles loaded; seed "
             + metaSeed + ", " + metaPlaced.length() + " pieces dealt.\n" );
     RACE_MetaCheckStartPad();
+}
+
+// Publish this map's one interesting fact where it can actually be read back.
+//
+// A log line is not enough here. The engine floods the console during a map
+// load and the log shipper drops lines inside that burst — which is precisely
+// when this prints, so the answer to "did the route come up correctly?" was
+// reliably missing from the logs while being present in a direct rcon reply.
+// A cvar survives the burst and answers in one short read:
+//
+//     rcon rs_meta_status   ->   "ok seed=4242 pieces=7 pad=7 spawn=96,0,32"
+//
+// Values are kept to letters, digits and , = _ - so the set command can never
+// be broken by its own argument.
+void RACE_MetaSetStatus( const String &in value )
+{
+    G_CmdExecute( "set rs_meta_status \"" + value + "\"\n" );
 }
 
 // Ask the ENGINE whether the start pad is actually under the spawn point — and
@@ -847,6 +865,7 @@ void RACE_MetaCheckStartPad()
     if ( !found )
     {
         G_Print( "^1metamap: the map has no spawn point at all.\n" );
+        RACE_MetaSetStatus( "FAIL_no_spawn_point" );
         return;
     }
 
@@ -879,6 +898,10 @@ void RACE_MetaCheckStartPad()
         G_Print( ( moved ? "^1metamap: solid ground is " : "^2metamap: start pad is " )
                 + int( from.z - tr.endPos.z ) + " units under the spawn at "
                 + int( from.x ) + " " + int( from.y ) + " " + int( from.z ) + ".\n" );
+        RACE_MetaSetStatus( ( moved ? "FAIL_spawn_moved" : "ok" )
+                + " seed=" + metaSeed + " pieces=" + metaPlaced.length()
+                + " pad=" + int( from.z - tr.endPos.z )
+                + " spawn=" + int( from.x ) + "," + int( from.y ) + "," + int( from.z ) );
         return;
     }
 
@@ -887,6 +910,9 @@ void RACE_MetaCheckStartPad()
             + ( tr.startSolid ? " (spawn is inside solid)" : " (open air)" )
             + " — players will fall on spawn. Check that every deck piece "
             + "compiled with an ORIGIN BRUSH (tools/mapgen/tiles.py _place).\n" );
+    RACE_MetaSetStatus( "FAIL_no_floor seed=" + metaSeed
+            + " pieces=" + metaPlaced.length()
+            + " spawn=" + int( from.x ) + "," + int( from.y ) + "," + int( from.z ) );
 }
 
 void RACE_MetaThink()
