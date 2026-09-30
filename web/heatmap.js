@@ -27,6 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 import { loadMapGeometry, renderMapBase, makeProject, fillBg, drawGrid, drawMarkers, THEME } from "./bsp.js";
 import { getMapIndex, rebuildMapIndex } from "./mapindex.js";
 
@@ -53,6 +54,17 @@ const CHECK_SECONDS = clampInt(process.env.HEATMAP_CHECK_SECONDS, 3600, 60, 8640
 // regeneration. Defaults to the refresh interval so a nightly run picks up every
 // map touched since the previous night.
 const ACTIVE_WINDOW_SECONDS = clampInt(process.env.HEATMAP_ACTIVE_WINDOW_SECONDS, INTERVAL_SECONDS, 3600, 30 * 86400);
+// How many never-rendered maps to draw per cycle. Bounded because the first
+// run over the whole pool would otherwise render thousands of 1000x1000 PNGs
+// back to back; at this rate the pool fills in over a day or so while a map
+// published minutes ago still gets its plan on the next cycle (newest first).
+const BASE_BUDGET = clampInt(process.env.HEATMAP_BASE_BUDGET, 25, 0, 5000);
+// How many missing replay meshes to convert per cycle (see ensureMeshes).
+// Zero turns it off. Some maps convert to tens of MB, so this is deliberately
+// a trickle rather than a sweep; MESH_DIR unset also turns it off.
+const MESH_BUDGET = clampInt(process.env.MESH_BUDGET, 10, 0, 5000);
+const MESH_DIR = process.env.MESH_DIR || "";
+const BSP2GLTF = process.env.BSP2GLTF || "/opt/tools/bsp2gltf/bsp2gltf.js";
 
 function clampInt(v, dflt, lo, hi) {
   const n = parseInt(v ?? "", 10);
@@ -164,6 +176,44 @@ function quantile(grid, max, q) {
 // Returns { png: Buffer, width, height, players, points, bounds } or null when
 // there are no usable points. Coordinates: world +X → image right, world +Y →
 // image up (north up); frames whose only motion is vertical still register.
+// Frame a world-space XY extent into the standardized SQUARE canvas: pad it,
+// then fit-centre it with the aspect preserved. Shared by the heatmap (which
+// frames the traffic) and the base-only render (which frames the geometry), so
+// a map that has no runs yet is drawn in the same place it will be once it does.
+export function frameBounds(minX, minY, maxX, maxY, size = SIZE) {
+  const spanX = Math.max(maxX - minX, 1);
+  const spanY = Math.max(maxY - minY, 1);
+  const pad = Math.max(spanX, spanY) * 0.04 + 32;
+  minX -= pad; maxX += pad; minY -= pad; maxY += pad;
+  const worldW = maxX - minX;
+  const worldH = maxY - minY;
+  let fw, fh;
+  if (worldW >= worldH) { fw = size; fh = Math.max(64, Math.round(size * (worldH / worldW))); }
+  else { fh = size; fw = Math.max(64, Math.round(size * (worldW / worldH))); }
+  const ox = Math.round((size - fw) / 2), oy = Math.round((size - fh) / 2);
+  return {
+    bounds: { minX, minY, maxX, maxY, worldW, worldH },
+    fit: { ox, oy, fw, fh },
+    scale: { sx: (fw - 1) / worldW, sy: (fh - 1) / worldH },
+  };
+}
+
+// The XY extent of a parsed BSP's drawable geometry, or null if it has none.
+export function geometryBounds(geom) {
+  if (!geom || !geom.vx || !geom.vx.length) return null;
+  const { vx, vy } = geom;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < vx.length; i++) {
+    const x = +vx[i], y = +vy[i];
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  return minX > maxX ? null : { minX, minY, maxX, maxY };
+}
+
 export function buildHeatmap(ghosts, opts = {}) {
   const size = opts.size || SIZE;
 
@@ -185,26 +235,17 @@ export function buildHeatmap(ghosts, opts = {}) {
   }
   if (!usable || totalPoints === 0 || minX > maxX) return null;
 
-  // Pad so the hottest cells near the extremes aren't clipped by the blur, and a
-  // degenerate axis (everyone on one line) still gets a sane extent.
-  const spanX = Math.max(maxX - minX, 1);
-  const spanY = Math.max(maxY - minY, 1);
-  const pad = Math.max(spanX, spanY) * 0.04 + 32;
-  minX -= pad; maxX += pad; minY -= pad; maxY += pad;
-  const worldW = maxX - minX;
-  const worldH = maxY - minY;
-
-  // Standardized SQUARE canvas so every map's image is the same size; the map is
-  // fit-centred (aspect preserved) inside it. fw/fh = the fit rectangle, ox/oy
-  // its offset — the map base + markers reuse these (via the returned `fit`) so
-  // they align with the traffic.
+  // Pad so the hottest cells near the extremes aren't clipped by the blur, a
+  // degenerate axis (everyone on one line) still gets a sane extent, and the
+  // map is fit-centred in a standardized SQUARE canvas. fw/fh = the fit
+  // rectangle, ox/oy its offset — the map base + markers reuse these (via the
+  // returned `fit`) so they align with the traffic.
   const W = size, H = size;
-  let fw, fh;
-  if (worldW >= worldH) { fw = size; fh = Math.max(64, Math.round(size * (worldH / worldW))); }
-  else { fh = size; fw = Math.max(64, Math.round(size * (worldW / worldH))); }
-  const ox = Math.round((size - fw) / 2), oy = Math.round((size - fh) / 2);
-  const sx = (fw - 1) / worldW;
-  const sy = (fh - 1) / worldH;
+  const framed = frameBounds(minX, minY, maxX, maxY, size);
+  ({ minX, minY, maxX, maxY } = framed.bounds);
+  const { worldW, worldH } = framed.bounds;
+  const { ox, oy, fw, fh } = framed.fit;
+  const { sx, sy } = framed.scale;
 
   // Pass 2: accumulate density with a bilinear splat, each player weighted 1
   // total (1/frameCount per frame) so presence — not run length — drives heat.
@@ -364,13 +405,37 @@ export function loadGhostsForMap(mapId, ghostDir = GHOST_DIR) {
 // Regenerate one map's heatmap files. Returns metadata, or null if the map has no
 // usable ghost data (in which case any stale image is removed so a de-populated
 // map doesn't keep serving an outdated heatmap).
+// Parse a map's world geometry, via the pool index (a pack's FILENAME routinely
+// differs from the map/bsp name, so the index is what finds it). Returns the
+// geometry and its XY extent, or null when no pack parses — a missing or
+// corrupt pack is a reason to draw less, never to fail.
+function loadGeometry(mapsDir, name, outDir, mapId) {
+  if (!mapsDir || !name) return null;
+  try {
+    const index = getMapIndex(mapsDir, outDir);
+    const geom = loadMapGeometry(mapsDir, name, (n) => index.get(n));
+    if (!geom) return null;
+    const min = geometryBounds(geom);
+    return min ? { geom, min } : null;
+  } catch (e) {
+    log(`map geometry unavailable for ${mapId} (${name}): ${e.message}`);
+    return null;
+  }
+}
+
 export function generateMap(mapId, name = null, { ghostDir = GHOST_DIR, outDir = HEATMAP_DIR, size = SIZE, mapsDir = MAPS_DIR } = {}) {
   const ghosts = loadGhostsForMap(mapId, ghostDir);
   const pngPath = path.join(outDir, `${mapId}.png`);
   const metaPath = path.join(outDir, `${mapId}.json`);
 
+  // A map nobody has finished yet has no traffic to draw, but it still has a
+  // floor plan, and that is the more useful half: it is what tells someone
+  // looking at a brand-new map what the course looks like. Frame the geometry
+  // instead of the traffic and draw the base alone. (Before this, such a map
+  // got no image at all and any earlier one was deleted.)
   const built = ghosts.length ? buildHeatmap(ghosts, { size }) : null;
-  if (!built) {
+  const geomOnly = built ? null : loadGeometry(mapsDir, name, outDir, mapId);
+  if (!built && !geomOnly) {
     for (const p of [pngPath, metaPath]) try { fs.unlinkSync(p); } catch {}
     return null;
   }
@@ -379,26 +444,31 @@ export function generateMap(mapId, name = null, { ghostDir = GHOST_DIR, outDir =
   // top-down geometry (when its .pk3 parses), the traffic heatmap over it, and
   // start / finish / checkpoint markers taken from the fastest run. Any map-base
   // failure (missing pack / unknown BSP) just leaves the heatmap on the themed bg.
-  const S = built.width;
+  // Where the traffic exists it decides the framing; with no traffic the
+  // geometry does.
+  const frame = built || (() => {
+    const f = frameBounds(geomOnly.min.minX, geomOnly.min.minY,
+                          geomOnly.min.maxX, geomOnly.min.maxY, size);
+    return { width: size, height: size, bounds: f.bounds, fit: f.fit, players: 0, points: 0 };
+  })();
+
+  const S = frame.width;
   const canvas = new Uint8Array(S * S * 4);
   fillBg(canvas, THEME.bg[0], THEME.bg[1], THEME.bg[2]);
   drawGrid(canvas, S);
   let mapBase = false;
-  if (mapsDir && name) {
+  const geom = geomOnly ? geomOnly.geom : (mapsDir && name ? loadGeometry(mapsDir, name, outDir, mapId)?.geom : null);
+  if (geom) {
     try {
-      // Resolve the map name to its real pack via the pool index (pack filenames
-      // routinely differ from the map/bsp name); the index is built + cached +
-      // persisted next to the rendered images (mapindex.json).
-      const index = getMapIndex(mapsDir, outDir);
-      const geom = loadMapGeometry(mapsDir, name, (n) => index.get(n));
-      if (geom) { renderMapBase(canvas, S, built.bounds, built.fit, geom); mapBase = true; }
+      renderMapBase(canvas, S, frame.bounds, frame.fit, geom);
+      mapBase = true;
     } catch (e) {
       log(`map-base render failed for ${mapId} (${name}): ${e.message}`);
     }
   }
-  compositeOver(canvas, built.rgba); // traffic heatmap over the map
-  try {
-    const P = makeProject(built.bounds, built.fit);
+  if (built) compositeOver(canvas, built.rgba); // traffic heatmap over the map
+  if (built) try {
+    const P = makeProject(frame.bounds, frame.fit);
     const fast = ghosts
       .filter((g) => g && Array.isArray(g.frames) && g.frames.length)
       .sort((a, b) => (a.time || Infinity) - (b.time || Infinity))[0];
@@ -418,12 +488,15 @@ export function generateMap(mapId, name = null, { ghostDir = GHOST_DIR, outDir =
   const meta = {
     mapId,
     name,
-    width: built.width,
-    height: built.height,
-    players: built.players,
-    points: built.points,
-    bounds: built.bounds,
+    width: frame.width,
+    height: frame.height,
+    players: frame.players,
+    points: frame.points,
+    bounds: frame.bounds,
     mapBase,
+    // false on a map nobody has finished yet: the image is its floor plan
+    // alone, with no traffic and no start/finish markers.
+    heat: Boolean(built),
     generatedAt: Math.floor(Date.now() / 1000),
   };
   // Atomic publish (write temp + rename) so the web never serves a half-written
@@ -498,8 +571,34 @@ async function mapsToRegenerate(client, { all = false, windowSecs = ACTIVE_WINDO
     for (const id of ghostDirMapIds()) {
       if (!fs.existsSync(path.join(HEATMAP_DIR, `${id}.png`))) ids.add(id);
     }
+    // ...and any map with no image at all, whether or not anyone has finished
+    // it. A map nobody has raced has no ghosts and no PBs, so neither pass
+    // above would ever pick it up, and it showed an empty panel on its page
+    // for good -- which is exactly the state a freshly generated map is in.
+    // Newest first, so a map published minutes ago gets its floor plan on the
+    // next cycle, and capped so the first run over a 4,900-map pool spreads
+    // itself over many cycles instead of pinning a core for an hour.
+    for (const id of await mapsWithoutImage(client, BASE_BUDGET)) ids.add(id);
   }
   return [...ids];
+}
+
+// Maps with no rendered image, newest first, at most `limit`.
+async function mapsWithoutImage(client, limit) {
+  if (limit <= 0) return [];
+  const r = await client.query(
+    `SELECT m.id FROM map m
+      WHERE NOT EXISTS (SELECT 1 FROM map_block b WHERE b.map_id = m.id)
+      ORDER BY m.id DESC`
+  );
+  const out = [];
+  for (const row of r.rows) {
+    const id = Number(row.id);
+    if (fs.existsSync(path.join(HEATMAP_DIR, `${id}.png`))) continue;
+    out.push(id);
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
 // Map ids that have a ghost directory on disk.
@@ -514,11 +613,57 @@ function ghostDirMapIds() {
   }
 }
 
+// Convert map packs that have no replay mesh yet into web/public/maps/<name>.glb,
+// which the in-browser replay viewer loads to draw the real level around the
+// ghost (web/public/assets/js/replay.js; without it the run plays over a bare
+// path). Nothing produced these for new maps: the whole 5,000-mesh set was a
+// hand-run command, so every map published since had no level to fly through.
+//
+// The converter is tools/bsp2gltf, run in its own process in --dir mode, which
+// already walks the pool and SKIPS any pack whose mesh exists -- so this is the
+// same code path as a full backfill, just with a budget on how much it does per
+// cycle. Run as a child so a malformed pack that crashes the parser costs one
+// mesh, not the whole sidecar.
+function ensureMeshes() {
+  if (!MESH_DIR || MESH_BUDGET <= 0 || !MAPS_DIR) return 0;
+  if (!fs.existsSync(BSP2GLTF)) {
+    log(`mesh conversion skipped: ${BSP2GLTF} is not mounted`);
+    return 0;
+  }
+  let out;
+  try {
+    fs.mkdirSync(MESH_DIR, { recursive: true });
+    out = spawnSync(process.execPath,
+                    [BSP2GLTF, "--dir", MAPS_DIR, MESH_DIR, "--limit", String(MESH_BUDGET)],
+                    { encoding: "utf8", timeout: 20 * 60 * 1000, maxBuffer: 32 * 1024 * 1024 });
+  } catch (e) {
+    log(`mesh conversion failed to start: ${e.message}`);
+    return 0;
+  }
+  if (out.error) {
+    log(`mesh conversion failed: ${out.error.message}`);
+    return 0;
+  }
+  const lines = String(out.stdout || "").split("\n").filter(Boolean);
+  const made = lines.filter((l) => l.startsWith("OK  "));
+  const failed = lines.filter((l) => l.startsWith("ERR "));
+  for (const l of made) log(`mesh ${l.slice(4)}`);
+  // A pack that cannot be converted is reported once per cycle and then tried
+  // again next time; the viewer falls back to the bare path meanwhile.
+  if (failed.length) log(`mesh conversion: ${failed.length} pack(s) failed, first: ${failed[0].slice(4)}`);
+  if (made.length) log(`mesh conversion: ${made.length} new mesh(es)`);
+  return made.length;
+}
+
 async function runOnce({ all = false, only = null } = {}) {
   return withPg(async (client) => {
     const ids = only ? only : await mapsToRegenerate(client, { all });
     if (!ids.length) {
       log("no maps due for regeneration");
+      // Meshes are on their own schedule: a pool whose plans are all drawn can
+      // still be missing thousands of them, which is the normal state on a box
+      // that has been running since before they were generated at all.
+      ensureMeshes();
       return 0;
     }
     let ok = 0, empty = 0;
@@ -536,6 +681,7 @@ async function runOnce({ all = false, only = null } = {}) {
       }
     }
     log(`done: ${ok} generated, ${empty} empty/removed, ${ids.length} considered`);
+    ensureMeshes();
     return ok;
   });
 }

@@ -246,9 +246,27 @@ services:
       # Map .pk3 packs (read-only) so each heatmap is drawn over a top-down render
       # of the map geometry (bsp.js). Same packs the game server serves.
       MAPS_DIR: "/maps"
+      # Replay meshes: the .glb the in-browser viewer flies the ghost through
+      # (web/public/assets/js/replay.js). This sidecar converts the packs that
+      # have none, a few per cycle, using tools/bsp2gltf mounted below. The
+      # whole 5,000-mesh set was a hand-run command before this, so any map
+      # published since had no level to fly through.
+      MESH_DIR: "/meshes"
+      MESH_BUDGET: "${MESH_BUDGET:-10}"
+      # How many never-rendered map plans to draw per cycle (newest first), so
+      # a map published minutes ago gets its plan on the next pass without the
+      # first run over the pool rendering thousands of PNGs back to back.
+      HEATMAP_BASE_BUDGET: "${HEATMAP_BASE_BUDGET:-25}"
     volumes:
       - ./data:/data
       - ./server/maps:/maps:ro
+      # The converter itself, read-only: it is a standalone script, so it is
+      # mounted rather than baked into the web image (whose build context is
+      # ./web and cannot reach ./tools).
+      - ./tools:/opt/tools:ro
+      # The SAME directory the web service serves meshes from, mounted
+      # read-only there and writable here — this is the only writer.
+      - ./web/public/maps:/meshes
     command: ["node", "heatmap.js", "--loop"]
     # This service reuses racesow-web, whose image HEALTHCHECK fetches
     # /api/health — an endpoint this batch loop never serves. Inheriting it left
