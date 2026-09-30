@@ -808,6 +808,40 @@ void RACE_MetaInit()
     RACE_MetaNewRoute( uint( pinned.integer ) );
     G_Print( "^2metamap: " + metaDeck.length() + " tiles loaded; seed "
             + metaSeed + ", " + metaPlaced.length() + " pieces dealt.\n" );
+    RACE_MetaCheckStartPad();
+}
+
+// Ask the ENGINE whether the start pad is actually under the spawn point.
+//
+// This is the check whose absence let an entire route get built 4,600 units
+// away from the play box with nothing noticing. The dealer, the manifest and
+// the compiled-deck checks were all internally consistent and all wrong
+// together: real seeds, real piece counts, real route lengths, describing
+// geometry no player could reach. Every one of them was reasoning about where
+// a tile OUGHT to be. A trace is the only thing here that asks where the floor
+// actually IS, which is the one authority that matters — and it costs one
+// trace, once, at map load.
+void RACE_MetaCheckStartPad()
+{
+    Vec3 from = RACE_MetaSpawnSpot();
+    Vec3 to = from;
+    to.z -= 256.0f;
+
+    Trace tr;
+    bool hit = tr.doTrace( from, playerMins, playerMaxs, to, 0, MASK_DEADSOLID );
+    if ( hit && !tr.startSolid )
+    {
+        G_Print( "^2metamap: start pad is " + int( from.z - tr.endPos.z )
+                + " units under the spawn.\n" );
+        return;
+    }
+
+    G_Print( "^1metamap: NOTHING SOLID under the spawn point at "
+            + int( from.x ) + " " + int( from.y ) + " " + int( from.z )
+            + ( tr.startSolid ? " (spawn is inside solid)" : " (open air)" )
+            + " — the dealt route is not where the map says it is. Players will "
+            + "fall into the pit on spawn. Check that every deck piece compiled "
+            + "with an ORIGIN BRUSH (tools/mapgen/tiles.py _place).\n" );
 }
 
 void RACE_MetaThink()
