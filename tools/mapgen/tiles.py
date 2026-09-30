@@ -37,11 +37,9 @@ Layout of the compiled map
             every player on it races that same route together, so there is no
             per-player geometry to keep apart — and a seed on a leaderboard
             means something, because it names a course other people can run.
+            The map's one spawn point sits where the start pad is always dealt.
     slots   a grid well above the play box holding every tile at the position
             it was compiled and lit. Nothing renders or collides here.
-    lobby   one small pad with the map's info_player_deathmatch, for the frame
-            between spawning and being put on the route (and as the fallback if
-            the deck manifest fails to load).
     shell   the sky box sealing all of it, plus a trigger_hurt under the play
             box: falling off a dealt route is the pit, as on any race map.
 
@@ -107,8 +105,11 @@ PIT_THICK = 256
 SLOT_Z = 4608            # the compile/lighting grid, clear above the play box
 SLOT_PITCH = 3072
 
-LOBBY_Y = -(PLAY_HALF + 1536)
-LOBBY_HALF = 192
+# Where a player spawns: on the start tile's pad, 8 units above its floor.
+# The start tile is laid from the play box's origin running along +X with its
+# walking surface at z = 0 (tiles._start_tile), and a player's origin sits 24
+# units above their feet.
+SPAWN = (96.0, 0.0, 32.0)
 
 SHELL_MARGIN = 768
 # Luxels per tile surface, indirectly: q3map2's default is one per 16 units,
@@ -474,12 +475,26 @@ def build_deck(name, title):
     _place(deck, GATE_NAME, [deck.gate],
            x0 + (i % cols) * SLOT_PITCH, y0 + (i // cols) * SLOT_PITCH, SLOT_Z)
 
-    # -- the lobby: somewhere to stand for the frame before the first deal, and
-    # the fallback if the manifest ever fails to load.
-    deck.course.world.append(_slab(0, LOBBY_Y, LOBBY_HALF, LOBBY_HALF, -32, 0, "start", 90))
-    deck.course.floor_polys.append((deck.course.world[-1].poly, "start"))
+    # -- the spawn point, ON the start pad.
+    #
+    # The route always begins at the play box's origin, so the start pad always
+    # lands in the same place and the map's own spawn can simply sit on it. The
+    # first version put the spawn in a lobby off to the side and had the
+    # gametype move the player onto the route; that move silently does nothing
+    # on the FIRST spawn after a map change, because Entity.origin only writes
+    # a client's pmove origin once the client reaches CS_SPAWNED
+    # (g_ascript.cpp, objectGameEntity_SetOrigin) — so the player stood in the
+    # lobby. Spawning where the pad is needs no move at all, and skips the
+    # one-frame jump across the arena that a think-loop fix leaves behind.
+    #
+    # There is deliberately no fallback floor under it. The only way for the
+    # route to be missing is a deck manifest that did not load, which means the
+    # map is unplayable anyway and says so loudly on the server console
+    # (RACE_MetaInit); a pad here could not be protected from a later piece of
+    # route being dealt through it, and a pad the route can eat is worse than
+    # no pad.
     deck.course.entities.append(({"classname": "info_player_deathmatch",
-                                  "origin": (0.0, LOBBY_Y, 40.0), "angle": 90}, []))
+                                  "origin": SPAWN, "angle": 0}, []))
 
     # -- the pit under every lane. Leaving a dealt route is the same mistake as
     # leaving any race map's: trigger_hurt, and the racemod respawns you.
@@ -501,7 +516,7 @@ def _shell(deck, x0, y0):
     gy = abs(y0) + SLOT_PITCH / 2.0
     m = SHELL_MARGIN
     x1 = max(PLAY_HALF, gx) + m
-    y1 = max(PLAY_HALF, gy, abs(LOBBY_Y) + LOBBY_HALF) + m
+    y1 = max(PLAY_HALF, gy) + m
     z0 = PIT_TOP - PIT_THICK - m
     z1 = SLOT_Z + 1024 + m
     T = 16

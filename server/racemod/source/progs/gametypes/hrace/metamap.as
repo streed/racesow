@@ -313,6 +313,8 @@ Vec3[] metaPreCursor;
 int[] metaPreHeading;
 float[] metaPreRoute;
 bool metaBareFinish = false;    // the route ended on a gate with no run-out
+// Players owing a trip to the start pad, applied from the think loop.
+bool[] metaStartPending( maxClients );
 Entity@ metaStartGate;
 Entity@ metaFinishGate;
 
@@ -773,7 +775,10 @@ void RACE_MetaNewRoute( uint seed )
     RACE_MetaExtend();
 }
 
-// Where a player begins: on the start pad, facing down it.
+// Where a player begins: on the start pad, facing down it. The route always
+// starts at the play box's origin running along +X with its walking surface at
+// z = 0, and a player's origin sits 24 units above their feet. Kept in step
+// with tiles.SPAWN, which is where the map's own spawn point is placed.
 Vec3 RACE_MetaSpawnSpot()
 {
     return Vec3( 96.0f, 0.0f, 32.0f );
@@ -815,10 +820,11 @@ void RACE_MetaThink()
         Client @client = G_GetClient( i );
         if ( @client == null || client.state() < CS_SPAWNED )
             continue;
-        if ( client.team == TEAM_SPECTATOR )
-            continue;
         Entity @ent = client.getEnt();
         if ( @ent == null )
+            continue;
+        RACE_MetaApplyStart( RACE_GetPlayer( client ) );
+        if ( client.team == TEAM_SPECTATOR )
             continue;
         RACE_MetaTrackProgress( ent );
     }
@@ -826,24 +832,58 @@ void RACE_MetaThink()
     RACE_MetaExtend();
 }
 
-// Put a spawning player on the start pad. The map's own info_player_deathmatch
-// is in a lobby off to the side and is only ever used for the frame before
-// this runs (and if the deck failed to load at all).
+// Mark a spawning player as owing a trip to the start pad.
+//
+// Nothing is moved here. GT_PlayerRespawn runs at the END of G_ClientRespawn,
+// and Entity.origin only writes a client's pmove origin once that client has
+// reached CS_SPAWNED (objectGameEntity_SetOrigin, g_ascript.cpp) — which it has
+// not on the first spawn after a map change. So the move is deferred to the
+// think loop, exactly as racemod already defers a player's saved start
+// ("applied from the think loop once they are a live prerace body",
+// hrace.as / savedstarts.as).
+//
+// The map's own spawn point already sits on the pad, so on a normal spawn this
+// has nothing to correct. It earns its keep after a re-deal (/seed), and it is
+// what puts the pad in the player's prerace slot so every later /kill and
+// /racerestart comes back here too.
 void RACE_MetaPlayerSpawn( Player @player )
 {
     if ( !metaIsMetaMap || !metaReady || @player == null )
         return;
     Client @client = player.client;
-    if ( @client == null || client.team == TEAM_SPECTATOR )
+    if ( @client == null )
         return;
+    metaStartPending[client.playerNum] = true;
+}
+
+// The deferred half: put the player on the start pad once they are a live
+// prerace body. One-shot per respawn.
+void RACE_MetaApplyStart( Player @player )
+{
+    Client @client = player.client;
+    int pn = client.playerNum;
+    if ( !metaStartPending[pn] )
+        return;
+    if ( client.team == TEAM_SPECTATOR || !player.preRace() )
+        return;                             // not a clean prerace body (yet)
 
     Entity @ent = client.getEnt();
-    if ( @ent == null )
-        return;
-    ent.origin = RACE_MetaSpawnSpot();
-    ent.angles = Vec3( 0.0f, 0.0f, 0.0f );
-    ent.set_velocity( Vec3( 0.0f, 0.0f, 0.0f ) );
-    ent.teleported = true;
+    if ( @ent == null || ent.health <= 0 || ent.isGhosting() )
+        return;                             // wait for a live body
+
+    // Built from currentPosition() so the fresh spawn's health, armour and
+    // weapons survive: this is a relocation, not a stored loadout. Writing it
+    // into prerace slot 0 is what makes every later /kill return to the pad.
+    Position p = player.currentPosition();
+    p.location = RACE_MetaSpawnSpot();
+    p.angles = Vec3( 0.0f, 0.0f, 0.0f );
+    p.velocity = Vec3( 0.0f, 0.0f, 0.0f );
+    p.saved = true;
+    p.recalled = false;
+    p.skipWeapons = false;
+    player.preRacePositionStore.set( "", p );
+    player.applyPosition( p );
+    metaStartPending[pn] = false;
 }
 
 bool RACE_MetaSomeoneRacing( Client @except )
