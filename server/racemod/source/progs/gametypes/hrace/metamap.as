@@ -811,37 +811,82 @@ void RACE_MetaInit()
     RACE_MetaCheckStartPad();
 }
 
-// Ask the ENGINE whether the start pad is actually under the spawn point.
+// Ask the ENGINE whether the start pad is actually under the spawn point — and
+// trace from the spawn ENTITY, not from where we think it is.
 //
-// This is the check whose absence let an entire route get built 4,600 units
-// away from the play box with nothing noticing. The dealer, the manifest and
-// the compiled-deck checks were all internally consistent and all wrong
-// together: real seeds, real piece counts, real route lengths, describing
-// geometry no player could reach. Every one of them was reasoning about where
-// a tile OUGHT to be. A trace is the only thing here that asks where the floor
-// actually IS, which is the one authority that matters — and it costs one
-// trace, once, at map load.
+// The first version of this traced from RACE_MetaSpawnSpot(), a constant, and
+// so it cheerfully confirmed the pad while the spawn itself had been moved out
+// from under it: SP_info_player_deathmatch runs G_DropSpawnpointToFloor
+// (g_utils.cpp:1927), which traces 16,000 units down and relocates the spawn
+// onto whatever it finds. That runs during entity spawn, before the route
+// exists, so it dropped the spawn to the sky shell ~3,300 units below the pad.
+// tiles.py sets spawnflags 1 to stop it; this is what notices if that ever
+// stops working.
+//
+// Between them these are the two things that can be wrong — the pad is not
+// where the dealer thinks, or the spawn is not where the map put it — and
+// neither is visible to any amount of reasoning about the manifest.
 void RACE_MetaCheckStartPad()
 {
-    Vec3 from = RACE_MetaSpawnSpot();
+    Vec3 want = RACE_MetaSpawnSpot();
+    Vec3 from = want;
+    bool found = false;
+
+    for ( int i = 0; i < numEntities; i++ )
+    {
+        Entity @ent = G_GetEntity( i );
+        if ( @ent == null || !ent.inuse )
+            continue;
+        if ( ent.classname != "info_player_deathmatch" && ent.classname != "info_player_start" )
+            continue;
+        from = ent.origin;
+        found = true;
+        break;
+    }
+
+    if ( !found )
+    {
+        G_Print( "^1metamap: the map has no spawn point at all.\n" );
+        return;
+    }
+
+    float drift = float( abs( double( from.x - want.x ) ) )
+            + float( abs( double( from.y - want.y ) ) )
+            + float( abs( double( from.z - want.z ) ) );
+    bool moved = drift > 8.0f;
+    if ( moved )
+    {
+        G_Print( "^1metamap: the spawn point has been MOVED to "
+                + int( from.x ) + " " + int( from.y ) + " " + int( from.z )
+                + ", away from the start pad at "
+                + int( want.x ) + " " + int( want.y ) + " " + int( want.z )
+                + " — something dropped it to the floor before the route was "
+                + "dealt. The deck's spawn needs spawnflags 1 "
+                + "(tools/mapgen/tiles.py).\n" );
+    }
+
     Vec3 to = from;
     to.z -= 256.0f;
-
     Trace tr;
     bool hit = tr.doTrace( from, playerMins, playerMaxs, to, 0, MASK_DEADSOLID );
     if ( hit && !tr.startSolid )
     {
-        G_Print( "^2metamap: start pad is " + int( from.z - tr.endPos.z )
-                + " units under the spawn.\n" );
+        // Only call it the start pad when the spawn is still where the map put
+        // it. A spawn that has drifted is standing on whatever it was dropped
+        // onto — the sky shell, usually — and saying "start pad" about that is
+        // how the first version of this check managed to report success on a
+        // map nobody could play.
+        G_Print( ( moved ? "^1metamap: solid ground is " : "^2metamap: start pad is " )
+                + int( from.z - tr.endPos.z ) + " units under the spawn at "
+                + int( from.x ) + " " + int( from.y ) + " " + int( from.z ) + ".\n" );
         return;
     }
 
     G_Print( "^1metamap: NOTHING SOLID under the spawn point at "
             + int( from.x ) + " " + int( from.y ) + " " + int( from.z )
             + ( tr.startSolid ? " (spawn is inside solid)" : " (open air)" )
-            + " — the dealt route is not where the map says it is. Players will "
-            + "fall into the pit on spawn. Check that every deck piece compiled "
-            + "with an ORIGIN BRUSH (tools/mapgen/tiles.py _place).\n" );
+            + " — players will fall on spawn. Check that every deck piece "
+            + "compiled with an ORIGIN BRUSH (tools/mapgen/tiles.py _place).\n" );
 }
 
 void RACE_MetaThink()

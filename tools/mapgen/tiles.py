@@ -516,8 +516,18 @@ def build_deck(name, title):
     # (RACE_MetaInit); a pad here could not be protected from a later piece of
     # route being dealt through it, and a pad the route can eat is worse than
     # no pad.
+    #
+    # spawnflags 1 is load-bearing. SP_info_player_deathmatch calls
+    # G_DropSpawnpointToFloor (game/g_utils.cpp:1927), which traces 16,000 units
+    # DOWN from the spawn and moves it onto whatever it hits. That runs during
+    # entity spawn — before GT_SpawnGametype deals the route — so there is no
+    # start pad under it yet, the trace falls all the way to the sky shell, and
+    # the spawn is permanently relocated ~3,300 units below where the pad is
+    # about to appear. The flag returns before the move (and after the
+    # inside-solid check, which still applies), which is exactly what a spawn
+    # whose floor is dealt later needs.
     deck.course.entities.append(({"classname": "info_player_deathmatch",
-                                  "origin": SPAWN, "angle": 0}, []))
+                                  "origin": SPAWN, "angle": 0, "spawnflags": 1}, []))
 
     # -- the pit under every lane. Leaving a dealt route is the same mistake as
     # leaving any race map's: trigger_hurt, and the racemod respawns you.
