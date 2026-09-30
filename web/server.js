@@ -47,6 +47,7 @@ import {
   MAX_BODY,
 } from "./blog.js";
 import { RULE_KINDS, WINDOWS, TIERS, validateDefinition, describeRule } from "./achievements.js";
+import { loadDeck } from "./random-deck.js";
 import {
   SCORINGS,
   STATUSES as TOURNAMENT_STATUSES,
@@ -2265,6 +2266,24 @@ api.post(
     }
     if (!r.ok) return res.status(400).json({ error: r.error || "bad run" });
     res.json({ ok: true, improved: r.improved, seed: r.seed });
+  })
+);
+
+// The deck a seed is dealt from, so the site can deal a route itself and show
+// what a seed builds before anyone races it.
+//
+// Read out of the COMPILED PACK the game servers deal from (MAPPACK_DIR, the
+// same read-only ./server/maps mount /download/map/<name> serves), never from a
+// copy kept beside the web code. A preview that drew a route the servers would
+// not deal would be worse than no preview, and a second copy of the manifest is
+// exactly how that happens.
+api.get(
+  "/random/deck",
+  cache(300, { edge: true }),
+  wrap(async (_req, res) => {
+    const deck = await loadDeck();
+    if (!deck) return res.status(503).json({ error: "no deck installed" });
+    res.json(deck);
   })
 );
 

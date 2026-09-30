@@ -1082,6 +1082,32 @@ class Tiles(unittest.TestCase):
     def setUpClass(cls):
         cls.tiles = [tiles.lay(r) for r in tiles.catalogue()]
 
+    @staticmethod
+    def compiled_deck():
+        """A deck with stand-in inline-model indices. The real ones are read
+        back out of the compiled bsp (build.build_deck); nothing about the
+        manifest's text depends on which numbers they are."""
+        deck = tiles.build_deck("random_map", "Random Map")
+        deck.models = {t.name: i + 1 for i, t in enumerate(deck.tiles)}
+        deck.models[tiles.GATE_NAME] = len(deck.tiles) + 1
+        return deck
+
+    def faces_by_model(self, text):
+        """The face block read back the way a plan would read it:
+        model -> [(tex, top, [(x, y)])], in the order it was written."""
+        out = {}
+        for ln in text.split("\n"):
+            r = ln.split()
+            if not r or r[0] != "face":
+                continue
+            n = int(r[4])
+            # The declared point count has to match the tokens that follow, or
+            # something in the line grew a space and became two tokens.
+            self.assertEqual(len(r), 5 + 2 * n, ln)
+            pts = [(float(r[5 + 2 * i]), float(r[6 + 2 * i])) for i in range(n)]
+            out.setdefault(int(r[1]), []).append((r[2], float(r[3]), pts))
+        return out
+
     def test_every_recipe_lays_cleanly(self):
         # layout's own rules (run-up before a gap, a gap that lands on floor, a
         # piece that does not run through itself) apply to a tile too.
@@ -1165,21 +1191,17 @@ class Tiles(unittest.TestCase):
             self.assertNotIn("origin", k)
 
     def test_manifest_refuses_a_tile_the_compiler_dropped(self):
-        deck = tiles.build_deck("random_map", "Random Map")
-        deck.models = {t.name: i + 1 for i, t in enumerate(deck.tiles)}
-        deck.models[tiles.GATE_NAME] = len(deck.tiles) + 1
+        deck = self.compiled_deck()
         tiles.manifest(deck)                      # complete: fine
         del deck.models[deck.tiles[3].name]
         with self.assertRaises(layout.LayoutError):
             tiles.manifest(deck)
 
     def test_manifest_reads_back_the_way_the_dealer_reads_it(self):
-        deck = tiles.build_deck("random_map", "Random Map")
-        deck.models = {t.name: i + 1 for i, t in enumerate(deck.tiles)}
-        deck.models[tiles.GATE_NAME] = len(deck.tiles) + 1
+        deck = self.compiled_deck()
         text = tiles.manifest(deck)
         rows = [ln.split() for ln in text.split("\n") if ln and not ln.startswith("//")]
-        self.assertEqual({r[0] for r in rows}, {"deck", "play", "gate", "tile"})
+        self.assertEqual({r[0] for r in rows}, {"deck", "play", "gate", "tile", "face"})
         tile_rows = [r for r in rows if r[0] == "tile"]
         self.assertEqual(len(tile_rows), len(deck.tiles))
         for r, t in zip(tile_rows, deck.tiles):
@@ -1193,6 +1215,66 @@ class Tiles(unittest.TestCase):
         for r in rows:
             for tok in r:
                 self.assertNotIn(" ", tok)
+
+    def test_every_tile_publishes_a_footprint(self):
+        # A tile with no face lines is a hole in the plan: the route would run
+        # into it, out of it, and show nothing in between.
+        deck = self.compiled_deck()
+        faces = self.faces_by_model(tiles.manifest(deck))
+        for t in deck.tiles:
+            with self.subTest(t.name):
+                self.assertTrue(faces.get(deck.models[t.name]), "no walkable face")
+
+    def test_footprints_stay_inside_the_tile_they_belong_to(self):
+        # The dealer reserves room for a tile by its declared box and tests
+        # every other placed tile against it. A footprint reaching outside that
+        # box is floor the dealer never knew it was fitting, so a plan drawn
+        # from it would show overlaps the server does not believe in.
+        #
+        # Half a unit is the whole tolerance: the points are the tile's own,
+        # rounded to whole units by manifest().
+        eps = 0.5
+        deck = self.compiled_deck()
+        faces = self.faces_by_model(tiles.manifest(deck))
+        for t in deck.tiles:
+            with self.subTest(t.name):
+                for tex, top, pts in faces[deck.models[t.name]]:
+                    self.assertGreaterEqual(top, t.mins[2] - eps, tex)
+                    self.assertLessEqual(top, t.maxs[2] + eps, tex)
+                    for x, y in pts:
+                        self.assertGreaterEqual(x, t.mins[0] - eps)
+                        self.assertLessEqual(x, t.maxs[0] + eps)
+                        self.assertGreaterEqual(y, t.mins[1] - eps)
+                        self.assertLessEqual(y, t.maxs[1] + eps)
+
+    def test_face_lines_round_trip_the_prisms_they_came_from(self):
+        # The plan a player sees is only the deck's own geometry if the text in
+        # the pack says what the prisms say. Same faces, same order, same shape.
+        eps = 0.5
+        deck = self.compiled_deck()
+        faces = self.faces_by_model(tiles.manifest(deck))
+        for t in deck.tiles:
+            with self.subTest(t.name):
+                got = faces[deck.models[t.name]]
+                want = tiles.floor_faces(t)
+                self.assertEqual(len(got), len(want))
+                for (tex, top, pts), pr in zip(got, want):
+                    self.assertEqual(tex, pr.tex)
+                    self.assertAlmostEqual(top, pr.zmax(), delta=eps)
+                    self.assertEqual(len(pts), len(pr.poly))
+                    for (x, y), (px, py) in zip(pts, pr.poly):
+                        self.assertAlmostEqual(x, px, delta=eps)
+                        self.assertAlmostEqual(y, py, delta=eps)
+
+    def test_only_walkable_roles_are_published(self):
+        # Walls, pylons, the sky shell and the trigger slabs are geometry a
+        # player runs past, never on; drawing them would fill the plan in.
+        deck = self.compiled_deck()
+        published = {tex for rows in self.faces_by_model(tiles.manifest(deck)).values()
+                     for tex, _, _ in rows}
+        self.assertTrue(published <= set(tiles.FLOOR_TEX), published)
+        for role in ("wall", "pylon", "sky", "trigger", "origin"):
+            self.assertNotIn(role, tiles.FLOOR_TEX)
 
 
 @unittest.skipUnless(build.find_q3map2(), "q3map2 not available (set Q3MAP2)")

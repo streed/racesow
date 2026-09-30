@@ -52,6 +52,11 @@ file inside a pk3 is readable). It is written AFTER compiling, because the
 inline-model index of each tile is assigned by q3map2 and read back out of the
 compiled entity lump rather than predicted from emission order.
 
+It also publishes the footprint of every walkable surface in every tile,
+which the dealer never reads: that is for drawing a PLAN of a seed's route
+outside the game. Taking the shapes from the same file the servers read is
+what stops a preview and a server disagreeing about what a seed looks like.
+
 Every tile obeys one mating contract, which is what makes any tile follow any
 other: it ENTERS at its local origin running along +X on level, full-width,
 walled floor, and it EXITS on level, full-width floor. Whatever it does in
@@ -563,6 +568,21 @@ def _shell(deck, x0, y0):
     deck.course.worldspawn["_lightmapscale"] = LIGHTMAP_SCALE
 
 
+# The walkable surfaces: the texture roles a player can stand on. wall, pylon,
+# sky, trigger and origin are geometry they only ever run past, and publishing
+# those would fill a plan in solid instead of drawing the route through it.
+FLOOR_TEX = ("floor", "start", "finish", "checkpoint", "edge", "trim",
+             "platform", "beam")
+
+
+def floor_faces(tile):
+    """A tile's walkable prisms, in the tile's own frame. Whole footprints, not
+    top faces: a prism IS its footprint extruded, so a floor slab and the trim
+    along its lip each contribute one polygon, which is what gives a plan its
+    edges."""
+    return [p for p in tile.prisms if p.tex in FLOOR_TEX]
+
+
 def manifest(deck):
     """The text the dealer reads (hrace/metamap.as, via G_LoadFile).
 
@@ -570,6 +590,11 @@ def manifest(deck):
     String::getToken is COM_Parse, which understands exactly that. Model
     indices come from deck.models, read back out of the compiled bsp — never
     predicted from the order entities were written.
+
+    Two blocks: the `tile` lines the dealer fits together, then the `face`
+    lines that say what each tile LOOKS like. RACE_MetaLoadDeck's head dispatch
+    has no trailing else, so a head it does not know is skipped in silence —
+    `face` costs a deployed server one getToken per line and nothing else.
     """
     missing = [t.name for t in deck.tiles if t.name not in deck.models]
     if GATE_NAME not in deck.models:
@@ -597,4 +622,24 @@ def manifest(deck):
             f(t.mins[0]), f(t.mins[1]), f(t.mins[2]),
             f(t.maxs[0]), f(t.maxs[1]), f(t.maxs[2]),
             f(t.route), t.kind, t.name))
+
+    out += [
+        "",
+        "// Walkable footprints, for drawing a plan of a dealt route away from the",
+        "// game. The dealer needs none of them — a tile's box is all it takes to",
+        "// fit one piece onto the next. Points are in the TILE'S OWN frame (entry",
+        "// at the origin, running +X, walking surface at z = 0), so a plan turns",
+        "// and moves them the way the engine turns and moves the tile's model.",
+        "// face <model> <tex> <top> <points> <x> <y> ... (<points> pairs)",
+    ]
+    for t in deck.tiles:
+        for p in floor_faces(t):
+            # Whole units. The smallest face in the deck is 98 across and a plan
+            # draws a 6,000-unit route a few hundred pixels wide, so half a unit
+            # is invisible — and this file ships inside every copy of the pack.
+            # `top` is the top plane's HIGHEST point: a ramp's top is a plane and
+            # not a height, and a plan shades by it rather than measuring from it.
+            out.append("face {} {} {} {} {}".format(
+                deck.models[t.name], p.tex, round(p.zmax()), len(p.poly),
+                " ".join(f"{round(x)} {round(y)}" for x, y in p.poly)))
     return "\n".join(out) + "\n"

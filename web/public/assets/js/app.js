@@ -3899,11 +3899,139 @@ async function viewAchievements() {
  * Hence the shape: one small ladder per seed, newest seed first, rather than
  * one list of times. Flattening them would invite exactly the comparison the
  * whole feature is built to avoid. */
+/* The deck a seed is dealt from. Fetched once: it is the compiled pack's own
+ * manifest, served straight out of the pack the servers deal from, so there is
+ * no second copy to drift. */
+let randomDeck = null;
+async function randomDeckOnce() {
+  if (!randomDeck) randomDeck = await api("/random/deck");
+  return randomDeck;
+}
+
+/* Deal a seed here, in the browser, with the same arithmetic the gametype runs.
+ * assets/js/random-dealer.js is a straight port, pinned to 340 golden routes
+ * generated from the model of hrace/metamap.as (web/test/random-dealer.test.js)
+ * — a preview that drew a route the servers would not deal would be worse than
+ * no preview at all. */
+async function dealSeedHere(seed, target) {
+  const [deck, mod] = await Promise.all([
+    randomDeckOnce(),
+    import("/assets/js/random-dealer.js"),
+  ]);
+  return { deck, route: mod.dealRoute(deck, seed, target), mod };
+}
+
+/* Hue names the kind of piece; lightness carries height, low to high, so an
+ * upper deck reads as lighter than what it crosses. Same scheme as the plan the
+ * generator draws offline. */
+const RANDOM_KIND_HUE = {
+  start: "#3fae5a", finish: "#d0463c", straight: "#8a8f98", turn: "#4b9fea",
+  ramp: "#e8953b", gap: "#ff6a1a", slalom: "#21c2a4", beam: "#c07be0",
+  split: "#d8c23f", wallclimb: "#e0607f", wallgap: "#22d3ee", dash: "#7a86f5",
+  combo: "#7f8aa0",
+};
+
+function randomPlanSvg(deck, route, px) {
+  const COS = (n) => [1, 0.70710678, 0, -0.70710678, -1, -0.70710678, 0, 0.70710678][n & 7];
+  const SIN = (n) => COS((n + 6) & 7);
+  const faces = [];
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  let zlo = Infinity, zhi = -Infinity;
+  for (const pc of route.pieces) {
+    const c = COS(pc.step), sn = SIN(pc.step);
+    for (const f of pc.tile.faces || []) {
+      const pts = f.points.map(([lx, ly]) => {
+        const wx = pc.at.x + lx * c - ly * sn;
+        const wy = pc.at.y + lx * sn + ly * c;
+        if (wx < x0) x0 = wx; if (wx > x1) x1 = wx;
+        if (wy < y0) y0 = wy; if (wy > y1) y1 = wy;
+        return [wx, wy];
+      });
+      const z = pc.at.z + f.top;
+      if (z < zlo) zlo = z; if (z > zhi) zhi = z;
+      faces.push({ pts, z, kind: pc.tile.kind, tex: f.tex });
+    }
+  }
+  if (!faces.length) return "";
+  const pad = 320;
+  x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
+  const w = x1 - x0, h = y1 - y0;
+  const scale = Math.min(px / w, (px * 0.62) / h);
+  const cw = w * scale, ch = h * scale;
+  const X = (x) => ((x - x0) * scale).toFixed(1);
+  // Screen y grows downward; the world's +y is north, so flip it.
+  const Y = (y) => ((y1 - y) * scale).toFixed(1);
+
+  // Paint low to high, so an overpass covers what it crosses.
+  faces.sort((a, b) => a.z - b.z);
+  const band = Math.max(1, zhi - zlo);
+  const poly = faces.map((f) => {
+    const base = RANDOM_KIND_HUE[f.kind] || "#8a8f98";
+    const t = (f.z - zlo) / band;                 // 0 low, 1 high
+    const op = (0.55 + 0.45 * t).toFixed(2);
+    return `<polygon points="${f.pts.map(([x, y]) => X(x) + "," + Y(y)).join(" ")}" `
+      + `fill="${base}" fill-opacity="${op}" stroke="#12161c" stroke-width="0.5"/>`;
+  }).join("");
+
+  const line = route.pieces.map((pc) => X(pc.at.x) + "," + Y(pc.at.y)).join(" ");
+  const first = route.pieces[0], last = route.pieces[route.pieces.length - 1];
+  const pin = (pc, label, fill) =>
+    `<circle cx="${X(pc.at.x)}" cy="${Y(pc.at.y)}" r="7" fill="${fill}" stroke="#0d1117" stroke-width="2"/>`
+    + `<text x="${X(pc.at.x)}" y="${(parseFloat(Y(pc.at.y)) - 14).toFixed(1)}" class="rpin">${label}</text>`;
+
+  return `<svg viewBox="0 0 ${cw.toFixed(0)} ${ch.toFixed(0)}" width="100%" `
+    + `preserveAspectRatio="xMidYMid meet" role="img" `
+    + `aria-label="Top-down plan of the route dealt from seed ${route.seed}">`
+    + `<rect width="100%" height="100%" fill="#0d1117"/>${poly}`
+    + `<polyline points="${line}" fill="none" stroke="#ffffff" stroke-opacity="0.55" `
+    + `stroke-width="1.5" stroke-dasharray="6 5"/>`
+    + pin(first, "START", "#3fae5a") + pin(last, "FINISH", "#d0463c")
+    + `</svg>`;
+}
+
+function randomPreviewMarkup(route) {
+  const kinds = {};
+  for (const pc of route.pieces) kinds[pc.tile.kind] = (kinds[pc.tile.kind] || 0) + 1;
+  const chips = Object.entries(kinds).sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `<span class="rchip"><i style="background:${RANDOM_KIND_HUE[k] || "#8a8f98"}"></i>`
+      + `${esc(k)} <b>${n}&#215;</b></span>`).join("");
+  const order = route.pieces
+    .map((pc, i) => `<span class="rord"><b>${i + 1}</b> ${esc(pc.tile.name)}</span>`).join("");
+  return `
+    <div class="rstats">
+      <div><span>Pieces</span><b>${route.pieces.length}</b></div>
+      <div><span>Route</span><b>${fmtNum(Math.round(route.length))} u</b></div>
+      <div><span>Par</span><b>${(route.length / 320).toFixed(1)} s</b></div>
+      <div><span>Ends on</span><b>${route.bare ? "gate only" : "finish run-out"}</b></div>
+    </div>
+    <div class="rkinds">${chips}</div>
+    <div class="rorder">${order}</div>`;
+}
+
+async function renderRandomPreview(seed) {
+  const box = document.getElementById("rprev");
+  if (!box) return;
+  box.innerHTML = `<div class="muted">Dealing seed ${esc(String(seed))}&#8230;</div>`;
+  try {
+    const { route } = await dealSeedHere(seed, 16000);
+    const width = Math.max(560, Math.min(1100, box.clientWidth || 900));
+    box.innerHTML = `<div class="rplan">${randomPlanSvg(randomDeck, route, width)}</div>`
+      + randomPreviewMarkup(route);
+  } catch (e) {
+    box.innerHTML = `<div class="empty">Couldn't deal that seed<br>`
+      + `<small>${esc(e.message || String(e))}</small></div>`;
+  }
+}
+
 async function viewRandom(params) {
   loading();
   const one = String(params.seed || "").trim();
   const d = await api("/random" + buildQuery(one ? { seed: one } : {}));
   const seeds = d.seeds || [];
+  // Which seed the preview opens on: the one asked for, else the board's most
+  // recent, else a number, so the panel is never empty on a first visit.
+  const previewSeed = one && /^\d+$/.test(one) ? parseInt(one, 10)
+                    : (seeds.length ? seeds[0].seed : 4242);
 
   const head = `
     <div class="page-title">RANDOM MAP</div>
@@ -3913,12 +4041,25 @@ async function viewRandom(params) {
       is long enough. Everyone on the server races the same route.
       These times are <strong>not records</strong> — a time only means something next to the seed
       that produced its course. Type <code>seed &lt;number&gt;</code> in game to race any of these.
-    </p>`;
+    </p>
+    <div class="panel rpanel">
+      <h3><span class="dot"></span>See a seed before you race it</h3>
+      <p class="muted rlede">Dealt right here, with the same arithmetic the server runs, out of the
+        deck the servers themselves deal from. Type any number.</p>
+      <form class="rform" id="rform" autocomplete="off">
+        <input id="rseed" name="seed" type="text" inputmode="numeric" pattern="[0-9]*"
+               value="${esc(String(previewSeed))}" aria-label="Seed" size="10">
+        <button type="submit">Deal it</button>
+        <button type="button" id="rrand" class="ghost">Surprise me</button>
+      </form>
+      <div id="rprev" class="rprev"></div>
+    </div>`;
 
   if (!seeds.length) {
     app.innerHTML = `${head}<div class="empty">${
       one ? `Nobody has finished seed ${esc(one)} yet.` : "Nobody has finished a random course yet."
     }</div>`;
+    wireRandomForm(previewSeed);
     return;
   }
 
@@ -3950,6 +4091,33 @@ async function viewRandom(params) {
       </div>`
       )
       .join("")}`;
+
+  wireRandomForm(previewSeed);
+}
+
+function wireRandomForm(initial) {
+  const form = document.getElementById("rform");
+  const input = document.getElementById("rseed");
+  if (!form || !input) return;
+  const deal = (n) => {
+    input.value = String(n);
+    renderRandomPreview(n);
+  };
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const n = parseInt(input.value, 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      document.getElementById("rprev").innerHTML =
+        `<div class="empty">A seed is a positive whole number.</div>`;
+      return;
+    }
+    deal(n);
+  });
+  // Six digits, the range the game itself hands out, so a seed found here can
+  // be typed straight into /seed.
+  const rnd = document.getElementById("rrand");
+  if (rnd) rnd.addEventListener("click", () => deal(1 + Math.floor(Math.random() * 999982)));
+  renderRandomPreview(initial);
 }
 
 /* ============================== tournaments ============================== */

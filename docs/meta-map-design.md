@@ -205,6 +205,33 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/build:/out" \
 The result is `random_map.pk3` (~360 KB), which installs into the shared map
 store like any other map.
 
+## Previewing a seed on the site
+
+`/random` deals a seed in the browser and draws the route it produces, before
+anyone has raced it.
+
+The dealer's placement is pure arithmetic over the manifest, so the same walk
+runs anywhere — `web/public/assets/js/random-dealer.js` is a port of
+`hrace/metamap.as`. That port is the whole risk: a preview that drew a route
+the servers would NOT deal is worse than no preview. So it is pinned to 340
+golden routes generated from the Python model of the gametype
+(`web/test/fixtures/random-dealer-golden.json`), covering several target
+distances and the awkward endings — routes that rewind twenty times, routes
+that end on a gate with no run-out. One mismatched piece fails the test.
+
+Two things keep the preview honest beyond that:
+
+- **The deck comes out of the compiled pack the servers deal from.**
+  `web/random-deck.js` reads `maps/random_map.deck` straight out of
+  `random_map.pk3` under the map-store mount, never from a copy kept beside the
+  web code — a second copy of the manifest is exactly how a preview starts
+  lying. The parse is cached on the pack's mtime and size, so a republished
+  pack is picked up without a restart.
+- **The manifest carries each piece's walkable footprint** (`face` lines, added
+  for this), so the plan draws the real shape of a turn rather than its
+  bounding box. `RACE_MetaLoadDeck`'s head chain has no trailing else, so the
+  gametype ignores them; the pack grew 5 KB.
+
 ## What is not done
 
 - **Difficulty.** Every tile carries flags for the moves it needs (dash, wall
@@ -212,6 +239,3 @@ store like any other map.
   easier deck is a few lines on top of `RACE_MetaPick`.
 - **Checkpoints.** A dealt route has none, so the in-game per-checkpoint
   comparison has nothing to show. Each tile could carry one.
-- **A route preview.** The site could draw a dealt route from its seed — the
-  dealer's placement is pure arithmetic over the manifest, so the same walk
-  runs anywhere. `tools/mapgen` already knows how to render a plan.
