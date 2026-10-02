@@ -63,6 +63,16 @@ description ──Claude──▶ spec.json ──layout──▶ brushes ──
 | `beam` | `length`, `beam_width` | no floor but a bridge down the middle, over the pit |
 | `split` | `length`, `direction`, `count` | a median wall and two lanes: the `direction` lane runs straight over `count` holes (85% of a run-speed jump, each after a full run-up), the other is solid but weaves through tight fins |
 
+**Ice.** A `straight`, `turn`, `ramp` or `slalom` may set `"ice": true` to
+floor it with the slick `ice` texture, whose shader carries `surfaceparm slick`.
+In the engine `SURF_SLICK` only skips ground friction
+(`gameshared/gs_pmove.c:483`); acceleration and gravity are unchanged, so a
+player still reaches run speed on an icy run-up and every gap guarantee holds.
+They just cannot brake, and slide wide through corners. Ice only changes the
+walking surface's texture, never the geometry. `build.check_bsp` confirms the
+compiled shaderref carries `SURF_SLICK`, and the site's slick scan
+(`web/bsp.js`) tags the map as slick like any icy pool map.
+
 **Checkpoints are guaranteed.** Like the start and finish, the generator adds
 them itself (`layout.plan_checkpoints`). It keeps any the plan placed, then adds
 one on a straight every 2,560 units of route (8 s of par) wherever the plan left
@@ -121,6 +131,70 @@ a spec is the thing to store, review and diff.
 Generated maps are named `gen_*`. Like any new bsp name, each one starts with
 an empty leaderboard.
 
+## Map editor: building a spec by hand
+
+`/mapgen/editor` builds the same spec in the browser. You pick pieces from a
+palette, set lengths, heights, angles, directions, open/ice flags with
+sliders, drag pieces to reorder them, and see the course in 3-D with the
+`mapgen_v1` textures (you can also ride its centre line). It imports and
+exports spec JSON (a model's reply, a `spec.json`, or a generated map via
+`?from=<token>`), and "Build it" queues the spec through `POST /api/mapgen/spec`
+under the same daily quota. An editor course then waits in `review` for an
+admin on `/admin/mapgen`, which lists each one with its stats and a link to
+preview it in 3-D. Approve moves it to the worker's queue. Reject turns it down
+with a reason shown on its job page, and gives back the requester's map and
+the site budget slot. Described maps skip this step. The worker skips planning
+for these `source = 'editor'` jobs: it normalizes the spec, checks it, and
+builds it.
+
+It borrows TrackMania's editor loop:
+
+- **Test drive (P).** Drive the course first person with
+  `mapgen-drive.js`, a port of the servers' `gs_pmove.c` (ground and air
+  acceleration, bunny-hop air control, slick ice, steps, ramps, dash and wall
+  jump) and of the box-against-brush trace, over the same brushes. It has a
+  clock from the start line, checkpoint splits against your best, respawn on
+  the last checkpoint (Enter), and restart (Backspace). The physics is
+  approximate in one place: no edge bevels, so a turn's outside corner can
+  catch a hair early.
+- **Validation and medals.** Your best finish is the author time. Gold,
+  silver and bronze are 6%, 20% and 50% slower, and the best run is shown as a
+  ghost the next time you drive. Any edit to the pieces un-validates the
+  course. Validations are kept in the browser and are not sent with a build.
+- **Ghost cursor.** Hovering a palette piece or macro shows it see-through
+  where it will attach, and an arrow marks the attach point.
+- **Hotbar.** `1`–`0` and `-` place pieces.
+- **Selection, copy and paste.** Shift-click or Shift+←/→ selects a run of
+  pieces; Ctrl+C, Ctrl+X and Ctrl+V copy, cut and paste it.
+- **Mirror (M)** flips the selection, or the whole course, left to right.
+- **Macros.** Save a selected run as a macro and place it again from the
+  palette.
+- **Paint (B)** switches to a brush: click pieces to make them ice or grip.
+  `I` toggles ice on the selection.
+- **My courses.** Save several courses in this browser and reopen them.
+
+`web/test/mapgen-drive.test.js` drives the port with scripted input. It checks
+that run speed comes in under a quarter second, that ice coasts while grip
+brakes, that walls hold, that every legal gap (drop −36 to 512) is cleared
+from run speed, and that an autopilot finishes First Light and Serpent Cut
+with every checkpoint in order.
+
+The page lays the course out with `web/public/assets/js/mapgen-course.js`, a
+port of `physics.py`, `spec.py` and `layout.py`, and draws it with
+`mapgen-textures.js`, a port of `assets.py`. Both are pinned by `golden.py`:
+
+```
+python3 tools/mapgen/golden.py            # re-dump after changing the generator
+python3 tools/mapgen/golden.py --check    # test_mapgen.py runs this
+```
+
+It writes `web/test/fixtures/mapgen-layout-golden.json.gz` (every example and
+a set of valid and refused courses: problems word for word, brushes, entities,
+route) and `mapgen-textures.json` (a sha256 per texture).
+`web/test/mapgen-course.test.js` and `mapgen-textures.test.js` must reproduce
+them exactly. A generator change that is not carried to the port fails both
+lanes.
+
 ## Worker: player requests from the website
 
 `worker.py` serves the `/mapgen` page. The web queues a request only after
@@ -158,6 +232,7 @@ files are committed. It uses the site's palette: `--orange #ff6a1a`,
 | `edge` | orange / black hazard stripes on every gap lip |
 | `trim` | orange stripe on the start and finish lines |
 | `pylon` | navy with cyan bands on slalom and split fins: steer round it (orange means a fall) |
+| `ice` | pale ice blue, the same grid, frost glints and ICE; `surfaceparm slick` (no friction). Ships only in packs that use it, in its own `mapgen_v1_ice.shader`, so an older pack's `mapgen_v1.shader` cannot shadow it |
 
 Textures are 256 px and the texture scale is 1, so 1 px = 1 unit and the grid
 measures true distances. Floor textures are rotated per piece so chevrons and

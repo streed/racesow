@@ -695,8 +695,8 @@ def flat(spec):
 
 class Assets(unittest.TestCase):
     def test_every_asset_generates(self):
-        files = assets.files()
-        for kind in assets.TEXTURES:
+        files = assets.files(ice=True)
+        for kind in list(assets.TEXTURES) + list(assets.ICE_TEXTURES):
             data = files[f"textures/{assets.VERSION}/{kind}.tga"]
             # 18-byte header + 256 x 256 x 3
             self.assertEqual(len(data), 18 + assets.SIZE * assets.SIZE * 3, kind)
@@ -704,13 +704,113 @@ class Assets(unittest.TestCase):
     def test_every_texture_layout_uses_exists(self):
         for name in layout.TEX.values():
             kind = name.split("/", 1)[1]
-            self.assertTrue(kind in assets.TEXTURES or kind in ("sky", "trigger", "origin"), name)
+            self.assertTrue(kind in assets.TEXTURES or kind in assets.ICE_TEXTURES
+                            or kind in ("sky", "trigger", "origin"), name)
 
     def test_walls_are_darker_than_floors(self):
         def luma(c):
             px = c.px
             return sum(0.299 * r + 0.587 * g + 0.114 * b for r, g, b in px) / len(px)
         self.assertLess(luma(assets.wall()), 0.6 * luma(assets.floor()))
+
+
+class Ice(unittest.TestCase):
+    """spec "ice": true -> the slick ice floor, and only the floor."""
+
+    ICY = course_of({"type": "straight", "length": 512},
+                    {"type": "ramp", "length": 768, "rise": -256, "ice": True},
+                    {"type": "turn", "direction": "left", "angle": 90, "radius": 512, "ice": True},
+                    {"type": "slalom", "length": 1024, "count": 3, "ice": True},
+                    {"type": "straight", "length": 512})
+
+    def test_only_floor_pieces_take_ice(self):
+        for t in specmod.ICEABLE:
+            self.assertNotIn("ice", " ".join(specmod.validate(self.ICY)), t)
+        errs = specmod.validate(course_of({"type": "straight", "length": 512},
+                                          {"type": "gap", "length": 128, "drop": 0, "ice": True},
+                                          {"type": "straight", "length": 512}))
+        self.assertTrue(any("only straight, turn, ramp, slalom can be ice" in e for e in errs), errs)
+        errs = specmod.validate(course_of({"type": "straight", "length": 512, "ice": "yes"}))
+        self.assertTrue(any("ice must be true or false" in e for e in errs), errs)
+
+    def test_schema_and_normalize_carry_it(self):
+        self.assertIn("ice", specmod.SEGMENT_SCHEMA["required"])
+        flat = {"type": "straight", "length": 512, "direction": "none", "angle": 0, "radius": 0,
+                "rise": 0, "drop": 0, "shortcut": False, "count": 0, "beam_width": 0,
+                "open": False, "ice": True}
+        out = specmod.normalize(course_of(flat, dict(flat, ice=False)))
+        self.assertEqual(out["segments"], [{"type": "straight", "length": 512, "ice": True},
+                                           {"type": "straight", "length": 512}])
+
+    def test_ice_changes_the_floor_texture_not_the_shape(self):
+        icy = layout.build(self.ICY)
+        dry = copy.deepcopy(self.ICY)
+        for seg in dry["segments"]:
+            seg.pop("ice", None)
+        plain = layout.build(dry)
+        self.assertEqual(len(icy.world), len(plain.world))
+        changed = [(a.tex, b.tex) for a, b in zip(icy.world, plain.world) if a.tex != b.tex]
+        self.assertTrue(changed)
+        self.assertEqual(set(changed), {("ice", "floor")})
+        for a, b in zip(icy.world, plain.world):
+            self.assertEqual((a.poly, a.zmin, a.top0, a.gx, a.gy), (b.poly, b.zmin, b.top0, b.gx, b.gy))
+        self.assertAlmostEqual(icy.length, plain.length)
+        self.assertTrue(build.uses_ice(icy))
+        self.assertFalse(build.uses_ice(plain))
+
+    def test_every_turn_wedge_is_floored(self):
+        # One floor ring per wedge, all wearing the piece's floor texture: the
+        # ring loop must not leak the last ring's texture into the next wedge.
+        for ice in (False, True):
+            c = layout.build(course_of({"type": "straight", "length": 512},
+                                       {"type": "turn", "direction": "right", "angle": 135,
+                                        "radius": 640, "ice": ice},
+                                       {"type": "straight", "length": 512}))
+            # A wedge's floor ring is the only slab whose top is at floor level.
+            slabs = [p for p in c.world if p.zmin == -layout.FLOOR_THICK and p.zmax() == 0]
+            self.assertFalse([p for p in slabs if p.tex == "wall"], "a floor wearing the wall")
+            n = sum(p.tex == "ice" for p in slabs)
+            self.assertEqual(n, 12 if ice else 0, "135 degrees is 12 wedges")
+
+    def test_ice_sides_are_walls(self):
+        course = layout.build(self.ICY)
+        prism = next(p for p in course.world if p.tex == "ice")
+        lines = mapfile.brush_lines(prism)
+        self.assertEqual(sum("mapgen_v1/ice" in ln for ln in lines), 1, "only the top face is ice")
+
+    def test_ice_ships_only_when_used(self):
+        self.assertNotIn(assets.ICE_SHADER_PATH, assets.files())
+        self.assertNotIn(f"textures/{assets.VERSION}/ice.tga", assets.files())
+        files = assets.files(ice=True)
+        self.assertIn("surfaceparm slick", files[assets.ICE_SHADER_PATH].decode())
+        self.assertIn(f"textures/{assets.VERSION}/ice.tga", files)
+        # The shared shader file is untouched, so an older pack cannot shadow ice.
+        self.assertNotIn("/ice", assets.SHADER)
+
+    def test_ice_reads_as_its_own_surface(self):
+        def mean(c):
+            n = len(c.px)
+            return [sum(p[i] for p in c.px) / n for i in range(3)]
+        r, g, b = mean(assets.ice())
+        fr, fg, fb = mean(assets.floor())
+        self.assertGreater(b - r, 40, "ice is clearly blue")
+        self.assertGreater(b, fb, "and lighter than the plain floor")
+
+
+@unittest.skipUnless(os.path.isdir(os.path.join(HERE, "..", "..", "web", "test", "fixtures")),
+                     "web/ is not here (the tools/ Docker image); the repo lanes run this")
+class Golden(unittest.TestCase):
+    """The map editor's copy of the layout (web/public/assets/js/mapgen-course.js)
+    is pinned to this one by a fixture golden.py dumps. If this fails, the
+    generator changed: re-run golden.py and carry the change to the port."""
+
+    def test_the_editor_fixture_is_current(self):
+        import golden
+        self.assertEqual(golden.main(["--check"]), 0)
+
+    def test_the_editor_textures_are_current(self):
+        import golden
+        self.assertEqual(golden.texture_hashes(), golden.load_texture_hashes())
 
 
 class Screenshots(unittest.TestCase):
@@ -937,6 +1037,53 @@ class Publish(unittest.TestCase):
         self.assertEqual((u["calls"], u["input_tokens"], u["output_tokens"]), (1, 2000, 6000))
         self.assertEqual(u["est_usd"], 0.16)
         self.assertEqual(rows[0][1], 7)
+
+    def _run_editor(self, spec):
+        conn = _FakeConn()
+        built = []
+
+        def planner(*a, **k):
+            raise AssertionError("an editor job must never call the model")
+
+        def builder(spec, out_dir, q3map2=None):
+            built.append(spec)
+            os.makedirs(out_dir, exist_ok=True)
+            pk3 = os.path.join(out_dir, spec["name"] + ".pk3")
+            shutil.copyfile(self.pk3, pk3)
+            open(os.path.join(out_dir, spec["name"] + ".svg"), "w").write("<svg/>")
+            return pk3, {"name": spec["name"], "pk3": pk3}
+
+        job = (9, "ef" * 16, "Built in the map editor: Icy", "2026-10-02", b"x" * 16, "editor",
+               json.dumps(spec))
+        outcome = worker.run_job(conn, job, os.path.join(self.tmp, "work"), planner, builder,
+                                 store=self.store)
+        return outcome, conn.log, built
+
+    def test_an_editor_spec_is_built_without_the_model(self):
+        spec = dict(Ice.ICY, name="gen_icy", extra="dropped")
+        spec["segments"] = [dict(s, junk=1) for s in spec["segments"]]
+        outcome, log, built = self._run_editor(spec)
+        self.assertEqual(outcome, "publishing")
+        self.assertEqual(built[0]["name"], worker.unique_name("gen_icy", "ef" * 16))
+        self.assertNotIn("extra", built[0])
+        self.assertFalse(any("junk" in s for s in built[0]["segments"]))
+        self.assertTrue(any(s.get("ice") for s in built[0]["segments"]))
+        self.assertFalse(any("llm_usage" in q for q, _ in log), "no model, no usage row")
+
+    def test_a_refused_editor_spec_fails_and_is_refunded(self):
+        bad = course_of({"type": "ramp", "length": 512, "rise": -128},
+                        {"type": "gap", "length": 96, "drop": 0},
+                        {"type": "straight", "length": 512})
+        outcome, log, built = self._run_editor(bad)
+        self.assertEqual(outcome, "failed")
+        self.assertEqual(built, [])
+        failed = [p for q, p in log if "status = 'failed'" in q][0]
+        self.assertIn("run-up", failed[0])
+        self.assertTrue(any("UPDATE mapgen_quota SET used = used - 1" in q for q, _ in log))
+        for junk in (None, {"segments": "no"}, {"segments": ["x"]}):
+            spec, problems = worker.check_editor_spec(junk, "ab" * 16)
+            self.assertIsNone(spec)
+            self.assertTrue(problems)
 
     def test_a_failed_plan_still_records_what_it_cost(self):
         conn = _FakeConn()
@@ -1336,6 +1483,39 @@ class Compile(unittest.TestCase):
                 self.assertIn("took longer than", str(cm.exception))
         finally:
             build.STAGE_TIMEOUT.update(old)
+
+    def test_icy_course_compiles_slick(self):
+        spec = dict(Ice.ICY, name="gen_icy_test")
+        with tempfile.TemporaryDirectory() as out:
+            pk3, report = build.build(spec, out)
+            with zipfile.ZipFile(pk3) as zf:
+                names = zf.namelist()
+                data = zf.read("maps/gen_icy_test.bsp")
+        self.assertIn(assets.ICE_SHADER_PATH, names)
+        self.assertEqual(report["ice_segments"], [1, 2, 3])
+        from bsp import Bsp
+        flags = [fl for n, fl, _ in Bsp(data).shaderrefs() if n == "textures/mapgen_v1/ice"]
+        self.assertTrue(flags and all(fl & build.SURF_SLICK for fl in flags), flags)
+        # A dry course packs no ice at all.
+        with tempfile.TemporaryDirectory() as out:
+            pk3, report = build.build(example(), out)
+            with zipfile.ZipFile(pk3) as zf:
+                self.assertNotIn(assets.ICE_SHADER_PATH, zf.namelist())
+        self.assertEqual(report["ice_segments"], [])
+
+    def test_check_catches_ice_without_slick(self):
+        spec = dict(Ice.ICY, name="gen_icy_test")
+        with tempfile.TemporaryDirectory() as out:
+            pk3, _ = build.build(spec, out)
+            with zipfile.ZipFile(pk3) as zf:
+                data = zf.read("maps/gen_icy_test.bsp")
+        from bsp import Bsp
+        b = Bsp(data)
+        for i, (n, fl, _) in enumerate(b.shaderrefs()):
+            if n == "textures/mapgen_v1/ice":
+                b.set_shaderref_flags(i, fl & ~build.SURF_SLICK)
+        problems = build.check_bsp(b.bytes(), ice=True)
+        self.assertTrue(any("without SURF_SLICK" in p for p in problems), problems)
 
     def test_check_catches_a_missing_stop_timer(self):
         with tempfile.TemporaryDirectory() as out:

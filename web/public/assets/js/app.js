@@ -14,6 +14,16 @@ const REPLAY_V = (() => {
   }
 })();
 
+// The same for the map editor (?ev=, a hash over its modules).
+const EDITOR_V = (() => {
+  try {
+    const src = document.currentScript && document.currentScript.src;
+    return new URLSearchParams((src && src.split("?")[1]) || "").get("ev") || "";
+  } catch (e) {
+    return "";
+  }
+})();
+
 const app = document.getElementById("app");
 
 /* ---------------------- analytics (Tastatur) ----------------------------- */
@@ -1272,14 +1282,16 @@ function stopMapgenPoll() {
 }
 
 const MAPGEN_STATUS = {
+  review: ["Awaiting approval", "An admin looks at every hand-built course before it is built."],
   queued: ["Queued", "Waiting for the generator."],
   planning: ["Planning", "Turning your description into a course."],
   building: ["Building", "Compiling and checking the map."],
   publishing: ["Publishing", "Built and checked. Waiting for the game servers to load it."],
   published: ["On the servers", "Vote for it in game."],
   failed: ["Failed", ""],
+  rejected: ["Turned down", ""],
 };
-const MAPGEN_DONE = new Set(["published", "failed"]);
+const MAPGEN_DONE = new Set(["published", "failed", "rejected"]);
 
 // " · 2 slaloms · 1 beam · 3 shortcuts · 4 overpasses" from a build report.
 function mapgenPieces(r) {
@@ -1287,7 +1299,8 @@ function mapgenPieces(r) {
   for (const f of Array.isArray(r.features) ? r.features : []) n[f.type] = (n[f.type] || 0) + 1;
   if (Array.isArray(r.shortcuts) && r.shortcuts.length) n.shortcut = r.shortcuts.length;
   if (Array.isArray(r.overpasses) && r.overpasses.length) n.overpass = r.overpasses.length;
-  const names = { wallclimb: "wall climb", wallgap: "wall-kick gap", dash: "dash drop" };
+  if (Array.isArray(r.ice_segments) && r.ice_segments.length) n.ice = r.ice_segments.length;
+  const names = { wallclimb: "wall climb", wallgap: "wall-kick gap", dash: "dash drop", ice: "icy piece" };
   const plural = (w, k) => (k === 1 ? w : w === "overpass" ? "overpasses" : w + "s");
   return Object.entries(n)
     .map(([w, k]) => ` · ${esc(String(k))} ${esc(plural(names[w] || w, k))}`)
@@ -1333,7 +1346,9 @@ function wireVoteCmd() {
 }
 
 function mapgenJobCard(j) {
-  const [label, blurb] = MAPGEN_STATUS[j.status] || [j.status, ""];
+  const [label, blurb] = j.source === "editor" && j.status === "planning"
+    ? ["Checking", "Checking every piece of your course."]
+    : MAPGEN_STATUS[j.status] || [j.status, ""];
   const r = j.report || {};
   const facts = j.mapName
     ? `<div class="mg-facts"><b>${esc(j.mapName)}</b>${r.par_seconds ? ` · about ${esc(String(r.par_seconds))} s at run speed` : ""}${r.checkpoints ? ` · ${esc(String(r.checkpoints))} checkpoint${r.checkpoints === 1 ? "" : "s"}` : ""}${mapgenPieces(r)}</div>`
@@ -1350,7 +1365,7 @@ function mapgenJobCard(j) {
       </div>
       <p class="mg-desc">${esc(j.description)}</p>
       ${facts}
-      ${j.status === "failed" ? `<p class="mg-err">${esc(j.error || "Something went wrong.")}</p>` : blurb ? `<p class="mg-blurb">${esc(blurb)}</p>` : ""}
+      ${j.status === "failed" || j.status === "rejected" ? `<p class="mg-err">${esc(j.error || "Something went wrong.")}</p>` : blurb ? `<p class="mg-blurb">${esc(blurb)}</p>` : ""}
       ${plan}
       ${j.mapName && j.status === "published" ? `<div class="mg-g-vote">${voteCmdBtn(j.mapName)}</div>` : ""}
       <a class="mg-open" href="/mapgen/${esc(j.token)}" data-nav="/mapgen/${esc(j.token)}">Follow this map →</a>
@@ -1373,16 +1388,26 @@ function mapgenClock(t) {
 }
 
 function mapgenStepper(j) {
-  const at = MAPGEN_STEPS.findIndex(([k]) => k === j.status);
-  const failed = j.status === "failed";
-  // A failed job stopped in planning if it never got a map name, else in building.
-  const stop = failed ? (j.mapName ? 2 : 1) : at;
-  return `<ol class="mg-steps">${MAPGEN_STEPS.map(([k, label], i) => {
-    // "On the servers" stays in progress until every active server has it.
-    const everywhere = (j.servers || []).length > 0 && j.servers.every((s) => s.seenAt);
+  // A map-editor job has its spec already: it starts with an admin's approval,
+  // and its "planning" step only checks the spec.
+  const editor = j.source === "editor";
+  const steps = editor
+    ? [["review", "Admin approval"], ...MAPGEN_STEPS.map(([k, l]) => [k, k === "planning" ? "Checking" : l])]
+    : MAPGEN_STEPS;
+  const when = { review: j.createdAt, queued: editor ? j.reviewedAt : j.createdAt, planning: j.startedAt,
+    publishing: j.publishedAt, published: j.liveAt };
+  const at = steps.findIndex(([k]) => k === j.status);
+  const failed = j.status === "failed" || j.status === "rejected";
+  // A rejected job stopped at approval; a failed one in planning if it never
+  // got a map name, else in building.
+  const stop = j.status === "rejected" ? 0
+    : failed ? steps.findIndex(([k]) => k === (j.mapName ? "building" : "planning")) : at;
+  // "On the servers" stays in progress until every active server has it.
+  const everywhere = (j.servers || []).length > 0 && j.servers.every((s) => s.seenAt);
+  return `<ol class="mg-steps">${steps.map(([k, label], i) => {
     const state = failed ? (i < stop ? "done" : i === stop ? "failed" : "todo")
       : i < at ? "done" : i === at ? (k === "published" && everywhere ? "done" : "now") : "todo";
-    const t = i === 0 ? j.createdAt : i === 1 ? j.startedAt : i === 3 ? j.publishedAt : i === 4 ? j.liveAt : null;
+    const t = when[k];
     return `<li class="mg-step ${state}"><span class="mg-dot" aria-hidden="true"></span>
       <span class="mg-step-label">${esc(label)}</span>
       ${t && state !== "todo" ? `<time>${esc(mapgenClock(t))}</time>` : ""}</li>`;
@@ -1398,13 +1423,20 @@ function mapgenNow(j) {
          <span>${s.seenAt ? `loaded ${esc(mapgenClock(s.seenAt))}` : "waiting for its next map scan"}</span></li>`).join("")}</ul>`
     : "";
   switch (j.status) {
+    case "review":
+      return `<p class="mg-now"><b>Waiting for an admin.</b> Every course built in the map editor is looked at
+        before it is built. Nothing is compiled until it is approved, and if it is turned down you get your map back.</p>`;
+    case "rejected":
+      return `<p class="mg-now mg-err">${esc(j.error || "An admin turned this course down.")}</p>`;
     case "queued": {
       const q = j.queue || { position: 1, ahead: 0, building: 0 };
       return `<p class="mg-now"><b>Number ${esc(String(q.position))} in line.</b>
         ${q.ahead ? `${esc(String(q.ahead))} request${q.ahead === 1 ? "" : "s"} ahead of yours` : "Yours is next"}${q.building ? `, and one is being built now.` : "."}</p>`;
     }
     case "planning":
-      return `<p class="mg-now"><b>Planning.</b> Claude is turning your description into a course plan, and every piece is being checked against the game's movement physics.</p>`;
+      return j.source === "editor"
+        ? `<p class="mg-now"><b>Checking.</b> Every piece of your course is being checked against the game's movement physics.</p>`
+        : `<p class="mg-now"><b>Planning.</b> Claude is turning your description into a course plan, and every piece is being checked against the game's movement physics.</p>`;
     case "building":
       return `<p class="mg-now"><b>Building and checking.</b> The course is being compiled into a map, then checked: every jump clearable, one start and finish, working checkpoints.</p>`;
     case "publishing":
@@ -1442,7 +1474,8 @@ async function viewMapgenJob(token) {
       <button class="btn" type="button" id="mg-copy">Copy link</button>
       <span class="flag-msg" id="mg-copied" role="status" aria-live="polite"></span>
     </div>
-    <p class="mg-privacy"><a href="/mapgen" data-nav="/mapgen">← Make another map</a></p>`;
+    <p class="mg-privacy"><a href="/mapgen" data-nav="/mapgen">← Make another map</a>
+      <span id="mg-remix"></span></p>`;
   const track = document.getElementById("mg-track");
   const copied = document.getElementById("mg-copied");
   document.getElementById("mg-copy").addEventListener("click", async () => {
@@ -1467,10 +1500,18 @@ async function viewMapgenJob(token) {
       : "";
     track.innerHTML = `${mapgenStepper(j)}${mapgenNow(j)}${facts}
       ${built ? `<img class="mg-plan" alt="Top-down plan of ${esc(j.mapName)}" src="/api/mapgen/jobs/${esc(j.token)}/plan.svg">` : ""}`;
+    // Once there is a spec (planned, or built in the editor), it can be
+    // opened in the map editor: to fix a refused course, or to remix one.
+    const remix = document.getElementById("mg-remix");
+    if (remix) {
+      remix.innerHTML = j.spec
+        ? ` · <a href="/mapgen/editor?from=${esc(j.token)}" data-nav="/mapgen/editor?from=${esc(j.token)}">Open it in the map editor →</a>`
+        : "";
+    }
   };
   // Poll while anything can still change: the job's own steps, then each
   // active server's confirmation.
-  const settled = (j) => j.status === "failed"
+  const settled = (j) => j.status === "failed" || j.status === "rejected"
     || (j.status === "published" && (j.servers || []).length > 0 && j.servers.every((s) => s.seenAt));
   const tick = async () => {
     try {
@@ -1507,6 +1548,7 @@ function mapgenGalleryCard(m) {
         <p class="mg-desc mg-g-desc">“${esc(m.description)}”</p>
         ${races}
         <div class="mg-g-vote">${voteCmdBtn(m.mapName)}</div>
+        <a class="mg-g-remix" href="/mapgen/editor?from=${esc(m.token)}" data-nav="/mapgen/editor?from=${esc(m.token)}">Remix in the editor →</a>
       </div>
     </article>`;
 }
@@ -1541,6 +1583,10 @@ async function viewMapgen() {
       turns, ramps, gaps, slaloms, beams, split lanes and open track, with wall jumps and dashes if you ask for them, and it can even cross over itself. Every jump is checked against the game's own movement before anyone sees it.
       A map that passes every check goes straight onto the game servers.
       <a href="/mapgen/gallery" data-nav="/mapgen/gallery">See every generated map →</a></p>
+    <a class="panel mg-editor-cta" href="/mapgen/editor" data-nav="/mapgen/editor">
+      <b>Or build it yourself in the map editor →</b>
+      <span>Place every straight, turn, ramp and jump by hand, set heights and angles, lay ice,
+        and ride it in 3-D before it is built.</span></a>
     <form class="panel mg-form" id="mg-form">
       <label class="flag-label" for="mg-desc">Your map</label>
       <textarea id="mg-desc" class="mg-input" rows="4" maxlength="500"
@@ -1609,6 +1655,55 @@ async function viewMapgen() {
     await refresh();
   });
   await refresh();
+}
+
+/* ------------------------------ map editor ------------------------------- */
+// Build a course spec by hand and see it in 3-D (assets/js/mapgen-editor.js,
+// three.js, lazily imported like the replay viewer). ?from=<token> opens a
+// generated map's spec to remix or fix it. Nothing here needs an account:
+// the draft lives in this browser, and "Build it" queues the spec under the
+// same daily identity and quota as a described map.
+let disposeEditor = null;
+function stopEditor() {
+  if (disposeEditor) {
+    try { disposeEditor(); } catch (e) { /* ignore */ }
+    disposeEditor = null;
+  }
+}
+
+async function viewMapgenEditor(params) {
+  loading();
+  let initial = null;
+  let note = "";
+  if (params.from && /^[0-9a-f]{32}$/.test(params.from)) {
+    try {
+      const j = await api(`/mapgen/jobs/${encodeURIComponent(params.from)}`);
+      if (j.spec) {
+        initial = j.spec;
+        note = j.mapName ? `Opened ${j.mapName}. Building it again makes a new map.` : "Opened the course from that request.";
+      } else {
+        note = "That request has no course yet.";
+      }
+    } catch (e) {
+      note = "No map request with that link.";
+    }
+  }
+  app.innerHTML = `
+    <div class="crumbs"><a href="/mapgen" data-nav="/mapgen">Make a map</a> / Editor</div>
+    <div class="page-title">MAP <span class="accent">EDITOR</span></div>
+    <p class="page-sub">Lay a race course out piece by piece: straights, turns, ramps, jumps, obstacles and wall jumps,
+      with every height, angle and length in game units, and ice wherever you want it slick. It is checked against the
+      game's movement as you go, drawn with the map's own textures, and built by the same generator as a described map.
+      Press <b>P</b> to test-drive it with the game's own movement and set an author time, TrackMania style.</p>
+    <div id="mge-root" class="mge"><div class="loading"><span class="spinner"></span></div></div>`;
+  const root = document.getElementById("mge-root");
+  try {
+    const mod = await import("/assets/js/mapgen-editor.js" + (EDITOR_V ? "?v=" + EDITOR_V : ""));
+    if (!root.isConnected) return;   // navigated away while it loaded
+    disposeEditor = await mod.mountEditor(root, { initial, initialNote: note, go, track });
+  } catch (e) {
+    root.innerHTML = `<div class="empty">The map editor failed to load<br><small>${esc(e.message || e)}</small></div>`;
+  }
 }
 
 /* ------------------------------ replay view ------------------------------ */
@@ -4624,6 +4719,7 @@ async function router() {
   stopLiveRefresh();
   stopMapgenPoll();
   stopReplay();
+  stopEditor();
   stopServerStream();
   // Legacy "#/…" URL (old shared link / bookmark): rewrite to the clean path
   // once, so the address bar never keeps a "#".
@@ -4656,6 +4752,7 @@ async function router() {
     else if (path === "/live") await viewLive();
     else if (path === "/mapgen") await viewMapgen();
     else if (path === "/mapgen/gallery") await viewMapgenGallery(params);
+    else if (path === "/mapgen/editor") await viewMapgenEditor(params);
     else if (path.startsWith("/mapgen/")) await viewMapgenJob(path.slice(8));
     else if (path === "/about") await viewAbout();
     else if (path === "/colors") viewColors();

@@ -3908,7 +3908,9 @@ class RaceDB {
     return rows.map((r) => ({ ...this._mapgenJobRow(r), requestedBy: r.requested_by }));
   }
 
-  async mapgenSubmit({ identity, day, description, perIdentity, budget, now = Math.floor(Date.now() / 1000) }) {
+  // `spec` is set for a course built in the map editor (/mapgen/editor): the
+  // worker builds it as given instead of planning one from the description.
+  async mapgenSubmit({ identity, day, description, perIdentity, budget, spec = null, now = Math.floor(Date.now() / 1000) }) {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -3943,10 +3945,13 @@ class RaceDB {
         return { ok: false, reason: "budget" };
       }
       const token = crypto.randomBytes(16).toString("hex");
+      // An editor course waits in 'review' for an admin (mapgenApprove); a
+      // description goes straight to the worker's queue.
       await client.query(
-        `INSERT INTO mapgen_job (token, description, quota_day, identity, created_at)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [token, description, day, identity, now]
+        `INSERT INTO mapgen_job (token, description, quota_day, identity, created_at, source, spec, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [token, description, day, identity, now, spec ? "editor" : "describe", spec ? JSON.stringify(spec) : null,
+          spec ? "review" : "queued"]
       );
       await client.query("COMMIT");
       return { ok: true, token, used: num(mine.rows[0].used) };
@@ -3973,6 +3978,7 @@ class RaceDB {
     return {
       token: r.token,
       description: r.description,
+      source: r.source || "describe",
       status: r.status,
       mapName: r.map_name || null,
       report: r.report || null,
@@ -3982,7 +3988,61 @@ class RaceDB {
       finishedAt: r.finished_at == null ? null : num(r.finished_at),
       publishedAt: r.published_at == null ? null : num(r.published_at),
       liveAt: r.live_at == null ? null : num(r.live_at),
+      reviewedAt: r.reviewed_at == null ? null : num(r.reviewed_at),
     };
+  }
+
+  // --- Admin approval of map-editor courses -----------------------------------
+  // The courses waiting for an admin, oldest first, with their specs (the admin
+  // page summarizes each and links to the 3-D preview).
+  async mapgenReviewQueue({ limit = 50 } = {}) {
+    const rows = await this.all(
+      "SELECT * FROM mapgen_job WHERE status = 'review' ORDER BY id LIMIT $1", [limit]);
+    return rows.map((r) => ({ ...this._mapgenJobRow(r), spec: r.spec || null }));
+  }
+
+  // Approve: into the worker's queue. Only a job still in review moves, so two
+  // admins clicking at once approve it once. Returns whether it moved.
+  async mapgenApprove({ token, by, now = Math.floor(Date.now() / 1000) }) {
+    const r = await this.pool.query(
+      `UPDATE mapgen_job SET status = 'queued', reviewed_at = $2, reviewed_by = $3
+        WHERE token = $1 AND status = 'review'`,
+      [token, now, by]
+    );
+    return r.rowCount > 0;
+  }
+
+  // Turn a course down: it is never built, the admin's note (or a stock line)
+  // is its public error, and the requester gets their map back, as does the
+  // site's daily budget, in the same transaction.
+  async mapgenReject({ token, by, note, now = Math.floor(Date.now() / 1000) }) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const r = await client.query(
+        `UPDATE mapgen_job SET status = 'rejected', reviewed_at = $2, reviewed_by = $3, error = $4, finished_at = $2
+          WHERE token = $1 AND status = 'review'
+          RETURNING quota_day, identity`,
+        [token, now, by, note]
+      );
+      if (!r.rows.length) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      const { quota_day: day, identity } = r.rows[0];
+      if (day && identity) {
+        await client.query(
+          "UPDATE mapgen_quota SET used = used - 1 WHERE day = $1 AND identity = $2 AND used > 0", [day, identity]);
+      }
+      if (day) await client.query("UPDATE mapgen_budget SET used = used - 1 WHERE day = $1 AND used > 0", [day]);
+      await client.query("COMMIT");
+      return true;
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 
   // Everything the job page shows: the job, its place in the queue while it
@@ -3994,7 +4054,9 @@ class RaceDB {
     if (typeof token !== "string" || !/^[0-9a-f]{32}$/.test(token)) return null;
     const r = await this.one("SELECT * FROM mapgen_job WHERE token = $1", [token]);
     if (!r) return null;
-    const job = this._mapgenJobRow(r);
+    // The spec rides along on the job page only (not in lists): it is what the
+    // map editor opens when someone remixes a generated map.
+    const job = { ...this._mapgenJobRow(r), spec: r.spec || null };
     let queue = null;
     if (r.status === "queued") {
       const q = await this.one(

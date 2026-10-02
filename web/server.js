@@ -33,6 +33,9 @@ import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js"
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
 import { cache, invalidate } from "./cache.js";
 import { createSaltStore, identify, SaltUnavailableError } from "./mapgen-identity.js";
+// The generator's course rules, ported (and pinned by test/mapgen-course.test.js)
+// so the map editor and this server refuse what tools/mapgen would refuse.
+import { build as mapgenLayout, normalize as mapgenNormalize, summary as mapgenSummary, MAX_SEGMENTS as MAPGEN_MAX_SEGMENTS } from "./public/assets/js/mapgen-course.js";
 import {
   BLOG_TAGS,
   isBlogTag,
@@ -117,6 +120,7 @@ const MAPGEN_BUDGET = intEnv("MAPGEN_DAILY_BUDGET", 40);
 const MAPGEN_DIR = process.env.MAPGEN_DIR || "/data/mapgen";
 const MAPGEN_DESC_MIN = 10;
 const MAPGEN_DESC_MAX = 500;
+const MAPGEN_NOTE_MAX = 200;   // an admin's reason for turning a course down
 const mapgenSalts = createSaltStore();
 
 // Legacy single-server token (optional). Per-server tokens live in the DB
@@ -644,6 +648,56 @@ api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (r
     identity: who.id,
     day: who.day,
     description,
+    perIdentity: MAPGEN_PER_IDENTITY,
+    budget: MAPGEN_BUDGET,
+  });
+  if (!r.ok) {
+    res.set("Retry-After", String(Math.max(1, who.resetsAt - Math.floor(Date.now() / 1000))));
+    const error = r.reason === "identity"
+      ? `You've used today's ${MAPGEN_PER_IDENTITY === 1 ? "map" : `${MAPGEN_PER_IDENTITY} maps`}. New ones open at 00:00 UTC.`
+      : "The map generator has made all the maps it can today. Try again after 00:00 UTC.";
+    return res.status(429).json({ error, reason: r.reason, resetsAt: who.resetsAt });
+  }
+  const job = await race.mapgenJob(r.token);
+  const budgetUsed = await race.mapgenBudgetUsed(who.day);
+  res.status(202).json({ job, quota: mapgenQuota(who, r.used, budgetUsed) });
+}));
+
+// A course built by hand in the map editor (/mapgen/editor). The same daily
+// quota and site budget as a description, but no model call: the worker checks
+// the spec and builds it, once an admin has approved it on /admin/mapgen (it
+// waits in 'review' until then, and a rejection gives the map back). It is checked here first, with the generator's own
+// rules (public/assets/js/mapgen-course.js), so a course the generator would
+// refuse never costs anyone their map; the worker checks it again anyway,
+// because this endpoint is as public as the form.
+api.post("/mapgen/spec", mapgenNoStore, express.json({ limit: "32kb" }), wrap(async (req, res) => {
+  const raw = req.body && req.body.spec;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Array.isArray(raw.segments)
+      || raw.segments.length > MAPGEN_MAX_SEGMENTS * 2
+      || !raw.segments.every((s) => s && typeof s === "object" && !Array.isArray(s))) {
+    return res.status(400).json({ error: "That isn't a course spec." });
+  }
+  const spec = mapgenNormalize(raw);
+  let problems;
+  try {
+    ({ problems } = mapgenLayout(spec));
+  } catch {
+    problems = ["the course could not be laid out"];
+  }
+  if (problems.length) {
+    return res.status(400).json({ error: "The generator would refuse this course.", problems: problems.slice(0, 20) });
+  }
+  let who;
+  try { who = await mapgenWho(req); } catch (e) { return mapgenFail(res, e); }
+  if (MAPGEN_BUDGET === 0) {
+    return res.status(503).json({ error: "Map requests are switched off right now." });
+  }
+  const r = await race.mapgenSubmit({
+    identity: who.id,
+    day: who.day,
+    // The title passed spec.TITLE_RE (plain words), so it is safe to show.
+    description: `Built in the map editor: ${spec.title}`,
+    spec,
     perIdentity: MAPGEN_PER_IDENTITY,
     budget: MAPGEN_BUDGET,
   });
@@ -3343,6 +3397,50 @@ admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
     : "";
   const mine = await race.mapgenAdminJobs({ limit: 10 });
   const built = await race.mapgenBuiltAdmin({ limit: 50 });
+  const waiting = await race.mapgenReviewQueue({ limit: 50 });
+  const reviewMsg = req.query.approved ? `<div class="msg ok">Approved: it is in the build queue.</div>`
+    : req.query.rejected ? `<div class="msg ok">Turned down. The requester got their map back.</div>`
+      : req.query.gone ? `<div class="msg err">That course was already decided.</div>` : "";
+  // Each course in the queue, summarized from its own layout: what it is,
+  // how long, what is in it. The 3-D preview is the editor itself.
+  const reviewRow = (j) => {
+    let facts = "";
+    try {
+      const { problems, course } = mapgenLayout(j.spec);
+      if (course) {
+        const sm = mapgenSummary(course, j.spec);
+        const kinds = {};
+        for (const sg of j.spec.segments) kinds[sg.type] = (kinds[sg.type] || 0) + 1;
+        facts = `${j.spec.segments.length} pieces · ${Math.round(sm.route_length)} units · par ${sm.par_seconds} s · ` +
+          `${sm.brushes} brushes${sm.ice_segments.length ? ` · ${sm.ice_segments.length} icy` : ""}<br>` +
+          `<span class="sub">${Object.entries(kinds).map(([k, n]) => `${n} ${escHtml(k)}`).join(", ")}</span>`;
+      }
+      if (problems.length) facts += `<br><span class="sub" style="color:#ffb4a0">${escHtml(problems[0])}</span>`;
+    } catch {
+      facts = `<span class="sub">could not lay out</span>`;
+    }
+    const csrf = escHtml(req.session.csrf);
+    return `<tr><td>${fmtWhen(j.createdAt)}</td>
+      <td><b>${escHtml(j.spec && j.spec.title)}</b><br><span class="sub">width ${escHtml(j.spec && j.spec.width)}</span></td>
+      <td>${facts}</td>
+      <td><a href="/mapgen/editor?from=${escHtml(j.token)}" target="_blank" rel="noopener">Preview in 3-D</a><br>
+          <a href="/mapgen/${escHtml(j.token)}" target="_blank" rel="noopener">job page</a></td>
+      <td><form method="post" action="/admin/mapgen/approve" style="margin:0 0 6px">
+            <input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="token" value="${escHtml(j.token)}">
+            <button class="ok" type="submit">Approve</button></form>
+          <form method="post" action="/admin/mapgen/reject" style="margin:0">
+            <input type="hidden" name="_csrf" value="${csrf}"><input type="hidden" name="token" value="${escHtml(j.token)}">
+            <input type="text" name="note" maxlength="${MAPGEN_NOTE_MAX}" placeholder="reason (shown to the requester)" style="width:14em">
+            <button class="warn" type="submit">Reject</button></form></td></tr>`;
+  };
+  const reviewSection = `<h1>Awaiting approval</h1>
+    <p class="sub">Courses built in the <a href="/mapgen/editor">map editor</a> wait here: nothing is compiled
+      until an admin approves it. Approving puts it in the build queue (the generator still runs every check);
+      rejecting gives the requester their map back and shows them your reason.</p>
+    ${reviewMsg}
+    ${waiting.length
+      ? `<table><tr><th>sent</th><th>course</th><th>what's in it</th><th>look</th><th>decide</th></tr>${waiting.map(reviewRow).join("")}</table>`
+      : `<p class="sub">Nothing waiting.</p>`}`;
   const recent = mine.length
     ? `<table><tr><th>requested</th><th>by</th><th>status</th><th>description</th></tr>${mine.map((j) =>
         `<tr><td>${fmtWhen(j.createdAt)}</td><td>${escHtml(j.requestedBy)}</td>
@@ -3350,6 +3448,7 @@ admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
              <td>${escHtml(j.description.slice(0, 80))}</td></tr>`).join("")}</table>`
     : `<p class="sub">No admin requests yet.</p>`;
   sendAdmin(res, "Generated maps", `<div class="crumbs"><a href="/admin/flags">← queue</a></div>
+    ${reviewSection}
     <h1>Request a map</h1>
     <p class="sub">Admin requests skip the per-person limit (${MAPGEN_PER_IDENTITY} a day) and the
       daily site budget. They are queued like any other and recorded under your name.</p>
@@ -3398,6 +3497,24 @@ admin.post("/mapgen/request", requireAdmin, wrap(async (req, res) => {
   if (description === null) return res.redirect(303, "/admin/mapgen?error=length");
   const token = await race.mapgenSubmitAdmin({ description, by: req.session.username });
   res.redirect(303, `/mapgen/${token}`);
+}));
+
+// Decide a map-editor course waiting in review (see mapgenReviewQueue).
+// Approving queues it for the worker; rejecting refunds the requester and
+// records the (cleaned, length-capped) reason as the job's public error.
+admin.post("/mapgen/approve", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const ok = await race.mapgenApprove({ token: String((req.body && req.body.token) || ""), by: req.session.username });
+  res.redirect(303, ok ? "/admin/mapgen?approved=1" : "/admin/mapgen?gone=1");
+}));
+
+admin.post("/mapgen/reject", requireAdmin, wrap(async (req, res) => {
+  if (!checkCsrf(req, res)) return;
+  const reason = String((req.body && req.body.note) || "")
+    .replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/g, " ").trim().slice(0, MAPGEN_NOTE_MAX);
+  const note = `An admin turned this course down${reason ? `: ${reason}` : "."} It didn't count toward your daily maps.`;
+  const ok = await race.mapgenReject({ token: String((req.body && req.body.token) || ""), by: req.session.username, note });
+  res.redirect(303, ok ? "/admin/mapgen?rejected=1" : "/admin/mapgen?gone=1");
 }));
 
 // Hide a built map from the public gallery, or show it again.
@@ -4934,14 +5051,21 @@ function assetVersion(rel) {
     return "";
   }
 }
+// The map editor is five modules (mapgen-editor.js imports the other four),
+// so its ?ev= covers all of them: a change to any one re-fetches the editor.
+const EDITOR_V = crypto.createHash("sha1")
+  .update(["mapgen-editor", "mapgen-pieces", "mapgen-course", "mapgen-textures", "mapgen-drive"]
+    .map((m) => assetVersion(`assets/js/${m}.js`)).join(""))
+  .digest("hex").slice(0, 10);
 const INDEX_HTML = readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
   // app.js carries its own hash AND replay.js's (as ?rv=): app.js dynamically
   // imports replay.js from a constant URL, so without this a browser holding an
   // old replay.js never refetches it on a replay-only change. app.js reads the
-  // rv param off its own <script src> and appends it to the import.
+  // rv param off its own <script src> and appends it to the import. ?ev= is the
+  // same for the map editor.
   .replace(
     "/assets/js/app.js",
-    `/assets/js/app.js?v=${assetVersion("assets/js/app.js")}&rv=${assetVersion("assets/js/replay.js")}`
+    `/assets/js/app.js?v=${assetVersion("assets/js/app.js")}&rv=${assetVersion("assets/js/replay.js")}&ev=${EDITOR_V}`
   )
   .replace("/assets/css/style.css", `/assets/css/style.css?v=${assetVersion("assets/css/style.css")}`);
 
@@ -5373,6 +5497,7 @@ const SITEMAP_PAGES = [
   ["/achievements", "0.7"],
   ["/live", "0.5"],
   ["/mapgen", "0.5"],
+  ["/mapgen/editor", "0.5"],
   ["/mapgen/gallery", "0.6"],
   ["/about", "0.4"],
   ["/colors", "0.4"],

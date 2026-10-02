@@ -45,6 +45,12 @@ Any straight, turn, ramp or gap may set "open": true to lose its side walls
 and float over the void, with its floor edges painted. The special-move pieces
 are open on every side except their kick wall.
 
+Any straight, turn, ramp or slalom may set "ice": true to floor it with the
+slick ice texture (surfaceparm slick). Ice only removes ground friction
+(physics.py): the player still accelerates to run speed on it, so every
+run-up rule holds, but keeps whatever speed they bring and slides wide
+through a corner instead of braking.
+
 A course may pass over itself where one part runs high enough above another
 (layout's self-intersection test is 3-D); layout reports those as overpasses.
 
@@ -67,6 +73,7 @@ import physics
 SEGMENT_TYPES = ("straight", "turn", "ramp", "gap", "checkpoint", "slalom", "beam", "split",
                  "wallclimb", "wallgap", "dash")
 OPENABLE = ("straight", "turn", "ramp", "gap")
+ICEABLE = ("straight", "turn", "ramp", "slalom")
 TURN_ANGLES = (45, 90, 135, 180)
 NAME_RE = re.compile(r"^gen_[a-z0-9_]{2,36}$")
 # The title is the one free-text field the model writes, and it lands in the
@@ -185,9 +192,10 @@ SEGMENT_SCHEMA = {
         "count": {"type": "integer"},
         "beam_width": {"type": "integer"},
         "open": {"type": "boolean"},
+        "ice": {"type": "boolean"},
     },
     "required": ["type", "length", "direction", "angle", "radius", "rise", "drop", "shortcut",
-                 "count", "beam_width", "open"],
+                 "count", "beam_width", "open", "ice"],
     "additionalProperties": False,
 }
 
@@ -213,12 +221,12 @@ def normalize(spec):
     """Drop the placeholder fields the flat schema forces on every segment, so a
     stored spec reads the way a human would write it."""
     keep = {
-        "straight": ("length", "open"),
-        "turn": ("direction", "angle", "radius", "shortcut", "open"),
-        "ramp": ("length", "rise", "open"),
+        "straight": ("length", "open", "ice"),
+        "turn": ("direction", "angle", "radius", "shortcut", "open", "ice"),
+        "ramp": ("length", "rise", "open", "ice"),
         "gap": ("length", "drop", "open"),
         "checkpoint": (),
-        "slalom": ("length", "count"),
+        "slalom": ("length", "count", "ice"),
         "beam": ("length", "beam_width"),
         "split": ("length", "direction", "count"),
         "wallclimb": ("length", "rise", "direction"),
@@ -233,7 +241,7 @@ def normalize(spec):
         for k in keep.get(t, ()):
             if k in seg:
                 clean[k] = seg[k]
-        for flag in ("shortcut", "open"):
+        for flag in ("shortcut", "open", "ice"):
             if clean.get(flag) is False:
                 del clean[flag]     # the default; keep stored specs short
         out["segments"].append(clean)
@@ -306,6 +314,11 @@ def validate(spec):
         elif seg.get("open") and t not in OPENABLE:
             errs.append(f"{where}: only {', '.join(OPENABLE)} can be open "
                         "(the special-move pieces are open already)")
+        if "ice" in seg and not isinstance(seg["ice"], bool):
+            errs.append(f"{where}: ice must be true or false")
+        elif seg.get("ice") and t not in ICEABLE:
+            errs.append(f"{where}: only {', '.join(ICEABLE)} can be ice "
+                        "(a piece that is jumped from or across keeps its grip)")
 
         def side():
             if seg.get("direction") not in ("left", "right"):

@@ -9,6 +9,8 @@ identity's quota and the site's budget and writes a mapgen_job row. This loop
 does the work:
 
     queued -> planning   describe.plan: Claude writes a spec, the layout checks it
+                         (a job from the map editor already HAS a spec: it is
+                         only checked, and no model is called)
            -> building   build.build: q3map2, pack, check the compiled bsp
            -> publishing the .pk3 is in the shared map store (MAPGEN_STORE)
            -> published  set by the web once a game server confirms it loaded
@@ -45,6 +47,7 @@ sys.path.insert(0, HERE)
 import build as buildmod  # noqa: E402
 import describe  # noqa: E402
 import layout  # noqa: E402
+import spec as specmod  # noqa: E402
 
 log = logging.getLogger("mapgen.worker")
 
@@ -54,6 +57,8 @@ STALE_SECONDS = 30 * 60
 PLAN_FAILED = ("The generator couldn't turn that description into a course it could check. "
                "Try describing it differently: the layout, the turns, where the jumps go.")
 BUILD_FAILED = "The map failed to build. That one's on us, so it didn't count toward your daily maps."
+EDITOR_FAILED = ("The generator refused this course: {problems} That one didn't count toward "
+                 "your daily maps. Open it in the editor to fix it.")
 PUBLISH_FAILED = ("The map was built but couldn't be copied to the servers. That one's on us, "
                   "so it didn't count toward your daily maps.")
 STORE_SENTINEL = ".racesow-map-store"   # docs/shared-maps.md
@@ -122,7 +127,7 @@ def claim(cur):
         """UPDATE mapgen_job SET status = 'planning', started_at = %s
            WHERE id = (SELECT id FROM mapgen_job WHERE status = 'queued'
                        ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
-           RETURNING id, token, description, quota_day, identity""",
+           RETURNING id, token, description, quota_day, identity, source, spec""",
         (now(),),
     )
     return cur.fetchone()
@@ -156,23 +161,59 @@ def record_usage(cur, job_id, calls):
              summary["output_tokens"], "?" if est is None else f"${est:.4f}")
 
 
-def run_job(conn, job, out_root, planner, builder, q3map2=None, store=None):
-    job_id, token, description, quota_day, identity = job
-    log.info("job %s: planning %r", job_id, description[:80])
-    calls = []
+def check_editor_spec(raw, token):
+    """A spec someone built by hand on /mapgen/editor -> (spec, problems).
+
+    It is as untrusted as a model's draft and goes through the same gate:
+    normalize (only known keys survive), a unique name, then spec.validate and
+    the layout. The editor ran the same rules in the page (its port is pinned
+    to this tree by golden.py), so a refusal here is rare; when it happens the
+    problems are what the requester sees."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("segments"), list):
+        return None, ["the spec is not a course"]
+    if not all(isinstance(s, dict) for s in raw["segments"]):
+        return None, ["every segment must be an object"]
+    spec = specmod.normalize(raw)
+    spec["name"] = unique_name(spec.get("name") if isinstance(spec.get("name"), str) else "gen_map", token)
     try:
-        spec, attempts = planner(description, log=lambda m: log.info("job %s: %s", job_id, m),
-                                 usage=calls)
-        spec["name"] = unique_name(spec["name"], token)
-        layout.build(spec)   # the name changed; re-check before anything else
-    except Exception as e:   # noqa: BLE001 - any planning failure is the same answer
+        layout.build(spec)
+    except layout.LayoutError as e:
+        return None, e.problems
+    return spec, []
+
+
+def run_job(conn, job, out_root, planner, builder, q3map2=None, store=None):
+    job_id, token, description, quota_day, identity, *rest = job
+    source, editor_spec = (list(rest) + [None, None])[:2]
+    if source == "editor":
+        log.info("job %s: checking an editor spec", job_id)
+        if isinstance(editor_spec, str):
+            editor_spec = json.loads(editor_spec)
+        spec, problems = check_editor_spec(editor_spec, token)
+        attempts = 0
+        if problems:
+            with conn.cursor() as cur:
+                # No model was called, so nothing was spent: refund it.
+                fail(cur, job_id, EDITOR_FAILED.format(problems="; ".join(problems[:3]) + "."),
+                     "editor spec refused: " + "; ".join(problems), refund=(quota_day, identity))
+            conn.commit()
+            return "failed"
+    else:
+        log.info("job %s: planning %r", job_id, description[:80])
+        calls = []
+        try:
+            spec, attempts = planner(description, log=lambda m: log.info("job %s: %s", job_id, m),
+                                     usage=calls)
+            spec["name"] = unique_name(spec["name"], token)
+            layout.build(spec)   # the name changed; re-check before anything else
+        except Exception as e:   # noqa: BLE001 - any planning failure is the same answer
+            with conn.cursor() as cur:
+                record_usage(cur, job_id, calls)
+                fail(cur, job_id, PLAN_FAILED, f"{type(e).__name__}: {e}")
+            conn.commit()
+            return "failed"
         with conn.cursor() as cur:
             record_usage(cur, job_id, calls)
-            fail(cur, job_id, PLAN_FAILED, f"{type(e).__name__}: {e}")
-        conn.commit()
-        return "failed"
-    with conn.cursor() as cur:
-        record_usage(cur, job_id, calls)
 
     with conn.cursor() as cur:
         cur.execute(

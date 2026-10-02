@@ -491,6 +491,67 @@ test("admin map requests skip the per-person limit and the site budget", async (
   assert.match(after, new RegExp(`/mapgen/${tokens[3]}`));
 });
 
+test("a map-editor course waits for an admin: approve queues it, reject refunds it", async () => {
+  const cookie = await adminCookie();
+  const course = (title) => ({ name: "gen_review_test", title, width: 384,
+    segments: [{ type: "straight", length: 768 }, { type: "ramp", length: 768, rise: -256, ice: true }, { type: "straight", length: 512 }] });
+  const send = (ip, title) => fetch(`${base}/api/mapgen/spec`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Forwarded-For": ip, "User-Agent": "Mozilla/5.0 Firefox/143.0" },
+    body: JSON.stringify({ spec: course(title) }),
+  }).then(async (r) => ({ status: r.status, json: await r.json() }));
+  const a = await send("198.51.100.71", "Glacier Approve");
+  const b = await send("198.51.100.72", "Glacier Reject");
+  assert.equal(a.status, 202);
+  assert.equal(a.json.job.status, "review");
+  assert.equal(b.json.job.status, "review");
+  const used = async () => (await db.query("SELECT COALESCE(SUM(used), 0)::int AS n FROM mapgen_quota")).rows[0].n;
+  const budget = async () => (await db.query("SELECT COALESCE(SUM(used), 0)::int AS n FROM mapgen_budget")).rows[0].n;
+  const used0 = await used(), budget0 = await budget();
+
+  const page = await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text();
+  assert.match(page, /Awaiting approval/);
+  assert.match(page, /Glacier Approve/);
+  assert.match(page, new RegExp(`/mapgen/editor\\?from=${a.json.job.token}`), "a 3-D preview link");
+  assert.match(page, /1 icy/);
+  const csrf = page.match(/name="_csrf" value="([0-9a-f]+)"/)?.[1];
+  const post = (path, fields) => fetch(`${base}/admin/mapgen/${path}`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(fields),
+  });
+  assert.equal((await post("approve", { token: a.json.job.token })).status, 403, "CSRF required");
+  const anon = await fetch(`${base}/admin/mapgen/approve`, { method: "POST", redirect: "manual",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ token: a.json.job.token }) });
+  assert.notEqual(anon.status, 303, "no session, no approval");
+
+  // Approve: into the worker's queue, with who and when.
+  const ok = await post("approve", { _csrf: csrf, token: a.json.job.token });
+  assert.equal(ok.status, 303);
+  assert.match(ok.headers.get("location"), /approved=1/);
+  const ra = (await db.query("SELECT status, reviewed_by, reviewed_at FROM mapgen_job WHERE token = $1", [a.json.job.token])).rows[0];
+  assert.equal(ra.status, "queued");
+  assert.equal(ra.reviewed_by, ADMIN_USER);
+  assert.ok(Number(ra.reviewed_at) > 0);
+  assert.match((await post("approve", { _csrf: csrf, token: a.json.job.token })).headers.get("location"), /gone=1/,
+    "deciding twice is refused");
+
+  // Reject: never built, the reason shown, the map and the budget given back.
+  const no = await post("reject", { _csrf: csrf, token: b.json.job.token, note: "  walls\u202e everywhere  " });
+  assert.match(no.headers.get("location"), /rejected=1/);
+  const rb = (await (await fetch(`${base}/api/mapgen/jobs/${b.json.job.token}`)).json());
+  assert.equal(rb.status, "rejected");
+  assert.equal(rb.error, "An admin turned this course down: walls everywhere It didn't count toward your daily maps.");
+  assert.equal(await used(), used0 - 1);
+  assert.equal(await budget(), budget0 - 1);
+  assert.match((await post("reject", { _csrf: csrf, token: b.json.job.token })).headers.get("location"), /gone=1/);
+
+  const after = await (await fetch(`${base}/admin/mapgen`, { headers: { cookie } })).text();
+  assert.match(after, /Nothing waiting/);
+});
+
 test("admin hides a built map from the public gallery and shows it again", async () => {
   const cookie = await adminCookie();
   const token = "cd".repeat(16);
