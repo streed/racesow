@@ -1640,6 +1640,7 @@ async function viewMapgen() {
     msg.textContent = "Sending…";
     try {
       const r = await apiPost("/mapgen", { description: input.value });
+      track("Request a map", { chars: input.value.trim().length });
       if (r && r.job && r.job.token) {
         go(`/mapgen/${r.job.token}`);
         return;
@@ -1680,6 +1681,9 @@ async function viewMapgenEditor(params) {
       const j = await api(`/mapgen/jobs/${encodeURIComponent(params.from)}`);
       if (j.spec) {
         initial = j.spec;
+        // A remix is a different act from starting a course, and the pageview
+        // alone cannot tell them apart.
+        track("Remix a course", { pieces: (j.spec.segments || []).length });
         note = j.mapName ? `Opened ${j.mapName}. Building it again makes a new map.` : "Opened the course from that request.";
       } else {
         note = "That request has no course yet.";
@@ -1691,11 +1695,13 @@ async function viewMapgenEditor(params) {
   app.innerHTML = `
     <div class="crumbs"><a href="/mapgen" data-nav="/mapgen">Make a map</a> / Editor</div>
     <div class="page-title">MAP <span class="accent">EDITOR</span></div>
-    <p class="page-sub">Lay a race course out piece by piece: straights, turns, ramps, jumps, obstacles and wall jumps,
-      with every height, angle and length in game units, and ice wherever you want it slick. It is checked against the
-      game's movement as you go, drawn with the map's own textures, and built by the same generator as a described map.
-      When the report under the course is clear, send it for approval: an admin looks it over, then it is
-      compiled and put on the game servers.</p>
+    <p class="page-sub">Lay a race course out piece by piece: straights, turns and chicanes, ramps and stairs, gaps,
+      stepping stones and strafe pads, slaloms, pillars, beams, ledges, tunnels and hazards, wall climbs and dashes —
+      with every height, angle and length in game units, ice wherever you want it slick, and each piece nudged
+      sideways or turned on the spot if you would rather it did not line up. The suggested range for every number is
+      the one the generator would pick itself; type past it whenever you mean to. It is drawn with the map's own
+      textures as you go and built by the same generator as a described map. When you are happy with it, send it for
+      approval: an admin looks it over, then it is compiled and put on the game servers.</p>
     <div id="mge-root" class="mge"><div class="loading"><span class="spinner"></span></div></div>`;
   const root = document.getElementById("mge-root");
   try {
@@ -4180,6 +4186,7 @@ async function renderRandomPreview(seed) {
   box.innerHTML = `<div class="muted">Dealing seed ${esc(String(seed))}&#8230;</div>`;
   try {
     const { route } = await dealSeedHere(seed, 16000);
+    track("Preview random seed", { seed: String(seed), pieces: route.length });
     const width = Math.max(560, Math.min(1100, box.clientWidth || 900));
     box.innerHTML = `<div class="rplan">${randomPlanSvg(randomDeck, route, width)}</div>`
       + randomPreviewMarkup(route);

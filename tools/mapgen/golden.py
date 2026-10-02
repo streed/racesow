@@ -61,13 +61,15 @@ def spiral_down(open_top=False, open_bottom=False):
 
 
 def cases():
-    """[(label, spec)]: every example, plus courses that reach each piece,
-    each rule and each message the editor can show."""
+    """[(label, spec, rules)]: every example, plus courses that reach each
+    piece, each rule and each message the editor can show — in both rule
+    tiers, because the editor lays out in the open one and the generator in
+    the strict one, and the port has to agree on both."""
     out = []
     for fn in sorted(os.listdir(EXAMPLES)):
         if fn.endswith(".json"):
             with open(os.path.join(EXAMPLES, fn)) as fh:
-                out.append((fn[:-5], json.load(fh)))
+                out.append((fn[:-5], json.load(fh), "strict"))
 
     loop = [S(1024)]
     for _ in range(4):
@@ -131,7 +133,79 @@ def cases():
         ("open_cut", spiral_down(open_top=True, open_bottom=True)),
         ("too_wide", course(*[S(4096)] * 5)),
     ]
-    return out
+
+    # -- the editor's own pieces --------------------------------------------
+    ST = {"type": "stairs", "length": 512, "rise": 128, "count": 8}
+    PL = {"type": "platforms", "length": 768, "count": 4, "drop": 0}
+    PI = {"type": "pillars", "length": 768, "count": 4}
+    TU = {"type": "tunnel", "length": 768, "height": 192}
+    CH = {"type": "chicane", "direction": "left", "angle": 30, "radius": 512}
+    BU = {"type": "bumps", "length": 768, "count": 4, "rise": 48}
+    PN = {"type": "pinch", "length": 512, "gate": 192}
+    LE = {"type": "ledge", "length": 512, "direction": "left", "ledge_width": 96}
+    HZ = {"type": "hazard", "length": 128}
+    SP = {"type": "strafepads", "count": 6, "spacing": 256, "curve": 0}
+    out += [
+        ("shape_pieces", course(S(640), ST, S(512), PL, S(512), PI, S(512), TU, S(512),
+                                CH, S(512), BU, S(512), PN, S(512), LE, S(512), HZ, S(640),
+                                width=448)),
+        ("strafepads_straight", course(S(640), SP, S(640))),
+        ("strafepads_curved", course(S(640), dict(SP, curve=60), S(640))),
+        ("strafepads_curved_right", course(S(640), dict(SP, curve=-45, count=4), S(640))),
+        ("shape_pieces_iced", course(S(512), dict(ST, ice=True), S(512), dict(BU, ice=True),
+                                     S(512), dict(TU, ice=True), S(512))),
+        ("shape_pieces_open", course(S(512), dict(ST, open=True), S(512), dict(PI, open=True),
+                                     S(512), dict(HZ, open=True), S(512))),
+        ("stairs_down", course(S(512), dict(ST, rise=-128), S(512))),
+        ("platforms_dropping", course(S(512), dict(PL, drop=192), S(512))),
+
+        # Nudges: sideways, on the spot, and both, inside the strict bounds.
+        ("nudge_shift", course(S(1024), S(1024, shift=200), S(1024))),
+        ("nudge_shift_right", course(S(1024), S(1024, shift=-200), S(1024))),
+        ("nudge_rotate", course(S(1024), S(1024, rotate=25), S(1024))),
+        ("nudge_both", course(S(1024), S(1024, shift=180, rotate=-20), S(1024))),
+        ("nudge_on_a_turn", course(S(1024), T("left", 90, 512, shift=120, rotate=15), S(1024))),
+
+        # Refused: the editor's pieces out of range, and nudges past strict.
+        ("bad_shape_ranges", course(
+            S(512), {"type": "stairs", "length": 64, "rise": 0, "count": 8},
+            {"type": "platforms", "length": 100, "count": 4, "drop": -50},
+            {"type": "pillars", "length": 96, "count": 4},
+            {"type": "tunnel", "length": 768, "height": 96},
+            {"type": "chicane", "direction": "none", "angle": 120, "radius": 512},
+            {"type": "bumps", "length": 512, "count": 2, "rise": 240},
+            {"type": "pinch", "length": 512, "gate": 900},
+            {"type": "ledge", "length": 512, "direction": "left", "ledge_width": 400},
+            {"type": "hazard", "length": 600},
+            {"type": "strafepads", "count": 200, "spacing": 900, "curve": 400})),
+        ("bad_nudge", course(S(512), S(512, shift=1024, rotate=90))),
+        ("bad_shape_flags", course(S(512), dict(TU, open=True), dict(HZ, ice=True))),
+        ("narrow_shape_pieces", course(S(512), PI, PN, width=256)),
+    ]
+
+    # Every one of those, laid again in the editor's tier: the same specs, the
+    # looser rules. This is what pins the port's open tier, where a refusal
+    # becomes a note and the numbers may run much wider.
+    out += [(f"open_{label}", spec, "open") for label, spec, *_ in list(out)
+            if not label.startswith("open_")]
+    # ...and courses only the open tier will take at all.
+    out += [
+        ("open_far_nudge", course(S(1024), S(1024, shift=1200, rotate=120), S(1024)), "open"),
+        ("open_unclearable", course({"type": "gap", "length": 900, "drop": 0},
+                                    {"type": "gap", "length": 700, "drop": 0},
+                                    {"type": "stairs", "length": 256, "rise": 640, "count": 4},
+                                    {"type": "strafepads", "count": 8, "spacing": 900,
+                                     "curve": 170}), "open"),
+        ("open_odd_angles", course(S(512), T("left", 37, 200), S(512),
+                                   {"type": "chicane", "direction": "right", "angle": 160,
+                                    "radius": 220}, S(512), width=96), "open"),
+        ("open_huge_pieces", course(S(8000), {"type": "tunnel", "length": 5000, "height": 3000},
+                                    {"type": "hazard", "length": 4000}), "open"),
+        ("open_tiny_pieces", course(S(32), {"type": "stairs", "length": 64, "rise": 16,
+                                            "count": 4}, S(32), width=64), "open"),
+        ("open_self_overlap", course(*[S(1024), T("left", 90, 320)] * 4), "open"),
+    ]
+    return [(c[0], c[1], c[2] if len(c) > 2 else "strict") for c in out]
 
 
 R3 = lambda v: round(v, 3)  # noqa: E731
@@ -148,14 +222,17 @@ def value(v):
     return R3(v) if isinstance(v, float) else v
 
 
-def dump_case(label, spec):
-    case = {"label": label, "spec": spec}
+def dump_case(label, spec, rules="strict"):
+    case = {"label": label, "spec": spec, "rules": rules}
     try:
-        c = layout.build(copy.deepcopy(spec))
+        c = layout.build(copy.deepcopy(spec), rules=rules)
     except layout.LayoutError as e:
         case["problems"] = e.problems
         return case
     case["problems"] = []
+    # The open tier keeps the pieces-fit-together findings instead of
+    # refusing over them, so they are part of what the port has to match.
+    case["notes"] = c.notes
     case["course"] = {
         "length": R3(c.length),
         "world": [prism(p) for p in c.world],
@@ -185,7 +262,7 @@ def dump():
             "wallgap_window": {str(d): list(specmod.wallgap_window(d)) for d in range(-94, -71)},
             "dash_window": {str(d): list(specmod.dash_window(d)) for d in (384, 512, 768, 1024)},
         },
-        "cases": [dump_case(label, spec) for label, spec in cases()],
+        "cases": [dump_case(label, spec, rules) for label, spec, rules in cases()],
     }
 
 

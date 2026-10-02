@@ -325,9 +325,38 @@ def ice():
     return c
 
 
+def hazard():
+    """Lethal floor: hot rock, dark crust broken by a glowing fracture grid.
+    It reads as "do not land here" at a glance and from any height, which is
+    the whole job — a hazard a player cannot see is just an unfair gap."""
+    crust, glow, hot = (38, 14, 10), (196, 72, 18), (252, 186, 64)
+    c = Canvas(SIZE, crust)
+    # A coarse cell grid with the glow in the cracks between the plates.
+    cell = SIZE // 4
+    for i in range(0, SIZE, cell):
+        c.rect(i - 3, 0, i + 3, SIZE, glow)
+        c.rect(0, i - 3, SIZE, i + 3, glow)
+    # Plates: a slightly lighter crust inset in each cell, so the cracks read
+    # as depth rather than as paint.
+    for gx in range(4):
+        for gy in range(4):
+            x0, y0 = gx * cell + 6, gy * cell + 6
+            shade = tuple(min(255, v + 10 + 6 * ((gx + gy) % 3)) for v in crust)
+            c.rect(x0, y0, x0 + cell - 12, y0 + cell - 12, shade)
+    # The hottest light pools where the cracks meet.
+    for i in range(0, SIZE, cell):
+        for j in range(0, SIZE, cell):
+            c.rect(i - 5, j - 5, i + 5, j + 5, hot)
+    # The stencil font is the one in this file: 0-9 and A C E F H I N O P R S T W.
+    s = "HOT"
+    c.text((SIZE - Canvas.text_width(s, 4)) // 2, 210, s, 4, hot)
+    return c
+
+
 TEXTURES = {
     "floor": floor, "wall": wall, "start": start, "finish": finish,
     "checkpoint": checkpoint, "edge": edge, "trim": trim, "pylon": pylon, "kick": kick,
+    "hazard": hazard,
 }
 # Shipped only with a course that uses them (files(ice=True)); see ICE_SHADER.
 ICE_TEXTURES = {"ice": ice}

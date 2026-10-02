@@ -729,7 +729,9 @@ class Ice(unittest.TestCase):
         errs = specmod.validate(course_of({"type": "straight", "length": 512},
                                           {"type": "gap", "length": 128, "drop": 0, "ice": True},
                                           {"type": "straight", "length": 512}))
-        self.assertTrue(any("only straight, turn, ramp, slalom can be ice" in e for e in errs), errs)
+        # The list in the message grows every time a floor piece is added, so
+        # the assertion is on what it says, not on today's spelling of it.
+        self.assertTrue(any("can be ice" in e and "segment 1 (gap)" in e for e in errs), errs)
         errs = specmod.validate(course_of({"type": "straight", "length": 512, "ice": "yes"}))
         self.assertTrue(any("ice must be true or false" in e for e in errs), errs)
 
@@ -901,14 +903,16 @@ class Hardening(unittest.TestCase):
         self.assertTrue(any("spreads" in p for p in cm.exception.problems))
 
     def test_brush_count_is_capped(self):
-        old = layout.BRUSH_MAX
-        layout.BRUSH_MAX = 50
+        # The ceiling lives on the rule tier (spec.STRICT); layout.BRUSH_MAX is
+        # an alias of it, so patching the alias would not be read.
+        old = specmod.STRICT.brushes
+        specmod.STRICT.brushes = 50
         try:
             with self.assertRaises(layout.LayoutError) as cm:
                 layout.build(example())
             self.assertTrue(any("brushes" in p for p in cm.exception.problems))
         finally:
-            layout.BRUSH_MAX = old
+            specmod.STRICT.brushes = old
 
     def test_every_example_is_well_inside_the_limits(self):
         examples = os.path.join(HERE, "examples")
@@ -1070,15 +1074,38 @@ class Publish(unittest.TestCase):
         self.assertTrue(any(s.get("ice") for s in built[0]["segments"]))
         self.assertFalse(any("llm_usage" in q for q, _ in log), "no model, no usage row")
 
+    def test_an_editor_course_is_held_to_the_open_tier(self):
+        """A gap with no run-up is a REFUSAL for a described map and a NOTE for
+        a course from the editor. A person laid this one out, could see it, and
+        an admin approves it before it is built, so the judgement is theirs —
+        see worker.EDITOR_RULES."""
+        no_runup = course_of({"type": "ramp", "length": 512, "rise": -128},
+                             {"type": "gap", "length": 96, "drop": 0},
+                             {"type": "straight", "length": 512})
+        with self.assertRaises(layout.LayoutError) as cm:
+            layout.build(dict(no_runup, name="gen_strict"))
+        self.assertTrue(any("run-up" in p for p in cm.exception.problems))
+
+        outcome, log, built = self._run_editor(no_runup)
+        self.assertEqual(outcome, "publishing", "the editor's tier should build it")
+        self.assertEqual(len(built), 1)
+        # ...and the finding is still made, as a note on the course.
+        course = layout.build(dict(no_runup, name="gen_open"), rules="open")
+        self.assertTrue(any("run-up" in n for n in course.notes))
+        self.assertFalse(any("mapgen_quota SET used = used - 1" in q for q, _ in log),
+                         "nothing to refund: it was built")
+
     def test_a_refused_editor_spec_fails_and_is_refunded(self):
-        bad = course_of({"type": "ramp", "length": 512, "rise": -128},
-                        {"type": "gap", "length": 96, "drop": 0},
+        # Refused by the OPEN tier: no number here is one the editor's own
+        # controls could produce, and the course could not be compiled.
+        bad = course_of({"type": "straight", "length": 512},
+                        {"type": "tunnel", "length": 512, "height": 99999},
                         {"type": "straight", "length": 512})
         outcome, log, built = self._run_editor(bad)
         self.assertEqual(outcome, "failed")
         self.assertEqual(built, [])
         failed = [p for q, p in log if "status = 'failed'" in q][0]
-        self.assertIn("run-up", failed[0])
+        self.assertIn("height", failed[0])
         self.assertTrue(any("UPDATE mapgen_quota SET used = used - 1" in q for q, _ in log))
         for junk in (None, {"segments": "no"}, {"segments": ["x"]}):
             spec, problems = worker.check_editor_spec(junk, "ab" * 16)
@@ -1209,10 +1236,18 @@ class Describe(unittest.TestCase):
                                      f"{fn}: frame {k} is inside a {p.tex} brush")
 
     def test_schema_is_what_the_prompt_describes(self):
+        # The model is offered the pieces the prompt actually teaches, and no
+        # others: a described map is never looked at before it is in the pool,
+        # so it must never be able to reach for a piece it was not told about.
         self.assertEqual(set(specmod.SEGMENT_SCHEMA["properties"]["type"]["enum"]),
-                         set(specmod.SEGMENT_TYPES))
-        for t in specmod.SEGMENT_TYPES:
+                         set(specmod.MODEL_SEGMENT_TYPES))
+        for t in specmod.MODEL_SEGMENT_TYPES:
             self.assertIn(t, describe.system_prompt())
+        # The editor's extra pieces are deliberately out of the model's reach.
+        for t in specmod.EDITOR_SEGMENT_TYPES:
+            self.assertNotIn(t, specmod.SEGMENT_SCHEMA["properties"]["type"]["enum"])
+        self.assertEqual(set(specmod.SEGMENT_TYPES),
+                         set(specmod.MODEL_SEGMENT_TYPES) | set(specmod.EDITOR_SEGMENT_TYPES))
 
 
 class Tiles(unittest.TestCase):

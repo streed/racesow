@@ -23,9 +23,21 @@ checked against the engine's own movement numbers before anything is
 compiled, and each has exactly one way to become brushes. That split gives
 three properties:
 
-- **Every map is raceable by construction.** A gap exists only if a player
-  running at a plain 320 ups clears it with margin. Strafing makes a map
-  faster, never possible.
+- **Every *described* map is raceable by construction.** A gap exists only if
+  a player running at a plain 320 ups clears it with margin. Strafing makes a
+  map faster, never possible. This is the **strict** rule tier (`spec.STRICT`),
+  and it holds wherever nobody looks at the result before it is in the pool: a
+  map from a description, and every `random_map` tile.
+  A course built by hand in the editor is held to the **open** tier
+  (`spec.OPEN`) instead. There, a person lays the course out, can see it, and
+  an admin approves it before it is built — so the rules about how the pieces
+  fit together (run-ups, landings, self-intersection, unintended cuts) become
+  notes on the report rather than refusals, and the numeric bounds widen to
+  whatever still compiles and loads. What both tiers enforce is the same:
+  geometry that closes, a world inside the compiler's reach, and a brush count
+  a server can hold. The editor also has ten pieces of its own that the model
+  is never offered, because the prompt does not teach them (`spec.py`:
+  `MODEL_SEGMENT_TYPES` / `EDITOR_SEGMENT_TYPES`).
 - **A bad plan is a repair prompt, not a broken map.** Validation errors go
   back to the model verbatim, and the loop runs until the plan passes or a
   budget runs out. The compiler never sees an unchecked plan.

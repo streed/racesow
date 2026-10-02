@@ -198,7 +198,34 @@ function ice() {
   return c;
 }
 
-const MAKERS = { floor, wall, start, finish, checkpoint, edge, trim, pylon, kick, ice };
+// Lethal floor: hot rock, dark crust broken by a glowing fracture grid. The
+// stencil font here is 0-9 and A C E F H I N O P R S T W, which is why the
+// label is HOT and not HAZARD. Mirrors assets.hazard() pixel for pixel; the
+// texture-hash fixture is what holds the two together.
+function hazard() {
+  const crust = [38, 14, 10], glow = [196, 72, 18], hot = [252, 186, 64];
+  const c = new Canvas(SIZE, crust);
+  const cell = Math.floor(SIZE / 4);
+  for (let i = 0; i < SIZE; i += cell) {
+    c.rect(i - 3, 0, i + 3, SIZE, glow);
+    c.rect(0, i - 3, SIZE, i + 3, glow);
+  }
+  for (let gx = 0; gx < 4; gx++) {
+    for (let gy = 0; gy < 4; gy++) {
+      const x0 = gx * cell + 6, y0 = gy * cell + 6;
+      const sh = crust.map((v) => Math.min(255, v + 10 + 6 * ((gx + gy) % 3)));
+      c.rect(x0, y0, x0 + cell - 12, y0 + cell - 12, sh);
+    }
+  }
+  for (let i = 0; i < SIZE; i += cell) {
+    for (let j = 0; j < SIZE; j += cell) c.rect(i - 5, j - 5, i + 5, j + 5, hot);
+  }
+  const s = "HOT";
+  c.text(Math.floor((SIZE - Canvas.textWidth(s, 4)) / 2), 210, s, 4, hot);
+  return c;
+}
+
+const MAKERS = { floor, wall, start, finish, checkpoint, edge, trim, pylon, kick, ice, hazard };
 export const KINDS = Object.keys(MAKERS);
 
 // The texture as rows of RGB, top row first (the image as drawn, not as TGA

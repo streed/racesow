@@ -95,15 +95,20 @@ CP_EDGE = 64
 # how far it may spread and how many brushes it may take, so no plan builds a
 # map that is slow to compile, heavy to download or heavy for every server to
 # load. The examples reach about 11,400 across and 420 brushes.
-EXTENT_MAX_XY = 16384
-EXTENT_MAX_Z = 8192
-BRUSH_MAX = 1500
+# The strict tier's own numbers, and the only place they are written down is
+# spec.STRICT — these are aliases so that reading them here still works.
+EXTENT_MAX_XY = specmod.STRICT.extent_xy
+EXTENT_MAX_Z = specmod.STRICT.extent_z
+BRUSH_MAX = specmod.STRICT.brushes
 
 FIN_THICK = 32          # slalom and split fins, along the course
 SPLIT_GATE = 96         # gates in a split's safe lane: 3 player widths
 VOID_DEPTH = 160        # side walls reach this far below a floorless piece
 EDGE_BAND = 16          # painted edge along an open floor, flush with it
 WALLCLIMB_ARC = 96      # how far before a wall climb's ledge the centre line rises
+HAZARD_DEPTH = 64       # how far a hazard's lethal floor sits below the corridor
+HAZARD_LIP = 8          # ...and how far its kill volume stops short of the top
+JOINT_DEPTH = 64        # how far a nudge's bridging plate reaches into each piece
 
 TEX = {
     "floor": "mapgen_v1/floor",
@@ -117,6 +122,7 @@ TEX = {
     "platform": "mapgen_v1/edge",
     "beam": "mapgen_v1/edge",
     "pylon": "mapgen_v1/pylon",
+    "hazard": "mapgen_v1/hazard",
     "kick": "mapgen_v1/kick",
     "sky": "mapgen_v1/sky",
     "trigger": "mapgen_v1/trigger",
@@ -178,6 +184,7 @@ class Course:
         self.falloff_segs = set()  # segments a player can leave downwards from
         self.worldspawn = {}  # extra worldspawn keys for the compiler (tiles.py)
         self.cuts = []        # unintended shortcuts found by _cuts(), reported with the map
+        self.notes = []       # open tier: the pieces-fit-together problems, kept as notes
         self.auto_checkpoints = []  # (segment, distance into it) of each checkpoint the generator added
         self.length = 0.0     # centre-line length, start trigger -> finish trigger
 
@@ -188,6 +195,35 @@ def _rect(o, f, l, back, fwd, right, left):
     def p(a, b):
         return (o[0] + f[0] * a + l[0] * b, o[1] + f[1] * a + l[1] * b)
     return [p(back, -right), p(fwd, -right), p(fwd, left), p(back, left)]
+
+
+def _area(poly):
+    """Twice the signed area of a footprint; sign gives the winding."""
+    return abs(sum(poly[i][0] * poly[(i + 1) % len(poly)][1]
+                   - poly[(i + 1) % len(poly)][0] * poly[i][1]
+                   for i in range(len(poly)))) / 2.0
+
+
+def _hull(points):
+    """Convex hull, counter-clockwise (monotone chain). Every brush footprint
+    has to be convex, and the hull is how a nudge's seam stays one."""
+    pts = sorted(set((round(x, 4), round(y, 4)) for x, y in points))
+    if len(pts) < 3:
+        return pts
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) >= 2:
+                (ax, ay), (bx, by) = out[-2], out[-1]
+                if (bx - ax) * (p[1] - ay) - (by - ay) * (p[0] - ax) > 0:
+                    break
+                out.pop()
+            out.append(p)
+        return out
+
+    lower, upper = half(pts), half(pts[::-1])
+    return lower[:-1] + upper[:-1]
 
 
 def _band(o, f, l, back, fwd, lo, hi):
@@ -336,8 +372,10 @@ def _poly_gap(a, b):
 
 
 class _Walker:
-    def __init__(self, spec, camera_pads=()):
+    def __init__(self, spec, camera_pads=(), rules="strict"):
         self.camera_pads = camera_pads
+        self.rules = rules
+        self.L = specmod.tier(rules)
         self.c = Course(spec)
         self.w = spec["width"]
         self.x = self.y = 0.0
@@ -370,6 +408,20 @@ class _Walker:
 
     def hull(self, poly, zlo, zhi):
         self.c.hulls.append(Hull(poly, zlo, zhi, self.seg))
+
+    def _note(self, msg):
+        """A problem with how the pieces fit TOGETHER — a missing run-up, a
+        landing on nothing, the course crossing itself, a cut round the side.
+
+        In the strict tier these are refusals: a described map or a random_map
+        tile has to be raceable by construction, because nothing looks at it
+        before it is in the pool. In the open tier the person in the editor can
+        see the course and an admin signs it off, so the same finding is worth
+        saying and not worth refusing — it lands on the report instead."""
+        if self.L.combine:
+            self.problems.append(msg)
+        else:
+            self.c.notes.append(msg)
 
     # -- pieces -------------------------------------------------------------
     def box_run(self, length, rise=0.0, tex="floor", floor=True, wall_floor=None, walls=(1, -1)):
@@ -673,6 +725,287 @@ class _Walker:
                                 "gate": SPLIT_GATE})
 
     # -- the walk -----------------------------------------------------------
+    # -- shape pieces -------------------------------------------------------
+    # None of these ask the player for a move physics.py has to model: they
+    # are corridor, laid differently, and that is why the editor can hand them
+    # out freely. Each one is built from the same box_run / _band / Prism
+    # vocabulary as the rest, so there is still one brush writer.
+
+    def stairs(self, length, rise, count, tex="floor", walls=(1, -1)):
+        """A staircase: `count` level treads climbing or dropping `rise` in
+        total. Each tread is its own slab reaching down to the run's base, so
+        no step floats, and the side walls span the whole run."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        z0 = self.z
+        tread, step = length / count, rise / count
+        lo, hi = z0 + min(0.0, rise), z0 + max(0.0, rise)
+        base = lo - FLOOR_THICK
+        for n in range(count):
+            poly = _rect(o, f, l, n * tread, (n + 1) * tread, half, half)
+            self.c.world.append(Prism.flat(poly, base, z0 + step * (n + 1), tex, self.heading))
+            self.c.floor_polys.append((poly, tex))
+        for side in (+1, -1):
+            if side in walls:
+                self.c.world.append(Prism.flat(self._wall_poly(o, f, l, side, 0, length),
+                                               base, hi + WALL_HEIGHT, "wall"))
+            else:
+                band = (_band(o, f, l, 0, length, half - EDGE_BAND, half) if side > 0
+                        else _band(o, f, l, 0, length, -half, -half + EDGE_BAND))
+                self.c.world.append(Prism.flat(band, base, hi + 1, "edge"))
+        self.hull(_rect(o, f, l, 0, length, half + WALL_THICK, half + WALL_THICK),
+                  base, hi + WALL_HEIGHT)
+        self.c.features.append({"type": "stairs", "segment": self.seg, "steps": count,
+                                "step": round(abs(step), 1)})
+        self.advance(length, rise)
+
+    def platforms(self, length, count, drop, tex="platform", walls=(1, -1)):
+        """Stepping stones over a pit: `count` cells, each a hole and then the
+        stone that ends it, stepping `drop` over the piece. The first hole is
+        at the lip, so the piece is entered by jumping, and the last stone ends
+        flush with the piece so the next one connects."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        z0 = self.z
+        cell = length / count
+        stone = cell * specmod.PLATFORM_FILL
+        lo, hi = z0 + min(0.0, drop), z0 + max(0.0, drop)
+        base = lo - FLOOR_THICK - VOID_DEPTH
+        for side in (+1, -1):
+            if side in walls:
+                self.c.world.append(Prism.flat(self._wall_poly(o, f, l, side, 0, length),
+                                               base, hi + WALL_HEIGHT, "wall"))
+        for n in range(count):
+            a = (n + 1) * cell - stone
+            z = z0 + drop * (n + 1) / count
+            poly = _rect(o, f, l, a, a + stone, half, half)
+            self.c.world.append(Prism.flat(poly, z - FLOOR_THICK, z, tex, self.heading))
+            self.c.floor_polys.append((poly, tex))
+        self.hull(_rect(o, f, l, 0, length, half + WALL_THICK, half + WALL_THICK),
+                  base, hi + WALL_HEIGHT)
+        self.c.features.append({"type": "platforms", "segment": self.seg, "stones": count,
+                                "hole": round(cell - stone)})
+        self.advance(length, drop)
+
+    def pillars(self, length, count, tex="floor", walls=(1, -1)):
+        """Free-standing columns down the middle: pass either side of each.
+        Unlike a slalom (fins off the walls) the line through them is a choice,
+        so the centre line is drawn weaving alternate sides."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        pw = specmod.PILLAR_MIN
+        self.box_run(length, tex=tex, walls=walls)
+        cell = length / count
+        spots = [cell * (n + 0.5) for n in range(count)]
+        for a in spots:
+            poly = _band(o, f, l, a - pw / 2.0, a + pw / 2.0, -pw / 2.0, pw / 2.0)
+            self.c.world.append(Prism.flat(poly, self.z - FLOOR_THICK,
+                                           self.z + WALL_HEIGHT, "pylon"))
+        lane = (half - pw / 2.0) / 2.0
+        self._reroute(o, f, l, [(a, lane if n % 2 else -lane) for n, a in enumerate(spots)])
+        self.c.features.append({"type": "pillars", "segment": self.seg, "pillars": count,
+                                "gate": round(half - pw / 2.0)})
+
+    def tunnel(self, length, height, tex="floor"):
+        """A roofed straight. Always walled — a tunnel with open sides is just
+        a straight with a canopy — and the roof is a full-width slab."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        z0 = self.z
+        self.box_run(length, tex=tex)
+        poly = _rect(o, f, l, 0, length, half + WALL_THICK, half + WALL_THICK)
+        self.c.world.append(Prism.flat(poly, z0 + height, z0 + height + ROOF_THICK, "wall"))
+        self.hull(poly, z0 - FLOOR_THICK, z0 + height + ROOF_THICK)
+        self.c.features.append({"type": "tunnel", "segment": self.seg, "height": height})
+
+    def chicane(self, direction, angle, radius, walls=True, floor_tex="floor"):
+        """A turn each way: the course leaves pointing the way it came in,
+        offset sideways by 2r(1 - cos angle). Two turn() calls and no geometry
+        of its own, so it curves and tessellates exactly like a turn does."""
+        other = "right" if direction == "left" else "left"
+        self.turn(direction, angle, radius, walls=walls, floor_tex=floor_tex)
+        self.turn(other, angle, radius, walls=walls, floor_tex=floor_tex)
+        self.c.features.append({"type": "chicane", "segment": self.seg, "angle": angle,
+                                "offset": round(2 * radius * (1 - math.cos(math.radians(angle))))})
+
+    def bumps(self, length, count, rise, tex="floor", walls=(1, -1)):
+        """A rolling floor: `count` humps, each a rise and an equal fall, so
+        the piece ends at the height it started. Two box_runs per hump, which
+        is what gives each face its sloped top plane."""
+        cell = length / count
+        for _ in range(count):
+            self.box_run(cell / 2.0, rise, tex=tex, walls=walls)
+            self.box_run(cell / 2.0, -rise, tex=tex, walls=walls)
+        self.c.features.append({"type": "bumps", "segment": self.seg, "bumps": count,
+                                "rise": rise})
+
+    def pinch(self, length, gate, tex="floor", walls=(1, -1)):
+        """The corridor narrows to `gate` for the length of the piece: full
+        floor, with a block against each wall taking the rest of the width."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        self.box_run(length, tex=tex, walls=walls)
+        for side in (+1, -1):
+            lo, hi = ((gate / 2.0, half) if side > 0 else (-half, -gate / 2.0))
+            self.c.world.append(Prism.flat(_band(o, f, l, 0, length, lo, hi),
+                                           self.z - FLOOR_THICK, self.z + WALL_HEIGHT, "pylon"))
+        self.c.features.append({"type": "pinch", "segment": self.seg, "gate": gate})
+
+    def ledge(self, length, direction, width, tex="floor"):
+        """A walkway along one wall, the rest of the corridor void. A beam
+        pushed against a side: the walls reach down past it, so the only way
+        out of a fall is the kill volume in the pit."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        z = self.z
+        sign = 1.0 if direction == "left" else -1.0
+        self.stripe("edge", -32, 0)
+        self.box_run(length, floor=False, wall_floor=z - FLOOR_THICK - VOID_DEPTH)
+        lo, hi = ((half - width, half) if sign > 0 else (-half, -half + width))
+        poly = _band(o, f, l, 0, length, lo, hi)
+        self.c.world.append(Prism.flat(poly, z - FLOOR_THICK, z, tex, self.heading))
+        self.c.floor_polys.append((poly, tex))
+        self._reroute(o, f, l, [(length / 2.0, sign * (half - width / 2.0))])
+        self.c.features.append({"type": "ledge", "segment": self.seg, "width": width,
+                                "side": direction})
+
+    def hazard(self, length, walls=(1, -1)):
+        """A recessed strip of lethal floor: jumped like a gap, but with
+        ground to land short on and ground to see it from.
+
+        The kill volume stops HAZARD_LIP below the corridor so that running
+        across the top never touches it — a jump apex is only about 46 units,
+        so a trigger standing proud of the floor would kill the player who
+        cleared it. Falling in touches it."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        z = self.z
+        self.box_run(length, floor=False, wall_floor=z - HAZARD_DEPTH - FLOOR_THICK, walls=walls)
+        poly = _rect(o, f, l, 0, length, half, half)
+        self.c.world.append(Prism.flat(poly, z - HAZARD_DEPTH - FLOOR_THICK, z - HAZARD_DEPTH,
+                                       "hazard", self.heading))
+        self.c.floor_polys.append((poly, "hazard"))
+        self.c.landmarks.append(("hazard", (self.x, self.y, z), self.heading))
+        self.c.entities.append(({"classname": "trigger_hurt", "dmg": 9999},
+                                [Prism.flat(poly, z - HAZARD_DEPTH, z - HAZARD_LIP, "trigger")]))
+        self.c.features.append({"type": "hazard", "segment": self.seg, "length": length})
+
+    def strafepads(self, count, spacing, curve, tex="platform"):
+        """A line of pads over the void, `spacing` apart centre to centre,
+        bending `curve` degrees across the whole run — signed, so one control
+        runs from a left arc through dead straight to a right arc.
+
+        There is nothing between the pads: the run is taken by strafe-jumping
+        from each to the next, and missing one is a fall into the pit. The
+        pads are parametrised exactly as turn() is, which is why a curved run
+        and a straight one are the same piece and not two."""
+        total = float(count) * spacing
+        o, f, l = self.frame()
+        h0 = self.heading
+        half = self.w / 2.0
+        pad = specmod.STRAFE_PAD_LEN
+        z = self.z
+        sweep = abs(curve)
+        sign = 1.0 if curve > 0 else -1.0
+        r = total / math.radians(sweep) if sweep else 0.0
+        cx = cy = a0 = 0.0
+        if sweep:
+            cx, cy = o[0] + l[0] * r * sign, o[1] + l[1] * r * sign
+            a0 = math.atan2(o[1] - cy, o[0] - cx)
+
+        def at(dist):
+            """(x, y), heading in degrees, at `dist` along the run."""
+            if not sweep:
+                return (o[0] + f[0] * dist, o[1] + f[1] * dist), h0
+            a = a0 + math.radians(sweep) * (dist / total) * sign
+            return (cx + r * math.cos(a), cy + r * math.sin(a)), h0 + sign * sweep * dist / total
+
+        for n in range(count):
+            (px, py), hd = at((n + 0.5) * spacing)
+            ph = math.radians(hd)
+            pf, pl = (math.cos(ph), math.sin(ph)), (-math.sin(ph), math.cos(ph))
+            poly = _rect((px, py), pf, pl, -pad / 2.0, pad / 2.0, half, half)
+            self.c.world.append(Prism.flat(poly, z - FLOOR_THICK, z, tex, hd))
+            self.c.floor_polys.append((poly, tex))
+            self.hull(poly, z - FLOOR_THICK, z)
+            self.c.route.append((px, py, z))
+
+        (ex, ey), _ = at(total)
+        self.x, self.y = ex, ey
+        self.heading = (h0 + sign * sweep) % 360.0
+        self.c.length += total
+        self.c.route.append((self.x, self.y, self.z))
+        self.c.landmarks.append(("strafepads", (o[0], o[1], z), h0))
+        self.c.features.append({"type": "strafepads", "segment": self.seg, "pads": count,
+                                "spacing": round(spacing), "gap": round(spacing - pad),
+                                "curve": curve})
+
+    # -- shifting and rotating a piece --------------------------------------
+
+    def _mouth(self):
+        """The corridor's cross-section at the cursor: its two corners, and
+        the forward direction a joint extrudes it along."""
+        o, f, l = self.frame()
+        half = self.w / 2.0
+        return ([(o[0] + l[0] * half, o[1] + l[1] * half),
+                 (o[0] - l[0] * half, o[1] - l[1] * half)], f)
+
+    def _nudge(self, seg):
+        """Move the cursor sideways (`shift`, + is left) and turn it on the
+        spot (`rotate`, + is left) before the piece is laid.
+
+        Both are cursor transforms, which is why every piece kind gets them
+        without knowing they exist: frame() is what each piece builds from.
+        The seam they open is bridged by _joint, so a nudge bends the course
+        instead of cutting it in two."""
+        shift = seg.get("shift") or 0
+        rot = seg.get("rotate") or 0
+        if not shift and not rot:
+            return
+        before = self._mouth()
+        if shift:
+            _, _, l = self.frame()
+            self.x += l[0] * shift
+            self.y += l[1] * shift
+            # A sideways step is distance the player covers, so the route and
+            # the par time have to carry it.
+            self.c.length += abs(shift)
+            self.c.route.append((self.x, self.y, self.z))
+        if rot:
+            self.heading = (self.heading + rot) % 360.0
+        self._joint(before)
+
+    def _joint(self, before):
+        """Floor bridging the seam a nudge opened.
+
+        Both cross-sections are extruded a little along their own heading —
+        the one being left backwards, the one about to be laid forwards — and
+        the plate is the convex hull of all of it. The extrusion is what makes
+        a plain sideways shift work: on its own, shifting moves the cursor
+        ALONG its cross-section, so the four corners are collinear and there is
+        no plate to be had. Giving each a little depth turns that line into an
+        area that covers both lanes and the ground between them.
+
+        The hull is also what keeps a hard rotation safe: past 90 degrees the
+        two cross-sections cross, and the quad through their corners in order
+        would be self-intersecting, which is not a brush. Its hull still is.
+
+        The plate sits one unit under the floor, for the reason stripe() does:
+        where it laps the corridor it is hidden instead of z-fighting with it,
+        and where it bridges, a 1-unit step is far under the engine's own
+        18-unit step and no player ever feels it."""
+        pts_b, fb = before
+        pts_a, fa = self._mouth()
+        d = JOINT_DEPTH
+        plate = _hull(pts_b + [(x - fb[0] * d, y - fb[1] * d) for x, y in pts_b]
+                      + pts_a + [(x + fa[0] * d, y + fa[1] * d) for x, y in pts_a])
+        if len(plate) < 3 or _area(plate) < 16.0:
+            return
+        top = self.z - 1
+        self.c.world.append(Prism.flat(plate, top - FLOOR_THICK, top, "floor", self.heading))
+        self.c.floor_polys.append((plate, "floor"))
+        self.hull(plate, top - FLOOR_THICK, self.z + WALL_HEIGHT)
+
     def _lay_segment(self, i, seg, segs, auto):
         """Lay one spec segment at the cursor.
 
@@ -683,6 +1016,8 @@ class _Walker:
         without a second geometry writer.
         """
         t = seg["type"]
+        # Sideways and on the spot, before anything is laid: see _nudge.
+        self._nudge(seg)
         sides = () if seg.get("open") else (1, -1)
         # Ice changes only the walking surface's texture, and with it the
         # surfaceparm slick the compiler bakes into the bsp: never the shape.
@@ -723,7 +1058,7 @@ class _Walker:
             self.runup = float(specmod.SPLIT_MOUTH)
         elif t == "wallclimb":
             if self.runup + seg["length"] / 2.0 < specmod.WALL_RUNUP:
-                self.problems.append(
+                self._note(
                     f"segment {i} (wallclimb): only {int(self.runup + seg['length'] / 2)} "
                     f"units of flat floor before its ledge; it needs {specmod.WALL_RUNUP} "
                     "(a ramp resets it, because a jump off a ramp flies high enough "
@@ -734,6 +1069,42 @@ class _Walker:
             self._gap(i, seg, segs, kick=seg["direction"])
         elif t == "dash":
             self._dash(i, seg, segs)
+        elif t == "stairs":
+            self.stairs(seg["length"], seg["rise"], seg["count"], tex=tex, walls=sides)
+            # A staircase is not flat floor: it cannot be the run-up to a jump.
+            self.runup = 0.0
+        elif t == "platforms":
+            self.platforms(seg["length"], seg["count"], seg.get("drop", 0), walls=sides)
+            # The last stone is the only footing, and it is one stone long.
+            self.runup = (seg["length"] / seg["count"]) * specmod.PLATFORM_FILL
+        elif t == "pillars":
+            self.pillars(seg["length"], seg["count"], tex=tex, walls=sides)
+            self.runup += seg["length"]
+        elif t == "tunnel":
+            self.tunnel(seg["length"], seg["height"], tex=tex)
+            self.runup += seg["length"]
+        elif t == "chicane":
+            self.chicane(seg["direction"], seg["angle"], seg["radius"],
+                         walls=bool(sides), floor_tex=tex)
+            self.runup += 2 * math.radians(seg["angle"]) * seg["radius"]
+        elif t == "bumps":
+            self.bumps(seg["length"], seg["count"], seg["rise"], tex=tex, walls=sides)
+            # Like a ramp: a jump off a hump leaves with the hump's own lift.
+            self.runup = 0.0
+        elif t == "pinch":
+            self.pinch(seg["length"], seg["gate"], tex=tex, walls=sides)
+            self.runup += seg["length"]
+        elif t == "ledge":
+            self.ledge(seg["length"], seg["direction"], seg["ledge_width"], tex=tex)
+            self.runup += seg["length"]
+        elif t == "hazard":
+            self.hazard(seg["length"], walls=sides)
+            self.runup = 0.0
+        elif t == "strafepads":
+            self.strafepads(seg["count"], seg["spacing"], seg.get("curve", 0),
+                            tex="ice" if seg.get("ice") else "platform")
+            # One pad is all the footing there is.
+            self.runup = float(specmod.STRAFE_PAD_LEN)
 
     def run(self):
         s = self.c.spec
@@ -762,7 +1133,8 @@ class _Walker:
             # or a dash drop, the sides of a beam, the holes in a split's fast
             # lane. Falling there is normally punished by the pit's
             # trigger_hurt; it is only a cut when a later piece is underneath.
-            if not sides or t in ("gap", "wallgap", "dash", "beam", "split"):
+            if not sides or t in ("gap", "wallgap", "dash", "beam", "split",
+                                  "platforms", "ledge", "hazard", "strafepads"):
                 self.c.falloff_segs.add(i)
             self._lay_segment(i, seg, segs, auto)
 
@@ -778,20 +1150,27 @@ class _Walker:
         return self.c
 
     def _size_limits(self):
+        """How far the course may spread and how many brushes it may take.
+
+        These are the one set of limits BOTH tiers enforce, because they are
+        not about the course being fair or even possible: past them the map
+        does not compile, or does not load, or hurts every server that holds
+        it. The open tier's are further out (spec.OPEN), not absent."""
+        xy, zmax, bmax = self.L.extent_xy, self.L.extent_z, self.L.brushes
         xs = [x for p in self.c.world for x, _ in p.poly]
         ys = [y for p in self.c.world for _, y in p.poly]
         zs = [z for p in self.c.world for z in (p.zmin, p.zmax())]
         dx, dy, dz = max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)
-        if max(dx, dy) > EXTENT_MAX_XY:
+        if max(dx, dy) > xy:
             self.problems.append(
-                f"the course spreads {int(dx)} x {int(dy)} units; at most {EXTENT_MAX_XY} "
+                f"the course spreads {int(dx)} x {int(dy)} units; at most {xy} "
                 "in each direction (fold it back on itself with turns)")
-        if dz > EXTENT_MAX_Z:
-            self.problems.append(f"the course is {int(dz)} units tall; at most {EXTENT_MAX_Z}")
+        if dz > zmax:
+            self.problems.append(f"the course is {int(dz)} units tall; at most {zmax}")
         brushes = len(self.c.world) + sum(len(b) for _, b in self.c.entities)
-        if brushes > BRUSH_MAX:
+        if brushes > bmax:
             self.problems.append(
-                f"the course needs {brushes} brushes; at most {BRUSH_MAX} "
+                f"the course needs {brushes} brushes; at most {bmax} "
                 "(fewer slalom fins, splits or tight turns)")
 
     def _camera_pads(self):
@@ -826,12 +1205,18 @@ class _Walker:
         self.box_run(ROOM_LEN, tex="finish")
         self.end_wall(behind=False)
 
-    LANDINGS = ("straight", "turn", "slalom", "split", "wallclimb")
+    # What a gap, a wall-kick gap or a dash may land on: a piece whose floor
+    # is solid where the jump arrives. The shape pieces that qualify do so for
+    # the same reason a straight does — you land on floor and keep running.
+    # platforms (a hole at its lip), ledge (void but for the walkway) and
+    # hazard (lethal) do not, and neither does another gap.
+    LANDINGS = ("straight", "turn", "slalom", "split", "wallclimb",
+                "stairs", "pillars", "tunnel", "chicane", "bumps", "pinch")
 
     def _landing(self, where, i, segs):
         nxt = segs[i + 1]["type"] if i + 1 < len(segs) else "finish"
         if nxt not in self.LANDINGS:
-            self.problems.append(
+            self._note(
                 f"{where}: must land on a {', '.join(self.LANDINGS[:-1])} or "
                 f"{self.LANDINGS[-1]}, not on {nxt!r}")
 
@@ -842,12 +1227,12 @@ class _Walker:
         kind = "wallgap" if kick else "gap"
         where = f"segment {i} ({kind})"
         if kick and self.runup < specmod.WALL_RUNUP:
-            self.problems.append(
+            self._note(
                 f"{where}: only {int(self.runup)} units of flat floor before it; a wall-kick "
                 f"gap needs {specmod.WALL_RUNUP} (straights and turns; a ramp resets it, "
                 "because a jump off a ramp flies high enough to skip the kick)")
         elif self.runup < physics.MIN_RUNUP:
-            self.problems.append(
+            self._note(
                 f"{where}: only {int(self.runup)} units of flat floor before it; a gap "
                 f"needs {int(physics.MIN_RUNUP)} of straight/turn run-up (ramps and "
                 "other gaps reset it)")
@@ -939,7 +1324,7 @@ class _Walker:
                         over[key] = min(over.get(key, 1e9), hi.zlo - lo.zhi)
                     continue
                 if _sat_overlap(a.poly, b.poly):
-                    self.problems.append(
+                    self._note(
                         f"course runs into itself: {_segname(a.seg)} overlaps {_segname(b.seg)}")
                     return
         # One entry per crossing: runs of adjacent segment pairs are the same
@@ -1028,7 +1413,7 @@ class _Walker:
                 how = (f"drop straight down onto {_segname(tgt)}" if gap <= 1.0
                        else f"jump the {int(gap)} units to {_segname(tgt)} at only "
                             f"{int(needed)} ups")
-                self.problems.append(
+                self._note(
                     f"unintended shortcut: from {_segname(src)} a player can {how}, skipping "
                     f"about {int(saved)} units of the course. Both are open, so there is "
                     "nothing in the way — give the later one walls (drop its \"open\": "
@@ -1130,13 +1515,21 @@ def _segname(i):
     return f"segment {i}"
 
 
-def build(spec, camera_pads=()):
+def build(spec, camera_pads=(), rules="strict"):
     """Validate ranges, then lay out. Raises LayoutError listing every problem.
-    camera_pads is for screenshots.py's overview only; see _camera_pads."""
-    problems = specmod.validate(spec)
+    camera_pads is for screenshots.py's overview only; see _camera_pads.
+
+    `rules` is the tier (spec.STRICT / spec.OPEN). The strict one is the
+    generator's: it refuses a course whose pieces do not fit together, because
+    nobody looks at a described map or a random_map tile before it is in the
+    pool. The open one is the map editor's: a person laid this out and an admin
+    approves it, so the pieces-fit-together rules become notes on the report
+    (course.notes) instead of refusals, and only the limits that decide whether
+    the map compiles and loads are still enforced."""
+    problems = specmod.validate(spec, rules)
     if problems:
         raise LayoutError(problems)
-    return _Walker(spec, camera_pads).run()
+    return _Walker(spec, camera_pads, rules).run()
 
 
 def preview_svg(course, px=900):

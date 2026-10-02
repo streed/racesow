@@ -35,7 +35,11 @@ import { cache, invalidate } from "./cache.js";
 import { createSaltStore, identify, SaltUnavailableError } from "./mapgen-identity.js";
 // The generator's course rules, ported (and pinned by test/mapgen-course.test.js)
 // so the map editor and this server refuse what tools/mapgen would refuse.
-import { build as mapgenLayout, normalize as mapgenNormalize, summary as mapgenSummary, MAX_SEGMENTS as MAPGEN_MAX_SEGMENTS } from "./public/assets/js/mapgen-course.js";
+import { build as mapgenLayout, normalize as mapgenNormalize, summary as mapgenSummary, tier as mapgenTier } from "./public/assets/js/mapgen-course.js";
+// The rule tier a hand-built course is held to. Must match
+// tools/mapgen/worker.py's EDITOR_RULES, or this gate and the build would
+// disagree about the same course.
+const MAPGEN_EDITOR_RULES = "open";
 import {
   BLOG_TAGS,
   isBlogTag,
@@ -666,26 +670,37 @@ api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (r
 // A course built by hand in the map editor (/mapgen/editor). The same daily
 // quota and site budget as a description, but no model call: the worker checks
 // the spec and builds it, once an admin has approved it on /admin/mapgen (it
-// waits in 'review' until then, and a rejection gives the map back). It is checked here first, with the generator's own
-// rules (public/assets/js/mapgen-course.js), so a course the generator would
-// refuse never costs anyone their map; the worker checks it again anyway,
-// because this endpoint is as public as the form.
+// waits in 'review' until then, and a rejection gives the map back). It is
+// checked here first, with the generator's own rules
+// (public/assets/js/mapgen-course.js), so a course that could not be built
+// never costs anyone their map; the worker checks it again anyway, because
+// this endpoint is as public as the form.
+//
+// The tier is the OPEN one, and it has to be the same one the worker uses
+// (tools/mapgen/worker.py: EDITOR_RULES) or this gate and the build would
+// disagree about the same course. A person laid this out, could see it, and
+// an admin approves it before it is built, so the rules about how the pieces
+// fit together are theirs to judge; what is still enforced is whether the map
+// compiles and loads.
 api.post("/mapgen/spec", mapgenNoStore, express.json({ limit: "32kb" }), wrap(async (req, res) => {
   const raw = req.body && req.body.spec;
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Array.isArray(raw.segments)
-      || raw.segments.length > MAPGEN_MAX_SEGMENTS * 2
+      // Cheap shape check before the real one; the tier's own cap (and the
+      // message that explains it) is validate's job, so this only has to be
+      // loose enough not to pre-empt it.
+      || raw.segments.length > mapgenTier(MAPGEN_EDITOR_RULES).segments * 2
       || !raw.segments.every((s) => s && typeof s === "object" && !Array.isArray(s))) {
     return res.status(400).json({ error: "That isn't a course spec." });
   }
   const spec = mapgenNormalize(raw);
   let problems;
   try {
-    ({ problems } = mapgenLayout(spec));
+    ({ problems } = mapgenLayout(spec, MAPGEN_EDITOR_RULES));
   } catch {
     problems = ["the course could not be laid out"];
   }
   if (problems.length) {
-    return res.status(400).json({ error: "The generator would refuse this course.", problems: problems.slice(0, 20) });
+    return res.status(400).json({ error: "That course cannot be built.", problems: problems.slice(0, 20) });
   }
   let who;
   try { who = await mapgenWho(req); } catch (e) { return mapgenFail(res, e); }
@@ -3406,7 +3421,7 @@ admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
   const reviewRow = (j) => {
     let facts = "";
     try {
-      const { problems, course } = mapgenLayout(j.spec);
+      const { problems, course, notes } = mapgenLayout(j.spec, MAPGEN_EDITOR_RULES);
       if (course) {
         const sm = mapgenSummary(course, j.spec);
         const kinds = {};
@@ -3416,6 +3431,12 @@ admin.get("/mapgen", requireAdmin, wrap(async (req, res) => {
           `<span class="sub">${Object.entries(kinds).map(([k, n]) => `${n} ${escHtml(k)}`).join(", ")}</span>`;
       }
       if (problems.length) facts += `<br><span class="sub" style="color:#ffb4a0">${escHtml(problems[0])}</span>`;
+      // What the open tier found and did not refuse over: the things worth an
+      // admin's eye before this goes in the pool.
+      else if (notes && notes.length) {
+        facts += `<br><span class="sub" style="color:#ffd24a">${escHtml(notes[0])}` +
+          `${notes.length > 1 ? ` (+${notes.length - 1} more)` : ""}</span>`;
+      }
     } catch {
       facts = `<span class="sub">could not lay out</span>`;
     }

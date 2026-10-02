@@ -161,6 +161,10 @@ def record_usage(cur, job_id, calls):
              summary["output_tokens"], "?" if est is None else f"${est:.4f}")
 
 
+# Which rule tier a hand-built course is held to; see check_editor_spec.
+EDITOR_RULES = "open"
+
+
 def check_editor_spec(raw, token):
     """A spec someone built by hand on /mapgen/editor -> (spec, problems).
 
@@ -168,7 +172,15 @@ def check_editor_spec(raw, token):
     normalize (only known keys survive), a unique name, then spec.validate and
     the layout. The editor ran the same rules in the page (its port is pinned
     to this tree by golden.py), so a refusal here is rare; when it happens the
-    problems are what the requester sees."""
+    problems are what the requester sees.
+
+    The tier is the OPEN one (spec.OPEN). A described map is never looked at
+    before it is in the pool, so the strict rules are all that stand between
+    the model and an unraceable course; a course from the editor was laid out
+    by a person who could see it and is approved by an admin before it is
+    built, so the rules about how the pieces fit together are theirs to
+    judge. What is still enforced is what decides whether the map compiles
+    and loads: see layout._size_limits."""
     if not isinstance(raw, dict) or not isinstance(raw.get("segments"), list):
         return None, ["the spec is not a course"]
     if not all(isinstance(s, dict) for s in raw["segments"]):
@@ -176,7 +188,7 @@ def check_editor_spec(raw, token):
     spec = specmod.normalize(raw)
     spec["name"] = unique_name(spec.get("name") if isinstance(spec.get("name"), str) else "gen_map", token)
     try:
-        layout.build(spec)
+        layout.build(spec, rules=EDITOR_RULES)
     except layout.LayoutError as e:
         return None, e.problems
     return spec, []

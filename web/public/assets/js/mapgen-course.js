@@ -153,10 +153,21 @@ export const wallClimb = () => JUMP_MARGIN * (jumpApex() + (WJ_UP * WJ_UP) / (2.
 /* --------------------------------- spec --------------------------------- */
 // tools/mapgen/spec.py: field ranges.
 
-export const SEGMENT_TYPES = ["straight", "turn", "ramp", "gap", "checkpoint", "slalom", "beam", "split",
-  "wallclimb", "wallgap", "dash"];
-export const OPENABLE = ["straight", "turn", "ramp", "gap"];
-export const ICEABLE = ["straight", "turn", "ramp", "slalom"];
+// What the language model is taught to write; SEGMENT_SCHEMA's enum is these.
+export const MODEL_SEGMENT_TYPES = ["straight", "turn", "ramp", "gap", "checkpoint", "slalom",
+  "beam", "split", "wallclimb", "wallgap", "dash"];
+// ...and what the map editor can lay as well: shape rather than move, asking
+// nothing of the player that physics.py has to model.
+export const EDITOR_SEGMENT_TYPES = ["stairs", "platforms", "pillars", "tunnel", "chicane",
+  "bumps", "pinch", "ledge", "hazard", "strafepads"];
+export const SEGMENT_TYPES = [...MODEL_SEGMENT_TYPES, ...EDITOR_SEGMENT_TYPES];
+// A piece can be open (no side walls, floating over the void) if it HAS side
+// walls to lose and a floor to paint the edge of.
+export const OPENABLE = ["straight", "turn", "ramp", "gap", "stairs", "platforms", "pillars",
+  "chicane", "bumps", "pinch", "hazard"];
+// Ice floors a piece. Anything with a walking surface can carry it.
+export const ICEABLE = ["straight", "turn", "ramp", "slalom", "stairs", "platforms", "pillars",
+  "tunnel", "chicane", "bumps", "pinch", "ledge", "strafepads"];
 export const TURN_ANGLES = [45, 90, 135, 180];
 export const NAME_RE = /^gen_[a-z0-9_]{2,36}$/;
 export const TITLE_RE = /^[A-Za-z0-9](?:[A-Za-z0-9 '&!?,:-]{0,38}[A-Za-z0-9!?'])?$/;
@@ -194,24 +205,170 @@ export const DASH_DROP = [384, 1024];
 export const DASH_PAD = 192;
 export const GAP_LENGTH_MAX = 4096;
 
+// -- the pieces that are shape rather than move (spec.py) -------------------
+export const FIN_THICK = 32;
+export const PLAYER_WIDTH = 32;
+export const STAIRS_RISE_MAX = 2048;
+export const STAIR_TREAD_MIN = 16;
+export const PLATFORM_MIN = 64;
+export const PLATFORM_FILL = 0.55;
+export const BUMP_MIN = 64;
+export const PILLAR_MIN = 48;
+export const PILLAR_CLEAR = 64;
+export const TUNNEL_MIN = 96;
+export const TUNNEL_SAFE = 160;
+export const PINCH_MIN = PLAYER_WIDTH + 16;
+export const PINCH_BITE = 32;
+export const LEDGE_MIN = 48;
+export const LEDGE_CLEAR = 64;
+export const HAZARD_MIN = 64;
+export const STRAFE_PAD_LEN = 128;
+export const STRAFE_GAP_MIN = 32;
+export const CHICANE_ANGLE = [10, 90];
+export const SHIFT_MAX = 4096;
+export const ROTATE_MAX = 180;
+export const STRICT_SHIFT_MAX = 256;
+export const STRICT_ROTATE_MAX = 30;
+
+// -- the two rule tiers (spec.STRICT / spec.OPEN) ---------------------------
+// "strict" is the generator's own: every bound is one physics.py can defend,
+// because a described map or a random_map tile goes in the pool with nobody
+// having looked at it. "open" is this editor: a person is laying the course
+// out, they can see it, and an admin approves it before it is built, so what
+// is left are the limits that decide whether the map COMPILES and LOADS.
+export const STRICT = {
+  name: "strict",
+  physics: true,
+  combine: true,
+  angles: TURN_ANGLES,
+  angleRange: null,
+  route: ROUTE_MAX,
+  segments: MAX_SEGMENTS,
+  width: [WIDTH_MIN, WIDTH_MAX],
+  straight: [STRAIGHT_MIN, STRAIGHT_MAX],
+  ramp: [RAMP_MIN, RAMP_MAX],
+  rise: 1024,
+  slope: null,
+  radiusSlack: 64,
+  radiusMax: TURN_RADIUS_MAX,
+  gap: [GAP_MIN, GAP_LENGTH_MAX],
+  dropMax: DROP_MAX,
+  dropMin: null,
+  slalomCount: SLALOM_COUNT,
+  slalomSpacing: SLALOM_SPACING,
+  beam: [STRAIGHT_MIN, BEAM_MAX_LENGTH],
+  beamClear: BEAM_WALL_CLEAR,
+  splitCount: SPLIT_COUNT,
+  splitRunway: SPLIT_RUNWAY,
+  wallclimbRise: WALLCLIMB_RISE,
+  wallclimbMin: WALLCLIMB_MIN,
+  wallgapDrop: WALLGAP_DROP,
+  dashDrop: DASH_DROP,
+  chicaneAngle: [10, 90],
+  bumpsRise: [16, 256],
+  padsCount: [2, 16],
+  padsSpacing: [STRAFE_PAD_LEN + STRAFE_GAP_MIN, 512],
+  padsCurve: 90,
+  stairsCount: [2, 32],
+  platformsCount: [2, 12],
+  pillarsCount: [1, 12],
+  bumpsCount: [1, 12],
+  tunnelHeight: [TUNNEL_SAFE, 512],
+  pinchGate: [PINCH_MIN, null],
+  ledgeWidth: [LEDGE_MIN, null],
+  hazard: [HAZARD_MIN, null],
+  shift: STRICT_SHIFT_MAX,
+  rotate: STRICT_ROTATE_MAX,
+  extentXY: 16384,
+  extentZ: 8192,
+  brushes: 1500,
+};
+
+// "Within reason" means the same thing throughout: the map still compiles,
+// still loads, and the piece is still the shape its name says.
+export const OPEN = {
+  name: "open",
+  physics: false,
+  combine: false,
+  angles: null,
+  angleRange: [5, 180],
+  route: 200000,
+  segments: 256,
+  width: [64, 2048],
+  straight: [32, 16384],
+  ramp: [32, 16384],
+  rise: 8192,
+  slope: 3.0,
+  radiusSlack: 8,
+  radiusMax: 8192,
+  gap: [16, 8192],
+  dropMax: 8192,
+  dropMin: -8192,
+  slalomCount: [1, 48],
+  slalomSpacing: FIN_THICK + PLAYER_WIDTH,
+  beam: [32, 8192],
+  beamClear: 16,
+  splitCount: [1, 24],
+  splitRunway: 32,
+  wallclimbRise: [16, 1024],
+  wallclimbMin: 64,
+  wallgapDrop: [-1024, 0],
+  dashDrop: [32, 4096],
+  chicaneAngle: [5, 170],
+  bumpsRise: [8, 1024],
+  padsCount: [1, 64],
+  padsSpacing: [STRAFE_PAD_LEN + STRAFE_GAP_MIN, 4096],
+  padsCurve: 270,
+  stairsCount: [1, 128],
+  platformsCount: [1, 48],
+  pillarsCount: [1, 48],
+  bumpsCount: [1, 48],
+  tunnelHeight: [TUNNEL_MIN, 4096],
+  pinchGate: [PINCH_MIN, null],
+  ledgeWidth: [LEDGE_MIN, null],
+  hazard: [HAZARD_MIN, 8192],
+  shift: SHIFT_MAX,
+  rotate: ROTATE_MAX,
+  extentXY: 30000,
+  extentZ: 16000,
+  brushes: 6000,
+};
+
+export const TIERS = { strict: STRICT, open: OPEN };
+
+// Anything unknown is the strict tier, so a caller that forgets to pass one
+// gets the safe tier and never the loose one.
+export const tier = (rules) => TIERS[rules] || STRICT;
+
+
 export const wallgapWindow = (drop) => [WALLGAP_MIN, int(wallJumpReach(drop))];
 export const dashWindow = (drop) => [int(jumpReach(drop)) + 1, int(dashReach(drop))];
 
 export function routeLength(seg) {
   const t = seg.type;
-  if (t === "turn") {
-    const a = seg.angle;
-    return radians(typeof a === "number" ? a : 0) * (seg.radius ?? 0);
+  if (t === "turn" || t === "chicane") {
+    const a = radians(typeof seg.angle === "number" ? seg.angle : 0);
+    // A chicane is two arcs of the same angle, one each way.
+    return a * (seg.radius ?? 0) * (t === "chicane" ? 2 : 1);
+  }
+  if (t === "strafepads") {
+    // The run is its pads end to end, however it bends.
+    const n = seg.count, sp = seg.spacing;
+    if (!isNum(n) || !isNum(sp)) return 0.0;
+    return Number(n) * Number(sp);
   }
   if (t === "checkpoint") return 0.0;
   const n = seg.length ?? 0;
+  if (!isNum(n)) return 0.0;
   return Number(n) + (t === "dash" ? DASH_PAD : 0);
 }
 
 export const splitHole = () => int(maxGap(0) * SPLIT_HOLE_FILL);
-export const splitMinLength = (count) =>
-  2 * SPLIT_MOUTH + count * (SPLIT_RUNWAY + splitHole()) + SPLIT_LANDING;
-export const turnRadiusMin = (width) => Math.floor(width / 2) + 64;
+export const splitMinLength = (count, rules = "strict") =>
+  2 * SPLIT_MOUTH + count * (tier(rules).splitRunway + splitHole()) + SPLIT_LANDING;
+export const platformCell = () => int(PLATFORM_MIN / PLATFORM_FILL);
+export const turnRadiusMin = (width, rules = "strict") =>
+  Math.floor(width / 2) + tier(rules).radiusSlack;
 
 const KEEP = {
   straight: ["length", "open", "ice"],
@@ -225,7 +382,19 @@ const KEEP = {
   wallclimb: ["length", "rise", "direction"],
   wallgap: ["length", "drop", "direction"],
   dash: ["length", "drop"],
+  stairs: ["length", "rise", "count", "open", "ice"],
+  platforms: ["length", "count", "drop", "open", "ice"],
+  pillars: ["length", "count", "open", "ice"],
+  tunnel: ["length", "height", "ice"],
+  chicane: ["direction", "angle", "radius", "open", "ice"],
+  bumps: ["length", "count", "rise", "open", "ice"],
+  pinch: ["length", "gate", "open", "ice"],
+  ledge: ["length", "direction", "ledge_width", "ice"],
+  hazard: ["length", "open"],
+  strafepads: ["count", "spacing", "curve", "ice"],
 };
+// Every piece may be nudged sideways and turned on the spot.
+export const NUDGE = ["shift", "rotate"];
 // The fields each piece type uses, for the editor's inspector.
 export const FIELDS = KEEP;
 
@@ -236,14 +405,19 @@ export function normalize(spec) {
   for (const seg of spec.segments || []) {
     const t = seg.type;
     const clean = { type: t };
-    for (const k of KEEP[t] || []) if (k in seg) clean[k] = seg[k];
+    for (const k of [...(KEEP[t] || []), ...NUDGE]) if (k in seg) clean[k] = seg[k];
     for (const flag of ["shortcut", "open", "ice"]) if (clean[flag] === false) delete clean[flag];
+    for (const z of NUDGE) if (clean[z] === 0) delete clean[z];
     out.segments.push(clean);
   }
   return out;
 }
 
-export function validate(spec) {
+export function validate(spec, rules = "strict") {
+  // `rules` names the tier (STRICT / OPEN above). The strict tier measures
+  // every take-off against the physics; the open tier — this editor — keeps
+  // only the bounds that decide whether the course can be built at all.
+  const L = tier(rules);
   const errs = [];
   if (!isObj(spec)) return ["spec must be a JSON object"];
 
@@ -259,30 +433,34 @@ export function validate(spec) {
   }
 
   let width = spec.width;
-  if (!Number.isInteger(width) || !(WIDTH_MIN <= width && width <= WIDTH_MAX)) {
-    errs.push(`width ${pyRepr(width)} must be an integer in [${WIDTH_MIN}, ${WIDTH_MAX}]`);
+  if (!Number.isInteger(width) || !(L.width[0] <= width && width <= L.width[1])) {
+    errs.push(`width ${pyRepr(width)} must be an integer in [${L.width[0]}, ${L.width[1]}]`);
     width = 384;
   }
 
   const segs = spec.segments;
   if (!Array.isArray(segs) || !segs.length) {
-    errs.push("segments must be a non-empty list");
+    // The start and the finish are implicit, so this is the whole of "a
+    // course needs a start, a finish, and something in between".
+    errs.push("segments must be a non-empty list: a course needs at least one " +
+      "piece between its start and its finish");
     return errs;
   }
-  if (segs.length > MAX_SEGMENTS) errs.push(`${segs.length} segments; at most ${MAX_SEGMENTS}`);
+  if (segs.length > L.segments) errs.push(`${segs.length} segments; at most ${L.segments}`);
 
   let route = 0.0;
   for (const seg of segs) {
     if (!isObj(seg)) continue;
-    const v = seg[seg.type === "turn" ? "radius" : "length"];
+    const v = seg[(seg.type === "turn" || seg.type === "chicane") ? "radius" : "length"];
     if (isNum(v) && v > 0) route += routeLength(seg);
   }
-  if (route > ROUTE_MAX) {
-    errs.push(`the route is ${int(route)} units long; at most ${ROUTE_MAX} ` +
-      `(about ${Math.floor(ROUTE_MAX / 320)} s at 320 ups)`);
+  if (route > L.route) {
+    errs.push(`the route is ${int(route)} units long; at most ${L.route} ` +
+      `(about ${Math.floor(L.route / 320)} s at 320 ups)`);
   }
 
-  const slope = maxRampSlope();
+  const slope = L.slope !== null ? L.slope : maxRampSlope();
+  const radiusMin = turnRadiusMin(width, rules);
   segs.forEach((seg, i) => {
     let where = `segment ${i}`;
     if (!isObj(seg)) {
@@ -308,59 +486,77 @@ export function validate(spec) {
       }
       return v;
     };
+    const needsWidth = (least, why) => {
+      if (width < least) errs.push(`${where}: needs width >= ${least} (${why})`);
+    };
 
     if ("open" in seg && typeof seg.open !== "boolean") {
       errs.push(`${where}: open must be true or false`);
     } else if (seg.open && !OPENABLE.includes(t)) {
       errs.push(`${where}: only ${OPENABLE.join(", ")} can be open ` +
-        "(the special-move pieces are open already)");
+        "(the rest have no side walls to lose)");
     }
     if ("ice" in seg && typeof seg.ice !== "boolean") {
       errs.push(`${where}: ice must be true or false`);
     } else if (seg.ice && !ICEABLE.includes(t)) {
       errs.push(`${where}: only ${ICEABLE.join(", ")} can be ice ` +
-        "(a piece that is jumped from or across keeps its grip)");
+        "(a piece with no walking surface has nothing to be slick)");
     }
 
-    const side = () => {
+    // Every piece may be nudged sideways and turned on the spot.
+    if ("shift" in seg) num("shift", -L.shift, L.shift);
+    if ("rotate" in seg) num("rotate", -L.rotate, L.rotate);
+
+    const side = (what = "the side of the kick wall") => {
       if (seg.direction !== "left" && seg.direction !== "right") {
-        errs.push(`${where}: direction (the side of the kick wall) must be 'left' or 'right'`);
+        errs.push(`${where}: direction (${what}) must be 'left' or 'right'`);
       }
     };
-
-    if (t === "straight") {
-      num("length", STRAIGHT_MIN, STRAIGHT_MAX);
-    } else if (t === "turn") {
+    const arc = (what) => {
       if (seg.direction !== "left" && seg.direction !== "right") {
         errs.push(`${where}: direction must be 'left' or 'right'`);
       }
-      if (!TURN_ANGLES.includes(seg.angle)) {
-        errs.push(`${where}: angle ${pyRepr(seg.angle)} must be one of ${tupleRepr(TURN_ANGLES)}`);
+      if (what === "chicane") {
+        whole("angle", ...L.chicaneAngle);
+      } else if (L.angles !== null) {
+        if (!L.angles.includes(seg.angle)) {
+          errs.push(`${where}: angle ${pyRepr(seg.angle)} must be one of ${tupleRepr(L.angles)}`);
+        }
+      } else {
+        whole("angle", ...L.angleRange);
       }
-      num("radius", turnRadiusMin(width), TURN_RADIUS_MAX);
+      num("radius", radiusMin, L.radiusMax);
+    };
+
+    if (t === "straight") {
+      num("length", ...L.straight);
+    } else if (t === "turn") {
+      arc("turn");
       if (seg.shortcut) {
         if (seg.angle !== 180) {
           errs.push(`${where}: a shortcut needs a 180-degree turn, not ${pyRepr(seg.angle)}`);
-        }
-        for (const [j, sideName] of [[i - 1, "before"], [i + 1, "after"]]) {
-          const nb = j >= 0 && j < segs.length ? segs[j] : null;
-          if (!isObj(nb) || nb.type !== "straight" || !isNum(nb.length) || nb.length < SHORTCUT_MIN_LEG) {
-            errs.push(`${where}: a shortcut needs a straight of at least ` +
-              `${SHORTCUT_MIN_LEG} directly ${sideName} the turn`);
+        } else if (L.combine) {
+          for (const [j, rel] of [[i - 1, "before"], [i + 1, "after"]]) {
+            const nb = j >= 0 && j < segs.length ? segs[j] : null;
+            if (!isObj(nb) || nb.type !== "straight" || !isNum(nb.length)
+                || nb.length < SHORTCUT_MIN_LEG) {
+              errs.push(`${where}: a shortcut needs a straight of at least ` +
+                `${SHORTCUT_MIN_LEG} directly ${rel} the turn`);
+            }
           }
         }
       }
     } else if (t === "ramp") {
-      const length = num("length", RAMP_MIN, RAMP_MAX);
-      const rise = num("rise", -1024, 1024);
+      const length = num("length", ...L.ramp);
+      const rise = num("rise", -L.rise, L.rise);
       if (length && rise !== null && Math.abs(rise) > slope * length + 1e-6) {
         errs.push(`${where}: rise ${rise} over length ${length} is steeper than ` +
-          `30 degrees; |rise| must be <= ${int(slope * length)}`);
+          `${Math.round(degrees(Math.atan(slope)))} degrees; |rise| must be <= ${int(slope * length)}`);
       }
     } else if (t === "gap") {
-      const drop = num("drop", -int(maxRise()), DROP_MAX);
-      const length = num("length", GAP_MIN, GAP_LENGTH_MAX);
-      if (drop !== null && length !== null) {
+      const drop = num("drop", L.dropMin !== null ? L.dropMin : -int(maxRise()), L.dropMax);
+      const length = num("length", ...L.gap);
+      if (L.physics && drop !== null && length !== null) {
         const reach = maxGap(drop);
         if (length > reach) {
           errs.push(`${where}: a ${length}-unit gap with drop ${drop} is not ` +
@@ -370,42 +566,34 @@ export function validate(spec) {
     } else if (t === "checkpoint") {
       // nothing to check
     } else if (t === "slalom") {
-      const length = num("length", STRAIGHT_MIN, STRAIGHT_MAX);
-      const count = whole("count", ...SLALOM_COUNT);
-      if (width - SLALOM_GATE < SLALOM_FIN_MIN) {
-        errs.push(`${where}: a slalom needs width >= ${SLALOM_GATE + SLALOM_FIN_MIN} ` +
-          `(a ${SLALOM_GATE}-unit gate beside each fin)`);
-      }
-      if (length && count && length / (count + 1) < SLALOM_SPACING) {
+      const length = num("length", ...L.straight);
+      const count = whole("count", ...L.slalomCount);
+      needsWidth(SLALOM_GATE + SLALOM_FIN_MIN, `a ${SLALOM_GATE}-unit gate beside each fin`);
+      if (length && count && length / (count + 1) < L.slalomSpacing) {
         errs.push(`${where}: ${count} fins in ${length} units are closer than ` +
-          `${SLALOM_SPACING}; length must be >= ${SLALOM_SPACING * (count + 1)}`);
+          `${L.slalomSpacing}; length must be >= ${L.slalomSpacing * (count + 1)}`);
       }
     } else if (t === "beam") {
-      num("length", STRAIGHT_MIN, BEAM_MAX_LENGTH);
-      num("beam_width", BEAM_MIN, width - 2 * BEAM_WALL_CLEAR);
+      num("length", ...L.beam);
+      num("beam_width", BEAM_MIN, Math.max(BEAM_MIN, width - 2 * L.beamClear));
     } else if (t === "split") {
-      if (seg.direction !== "left" && seg.direction !== "right") {
-        errs.push(`${where}: direction (the side of the fast lane with the holes) ` +
-          "must be 'left' or 'right'");
-      }
-      const count = whole("count", ...SPLIT_COUNT);
-      const length = num("length", STRAIGHT_MIN, STRAIGHT_MAX);
-      if ((width - SPLIT_MEDIAN) / 2 < SPLIT_LANE_MIN) {
-        errs.push(`${where}: a split needs width >= ${2 * SPLIT_LANE_MIN + SPLIT_MEDIAN} ` +
-          `for two ${SPLIT_LANE_MIN}-unit lanes`);
-      }
-      if (length && count && length < splitMinLength(count)) {
-        errs.push(`${where}: ${count} hole(s) need length >= ${splitMinLength(count)}`);
+      side("the side of the fast lane with the holes");
+      const count = whole("count", ...L.splitCount);
+      const length = num("length", ...L.straight);
+      needsWidth(2 * SPLIT_LANE_MIN + SPLIT_MEDIAN, `two ${SPLIT_LANE_MIN}-unit lanes`);
+      const least = count ? splitMinLength(count, rules) : null;
+      if (length && least && length < least) {
+        errs.push(`${where}: ${count} hole(s) need length >= ${least}`);
       }
     } else if (t === "wallclimb") {
       side();
-      num("length", WALLCLIMB_MIN, STRAIGHT_MAX);
-      whole("rise", ...WALLCLIMB_RISE);
+      num("length", L.wallclimbMin, L.straight[1]);
+      whole("rise", ...L.wallclimbRise);
     } else if (t === "wallgap") {
       side();
-      const drop = whole("drop", ...WALLGAP_DROP);
-      const length = num("length", GAP_MIN, GAP_LENGTH_MAX);
-      if (drop !== null && length !== null) {
+      const drop = whole("drop", ...L.wallgapDrop);
+      const length = num("length", ...L.gap);
+      if (L.physics && drop !== null && length !== null) {
         const [lo, hi] = wallgapWindow(drop);
         if (!(lo <= length && length <= hi)) {
           errs.push(`${where}: at drop ${drop} a wall-kick gap must be ${lo}-${hi} ` +
@@ -413,15 +601,102 @@ export function validate(spec) {
         }
       }
     } else if (t === "dash") {
-      const drop = whole("drop", ...DASH_DROP);
-      const length = num("length", GAP_MIN, GAP_LENGTH_MAX);
-      if (drop !== null && length !== null) {
+      const drop = whole("drop", ...L.dashDrop);
+      const length = num("length", ...L.gap);
+      if (L.physics && drop !== null && length !== null) {
         const [lo, hi] = dashWindow(drop);
         if (!(lo <= length && length <= hi)) {
           errs.push(`${where}: at drop ${drop} a dash gap must be ${lo}-${hi} long: ` +
             "shorter can be jumped, longer cannot be dashed");
         }
       }
+
+    // -- shape pieces -------------------------------------------------------
+    } else if (t === "stairs") {
+      const length = num("length", ...L.straight);
+      const count = whole("count", ...L.stairsCount);
+      const cap = Math.min(L.rise, STAIRS_RISE_MAX);
+      const rise = num("rise", -cap, cap);
+      if (length && count && length / count < STAIR_TREAD_MIN) {
+        errs.push(`${where}: ${count} steps in ${length} units leave treads under ` +
+          `${STAIR_TREAD_MIN}; length must be >= ${STAIR_TREAD_MIN * count}`);
+      }
+      if (L.physics && count && rise !== null && Math.abs(rise) / count > STEP_SIZE) {
+        errs.push(`${where}: steps of ${int(Math.abs(rise) / count)} are taller than the ` +
+          `${int(STEP_SIZE)}-unit step the engine walks up; use more steps or less rise`);
+      }
+    } else if (t === "platforms") {
+      const length = num("length", ...L.straight);
+      const count = whole("count", ...L.platformsCount);
+      const drop = num("drop", L.dropMin !== null ? L.dropMin : -int(maxRise()), L.dropMax);
+      const cell = platformCell();
+      if (length && count && length / count < cell) {
+        errs.push(`${where}: ${count} stones need length >= ${cell * count} ` +
+          `(each is a ${PLATFORM_MIN}-unit landing and the hole before it)`);
+      }
+      if (L.physics && length && count) {
+        const hole = (length / count) * (1.0 - PLATFORM_FILL);
+        const reach = maxGap(drop || 0);
+        if (hole > reach) {
+          errs.push(`${where}: the holes are ${int(hole)} units; at drop ` +
+            `${int(drop || 0)} a run-speed jump clears ${int(reach)}`);
+        }
+      }
+    } else if (t === "pillars") {
+      const length = num("length", ...L.straight);
+      const count = whole("count", ...L.pillarsCount);
+      needsWidth(PILLAR_MIN + 2 * PILLAR_CLEAR,
+        `a ${PILLAR_CLEAR}-unit gate either side of each pillar`);
+      if (length && count && length / count < FIN_THICK + PLAYER_WIDTH) {
+        errs.push(`${where}: ${count} pillars in ${length} units would touch; ` +
+          `length must be >= ${(FIN_THICK + PLAYER_WIDTH) * count}`);
+      }
+    } else if (t === "tunnel") {
+      num("length", ...L.straight);
+      num("height", ...L.tunnelHeight);
+    } else if (t === "chicane") {
+      arc("chicane");
+    } else if (t === "bumps") {
+      const length = num("length", ...L.straight);
+      const count = whole("count", ...L.bumpsCount);
+      const rise = num("rise", ...L.bumpsRise);
+      if (length && count && length / count < BUMP_MIN) {
+        errs.push(`${where}: ${count} bumps in ${length} units are shorter than ` +
+          `${BUMP_MIN}; length must be >= ${BUMP_MIN * count}`);
+      }
+      if (L.physics && length && count && rise) {
+        const half = length / count / 2.0;
+        if (rise > slope * half + 1e-6) {
+          errs.push(`${where}: bumps ${int(rise)} tall over ${int(half)}-unit ` +
+            `faces are steeper than ${Math.round(degrees(Math.atan(slope)))} ` +
+            `degrees; rise must be <= ${int(slope * half)}`);
+        }
+      }
+    } else if (t === "pinch") {
+      num("length", ...L.straight);
+      needsWidth(PINCH_MIN + 2 * PINCH_BITE,
+        `a ${PINCH_MIN}-unit gate with ${PINCH_BITE} taken off each side`);
+      num("gate", PINCH_MIN, Math.max(PINCH_MIN, width - 2 * PINCH_BITE));
+    } else if (t === "ledge") {
+      side("the wall the walkway runs along");
+      num("length", ...L.beam);
+      num("ledge_width", LEDGE_MIN, Math.max(LEDGE_MIN, width - LEDGE_CLEAR));
+    } else if (t === "strafepads") {
+      whole("count", ...L.padsCount);
+      const spacing = num("spacing", ...L.padsSpacing);
+      num("curve", -L.padsCurve, L.padsCurve);
+      if (L.physics && spacing !== null) {
+        const gap = spacing - STRAFE_PAD_LEN;
+        const reach = maxGap(0);
+        if (gap > reach) {
+          errs.push(`${where}: ${int(gap)} units between pads; a run-speed jump ` +
+            `clears ${int(reach)}`);
+        }
+      }
+    } else if (t === "hazard") {
+      let [lo, hi] = L.hazard;
+      if (hi === null) hi = int(maxGap(0));
+      num("length", lo, hi);
     } else {
       errs.push(`${where}: unknown type; must be one of ${tupleRepr(SEGMENT_TYPES)}`);
     }
@@ -454,14 +729,19 @@ export const CP_EVERY = 2560;
 const CP_MIN = 1024;
 const CP_END_MIN = 768;
 const CP_EDGE = 64;
-export const EXTENT_MAX_XY = 16384;
-export const EXTENT_MAX_Z = 8192;
-export const BRUSH_MAX = 1500;
-const FIN_THICK = 32;
+// The strict tier's own numbers; STRICT above is where they are written down.
+export const EXTENT_MAX_XY = STRICT.extentXY;
+export const EXTENT_MAX_Z = STRICT.extentZ;
+export const BRUSH_MAX = STRICT.brushes;
+// FIN_THICK is declared with the shape-piece constants above.
 const SPLIT_GATE = 96;
 export const VOID_DEPTH = 160;
 const EDGE_BAND = 16;
 const WALLCLIMB_ARC = 96;
+const HAZARD_DEPTH = 64;
+const HAZARD_LIP = 8;
+const JOINT_DEPTH = 64;
+const ROOF_THICK_TUNNEL = 16;
 
 export class Prism {
   constructor(poly, zmin, top0, gx = 0.0, gy = 0.0, tex = "floor", heading = null) {
@@ -492,6 +772,43 @@ function rect(o, f, l, back, fwd, right, left) {
   return [p(back, -right), p(fwd, -right), p(fwd, left), p(back, left)];
 }
 const band = (o, f, l, back, fwd, lo, hi) => rect(o, f, l, back, fwd, -lo, hi);
+
+// Twice the signed area of a footprint, unsigned; mirrors layout._area.
+function polyArea(poly) {
+  let a = 0.0;
+  for (let i = 0; i < poly.length; i++) {
+    const [x0, y0] = poly[i], [x1, y1] = poly[(i + 1) % poly.length];
+    a += x0 * y1 - x1 * y0;
+  }
+  return Math.abs(a) / 2.0;
+}
+
+// Convex hull, counter-clockwise (monotone chain); mirrors layout._hull.
+// Every brush footprint has to be convex, and the hull is how a nudge's seam
+// stays one.
+function convexHull(points) {
+  const seen = new Map();
+  for (const [x, y] of points) {
+    const p = [pyRound(x, 4), pyRound(y, 4)];
+    seen.set(`${p[0]},${p[1]}`, p);
+  }
+  const pts = [...seen.values()].sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]));
+  if (pts.length < 3) return pts;
+  const half = (seq) => {
+    const out = [];
+    for (const p of seq) {
+      while (out.length >= 2) {
+        const [ax, ay] = out[out.length - 2], [bx, by] = out[out.length - 1];
+        if ((bx - ax) * (p[1] - ay) - (by - ay) * (p[0] - ax) > 0) break;
+        out.pop();
+      }
+      out.push(p);
+    }
+    return out;
+  };
+  const lower = half(pts), upper = half([...pts].reverse());
+  return [...lower.slice(0, -1), ...upper.slice(0, -1)];
+}
 
 export function planCheckpoints(spec) {
   const segs = spec.segments;
@@ -609,14 +926,22 @@ function polyGap(a, b) {
 }
 
 const segname = (i) => (i < 0 ? "the start room" : `segment ${i}`);
-const LANDINGS = ["straight", "turn", "slalom", "split", "wallclimb"];
+// What a gap, a wall-kick gap or a dash may land on: a piece whose floor is
+// solid where the jump arrives. platforms (a hole at its lip), ledge (void but
+// for the walkway), hazard (lethal) and strafepads do not qualify.
+const LANDINGS = ["straight", "turn", "slalom", "split", "wallclimb",
+  "stairs", "pillars", "tunnel", "chicane", "bumps", "pinch"];
 
 class Walker {
-  constructor(spec) {
+  constructor(spec, rules = "strict") {
+    this.rules = rules;
+    this.L = tier(rules);
     this.c = {
       spec, world: [], entities: [], hulls: [], floorPolys: [], route: [], landmarks: [],
       shortcuts: [], features: [], overpasses: [], segDist: [], openSegs: new Set(),
       falloffSegs: new Set(), cuts: [], autoCheckpoints: [], length: 0.0, bounds: null,
+      // Open tier: the pieces-fit-together problems, kept as notes.
+      notes: [],
       // The editor's additions: where the cursor stood (x, y, z, heading)
       // and how far along the route it was as each segment began, plus one
       // more entry for the finish line.
@@ -692,6 +1017,16 @@ class Walker {
     this.hull(rect(o, f, l, 0, length, half + WALL_THICK, half + WALL_THICK),
       base, Math.max(z0, z0 + rise) + WALL_HEIGHT);
     this.advance(length, rise);
+  }
+
+  // A problem with how the pieces fit TOGETHER — a missing run-up, a landing
+  // on nothing, the course crossing itself, a cut round the side. Refusals in
+  // the strict tier, which nobody looks at before it is in the pool; notes on
+  // the report in the open tier, where a person can see the course and an
+  // admin signs it off.
+  note(msg) {
+    if (this.L.combine) this.problems.push(msg);
+    else this.c.notes.push(msg);
   }
 
   wallPoly(o, f, l, side, a, b) {
@@ -926,8 +1261,241 @@ class Walker {
       safe_fins: n, gate: SPLIT_GATE });
   }
 
+  // -- shape pieces -------------------------------------------------------
+  // Mirrors layout.py's methods of the same names, brush for brush and in the
+  // same order: the golden fixture compares them one by one.
+
+  stairs(length, rise, count, tex = "floor", walls = [1, -1]) {
+    const [o, f, l] = this.frame();
+    const half = this.w / 2.0;
+    const z0 = this.z;
+    const tread = length / count, step = rise / count;
+    const lo = z0 + Math.min(0.0, rise), hi = z0 + Math.max(0.0, rise);
+    const base = lo - FLOOR_THICK;
+    for (let n = 0; n < count; n++) {
+      const poly = rect(o, f, l, n * tread, (n + 1) * tread, half, half);
+      this.add(Prism.flat(poly, base, z0 + step * (n + 1), tex, this.heading));
+      this.c.floorPolys.push([poly, tex]);
+    }
+    for (const side of [1, -1]) {
+      if (walls.includes(side)) {
+        this.add(Prism.flat(this.wallPoly(o, f, l, side, 0, length), base, hi + WALL_HEIGHT, "wall"));
+      } else {
+        const b = side > 0 ? band(o, f, l, 0, length, half - EDGE_BAND, half)
+          : band(o, f, l, 0, length, -half, -half + EDGE_BAND);
+        this.add(Prism.flat(b, base, hi + 1, "edge"));
+      }
+    }
+    this.hull(rect(o, f, l, 0, length, half + WALL_THICK, half + WALL_THICK), base, hi + WALL_HEIGHT);
+    this.c.features.push({ type: "stairs", segment: this.seg, steps: count,
+      step: pyRound(Math.abs(step), 1) });
+    this.advance(length, rise);
+  }
+
+  platforms(length, count, drop, tex = "platform", walls = [1, -1]) {
+    const [o, f, l] = this.frame();
+    const half = this.w / 2.0;
+    const z0 = this.z;
+    const cell = length / count;
+    const stone = cell * PLATFORM_FILL;
+    const lo = z0 + Math.min(0.0, drop), hi = z0 + Math.max(0.0, drop);
+    const base = lo - FLOOR_THICK - VOID_DEPTH;
+    for (const side of [1, -1]) {
+      if (walls.includes(side)) {
+        this.add(Prism.flat(this.wallPoly(o, f, l, side, 0, length), base, hi + WALL_HEIGHT, "wall"));
+      }
+    }
+    for (let n = 0; n < count; n++) {
+      const a = (n + 1) * cell - stone;
+      const z = z0 + (drop * (n + 1)) / count;
+      const poly = rect(o, f, l, a, a + stone, half, half);
+      this.add(Prism.flat(poly, z - FLOOR_THICK, z, tex, this.heading));
+      this.c.floorPolys.push([poly, tex]);
+    }
+    this.hull(rect(o, f, l, 0, length, half + WALL_THICK, half + WALL_THICK), base, hi + WALL_HEIGHT);
+    this.c.features.push({ type: "platforms", segment: this.seg, stones: count,
+      hole: pyRound(cell - stone) });
+    this.advance(length, drop);
+  }
+
+  pillars(length, count, tex = "floor", walls = [1, -1]) {
+    const [o, f, l] = this.frame();
+    const half = this.w / 2.0;
+    const pw = PILLAR_MIN;
+    this.boxRun(length, { tex, walls });
+    const cell = length / count;
+    const spots = Array.from({ length: count }, (_, n) => cell * (n + 0.5));
+    for (const a of spots) {
+      const poly = band(o, f, l, a - pw / 2.0, a + pw / 2.0, -pw / 2.0, pw / 2.0);
+      this.add(Prism.flat(poly, this.z - FLOOR_THICK, this.z + WALL_HEIGHT, "pylon"));
+    }
+    const lane = (half - pw / 2.0) / 2.0;
+    this.reroute(o, f, l, spots.map((a, n) => [a, n % 2 ? lane : -lane]));
+    this.c.features.push({ type: "pillars", segment: this.seg, pillars: count,
+      gate: pyRound(half - pw / 2.0) });
+  }
+
+  tunnel(length, height, tex = "floor") {
+    const [o, f, l] = this.frame();
+    const half = this.w / 2.0;
+    const z0 = this.z;
+    this.boxRun(length, { tex });
+    const poly = rect(o, f, l, 0, length, half + WALL_THICK, half + WALL_THICK);
+    this.add(Prism.flat(poly, z0 + height, z0 + height + ROOF_THICK_TUNNEL, "wall"));
+    this.hull(poly, z0 - FLOOR_THICK, z0 + height + ROOF_THICK_TUNNEL);
+    this.c.features.push({ type: "tunnel", segment: this.seg, height });
+  }
+
+  chicane(direction, angle, radius, walls = true, tex = "floor") {
+    const other = direction === "left" ? "right" : "left";
+    this.turn(direction, angle, radius, walls, tex);
+    this.turn(other, angle, radius, walls, tex);
+    this.c.features.push({ type: "chicane", segment: this.seg, angle,
+      offset: pyRound(2 * radius * (1 - Math.cos(radians(angle)))) });
+  }
+
+  bumps(length, count, rise, tex = "floor", walls = [1, -1]) {
+    const cell = length / count;
+    for (let n = 0; n < count; n++) {
+      this.boxRun(cell / 2.0, { rise, tex, walls });
+      this.boxRun(cell / 2.0, { rise: -rise, tex, walls });
+    }
+    this.c.features.push({ type: "bumps", segment: this.seg, bumps: count, rise });
+  }
+
+  pinch(length, gate, tex = "floor", walls = [1, -1]) {
+    const [o, f, l] = this.frame();
+    const half = this.w / 2.0;
+    this.boxRun(length, { tex, walls });
+    for (const side of [1, -1]) {
+      const [lo, hi] = side > 0 ? [gate / 2.0, half] : [-half, -gate / 2.0];
+      this.add(Prism.flat(band(o, f, l, 0, length, lo, hi),
+        this.z - FLOOR_THICK, this.z + WALL_HEIGHT, "pylon"));
+    }
+    this.c.features.push({ type: "pinch", segment: this.seg, gate });
+  }
+
+  ledge(length, direction, width, tex = "floor") {
+    const [o, f, l] = this.frame();
+    const half = this.w / 2.0;
+    const z = this.z;
+    const sign = direction === "left" ? 1.0 : -1.0;
+    this.stripe("edge", -32, 0);
+    this.boxRun(length, { floor: false, wallFloor: z - FLOOR_THICK - VOID_DEPTH });
+    const [lo, hi] = sign > 0 ? [half - width, half] : [-half, -half + width];
+    const poly = band(o, f, l, 0, length, lo, hi);
+    this.add(Prism.flat(poly, z - FLOOR_THICK, z, tex, this.heading));
+    this.c.floorPolys.push([poly, tex]);
+    this.reroute(o, f, l, [[length / 2.0, sign * (half - width / 2.0)]]);
+    this.c.features.push({ type: "ledge", segment: this.seg, width, side: direction });
+  }
+
+  hazard(length, walls = [1, -1]) {
+    const [o, f, l] = this.frame();
+    const half = this.w / 2.0;
+    const z = this.z;
+    this.boxRun(length, { floor: false, wallFloor: z - HAZARD_DEPTH - FLOOR_THICK, walls });
+    const poly = rect(o, f, l, 0, length, half, half);
+    this.add(Prism.flat(poly, z - HAZARD_DEPTH - FLOOR_THICK, z - HAZARD_DEPTH, "hazard", this.heading));
+    this.c.floorPolys.push([poly, "hazard"]);
+    this.c.landmarks.push(["hazard", [this.x, this.y, z], this.heading]);
+    this.c.entities.push([{ classname: "trigger_hurt", dmg: 9999 },
+      [Prism.flat(poly, z - HAZARD_DEPTH, z - HAZARD_LIP, "trigger")]]);
+    this.c.features.push({ type: "hazard", segment: this.seg, length });
+  }
+
+  strafepads(count, spacing, curve, tex = "platform") {
+    const total = Number(count) * spacing;
+    const [o, f, l] = this.frame();
+    const h0 = this.heading;
+    const half = this.w / 2.0;
+    const pad = STRAFE_PAD_LEN;
+    const z = this.z;
+    const sweep = Math.abs(curve);
+    const sign = curve > 0 ? 1.0 : -1.0;
+    const r = sweep ? total / radians(sweep) : 0.0;
+    let cx = 0.0, cy = 0.0, a0 = 0.0;
+    if (sweep) {
+      cx = o[0] + l[0] * r * sign; cy = o[1] + l[1] * r * sign;
+      a0 = Math.atan2(o[1] - cy, o[0] - cx);
+    }
+    const at = (dist) => {
+      if (!sweep) return [[o[0] + f[0] * dist, o[1] + f[1] * dist], h0];
+      const a = a0 + radians(sweep) * (dist / total) * sign;
+      return [[cx + r * Math.cos(a), cy + r * Math.sin(a)], h0 + (sign * sweep * dist) / total];
+    };
+    for (let n = 0; n < count; n++) {
+      const [[px, py], hd] = at((n + 0.5) * spacing);
+      const ph = radians(hd);
+      const pf = [Math.cos(ph), Math.sin(ph)], pl = [-Math.sin(ph), Math.cos(ph)];
+      const poly = rect([px, py], pf, pl, -pad / 2.0, pad / 2.0, half, half);
+      this.add(Prism.flat(poly, z - FLOOR_THICK, z, tex, hd));
+      this.c.floorPolys.push([poly, tex]);
+      this.hull(poly, z - FLOOR_THICK, z);
+      this.c.route.push([px, py, z]);
+    }
+    const [[ex, ey]] = at(total);
+    this.x = ex; this.y = ey;
+    this.heading = pymod(h0 + sign * sweep, 360.0);
+    this.c.length += total;
+    this.c.route.push([this.x, this.y, this.z]);
+    this.c.landmarks.push(["strafepads", [o[0], o[1], z], h0]);
+    this.c.features.push({ type: "strafepads", segment: this.seg, pads: count,
+      spacing: pyRound(spacing), gap: pyRound(spacing - pad), curve });
+  }
+
+  // -- shifting and rotating a piece --------------------------------------
+
+  mouth() {
+    const [o, , l] = this.frame();
+    const half = this.w / 2.0;
+    return [[[o[0] + l[0] * half, o[1] + l[1] * half],
+      [o[0] - l[0] * half, o[1] - l[1] * half]], this.frame()[1]];
+  }
+
+  // Move the cursor sideways (`shift`, + is left) and turn it on the spot
+  // (`rotate`, + is left) before the piece is laid. Both are cursor
+  // transforms, which is why every piece kind gets them without knowing they
+  // exist: frame() is what each piece builds from.
+  nudge(seg) {
+    const shift = seg.shift || 0;
+    const rot = seg.rotate || 0;
+    if (!shift && !rot) return;
+    const before = this.mouth();
+    if (shift) {
+      const [, , l] = this.frame();
+      this.x += l[0] * shift;
+      this.y += l[1] * shift;
+      this.c.length += Math.abs(shift);
+      this.c.route.push([this.x, this.y, this.z]);
+    }
+    if (rot) this.heading = pymod(this.heading + rot, 360.0);
+    this.joint(before);
+  }
+
+  // Floor bridging the seam a nudge opened. Both cross-sections are extruded
+  // a little along their own heading and the plate is the convex hull of all
+  // of it — the extrusion is what makes a plain sideways shift work (on its
+  // own it moves the cursor ALONG its cross-section, so the four corners are
+  // collinear), and the hull is what keeps a hard rotation a valid brush.
+  // The plate sits a unit under the floor for the reason stripe() does.
+  joint(before) {
+    const [ptsB, fb] = before;
+    const [ptsA, fa] = this.mouth();
+    const d = JOINT_DEPTH;
+    const plate = convexHull([...ptsB, ...ptsB.map(([x, y]) => [x - fb[0] * d, y - fb[1] * d]),
+      ...ptsA, ...ptsA.map(([x, y]) => [x + fa[0] * d, y + fa[1] * d])]);
+    if (plate.length < 3 || polyArea(plate) < 16.0) return;
+    const top = this.z - 1;
+    this.add(Prism.flat(plate, top - FLOOR_THICK, top, "floor", this.heading));
+    this.c.floorPolys.push([plate, "floor"]);
+    this.hull(plate, top - FLOOR_THICK, this.z + WALL_HEIGHT);
+  }
+
   laySegment(i, seg, segs, auto) {
     const t = seg.type;
+    // Sideways and on the spot, before anything is laid: see nudge().
+    this.nudge(seg);
     const sides = seg.open ? [] : [1, -1];
     const tex = seg.ice ? "ice" : "floor";
     if (t === "straight") {
@@ -964,7 +1532,7 @@ class Walker {
       this.runup = SPLIT_MOUTH;
     } else if (t === "wallclimb") {
       if (this.runup + seg.length / 2.0 < WALL_RUNUP) {
-        this.problems.push(
+        this.note(
           `segment ${i} (wallclimb): only ${int(this.runup + seg.length / 2)} ` +
           `units of flat floor before its ledge; it needs ${WALL_RUNUP} ` +
           "(a ramp resets it, because a jump off a ramp flies high enough " +
@@ -976,6 +1544,40 @@ class Walker {
       this.gap(i, seg, segs, seg.direction);
     } else if (t === "dash") {
       this.dash(i, seg, segs);
+    } else if (t === "stairs") {
+      this.stairs(seg.length, seg.rise, seg.count, tex, sides);
+      // A staircase is not flat floor: it cannot be the run-up to a jump.
+      this.runup = 0.0;
+    } else if (t === "platforms") {
+      this.platforms(seg.length, seg.count, seg.drop ?? 0, "platform", sides);
+      // The last stone is the only footing, and it is one stone long.
+      this.runup = (seg.length / seg.count) * PLATFORM_FILL;
+    } else if (t === "pillars") {
+      this.pillars(seg.length, seg.count, tex, sides);
+      this.runup += seg.length;
+    } else if (t === "tunnel") {
+      this.tunnel(seg.length, seg.height, tex);
+      this.runup += seg.length;
+    } else if (t === "chicane") {
+      this.chicane(seg.direction, seg.angle, seg.radius, sides.length > 0, tex);
+      this.runup += 2 * radians(seg.angle) * seg.radius;
+    } else if (t === "bumps") {
+      this.bumps(seg.length, seg.count, seg.rise, tex, sides);
+      // Like a ramp: a jump off a hump leaves with the hump's own lift.
+      this.runup = 0.0;
+    } else if (t === "pinch") {
+      this.pinch(seg.length, seg.gate, tex, sides);
+      this.runup += seg.length;
+    } else if (t === "ledge") {
+      this.ledge(seg.length, seg.direction, seg.ledge_width, tex);
+      this.runup += seg.length;
+    } else if (t === "hazard") {
+      this.hazard(seg.length, sides);
+      this.runup = 0.0;
+    } else if (t === "strafepads") {
+      this.strafepads(seg.count, seg.spacing, seg.curve ?? 0, seg.ice ? "ice" : "platform");
+      // One pad is all the footing there is.
+      this.runup = STRAFE_PAD_LEN;
     }
   }
 
@@ -995,7 +1597,8 @@ class Walker {
       const t = seg.type;
       const open = !!seg.open;
       if (open) this.c.openSegs.add(i);
-      if (open || ["gap", "wallgap", "dash", "beam", "split"].includes(t)) this.c.falloffSegs.add(i);
+      if (open || ["gap", "wallgap", "dash", "beam", "split",
+        "platforms", "ledge", "hazard", "strafepads"].includes(t)) this.c.falloffSegs.add(i);
       this.laySegment(i, seg, segs, auto);
     });
     this.seg = segs.length;
@@ -1008,7 +1611,11 @@ class Walker {
     return this.c;
   }
 
+  // The one set of limits BOTH tiers enforce: past them the map does not
+  // compile, or does not load, or hurts every server that holds it. The open
+  // tier's are further out (OPEN above), not absent.
   sizeLimits() {
+    const { extentXY, extentZ, brushes: bmax } = this.L;
     let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
     for (const p of this.c.world) {
       for (const [x, y] of p.poly) {
@@ -1017,14 +1624,14 @@ class Walker {
       z0 = Math.min(z0, p.zmin); z1 = Math.max(z1, p.zmax());
     }
     const dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
-    if (Math.max(dx, dy) > EXTENT_MAX_XY) {
-      this.problems.push(`the course spreads ${int(dx)} x ${int(dy)} units; at most ${EXTENT_MAX_XY} ` +
+    if (Math.max(dx, dy) > extentXY) {
+      this.problems.push(`the course spreads ${int(dx)} x ${int(dy)} units; at most ${extentXY} ` +
         "in each direction (fold it back on itself with turns)");
     }
-    if (dz > EXTENT_MAX_Z) this.problems.push(`the course is ${int(dz)} units tall; at most ${EXTENT_MAX_Z}`);
+    if (dz > extentZ) this.problems.push(`the course is ${int(dz)} units tall; at most ${extentZ}`);
     const brushes = brushCount(this.c);
-    if (brushes > BRUSH_MAX) {
-      this.problems.push(`the course needs ${brushes} brushes; at most ${BRUSH_MAX} ` +
+    if (brushes > bmax) {
+      this.problems.push(`the course needs ${brushes} brushes; at most ${bmax} ` +
         "(fewer slalom fins, splits or tight turns)");
     }
   }
@@ -1050,7 +1657,7 @@ class Walker {
   landing(where, i, segs) {
     const nxt = i + 1 < segs.length ? segs[i + 1].type : "finish";
     if (!LANDINGS.includes(nxt)) {
-      this.problems.push(`${where}: must land on a ${LANDINGS.slice(0, -1).join(", ")} or ` +
+      this.note(`${where}: must land on a ${LANDINGS.slice(0, -1).join(", ")} or ` +
         `${LANDINGS[LANDINGS.length - 1]}, not on ${pyRepr(nxt)}`);
     }
   }
@@ -1059,12 +1666,12 @@ class Walker {
     const kind = kick ? "wallgap" : "gap";
     const where = `segment ${i} (${kind})`;
     if (kick && this.runup < WALL_RUNUP) {
-      this.problems.push(
+      this.note(
         `${where}: only ${int(this.runup)} units of flat floor before it; a wall-kick ` +
         `gap needs ${WALL_RUNUP} (straights and turns; a ramp resets it, ` +
         "because a jump off a ramp flies high enough to skip the kick)");
     } else if (this.runup < MIN_RUNUP) {
-      this.problems.push(
+      this.note(
         `${where}: only ${int(this.runup)} units of flat floor before it; a gap ` +
         `needs ${int(MIN_RUNUP)} of straight/turn run-up (ramps and ` +
         "other gaps reset it)");
@@ -1149,7 +1756,7 @@ class Walker {
           continue;
         }
         if (satOverlap(a.poly, b.poly)) {
-          this.problems.push(`course runs into itself: ${segname(a.seg)} overlaps ${segname(b.seg)}`);
+          this.note(`course runs into itself: ${segname(a.seg)} overlaps ${segname(b.seg)}`);
           this.c.collision = [a.seg, b.seg];
           return;
         }
@@ -1193,7 +1800,7 @@ class Walker {
           gap: pyRound(gap), needs_ups: pyRound(needed) });
         const how = gap <= 1.0 ? `drop straight down onto ${segname(tgt)}`
           : `jump the ${int(gap)} units to ${segname(tgt)} at only ${int(needed)} ups`;
-        this.problems.push(
+        this.note(
           `unintended shortcut: from ${segname(src)} a player can ${how}, skipping ` +
           `about ${int(saved)} units of the course. Both are open, so there is ` +
           "nothing in the way — give the later one walls (drop its \"open\": " +
@@ -1276,25 +1883,28 @@ export function brushCount(course) {
 // layout's own. Unlike layout.build(), a course is returned even when layout
 // found problems, so the editor can show WHERE the course runs into itself;
 // course is null only when the ranges are wrong or the walk itself fails.
-export function build(spec) {
-  const problems = validate(spec);
+// `rules` is the tier: "strict" is the generator's (described maps, random_map
+// tiles), "open" is the map editor's. See STRICT / OPEN above.
+export function build(spec, rules = "strict") {
+  const problems = validate(spec, rules);
   if (problems.length) return { problems, course: null };
   let course;
-  const w = new Walker(spec);
+  const w = new Walker(spec, rules);
   try {
     course = w.run();
   } catch (e) {
     return { problems: [`layout failed: ${e.message}`], course: null };
   }
-  return { problems: w.problems, course };
+  return { problems: w.problems, course, notes: course.notes };
 }
 
 // Lay the course out regardless of name/title problems: those are words, not
 // geometry, and the editor should keep drawing while a title is half-typed.
-export function preview(spec) {
-  const geometric = validate({ ...spec, name: "gen_preview", title: "Preview" });
+export function preview(spec, rules = "strict") {
+  const named = { ...spec, name: "gen_preview", title: "Preview" };
+  const geometric = validate(named, rules);
   if (geometric.length) return { problems: geometric, course: null };
-  return build({ ...spec, name: "gen_preview", title: "Preview" });
+  return build(named, rules);
 }
 
 // The facts the build report will carry, from a laid-out course.

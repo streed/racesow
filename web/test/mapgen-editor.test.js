@@ -12,6 +12,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import { ADMIN_URL } from "./pg-util.js";
+import * as mg from "../public/assets/js/mapgen-course.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_JS = path.join(__dirname, "..", "server.js");
@@ -75,18 +76,46 @@ const ICY = {
 
 test("a refused course costs nothing and says why", async () => {
   const bob = as("203.0.113.20");
-  const r = await bob.post("/mapgen/spec", { spec: { ...ICY, segments: [
-    { type: "ramp", length: 512, rise: -128 }, { type: "gap", length: 96, drop: 0 }, { type: "straight", length: 512 }] } });
-  assert.equal(r.status, 400);
-  assert.ok(r.json.problems.some((p) => p.includes("run-up")), r.json.problems.join(" | "));
   const bad = await bob.post("/mapgen/spec", { spec: { ...ICY, title: "<script>" } });
   assert.equal(bad.status, 400);
   assert.ok(bad.json.problems.some((p) => p.startsWith("title")));
   for (const junk of [{}, { spec: [] }, { spec: { segments: "x" } }, { spec: { segments: [null] } },
-    { spec: { ...ICY, segments: Array(200).fill({ type: "straight", length: 128 }) } }]) {
+    // Past the editor's own cap, and past the cheap shape check before it.
+    { spec: { ...ICY, segments: Array(300).fill({ type: "straight", length: 128 }) } },
+    { spec: { ...ICY, segments: Array(900).fill({ type: "straight", length: 128 }) } },
+    // A number no control here could produce: the course could not be built.
+    { spec: { ...ICY, segments: [{ type: "tunnel", length: 512, height: 99999 }] } }]) {
     assert.equal((await bob.post("/mapgen/spec", junk)).status, 400, JSON.stringify(junk).slice(0, 60));
   }
   assert.equal((await bob.get("/mapgen/quota")).json.used, 0);
+});
+
+test("a hand-built course is held to the editor's tier, not the generator's", async () => {
+  // The rules about how pieces fit TOGETHER are the generator's, for maps
+  // nobody looks at before they are in the pool. A person laid this one out
+  // and an admin approves it, so a gap with no run-up is theirs to judge.
+  const dave = as("203.0.113.70");
+  const noRunup = { ...ICY, segments: [
+    { type: "ramp", length: 512, rise: -128 },
+    { type: "gap", length: 96, drop: 0 },
+    { type: "straight", length: 512 }] };
+  assert.ok(mg.validate(noRunup, "strict").length === 0, "the ranges themselves are fine");
+  assert.ok(mg.build(noRunup, "strict").problems.some((p) => p.includes("run-up")),
+    "the generator's tier refuses it");
+  const r = await dave.post("/mapgen/spec", { spec: noRunup });
+  assert.equal(r.status, 202, JSON.stringify(r.json).slice(0, 200));
+  // ...and the finding survives as a note, for the admin reviewing it.
+  assert.ok(mg.build(noRunup, "open").notes.some((p) => p.includes("run-up")));
+
+  // Numbers far past the generator's band are the editor's to allow, too.
+  const wide = { ...ICY, name: "gen_wide_by_hand", segments: [
+    { type: "straight", length: 9000, shift: 900, rotate: 120 },
+    { type: "turn", direction: "left", angle: 37, radius: 300 },
+    { type: "strafepads", count: 20, spacing: 900, curve: 200 }] };
+  assert.ok(mg.validate(wide, "strict").length >= 4, "the generator's tier refuses every one");
+  assert.deepEqual(mg.validate(wide, "open"), []);
+  const eve = as("203.0.113.71");
+  assert.equal((await eve.post("/mapgen/spec", { spec: wide })).status, 202);
 });
 
 test("an accepted course waits for an admin, as an editor job, spec and all", async () => {

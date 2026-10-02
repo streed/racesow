@@ -70,10 +70,28 @@ import re
 
 import physics
 
-SEGMENT_TYPES = ("straight", "turn", "ramp", "gap", "checkpoint", "slalom", "beam", "split",
-                 "wallclimb", "wallgap", "dash")
-OPENABLE = ("straight", "turn", "ramp", "gap")
-ICEABLE = ("straight", "turn", "ramp", "slalom")
+# What the language model is taught to write (describe.py's prompt documents
+# every one of these, and SEGMENT_SCHEMA's enum is built from them). A
+# described map goes in the pool with nobody having looked at it, so the
+# model's vocabulary is kept to the pieces whose rules the prompt can state.
+MODEL_SEGMENT_TYPES = ("straight", "turn", "ramp", "gap", "checkpoint", "slalom", "beam",
+                       "split", "wallclimb", "wallgap", "dash")
+# ...and what the map editor can lay as well. These are shape rather than
+# move: corridor built differently, asking nothing of the player that
+# physics.py has to model. A person picks them, sees the result, and an admin
+# approves it, so they need no prompt to explain them — and keeping them out
+# of the model's enum means it can never reach for one it was not told about.
+EDITOR_SEGMENT_TYPES = ("stairs", "platforms", "pillars", "tunnel", "chicane", "bumps",
+                        "pinch", "ledge", "hazard", "strafepads")
+SEGMENT_TYPES = MODEL_SEGMENT_TYPES + EDITOR_SEGMENT_TYPES
+# A piece can be open (no side walls, floating over the void) if it HAS side
+# walls to lose and a floor to paint the edge of.
+OPENABLE = ("straight", "turn", "ramp", "gap", "stairs", "platforms", "pillars",
+            "chicane", "bumps", "pinch", "hazard")
+# Ice floors a piece. Anything with a walking surface can carry it; a piece
+# that is only jumped from has nothing to be slick.
+ICEABLE = ("straight", "turn", "ramp", "slalom", "stairs", "platforms", "pillars",
+           "tunnel", "chicane", "bumps", "pinch", "ledge", "strafepads")
 TURN_ANGLES = (45, 90, 135, 180)
 NAME_RE = re.compile(r"^gen_[a-z0-9_]{2,36}$")
 # The title is the one free-text field the model writes, and it lands in the
@@ -138,6 +156,213 @@ WALL_RUNUP = 384
 DASH_DROP = (384, 1024)
 DASH_PAD = 192
 
+# -- the pieces that are shape rather than move -----------------------------
+# None of these ask anything of the player that physics.py has to model: they
+# are corridor, laid differently. That is why their bounds are mostly about
+# the geometry closing (a fin that does not touch the next one, a gate a
+# player fits through) rather than about what a run can clear.
+FIN_THICK = 32           # layout.FIN_THICK; a test keeps the two in step
+PLAYER_WIDTH = 32        # the engine's own player box, and the floor of every gate
+
+# Stairs: `count` steps over `length`, climbing or dropping `rise` in total.
+# A step taller than the engine's step height has to be jumped, which is
+# allowed (it is just a harder staircase) but never generated.
+STAIRS_RISE_MAX = 2048
+STAIR_TREAD_MIN = 16     # a tread shorter than this is a wall, not a step
+# Platforms: `count` stepping stones with a hole between each, over a pit.
+PLATFORM_MIN = 64        # a stone shorter than this is not a landing
+PLATFORM_FILL = 0.55     # of each stone-and-hole cell that is stone
+# Bumps: a rolling floor of `count` humps, each a rise and a fall.
+BUMP_MIN = 64            # shorter than this and a hump is a kerb
+# Pillars: columns standing clear of both walls, to weave around.
+PILLAR_MIN = 48
+PILLAR_CLEAR = 64        # gate left between a pillar and each wall
+# Tunnel: a roofed straight. The roof has to clear a jump or the piece is a
+# trap, which the strict tier insists on and the editor may ignore.
+TUNNEL_MIN = 96          # the player box is 56 tall; this is crawl-free headroom
+TUNNEL_SAFE = 160        # clears a jump, so the roof is scenery and not a trap
+# Pinch: the corridor narrows to `gate` for the length of the piece.
+PINCH_MIN = PLAYER_WIDTH + 16
+PINCH_BITE = 32          # each side must take at least this much
+# Ledge: a walkway along one wall, the rest of the corridor void.
+LEDGE_MIN = 48
+LEDGE_CLEAR = 64         # void left between the ledge and the far wall
+# Hazard: a strip of lethal floor, jumped like a gap but with ground to land
+# short on. The strict tier keeps it inside a run-speed jump.
+HAZARD_MIN = 64
+# Strafe pads: a line of pads over the void with a gap between each, taken by
+# strafe-jumping from one to the next. `count` pads, `spacing` centre to
+# centre, and `curve` degrees of bend across the whole run -- signed, so one
+# control runs from a left arc through dead straight to a right arc.
+STRAFE_PAD_LEN = 128     # the pad itself, along the run
+STRAFE_GAP_MIN = 32      # a pad run with no gap between pads is just a floor
+# Chicane: a left-right (or right-left) pair of turns that leaves the course
+# pointing the way it came in, offset sideways. Its bounds are a turn's.
+CHICANE_ANGLE = (10, 90)
+
+# -- shifting and rotating a piece ------------------------------------------
+# Every piece may carry `shift` (sideways, + is left) and `rotate` (degrees,
+# + is left) applied BEFORE it is laid. They are cursor transforms, which is
+# why they work on every piece kind without any piece knowing about them, and
+# layout._joint bridges the seam they open so a modest nudge stays walkable.
+# The strict tier keeps both small: a described course should read as a course,
+# not as pieces scattered near each other.
+SHIFT_MAX = 4096
+ROTATE_MAX = 180
+STRICT_SHIFT_MAX = 256
+STRICT_ROTATE_MAX = 30
+
+# ---------------------------------------------------------------------------
+# Two rule tiers.
+#
+# "strict" is the generator's own, and every bound in it is one physics.py can
+# defend. A described map (describe.py) and every random_map tile (tiles.py)
+# go in the pool with nobody having looked at them, so they have to be
+# raceable by construction: a gap no wider than a jump reaches, a ledge no
+# higher than a wall jump climbs, a run-up before every take-off.
+#
+# "open" is the map editor. A person is laying the course out piece by piece,
+# they can see it as they go, and an admin approves it before it is built — so
+# the judgement the strict tier has to make by rule, this tier leaves to them.
+# What survives are the limits that decide whether the map can be COMPILED and
+# LOADED at all: geometry that closes instead of turning inside out, a world
+# inside the compiler's reach, and a brush count a server can hold. Nothing
+# here is about whether the course is fair or even possible.
+#
+# The editor still OFFERS the strict numbers — PIECES.make() in
+# mapgen-pieces.js builds every new piece from them, so the default course is
+# a sane one. These wider bounds are only how far a value may be pushed by
+# hand once someone means to.
+# ---------------------------------------------------------------------------
+
+class Tier:
+    """The bounds and switches one rule tier applies.
+
+    `physics` is the difference that matters: with it off, lengths and heights
+    are no longer measured against what a player can actually do, which is
+    the whole of what "the editor is less strict" means."""
+
+    def __init__(self, name, **kw):
+        self.name = name
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+STRICT = Tier(
+    "strict",
+    physics=True,            # measure every take-off against physics.py
+    combine=True,            # run-ups, landings, self-intersection, cuts (layout.py)
+    angles=TURN_ANGLES,      # the four angles the model may ask for
+    angle_range=None,
+    route=ROUTE_MAX,
+    segments=MAX_SEGMENTS,
+    width=(WIDTH_MIN, WIDTH_MAX),
+    straight=(STRAIGHT_MIN, STRAIGHT_MAX),
+    ramp=(RAMP_MIN, RAMP_MAX),
+    rise=1024,
+    slope=None,              # None: physics.max_ramp_slope(), i.e. 30 degrees
+    radius_slack=64,         # centre-line radius floor over half the width
+    radius_max=TURN_RADIUS_MAX,
+    gap=(GAP_MIN, 4096),
+    drop_max=DROP_MAX,
+    drop_min=None,           # None: -physics.max_rise()
+    slalom_count=SLALOM_COUNT,
+    slalom_spacing=SLALOM_SPACING,
+    beam=(STRAIGHT_MIN, 2048),
+    beam_clear=BEAM_WALL_CLEAR,
+    split_count=SPLIT_COUNT,
+    split_runway=SPLIT_RUNWAY,
+    wallclimb_rise=WALLCLIMB_RISE,
+    wallclimb_min=WALLCLIMB_MIN,
+    wallgap_drop=WALLGAP_DROP,
+    dash_drop=DASH_DROP,
+    chicane_angle=(10, 90),
+    bumps_rise=(16, 256),
+    pads_count=(2, 16),
+    pads_spacing=(STRAFE_PAD_LEN + STRAFE_GAP_MIN, 512),
+    pads_curve=90,
+    stairs_count=(2, 32),
+    platforms_count=(2, 12),
+    pillars_count=(1, 12),
+    bumps_count=(1, 12),
+    tunnel_height=(TUNNEL_SAFE, 512),
+    pinch_gate=(PINCH_MIN, None),      # None: width - 2 * PINCH_BITE
+    ledge_width=(LEDGE_MIN, None),     # None: width - LEDGE_CLEAR
+    hazard=(HAZARD_MIN, None),         # None: physics.max_gap(0), it is jumped
+    shift=STRICT_SHIFT_MAX,
+    rotate=STRICT_ROTATE_MAX,
+    # The laid-out course's ceilings. This is where they are written down;
+    # layout.EXTENT_MAX_XY and friends are aliases of these three.
+    extent_xy=16384,
+    extent_z=8192,
+    brushes=1500,
+)
+
+# "Within reason" for every one of these means the same thing: the map still
+# compiles, still loads, and the piece is still the shape its name says. A
+# 64-unit corridor is tight but a 32-wide player fits; a 6,000-brush map is
+# heavy but it builds; a 71-degree ramp is a wall to run up but a fine one to
+# come down. Past these the geometry stops being geometry.
+OPEN = Tier(
+    "open",
+    physics=False,
+    combine=False,
+    angles=None,             # any angle, not just the model's four
+    angle_range=(5, 180),
+    route=200000,
+    segments=256,
+    width=(64, 2048),
+    straight=(32, 16384),
+    ramp=(32, 16384),
+    rise=8192,
+    slope=3.0,               # ~71 degrees: still a ramp, not a wall
+    radius_slack=8,          # the inner wall may almost pinch shut
+    radius_max=8192,
+    gap=(16, 8192),
+    drop_max=8192,
+    drop_min=-8192,
+    slalom_count=(1, 48),
+    slalom_spacing=FIN_THICK + PLAYER_WIDTH,   # fins that do not touch
+    beam=(32, 8192),
+    beam_clear=16,
+    split_count=(1, 24),
+    split_runway=32,
+    wallclimb_rise=(16, 1024),
+    wallclimb_min=64,
+    wallgap_drop=(-1024, 0),
+    dash_drop=(32, 4096),
+    chicane_angle=(5, 170),
+    bumps_rise=(8, 1024),
+    pads_count=(1, 64),
+    pads_spacing=(STRAFE_PAD_LEN + STRAFE_GAP_MIN, 4096),
+    pads_curve=270,
+    stairs_count=(1, 128),
+    platforms_count=(1, 48),
+    pillars_count=(1, 48),
+    bumps_count=(1, 48),
+    tunnel_height=(TUNNEL_MIN, 4096),
+    pinch_gate=(PINCH_MIN, None),
+    ledge_width=(LEDGE_MIN, None),
+    hazard=(HAZARD_MIN, 8192),
+    shift=SHIFT_MAX,
+    rotate=ROTATE_MAX,
+    # Further out, and still the compile-and-load limits rather than taste: a
+    # 30,000-unit spread keeps a centred course inside the compiler's own
+    # +-16,384 half-world, and 6,000 brushes builds in seconds and loads like
+    # any hand-made map already in the pool.
+    extent_xy=30000,
+    extent_z=16000,
+    brushes=6000,
+)
+
+TIERS = {"strict": STRICT, "open": OPEN}
+
+
+def tier(rules):
+    """The Tier named by `rules`; anything unknown is the strict one, so a
+    caller that forgets to pass it gets the safe tier, never the loose one."""
+    return TIERS.get(rules, STRICT)
+
 
 def wallgap_window(drop):
     """(shortest, longest) wall-kick gap up onto a ledge -drop higher: no
@@ -155,12 +380,22 @@ def dash_window(drop):
 def route_length(seg):
     """Centre-line length a segment adds to the route."""
     t = seg.get("type")
-    if t == "turn":
+    if t in ("turn", "chicane"):
         a = seg.get("angle")
-        return math.radians(a if isinstance(a, (int, float)) else 0) * seg.get("radius", 0)
+        a = math.radians(a if isinstance(a, (int, float)) else 0)
+        # A chicane is two arcs of the same angle, one each way.
+        return a * seg.get("radius", 0) * (2 if t == "chicane" else 1)
+    if t == "strafepads":
+        # The run is its pads end to end, however it bends.
+        n, sp = seg.get("count", 0), seg.get("spacing", 0)
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (n, sp)):
+            return 0.0
+        return float(n) * float(sp)
     if t == "checkpoint":
         return 0.0
     n = seg.get("length", 0)
+    if not isinstance(n, (int, float)) or isinstance(n, bool):
+        n = 0
     return float(n) + (DASH_PAD if t == "dash" else 0)
 
 
@@ -170,8 +405,14 @@ def split_hole():
     return int(physics.max_gap(0) * SPLIT_HOLE_FILL)
 
 
-def split_min_length(count):
-    return 2 * SPLIT_MOUTH + count * (SPLIT_RUNWAY + split_hole()) + SPLIT_LANDING
+def split_min_length(count, rules="strict"):
+    runway = tier(rules).split_runway
+    return 2 * SPLIT_MOUTH + count * (runway + split_hole()) + SPLIT_LANDING
+
+
+def platform_cell():
+    """The smallest stone-plus-hole a platforms piece can be cut into."""
+    return int(PLATFORM_MIN / PLATFORM_FILL)
 
 # The JSON Schema handed to the model as its structured-output format. It is
 # deliberately flat — every segment carries every field, irrelevant ones set
@@ -181,7 +422,7 @@ def split_min_length(count):
 SEGMENT_SCHEMA = {
     "type": "object",
     "properties": {
-        "type": {"type": "string", "enum": list(SEGMENT_TYPES)},
+        "type": {"type": "string", "enum": list(MODEL_SEGMENT_TYPES)},
         "length": {"type": "integer"},
         "direction": {"type": "string", "enum": ["left", "right", "none"]},
         "angle": {"type": "integer"},
@@ -212,9 +453,11 @@ SPEC_SCHEMA = {
 }
 
 
-def turn_radius_min(width):
-    """Centre-line radius below which the inner wall would pinch the corridor."""
-    return width // 2 + 64
+def turn_radius_min(width, rules="strict"):
+    """Centre-line radius below which the inner wall would pinch the corridor.
+    The editor's tier leaves only the geometric margin: at the strict slack a
+    corner is comfortable, at the open one the inner wall nearly closes."""
+    return width // 2 + tier(rules).radius_slack
 
 
 def normalize(spec):
@@ -232,24 +475,47 @@ def normalize(spec):
         "wallclimb": ("length", "rise", "direction"),
         "wallgap": ("length", "drop", "direction"),
         "dash": ("length", "drop"),
+        "stairs": ("length", "rise", "count", "open", "ice"),
+        "platforms": ("length", "count", "drop", "open", "ice"),
+        "pillars": ("length", "count", "open", "ice"),
+        "tunnel": ("length", "height", "ice"),
+        "chicane": ("direction", "angle", "radius", "open", "ice"),
+        "bumps": ("length", "count", "rise", "open", "ice"),
+        "pinch": ("length", "gate", "open", "ice"),
+        "ledge": ("length", "direction", "ledge_width", "ice"),
+        "hazard": ("length", "open"),
+        "strafepads": ("count", "spacing", "curve", "ice"),
     }
     out = {k: spec[k] for k in ("name", "title", "width") if k in spec}
     out["segments"] = []
     for seg in spec.get("segments", []):
         t = seg.get("type")
         clean = {"type": t}
-        for k in keep.get(t, ()):
+        # Every piece may be nudged sideways and turned on the spot, so these
+        # two survive normalize whatever the piece is.
+        for k in keep.get(t, ()) + ("shift", "rotate"):
             if k in seg:
                 clean[k] = seg[k]
         for flag in ("shortcut", "open", "ice"):
             if clean.get(flag) is False:
                 del clean[flag]     # the default; keep stored specs short
+        for z in ("shift", "rotate"):
+            if clean.get(z) == 0:
+                del clean[z]        # likewise: no nudge is the normal case
         out["segments"].append(clean)
     return out
 
 
-def validate(spec):
-    """Return a list of human-readable problems; empty means the ranges are ok."""
+def validate(spec, rules="strict"):
+    """Return a list of human-readable problems; empty means the ranges are ok.
+
+    `rules` names the tier (STRICT / OPEN above). The strict tier measures
+    every take-off against physics.py, so a described map or a random_map tile
+    is raceable by construction. The open tier — the map editor — keeps only
+    the bounds that decide whether the course can be built at all, and leaves
+    the rest to the person laying it out and the admin who approves it.
+    """
+    L = tier(rules)
     errs = []
     if not isinstance(spec, dict):
         return ["spec must be a JSON object"]
@@ -261,32 +527,36 @@ def validate(spec):
     title = spec.get("title")
     if not isinstance(title, str) or not TITLE_RE.match(title) or "  " in title:
         errs.append(f"title {title!r} must be 1-40 characters of letters, digits, single "
-                    "spaces and ' & ! ? , : - (no other punctuation), naming the course's theme")
+                    "spaces and \' & ! ? , : - (no other punctuation), naming the course\'s theme")
 
     width = spec.get("width")
-    if not isinstance(width, int) or not WIDTH_MIN <= width <= WIDTH_MAX:
-        errs.append(f"width {width!r} must be an integer in [{WIDTH_MIN}, {WIDTH_MAX}]")
+    if not isinstance(width, int) or not L.width[0] <= width <= L.width[1]:
+        errs.append(f"width {width!r} must be an integer in [{L.width[0]}, {L.width[1]}]")
         width = 384
 
     segs = spec.get("segments")
     if not isinstance(segs, list) or not segs:
-        errs.append("segments must be a non-empty list")
+        # The start and the finish are implicit, so this is the whole of
+        # "a course needs a start, a finish, and something in between".
+        errs.append("segments must be a non-empty list: a course needs at least one "
+                    "piece between its start and its finish")
         return errs
-    if len(segs) > MAX_SEGMENTS:
-        errs.append(f"{len(segs)} segments; at most {MAX_SEGMENTS}")
+    if len(segs) > L.segments:
+        errs.append(f"{len(segs)} segments; at most {L.segments}")
 
     route = 0.0
     for seg in segs:
         if not isinstance(seg, dict):
             continue
-        v = seg.get("radius" if seg.get("type") == "turn" else "length")
+        v = seg.get("radius" if seg.get("type") in ("turn", "chicane") else "length")
         if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
             route += route_length(seg)
-    if route > ROUTE_MAX:
-        errs.append(f"the route is {int(route)} units long; at most {ROUTE_MAX} "
-                    f"(about {ROUTE_MAX // 320} s at 320 ups)")
+    if route > L.route:
+        errs.append(f"the route is {int(route)} units long; at most {L.route} "
+                    f"(about {L.route // 320} s at 320 ups)")
 
-    slope = physics.max_ramp_slope()
+    slope = L.slope if L.slope is not None else physics.max_ramp_slope()
+    radius_min = turn_radius_min(width, rules)
     for i, seg in enumerate(segs):
         where = f"segment {i}"
         if not isinstance(seg, dict):
@@ -309,50 +579,74 @@ def validate(spec):
                 return None
             return v
 
+        def needs_width(least, why):
+            if width < least:
+                errs.append(f"{where}: needs width >= {least} ({why})")
+
         if "open" in seg and not isinstance(seg["open"], bool):
             errs.append(f"{where}: open must be true or false")
         elif seg.get("open") and t not in OPENABLE:
             errs.append(f"{where}: only {', '.join(OPENABLE)} can be open "
-                        "(the special-move pieces are open already)")
+                        "(the rest have no side walls to lose)")
         if "ice" in seg and not isinstance(seg["ice"], bool):
             errs.append(f"{where}: ice must be true or false")
         elif seg.get("ice") and t not in ICEABLE:
             errs.append(f"{where}: only {', '.join(ICEABLE)} can be ice "
-                        "(a piece that is jumped from or across keeps its grip)")
+                        "(a piece with no walking surface has nothing to be slick)")
 
-        def side():
+        # Every piece may be nudged sideways and turned on the spot.
+        if "shift" in seg:
+            num("shift", -L.shift, L.shift)
+        if "rotate" in seg:
+            num("rotate", -L.rotate, L.rotate)
+
+        def side(what="the side of the kick wall"):
             if seg.get("direction") not in ("left", "right"):
-                errs.append(f"{where}: direction (the side of the kick wall) must be "
-                            "'left' or 'right'")
+                errs.append(f"{where}: direction ({what}) must be \'left\' or \'right\'")
+
+        def arc(what):
+            """A turn\'s three fields, shared by turn and chicane."""
+            if seg.get("direction") not in ("left", "right"):
+                errs.append(f"{where}: direction must be \'left\' or \'right\'")
+            lo, hi = L.chicane_angle if what == "chicane" else (None, None)
+            a = seg.get("angle")
+            if what == "chicane":
+                whole("angle", lo, hi)
+            elif L.angles is not None:
+                if a not in L.angles:
+                    errs.append(f"{where}: angle {a!r} must be one of {L.angles}")
+            else:
+                whole("angle", *L.angle_range)
+            num("radius", radius_min, L.radius_max)
 
         if t == "straight":
-            num("length", STRAIGHT_MIN, STRAIGHT_MAX)
+            num("length", *L.straight)
         elif t == "turn":
-            if seg.get("direction") not in ("left", "right"):
-                errs.append(f"{where}: direction must be 'left' or 'right'")
-            if seg.get("angle") not in TURN_ANGLES:
-                errs.append(f"{where}: angle {seg.get('angle')!r} must be one of {TURN_ANGLES}")
-            num("radius", turn_radius_min(width), TURN_RADIUS_MAX)
+            arc("turn")
             if seg.get("shortcut"):
                 if seg.get("angle") != 180:
-                    errs.append(f"{where}: a shortcut needs a 180-degree turn, not {seg.get('angle')!r}")
-                for j, side in ((i - 1, "before"), (i + 1, "after")):
-                    nb = segs[j] if 0 <= j < len(segs) else None
-                    if (not isinstance(nb, dict) or nb.get("type") != "straight"
-                            or not isinstance(nb.get("length"), (int, float))
-                            or nb["length"] < SHORTCUT_MIN_LEG):
-                        errs.append(f"{where}: a shortcut needs a straight of at least "
-                                    f"{SHORTCUT_MIN_LEG} directly {side} the turn")
+                    errs.append(f"{where}: a shortcut needs a 180-degree turn, "
+                                f"not {seg.get('angle')!r}")
+                elif L.combine:
+                    for j, rel in ((i - 1, "before"), (i + 1, "after")):
+                        nb = segs[j] if 0 <= j < len(segs) else None
+                        if (not isinstance(nb, dict) or nb.get("type") != "straight"
+                                or not isinstance(nb.get("length"), (int, float))
+                                or nb["length"] < SHORTCUT_MIN_LEG):
+                            errs.append(f"{where}: a shortcut needs a straight of at least "
+                                        f"{SHORTCUT_MIN_LEG} directly {rel} the turn")
         elif t == "ramp":
-            length = num("length", RAMP_MIN, RAMP_MAX)
-            rise = num("rise", -1024, 1024)
+            length = num("length", *L.ramp)
+            rise = num("rise", -L.rise, L.rise)
             if length and rise is not None and abs(rise) > slope * length + 1e-6:
                 errs.append(f"{where}: rise {rise} over length {length} is steeper than "
-                            f"30 degrees; |rise| must be <= {int(slope * length)}")
+                            f"{round(math.degrees(math.atan(slope)))} degrees; "
+                            f"|rise| must be <= {int(slope * length)}")
         elif t == "gap":
-            drop = num("drop", -int(physics.max_rise()), DROP_MAX)
-            length = num("length", GAP_MIN, 4096)
-            if drop is not None and length is not None:
+            drop = num("drop", L.drop_min if L.drop_min is not None
+                       else -int(physics.max_rise()), L.drop_max)
+            length = num("length", *L.gap)
+            if L.physics and drop is not None and length is not None:
                 reach = physics.max_gap(drop)
                 if length > reach:
                     errs.append(f"{where}: a {length}-unit gap with drop {drop} is not "
@@ -360,49 +654,125 @@ def validate(spec):
         elif t == "checkpoint":
             pass
         elif t == "slalom":
-            length = num("length", STRAIGHT_MIN, STRAIGHT_MAX)
-            count = whole("count", *SLALOM_COUNT)
-            if width - SLALOM_GATE < SLALOM_FIN_MIN:
-                errs.append(f"{where}: a slalom needs width >= {SLALOM_GATE + SLALOM_FIN_MIN} "
-                            f"(a {SLALOM_GATE}-unit gate beside each fin)")
-            if length and count and length / (count + 1) < SLALOM_SPACING:
+            length = num("length", *L.straight)
+            count = whole("count", *L.slalom_count)
+            needs_width(SLALOM_GATE + SLALOM_FIN_MIN,
+                        f"a {SLALOM_GATE}-unit gate beside each fin")
+            if length and count and length / (count + 1) < L.slalom_spacing:
                 errs.append(f"{where}: {count} fins in {length} units are closer than "
-                            f"{SLALOM_SPACING}; length must be >= {SLALOM_SPACING * (count + 1)}")
+                            f"{L.slalom_spacing}; length must be >= "
+                            f"{L.slalom_spacing * (count + 1)}")
         elif t == "beam":
-            num("length", STRAIGHT_MIN, 2048)
-            num("beam_width", BEAM_MIN, width - 2 * BEAM_WALL_CLEAR)
+            num("length", *L.beam)
+            num("beam_width", BEAM_MIN, max(BEAM_MIN, width - 2 * L.beam_clear))
         elif t == "split":
-            if seg.get("direction") not in ("left", "right"):
-                errs.append(f"{where}: direction (the side of the fast lane with the holes) "
-                            "must be 'left' or 'right'")
-            count = whole("count", *SPLIT_COUNT)
-            length = num("length", STRAIGHT_MIN, STRAIGHT_MAX)
-            if (width - SPLIT_MEDIAN) / 2 < SPLIT_LANE_MIN:
-                errs.append(f"{where}: a split needs width >= {2 * SPLIT_LANE_MIN + SPLIT_MEDIAN} "
-                            f"for two {SPLIT_LANE_MIN}-unit lanes")
-            if length and count and length < split_min_length(count):
-                errs.append(f"{where}: {count} hole(s) need length >= {split_min_length(count)}")
+            side("the side of the fast lane with the holes")
+            count = whole("count", *L.split_count)
+            length = num("length", *L.straight)
+            needs_width(2 * SPLIT_LANE_MIN + SPLIT_MEDIAN,
+                        f"two {SPLIT_LANE_MIN}-unit lanes")
+            least = split_min_length(count, rules) if count else None
+            if length and least and length < least:
+                errs.append(f"{where}: {count} hole(s) need length >= {least}")
         elif t == "wallclimb":
             side()
-            num("length", WALLCLIMB_MIN, STRAIGHT_MAX)
-            whole("rise", *WALLCLIMB_RISE)
+            num("length", L.wallclimb_min, L.straight[1])
+            whole("rise", *L.wallclimb_rise)
         elif t == "wallgap":
             side()
-            drop = whole("drop", *WALLGAP_DROP)
-            length = num("length", GAP_MIN, 4096)
-            if drop is not None and length is not None:
+            drop = whole("drop", *L.wallgap_drop)
+            length = num("length", *L.gap)
+            if L.physics and drop is not None and length is not None:
                 lo, hi = wallgap_window(drop)
                 if not lo <= length <= hi:
                     errs.append(f"{where}: at drop {drop} a wall-kick gap must be {lo}-{hi} "
                                 "long; longer cannot be made even with the wall jump")
         elif t == "dash":
-            drop = whole("drop", *DASH_DROP)
-            length = num("length", GAP_MIN, 4096)
-            if drop is not None and length is not None:
+            drop = whole("drop", *L.dash_drop)
+            length = num("length", *L.gap)
+            if L.physics and drop is not None and length is not None:
                 lo, hi = dash_window(drop)
                 if not lo <= length <= hi:
                     errs.append(f"{where}: at drop {drop} a dash gap must be {lo}-{hi} long: "
                                 "shorter can be jumped, longer cannot be dashed")
+
+        # -- shape pieces ---------------------------------------------------
+        elif t == "stairs":
+            length = num("length", *L.straight)
+            count = whole("count", *L.stairs_count)
+            rise = num("rise", -min(L.rise, STAIRS_RISE_MAX), min(L.rise, STAIRS_RISE_MAX))
+            if length and count and length / count < STAIR_TREAD_MIN:
+                errs.append(f"{where}: {count} steps in {length} units leave treads under "
+                            f"{STAIR_TREAD_MIN}; length must be >= {STAIR_TREAD_MIN * count}")
+            if L.physics and count and rise is not None and abs(rise) / count > physics.STEP_SIZE:
+                errs.append(f"{where}: steps of {int(abs(rise) / count)} are taller than the "
+                            f"{int(physics.STEP_SIZE)}-unit step the engine walks up; use more "
+                            "steps or less rise")
+        elif t == "platforms":
+            length = num("length", *L.straight)
+            count = whole("count", *L.platforms_count)
+            drop = num("drop", L.drop_min if L.drop_min is not None
+                       else -int(physics.max_rise()), L.drop_max)
+            cell = platform_cell()
+            if length and count and length / count < cell:
+                errs.append(f"{where}: {count} stones need length >= {cell * count} "
+                            f"(each is a {PLATFORM_MIN}-unit landing and the hole before it)")
+            if L.physics and length and count:
+                hole = (length / count) * (1.0 - PLATFORM_FILL)
+                reach = physics.max_gap(drop or 0)
+                if hole > reach:
+                    errs.append(f"{where}: the holes are {int(hole)} units; at drop "
+                                f"{int(drop or 0)} a run-speed jump clears {int(reach)}")
+        elif t == "pillars":
+            length = num("length", *L.straight)
+            count = whole("count", *L.pillars_count)
+            needs_width(PILLAR_MIN + 2 * PILLAR_CLEAR,
+                        f"a {PILLAR_CLEAR}-unit gate either side of each pillar")
+            if length and count and length / count < FIN_THICK + PLAYER_WIDTH:
+                errs.append(f"{where}: {count} pillars in {length} units would touch; "
+                            f"length must be >= {(FIN_THICK + PLAYER_WIDTH) * count}")
+        elif t == "tunnel":
+            num("length", *L.straight)
+            num("height", *L.tunnel_height)
+        elif t == "chicane":
+            arc("chicane")
+        elif t == "bumps":
+            length = num("length", *L.straight)
+            count = whole("count", *L.bumps_count)
+            rise = num("rise", *L.bumps_rise)
+            if length and count and length / count < BUMP_MIN:
+                errs.append(f"{where}: {count} bumps in {length} units are shorter than "
+                            f"{BUMP_MIN}; length must be >= {BUMP_MIN * count}")
+            if L.physics and length and count and rise:
+                half = length / count / 2.0
+                if rise > slope * half + 1e-6:
+                    errs.append(f"{where}: bumps {int(rise)} tall over {int(half)}-unit "
+                                f"faces are steeper than {round(math.degrees(math.atan(slope)))} "
+                                f"degrees; rise must be <= {int(slope * half)}")
+        elif t == "pinch":
+            num("length", *L.straight)
+            needs_width(PINCH_MIN + 2 * PINCH_BITE,
+                        f"a {PINCH_MIN}-unit gate with {PINCH_BITE} taken off each side")
+            num("gate", PINCH_MIN, max(PINCH_MIN, width - 2 * PINCH_BITE))
+        elif t == "ledge":
+            side("the wall the walkway runs along")
+            num("length", *L.beam)
+            num("ledge_width", LEDGE_MIN, max(LEDGE_MIN, width - LEDGE_CLEAR))
+        elif t == "strafepads":
+            count = whole("count", *L.pads_count)
+            spacing = num("spacing", *L.pads_spacing)
+            num("curve", -L.pads_curve, L.pads_curve)
+            if L.physics and spacing is not None:
+                gap = spacing - STRAFE_PAD_LEN
+                reach = physics.max_gap(0)
+                if gap > reach:
+                    errs.append(f"{where}: {int(gap)} units between pads; a run-speed jump "
+                                f"clears {int(reach)}")
+        elif t == "hazard":
+            lo, hi = L.hazard
+            if hi is None:
+                hi = int(physics.max_gap(0))
+            num("length", lo, hi)
         else:
             errs.append(f"{where}: unknown type; must be one of {SEGMENT_TYPES}")
     return errs

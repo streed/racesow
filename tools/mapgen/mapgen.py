@@ -30,6 +30,7 @@ sys.path.insert(0, HERE)
 
 import build as buildmod  # noqa: E402
 import layout  # noqa: E402
+import spec as specmod  # noqa: E402
 
 
 def _load(path):
@@ -66,7 +67,7 @@ def cmd_plan(args):
 def cmd_check(args):
     spec = _load(args.spec)
     try:
-        course = layout.build(spec)
+        course = layout.build(spec, rules=args.rules)
     except layout.LayoutError as e:
         _emit(args, {"ok": False, "problems": e.problems},
               "rejected:\n  " + "\n  ".join(e.problems))
@@ -98,7 +99,8 @@ def _extras(features, shortcuts, overpasses):
 def _build(args, spec):
     try:
         pk3, report = buildmod.build(spec, args.out, q3map2=args.q3map2,
-                                     fast=not args.final, keep_work=args.keep_work)
+                                     fast=not args.final, keep_work=args.keep_work,
+                                     rules=getattr(args, "rules", "strict"))
     except layout.LayoutError as e:
         _emit(args, {"ok": False, "problems": e.problems},
               "rejected:\n  " + "\n  ".join(e.problems))
@@ -152,9 +154,18 @@ def main(argv=None):
     sp.add_argument("description")
     sp.add_argument("-o", "--output")
 
+    # Which rule tier to hold the spec to. "strict" is the generator's own and
+    # the default everywhere; "open" is the map editor's, where the pieces-fit-
+    # together rules become notes on the report rather than refusals (a person
+    # laid the course out and an admin approves it). See spec.py.
+    def rules_opt(sp):
+        sp.add_argument("--rules", choices=sorted(specmod.TIERS), default="strict",
+                        help="rule tier: strict (the generator) or open (the map editor)")
+
     sc = sub.add_parser("check", help="validate a spec and lay it out; no compile")
     sc.add_argument("spec")
     sc.add_argument("--svg", help="write a top-down plan preview")
+    rules_opt(sc)
 
     def build_opts(sp):
         sp.add_argument("--out", required=True, help="output directory")
@@ -167,6 +178,7 @@ def main(argv=None):
     sb = sub.add_parser("build", help="spec -> compiled, checked .pk3")
     sb.add_argument("spec")
     build_opts(sb)
+    rules_opt(sb)
 
     sg = sub.add_parser("generate", help="description -> .pk3 (plan + build)")
     sg.add_argument("description")

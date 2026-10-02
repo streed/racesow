@@ -57,11 +57,37 @@ test("the fixture covers both verdicts", () => {
   assert.ok(ok.some((c) => c.course.world.some((p) => p[0] === "ice")), "an icy course");
 });
 
+test("the fixture covers both rule tiers, and what separates them", () => {
+  const byTier = (r) => golden.cases.filter((c) => c.rules === r);
+  assert.ok(byTier("strict").length >= 20, "strict cases");
+  assert.ok(byTier("open").length >= 20, "open cases");
+  // Every piece the editor can lay is laid somewhere in here.
+  const laid = new Set(golden.cases.flatMap((c) => (c.spec.segments || [])
+    .filter((sg) => sg && typeof sg === "object").map((sg) => sg.type)));
+  for (const t of mg.SEGMENT_TYPES) assert.ok(laid.has(t), `${t} is never laid`);
+  // The nudge fields reach the fixture too.
+  const nudged = golden.cases.some((c) => (c.spec.segments || [])
+    .some((sg) => sg && (sg.shift || sg.rotate)));
+  assert.ok(nudged, "a shifted or rotated piece");
+  // ...and the open tier really does accept courses the strict one refuses.
+  const strictRefused = new Set(byTier("strict").filter((c) => c.problems.length).map((c) => c.label));
+  const openTook = byTier("open").filter((c) => !c.problems.length
+    && strictRefused.has(c.label.replace(/^open_/, "")));
+  assert.ok(openTook.length >= 3, "courses the open tier takes and the strict one will not");
+  // ...and says what it found instead of refusing.
+  assert.ok(openTook.some((c) => c.notes && c.notes.length), "a course taken with notes");
+});
+
 for (const kase of golden.cases) {
   test(`${kase.label}: ${kase.problems.length ? "refused for the same reasons" : "the same course"}`, () => {
-    const { problems, course } = mg.build(structuredClone(kase.spec));
+    // Each case names its rule tier: the editor lays out in the open one and
+    // the generator in the strict one, and the port has to agree on both.
+    const { problems, course, notes } = mg.build(structuredClone(kase.spec), kase.rules);
     assert.deepEqual(problems, kase.problems);
     if (kase.problems.length) return;
+    // In the open tier a pieces-fit-together finding becomes a note rather
+    // than a refusal, so the notes are part of what has to match.
+    assert.deepEqual(notes, kase.notes, "notes");
     const want = kase.course;
     near(course.length, want.length, "length");
     assert.equal(course.world.length, want.world.length, "brush count");

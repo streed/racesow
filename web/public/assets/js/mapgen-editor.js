@@ -18,9 +18,18 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 import * as mg from "./mapgen-course.js";
 import * as tx from "./mapgen-textures.js";
-import { PIECES, GROUPS, limits, fix, chipLabel, slug, STARTERS, adopt, HOTBAR, HOTKEYS, mirror } from "./mapgen-pieces.js";
+import { PIECES, GROUPS, limits, fix, chipLabel, nudgeLabel, slug, STARTERS, adopt, HOTBAR, HOTKEYS, mirror, widthLimits } from "./mapgen-pieces.js";
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+// The rule tier a course built here is held to, and the two bands every
+// control offers: see mapgen-pieces.js. The generator's band is what the
+// sliders span and what new pieces are built from; the editor's is how far a
+// number may be pushed by hand.
+const RULES = "open";
+const WIDTH_BAND = widthLimits(RULES);
+const WIDTH_SOFT = widthLimits("strict");
+const SEG_CAP = mg.tier(RULES).segments;
+const BRUSH_CAP = mg.tier(RULES).brushes;
 const fmt = (n) => Math.round(n).toLocaleString("en-US");
 const secs = (u) => `${(u / mg.RUN_SPEED).toFixed(1)} s`;
 
@@ -456,12 +465,16 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       <label class="mge-field mge-title"><span>Title</span>
         <input id="mge-title" type="text" maxlength="40" autocomplete="off" spellcheck="false"></label>
       <label class="mge-field mge-width"><span>Corridor width <b id="mge-wv"></b></span>
-        <input id="mge-width" type="range" min="${mg.WIDTH_MIN}" max="${mg.WIDTH_MAX}" step="16"></label>
+        <span class="mge-wctl">
+          <input id="mge-width" type="range" min="${mg.WIDTH_MIN}" max="${mg.WIDTH_MAX}" step="16">
+          <input id="mge-widthn" type="number" min="${WIDTH_BAND[0]}" max="${WIDTH_BAND[1]}" step="16"
+            aria-label="Corridor width in units"></span></label>
       <div class="mge-actions">
         <button type="button" class="btn mge-ib" data-act="undo" title="Undo (Ctrl+Z)" aria-label="Undo">↶</button>
         <button type="button" class="btn mge-ib" data-act="redo" title="Redo (Ctrl+Shift+Z)" aria-label="Redo">↷</button>
         <details class="mge-menu"><summary class="btn">Course ▾</summary><div class="mge-pop panel">
           <button type="button" data-act="new">New blank course</button>
+          <button type="button" class="mge-danger" data-act="clearall">Clear the whole course…</button>
           <div class="mge-sep">Start from</div>
           <button type="button" data-starter="first_light">First Light</button>
           <button type="button" data-starter="ice_run">Glacier Run (ice)</button>
@@ -509,6 +522,19 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       <ol class="mge-chips" id="mge-chips"></ol>
     </section>
     <section class="mge-report panel" id="mge-report" aria-live="polite"></section>
+    <dialog class="mge-dlg panel mge-confirm" id="mge-clear">
+      <form method="dialog">
+        <div class="mge-h">Clear the whole course?</div>
+        <p class="mge-note">This removes every piece and leaves one straight to start again from.
+          The title and the corridor width are kept.</p>
+        <p class="mge-note">Ctrl+Z puts it back if you change your mind.</p>
+        <div class="mge-dlg-row">
+          <span class="mge-grow"></span>
+          <button type="button" class="btn" value="cancel" data-act="closeclear">Keep it</button>
+          <button type="button" class="btn mge-del" data-act="doclear">Clear <b id="mge-clearn"></b></button>
+        </div>
+      </form>
+    </dialog>
     <dialog class="mge-dlg panel" id="mge-dlg">
       <form method="dialog">
         <div class="mge-h">Import a course spec</div>
@@ -527,6 +553,8 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
 
   const $ = (sel) => root.querySelector(sel);
   const titleIn = $("#mge-title"), widthIn = $("#mge-width"), widthV = $("#mge-wv");
+  const widthN = $("#mge-widthn");
+  const clearDlg = $("#mge-clear");
   const chipsEl = $("#mge-chips"), inspEl = $("#mge-insp"), reportEl = $("#mge-report");
   const dlg = $("#mge-dlg");
 
@@ -575,10 +603,10 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     const p = PIECES[kind];
     const need = p.needs && p.needs(st.spec.width);
     if (need) return flash(`${p.name} ${need}: widen the corridor first.`);
-    if (st.spec.segments.length >= mg.MAX_SEGMENTS) return flash(`A course has at most ${mg.MAX_SEGMENTS} pieces.`);
+    if (st.spec.segments.length >= SEG_CAP) return flash(`A course has at most ${SEG_CAP} pieces.`);
     let seg = p.make(st.spec.width);
     if (st.surface === "ice" && mg.ICEABLE.includes(kind)) seg.ice = true;
-    seg = fix(seg, st.spec.width);
+    seg = fix(seg, st.spec.width, RULES);
     const i = at ?? (st.selected === null ? st.spec.segments.length : st.selected + 1);
     const [next] = withSegs((segs) => segs.splice(i, 0, seg));
     commit(next, { select: i });
@@ -596,7 +624,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     commit(next, { select: to });
   }
   function duplicate(i) {
-    if (i === null || st.spec.segments.length >= mg.MAX_SEGMENTS) return;
+    if (i === null || st.spec.segments.length >= SEG_CAP) return;
     const [next] = withSegs((segs) => segs.splice(i + 1, 0, { ...segs[i] }));
     commit(next, { select: i + 1 });
   }
@@ -606,7 +634,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
   let liveBase = null;
   function setFields(i, patch, { live = false } = {}) {
     if (live && !liveBase) liveBase = JSON.stringify({ spec: st.spec, selected: st.selected });
-    const [next] = withSegs((segs) => { segs[i] = fix({ ...segs[i], ...patch }, st.spec.width); });
+    const [next] = withSegs((segs) => { segs[i] = fix({ ...segs[i], ...patch }, st.spec.width, RULES); });
     if (live) {
       st.spec = next;
       scheduleRefresh();
@@ -625,7 +653,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
   }
   function setWidth(w, live) {
     if (live && !liveBase) liveBase = JSON.stringify({ spec: st.spec, selected: st.selected });
-    const segs = st.spec.segments.map((s) => fix(s, w));
+    const segs = st.spec.segments.map((s) => fix(s, w, RULES));
     const next = { ...st.spec, width: w, segments: segs };
     if (live) { st.spec = next; scheduleRefresh(); return; }
     if (liveBase) { st.undo.push(liveBase); st.redo = []; liveBase = null; st.spec = next; saveDraft(next); refresh(); }
@@ -653,9 +681,9 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     flash(`${cut ? "Cut" : "Copied"} ${clip.length} piece${clip.length === 1 ? "" : "s"}. Ctrl+V pastes after the selection.`);
   }
   function insertPieces(pieces, at = null, label = "Pasted") {
-    const segs0 = (pieces || []).filter((x) => x && PIECES[x.type]).map((x) => fix(x, st.spec.width));
+    const segs0 = (pieces || []).filter((x) => x && PIECES[x.type]).map((x) => fix(x, st.spec.width, RULES));
     if (!segs0.length) return flash("Nothing to paste yet: copy some pieces with Ctrl+C.");
-    if (st.spec.segments.length + segs0.length > mg.MAX_SEGMENTS) return flash(`That would make more than ${mg.MAX_SEGMENTS} pieces.`);
+    if (st.spec.segments.length + segs0.length > SEG_CAP) return flash(`That would make more than ${SEG_CAP} pieces.`);
     const r = selRange();
     const i = at ?? (r ? r[1] + 1 : st.spec.segments.length);
     const [next] = withSegs((segs) => segs.splice(i, 0, ...segs0));
@@ -673,7 +701,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     const r = selRange();
     if (!r) return;
     const [next] = withSegs((segs) => {
-      for (let i = r[0]; i <= r[1]; i++) segs[i] = fix({ ...segs[i], ice }, st.spec.width);
+      for (let i = r[0]; i <= r[1]; i++) segs[i] = fix({ ...segs[i], ice }, st.spec.width, RULES);
     });
     commit(next, { keepRange: true });
   }
@@ -726,8 +754,8 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     const r = selRange();
     const i = r ? r[1] + 1 : st.spec.segments.length;
     const segs = [...st.spec.segments];
-    segs.splice(i, 0, ...pieces.map((x) => fix(x, st.spec.width)));
-    const g = mg.preview({ ...fullSpec(), segments: segs.slice(0, mg.MAX_SEGMENTS) });
+    segs.splice(i, 0, ...pieces.map((x) => fix(x, st.spec.width, RULES)));
+    const g = mg.preview({ ...fullSpec(), segments: segs.slice(0, mg.tier(RULES).segments) }, RULES);
     if (!g.course) return view.setPreview(null);
     view.setPreview(g.course.world.filter((p) => p.seg !== null && p.seg >= i && p.seg < i + pieces.length));
   }
@@ -782,9 +810,11 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
 
   function refresh({ inspector = true } = {}) {
     const full = fullSpec();
-    const geo = mg.preview(full);
-    const words = mg.validate(full).filter((p) => p.startsWith("name ") || p.startsWith("title "));
-    st.result = { problems: [...words, ...geo.problems], course: geo.course };
+    const geo = mg.preview(full, RULES);
+    const words = mg.validate(full, RULES).filter((p) => p.startsWith("name ") || p.startsWith("title "));
+    // The open tier keeps the pieces-fit-together findings as notes instead
+    // of refusing over them; the report shows them as advice.
+    st.result = { problems: [...words, ...geo.problems], course: geo.course, notes: geo.notes || [] };
     if (geo.course) view.setCourse(geo.course);
     view.highlight({ range: selRange(), bad: badSegs() });
     updateCursor();
@@ -794,6 +824,11 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     if (document.activeElement !== titleIn) titleIn.value = st.spec.title;
     titleIn.classList.toggle("bad", !mg.TITLE_RE.test(st.spec.title) || st.spec.title.includes("  "));
     widthIn.value = st.spec.width;
+    // The slider spans the suggested band, stretched to hold a width that is
+    // already outside it; the number box spans everything allowed.
+    widthIn.min = Math.min(WIDTH_SOFT[0], st.spec.width);
+    widthIn.max = Math.max(WIDTH_SOFT[1], st.spec.width);
+    if (document.activeElement !== widthN) widthN.value = st.spec.width;
     widthV.textContent = `${st.spec.width}`;
     root.querySelectorAll("[data-surface]").forEach((b) => b.setAttribute("aria-checked", String(b.dataset.surface === st.surface)));
     root.querySelectorAll("[data-add]").forEach((b) => {
@@ -818,21 +853,39 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       segs.map((s, i) => `<li class="mge-chip${inSel(i) ? " on" : ""}${bad.has(i) ? " bad" : ""}${s.ice ? " ice" : ""}${s.open ? " open" : ""}"
           draggable="true" data-i="${i}" tabindex="0" role="button" aria-pressed="${i === st.selected}"
           title="${esc(PIECES[s.type].name)} (piece ${i})">
-          <em>${i}</em>${icon(s.type)}<span><b>${esc(PIECES[s.type].name)}</b><small>${esc(chipLabel(s))}${s.ice ? " ❄" : ""}</small></span></li>`).join("") +
+          <em>${i}</em>${icon(s.type)}<span><b>${esc(PIECES[s.type].name)}</b><small>${esc(chipLabel(s))}${s.ice ? " ❄" : ""}${
+            s.shift || s.rotate ? ` ${esc(nudgeLabel(s))}` : ""}</small></span></li>`).join("") +
       `<li class="mge-chip end finish" aria-label="Finish room">${icon("checkpoint")}<span>Finish</span></li>`;
   }
 
-  function slider(key, label, val, [lo, hi], { step = 1, unit = "", note = "", invert = false } = {}) {
+  // Two bands, and the difference is the point: the number box spans
+  // everything this piece MAY be, and the slider spans the band it probably
+  // SHOULD be — the generator's own, which is fine-grained enough to be worth
+  // dragging. A value already outside the suggested band stretches the
+  // slider to include it rather than being silently clamped back, so a
+  // deliberate choice survives being touched.
+  function bands(key, val, hard, soft, invert) {
+    const h = invert ? [-hard[1], -hard[0]] : hard;
+    const s0 = soft && soft[key] ? (invert ? [-soft[key][1], -soft[key][0]] : soft[key]) : h;
     const v = invert ? -val : val;
-    const [a, b] = invert ? [-hi, -lo] : [lo, hi];
-    const fixed = a === b;
-    return `<div class="mge-row" data-key="${key}" data-invert="${invert ? 1 : 0}">
+    const band = [Math.max(h[0], Math.min(s0[0], v)), Math.min(h[1], Math.max(s0[1], v))];
+    return { hard: h, soft: s0, band, outside: v < s0[0] || v > s0[1] };
+  }
+
+  function slider(key, label, val, hard, { step = 1, unit = "", note = "", invert = false, soft = null } = {}) {
+    const b = bands(key, val, hard, soft, invert);
+    const v = invert ? -val : val;
+    const fixed = b.hard[0] === b.hard[1];
+    const hint = b.soft[0] === b.hard[0] && b.soft[1] === b.hard[1]
+      ? `${fmt(b.hard[0])} – ${fmt(b.hard[1])} ${esc(unit)}`
+      : `${fmt(b.soft[0])} – ${fmt(b.soft[1])} suggested · up to ${fmt(b.hard[0])} – ${fmt(b.hard[1])} ${esc(unit)}`;
+    return `<div class="mge-row${b.outside ? " wide" : ""}" data-key="${key}" data-invert="${invert ? 1 : 0}">
       <label><span>${esc(label)}</span><output data-out="${key}">${esc(note)}</output></label>
       <div class="mge-ctl">
-        <input type="range" min="${a}" max="${b}" step="${step}" value="${v}" ${fixed ? "disabled" : ""} aria-label="${esc(label)}">
-        <input type="number" min="${a}" max="${b}" step="${step}" value="${v}" ${fixed ? "disabled" : ""} aria-label="${esc(label)} ${esc(unit)}">
+        <input type="range" min="${b.band[0]}" max="${b.band[1]}" step="${step}" value="${v}" ${fixed ? "disabled" : ""} aria-label="${esc(label)}">
+        <input type="number" min="${b.hard[0]}" max="${b.hard[1]}" step="${step}" value="${v}" ${fixed ? "disabled" : ""} aria-label="${esc(label)} ${esc(unit)}">
       </div>
-      <div class="mge-range">${fmt(a)} – ${fmt(b)} ${esc(unit)}</div>
+      <div class="mge-range">${hint}${b.outside ? " · <b>beyond the suggested range</b>" : ""}</div>
     </div>`;
   }
   const seg2 = (key, label, opts, val) => `<div class="mge-row"><label><span>${esc(label)}</span></label>
@@ -841,6 +894,18 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
   const toggle = (key, label, on, note, disabled = false) => `<label class="mge-tog${disabled ? " off" : ""}">
       <input type="checkbox" data-flag="${key}" ${on ? "checked" : ""} ${disabled ? "disabled" : ""}>
       <span><b>${label}</b><small>${esc(note)}</small></span></label>`;
+
+  // What each piece calls its count and its length. Keeping these in a table
+  // rather than in the row list is what stops that list growing a conditional
+  // per piece as the palette grows.
+  const COUNT_LABEL = {
+    slalom: "Fins", split: "Holes in the fast lane", stairs: "Steps",
+    platforms: "Stones", pillars: "Pillars", bumps: "Bumps", strafepads: "Pads",
+  };
+  const LENGTH_LABEL = {
+    gap: "Gap length (lip to lip)", wallgap: "Gap length (lip to lip)",
+    dash: "Gap length (lip to lip)", hazard: "How far across",
+  };
 
   function readout(seg, key) {
     switch (key) {
@@ -851,8 +916,26 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
         if (seg.type === "wallgap") return `ledge ${-seg.drop} up`;
         return `lands ${fmt(seg.drop)} lower`;
       case "radius": return `${fmt(seg.radius)} · ${secs(mg.routeLength(seg))}`;
-      case "count": return String(seg.count);
+      case "count":
+        if (seg.type === "stairs" && seg.count) {
+          return `${seg.count} steps of ${fmt(Math.abs(seg.rise || 0) / seg.count)}`;
+        }
+        if (seg.type === "strafepads") return `${seg.count} pads`;
+        return String(seg.count);
       case "beam_width": return `${seg.beam_width} (player is 32)`;
+      case "ledge_width": return `${seg.ledge_width} (player is 32)`;
+      case "gate": return `${seg.gate} (player is 32)`;
+      case "height": return `${fmt(seg.height)} (a jump needs about 160)`;
+      case "angle": return `${seg.angle}°`;
+      case "spacing":
+        return `${fmt(seg.spacing)} apart · ${fmt(Math.max(0, (seg.spacing || 0) - mg.STRAFE_PAD_LEN))} of air`;
+      case "curve":
+        return !seg.curve ? "straight"
+          : `${Math.abs(seg.curve)}° to the ${seg.curve > 0 ? "left" : "right"}`;
+      case "shift": return !seg.shift ? "in line"
+        : `${fmt(Math.abs(seg.shift))} to the ${seg.shift > 0 ? "left" : "right"}`;
+      case "rotate": return !seg.rotate ? "square on"
+        : `${Math.abs(seg.rotate)}° to the ${seg.rotate > 0 ? "left" : "right"}`;
       default: return "";
     }
   }
@@ -889,7 +972,8 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       return;
     }
     const s = st.spec.segments[i];
-    const L = limits(s, st.spec.width);
+    const L = limits(s, st.spec.width, RULES);
+    const SOFT = limits(s, st.spec.width, "strict");
     const start = st.result && st.result.course && st.result.course.segStart;
     const z0 = start && start[i] ? Math.round(start[i].z) : null;
     const z1 = start && start[i + 1] ? Math.round(start[i + 1].z) : null;
@@ -903,14 +987,38 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       const label = s.type === "split" ? "Fast lane" : "Kick wall";
       rows.push(seg2("direction", label, [["left", "Left"], ["right", "Right"]], s.direction));
     }
-    if (L.count) rows.push(slider("count", s.type === "slalom" ? "Fins" : "Holes in the fast lane", s.count, L.count, { note: readout(s, "count") }));
-    if (L.drop && s.type === "gap") rows.push(slider("drop", "Landing height", s.drop, L.drop, { step: 8, unit: "units", note: readout(s, "drop"), invert: true }));
-    if (L.drop && s.type === "wallgap") rows.push(slider("drop", "Ledge height", s.drop, L.drop, { unit: "units", note: readout(s, "drop"), invert: true }));
-    if (L.drop && s.type === "dash") rows.push(slider("drop", "Drop", s.drop, L.drop, { step: 8, unit: "units", note: readout(s, "drop") }));
-    if (L.length) rows.push(slider("length", s.type === "gap" || s.type === "wallgap" || s.type === "dash" ? "Gap length (lip to lip)" : "Length", s.length, L.length, { step: L.length[1] - L.length[0] > 600 ? 16 : 1, unit: "units", note: readout(s, "length") }));
-    if (L.rise && s.type === "ramp") rows.push(slider("rise", "Height change", s.rise, L.rise, { step: 8, unit: "units", note: readout(s, "rise") }));
-    if (L.rise && s.type === "wallclimb") rows.push(slider("rise", "Ledge height", s.rise, L.rise, { unit: "units", note: `ledge ${s.rise} up` }));
-    if (L.beam_width) rows.push(slider("beam_width", "Beam width", s.beam_width, L.beam_width, { step: 4, unit: "units", note: readout(s, "beam_width") }));
+    if (s.type === "chicane") {
+      rows.push(seg2("direction", "First bend", [["left", "↰ Left"], ["right", "Right ↱"]], s.direction));
+      rows.push(slider("angle", "Angle of each bend", s.angle, L.angle, { unit: "°", soft: SOFT, note: readout(s, "angle") }));
+      rows.push(slider("radius", "Radius (bigger is gentler)", s.radius, L.radius, { step: 16, unit: "units", soft: SOFT, note: readout(s, "radius") }));
+    }
+    if (s.type === "ledge") {
+      rows.push(seg2("direction", "Which wall", [["left", "Left"], ["right", "Right"]], s.direction));
+    }
+    // A turn's angle is a fixed choice in the generator's band and a free
+    // number past it, so the editor offers both: the four buttons above, and
+    // this slider whenever the course has left them behind.
+    if (s.type === "turn" && L.angle && !mg.TURN_ANGLES.includes(s.angle)) {
+      rows.push(slider("angle", "Angle", s.angle, L.angle, { unit: "°", soft: SOFT, note: `${s.angle}°` }));
+    }
+    if (L.count) {
+      rows.push(slider("count", COUNT_LABEL[s.type] || "Count", s.count, L.count, { soft: SOFT, note: readout(s, "count") }));
+    }
+    if (L.drop && s.type === "gap") rows.push(slider("drop", "Landing height", s.drop, L.drop, { step: 8, unit: "units", soft: SOFT, note: readout(s, "drop"), invert: true }));
+    if (L.drop && s.type === "wallgap") rows.push(slider("drop", "Ledge height", s.drop, L.drop, { unit: "units", soft: SOFT, note: readout(s, "drop"), invert: true }));
+    if (L.drop && s.type === "dash") rows.push(slider("drop", "Drop", s.drop, L.drop, { step: 8, unit: "units", soft: SOFT, note: readout(s, "drop") }));
+    if (L.drop && s.type === "platforms") rows.push(slider("drop", "Height change", s.drop, L.drop, { step: 8, unit: "units", soft: SOFT, note: readout(s, "drop") }));
+    if (L.spacing) rows.push(slider("spacing", "Spacing (pad to pad)", s.spacing, L.spacing, { step: 8, unit: "units", soft: SOFT, note: readout(s, "spacing") }));
+    if (L.curve) rows.push(slider("curve", "Curve (left ← straight → right)", s.curve ?? 0, L.curve, { unit: "°", soft: SOFT, note: readout(s, "curve") }));
+    if (L.length) rows.push(slider("length", LENGTH_LABEL[s.type] || "Length", s.length, L.length, { step: L.length[1] - L.length[0] > 600 ? 16 : 1, unit: "units", soft: SOFT, note: readout(s, "length") }));
+    if (L.rise && s.type === "ramp") rows.push(slider("rise", "Height change", s.rise, L.rise, { step: 8, unit: "units", soft: SOFT, note: readout(s, "rise") }));
+    if (L.rise && s.type === "wallclimb") rows.push(slider("rise", "Ledge height", s.rise, L.rise, { unit: "units", soft: SOFT, note: `ledge ${s.rise} up` }));
+    if (L.rise && s.type === "stairs") rows.push(slider("rise", "Height change", s.rise, L.rise, { step: 8, unit: "units", soft: SOFT, note: readout(s, "rise") }));
+    if (L.rise && s.type === "bumps") rows.push(slider("rise", "Bump height", s.rise, L.rise, { step: 4, unit: "units", soft: SOFT, note: readout(s, "rise") }));
+    if (L.height) rows.push(slider("height", "Roof height", s.height, L.height, { step: 8, unit: "units", soft: SOFT, note: readout(s, "height") }));
+    if (L.gate) rows.push(slider("gate", "Gate width", s.gate, L.gate, { step: 4, unit: "units", soft: SOFT, note: readout(s, "gate") }));
+    if (L.ledge_width) rows.push(slider("ledge_width", "Walkway width", s.ledge_width, L.ledge_width, { step: 4, unit: "units", soft: SOFT, note: readout(s, "ledge_width") }));
+    if (L.beam_width) rows.push(slider("beam_width", "Beam width", s.beam_width, L.beam_width, { step: 4, unit: "units", soft: SOFT, note: readout(s, "beam_width") }));
     const flags = [];
     if (mg.ICEABLE.includes(s.type)) flags.push(toggle("ice", `${icon("ice")} Ice`, s.ice, "Slick floor: no friction, so speed carries and corners slide."));
     if (mg.OPENABLE.includes(s.type)) flags.push(toggle("open", "Open", s.open, "No side walls. Falling off sends you back to the start."));
@@ -918,12 +1026,27 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       flags.push(toggle("shortcut", "Shortcut stones", s.shortcut,
         s.angle === 180 ? `Stepping stones across the U. Needs a straight of ${mg.SHORTCUT_MIN_LEG}+ on both sides.` : "Only on a 180° turn.", s.angle !== 180));
     }
+    // Sideways and on the spot. Every piece takes these, so they live in their
+    // own group rather than among the fields that differ piece to piece; it
+    // opens by itself once a piece has been nudged, so the setting is never
+    // hidden from the person who made it.
+    const nudged = Boolean(s.shift || s.rotate);
+    const nudge = `<details class="mge-nudge"${nudged ? " open" : ""}>
+      <summary>Offset and rotation${nudged ? ` <b>${esc(nudgeLabel(s))}</b>` : ""}</summary>
+      <p class="mge-note">Move this piece off the line the one before it left, and turn it on the
+        spot. The floor between them is bridged for you, so pieces need not line up.</p>
+      ${slider("shift", "Sideways (right ← → left)", s.shift ?? 0, L.shift, { step: 8, unit: "units", soft: SOFT, note: readout(s, "shift") })}
+      ${slider("rotate", "Turn on the spot (right ← → left)", s.rotate ?? 0, L.rotate, { unit: "°", soft: SOFT, note: readout(s, "rotate") })}
+      ${nudged ? `<div class="mge-iact"><button type="button" class="btn" data-act="unnudge">Back in line</button></div>` : ""}
+    </details>`;
+
     inspEl.innerHTML = `
       <div class="mge-ihead">${icon(s.type)}<div><div class="mge-h">${esc(PIECES[s.type].name)} <em>#${i}</em></div>
         <small>${esc(PIECES[s.type].hint)}</small></div></div>
       ${z0 !== null ? `<p class="mge-elev">Height: starts at <b>${fmt(z0)}</b>${z1 !== null && z1 !== z0 ? `, ends at <b>${fmt(z1)}</b>` : ""}</p>` : ""}
       ${rows.join("")}
       ${flags.length ? `<div class="mge-flags">${flags.join("")}</div>` : ""}
+      ${nudge}
       <div class="mge-iact">
         <button type="button" class="btn" data-act="left" title="Move earlier (Alt+←)">◀ Move</button>
         <button type="button" class="btn" data-act="right" title="Move later (Alt+→)">Move ▶</button>
@@ -939,18 +1062,29 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     const i = st.selected;
     if (i === null) return;
     const s = st.spec.segments[i];
-    const L = limits(s, st.spec.width);
+    const L = limits(s, st.spec.width, RULES);
+    const SOFT = limits(s, st.spec.width, "strict");
     inspEl.querySelectorAll(".mge-row[data-key]").forEach((row) => {
       const key = row.dataset.key, inv = row.dataset.invert === "1";
       const out = row.querySelector("output");
       if (out) out.textContent = key === "rise" && s.type === "wallclimb" ? `ledge ${s.rise} up` : readout(s, key);
       if (!L[key]) return;
-      const [a, b] = inv ? [-L[key][1], -L[key][0]] : L[key];
+      const b = bands(key, s[key], L[key], SOFT, inv);
+      const rng = row.querySelector('input[type="range"]');
+      const nud = row.querySelector('input[type="number"]');
+      // The slider spans the suggested band (stretched to hold the current
+      // value); the number box spans everything allowed.
+      if (rng) { rng.min = b.band[0]; rng.max = b.band[1]; }
+      if (nud) { nud.min = b.hard[0]; nud.max = b.hard[1]; }
       for (const inp of row.querySelectorAll("input")) {
-        inp.min = a; inp.max = b;
         if (document.activeElement !== inp) inp.value = inv ? -s[key] : s[key];
       }
-      row.querySelector(".mge-range").textContent = `${fmt(a)} – ${fmt(b)} units`;
+      row.classList.toggle("wide", b.outside);
+      row.querySelector(".mge-range").innerHTML =
+        (b.soft[0] === b.hard[0] && b.soft[1] === b.hard[1]
+          ? `${fmt(b.hard[0])} – ${fmt(b.hard[1])} units`
+          : `${fmt(b.soft[0])} – ${fmt(b.soft[1])} suggested · up to ${fmt(b.hard[0])} – ${fmt(b.hard[1])} units`)
+        + (b.outside ? " · <b>beyond the suggested range</b>" : "");
     });
   }
 
@@ -967,8 +1101,8 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
         <span><b>${sum.checkpoints}</b> checkpoint${sum.checkpoints === 1 ? "" : "s"}${sum.auto_checkpoints ? ` (${sum.auto_checkpoints} added)` : ""}</span>
         ${sum.overpasses.length ? `<span><b>${sum.overpasses.length}</b> overpass${sum.overpasses.length === 1 ? "" : "es"}</span>` : ""}
         ${sum.ice_segments.length ? `<span>${icon("ice")} <b>${sum.ice_segments.length}</b> icy</span>` : ""}
-        <span class="${brushes > mg.BRUSH_MAX ? "over" : ""}"><b>${fmt(brushes)}</b> / ${fmt(mg.BRUSH_MAX)} brushes</span>
-        <span><b>${st.spec.segments.length}</b> / ${mg.MAX_SEGMENTS} pieces</span>
+        <span class="${brushes > BRUSH_CAP ? "over" : ""}"><b>${fmt(brushes)}</b> / ${fmt(BRUSH_CAP)} brushes</span>
+        <span><b>${st.spec.segments.length}</b> / ${SEG_CAP} pieces</span>
       </div>` : "";
     const quota = st.quota;
     const canBuild = !bad && (!quota || (quota.remaining > 0 && quota.open));
@@ -977,14 +1111,24 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     build.title = bad ? "Fix the problems listed under the course first" : quota && !quota.open ? "The generator is closed for today"
       : quota && quota.remaining === 0 ? "You've used today's maps"
         : "Send it to an admin; once approved it is compiled and put on the game servers";
+    // A note is not a problem. The generator refuses a described course over
+    // these, because nobody looks at one before it is in the pool; here they
+    // are things worth knowing about your own course, and yours to decide on.
+    const notes = r.notes || [];
+    const item = (p, cls) => {
+      const m = p.match(/segment (\d+)/);
+      return `<li class="${cls}">${m ? `<button type="button" class="mge-goto" data-goto="${m[1]}">#${m[1]}</button>` : ""}${esc(p)}</li>`;
+    };
     reportEl.innerHTML = `
       <div class="mge-verdict ${bad ? "no" : "ok"}">${bad ? `${bad} problem${bad === 1 ? "" : "s"} to fix before it can be built`
-        : "Ready to send: the generator accepts this course. An admin approves it before it is built."}</div>
+        : "Ready to send. An admin approves it before it is built."}</div>
       ${facts}
-      ${bad ? `<ul class="mge-probs">${r.problems.map((p) => {
-        const m = p.match(/segment (\d+)/);
-        return `<li>${m ? `<button type="button" class="mge-goto" data-goto="${m[1]}">#${m[1]}</button>` : ""}${esc(p)}</li>`;
-      }).join("")}</ul>` : ""}
+      ${bad ? `<ul class="mge-probs">${r.problems.map((p) => item(p, "")).join("")}</ul>` : ""}
+      ${notes.length ? `<details class="mge-notes"${bad ? "" : " open"}>
+        <summary>${notes.length} thing${notes.length === 1 ? "" : "s"} worth a look</summary>
+        <p class="mge-note">None of these stop the course being built — they are the checks the
+          generator applies to a course nobody has seen. Your call.</p>
+        <ul class="mge-probs">${notes.map((p) => item(p, "advice")).join("")}</ul></details>` : ""}
       ${quota ? `<p class="mge-quota">${esc(quotaLine(quota))} · map name <code>${esc(slug(st.spec.title))}_…</code></p>` : ""}`;
   }
 
@@ -1009,6 +1153,11 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
   });
   on(widthIn, "input", () => setWidth(Number(widthIn.value), true));
   on(widthIn, "change", () => setWidth(Number(widthIn.value), false));
+  on(widthN, "input", () => {
+    const w = Number(widthN.value);
+    if (Number.isFinite(w) && w >= WIDTH_BAND[0] && w <= WIDTH_BAND[1]) setWidth(w, true);
+  });
+  on(widthN, "change", () => setWidth(clamp(Number(widthN.value) || 384, ...WIDTH_BAND), false));
 
   on(root, "click", (e) => {
     const t = e.target.closest("button, [data-add], [data-goto]");
@@ -1056,6 +1205,28 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
         commit(structuredClone(STARTERS.blank), { select: 0 });
         return;
       case "import": t.closest("details").open = false; $("#mge-imsg").textContent = ""; return dlg.showModal();
+      case "clearall": {
+        t.closest("details").open = false;
+        const n = st.spec.segments.length;
+        $("#mge-clearn").textContent = `${n} piece${n === 1 ? "" : "s"}`;
+        track("Map editor clear asked", { pieces: n });
+        return clearDlg.showModal();
+      }
+      case "closeclear": return clearDlg.close();
+      case "doclear": {
+        const n = st.spec.segments.length;
+        clearDlg.close();
+        // Title and width survive; one straight is left so there is something
+        // to build on (and because a course with no pieces is not a course).
+        commit({ ...st.spec, segments: [PIECES.straight.make(st.spec.width)] }, { select: 0 });
+        track("Map editor clear", { pieces: n });
+        return flash(`Cleared ${n} piece${n === 1 ? "" : "s"}. Ctrl+Z puts them back.`);
+      }
+      case "unnudge": {
+        if (st.selected === null) return;
+        track("Map editor nudge", { field: "cleared" });
+        return setFields(st.selected, { shift: 0, rotate: 0 });
+      }
       case "close": return dlg.close();
       case "doimport": return doImport();
       case "download": t.closest("details").open = false; return download();
@@ -1141,9 +1312,17 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     if (e.target.dataset.flag) return setFields(st.selected, { [e.target.dataset.flag]: e.target.checked });
     const row = e.target.closest(".mge-row[data-key]");
     if (!row) return;
+    const key = row.dataset.key;
     const v = Number(e.target.value);
     const inv = row.dataset.invert === "1";
-    setFields(st.selected, { [row.dataset.key]: Number.isFinite(v) ? (inv ? -v : v) : NaN });
+    setFields(st.selected, { [key]: Number.isFinite(v) ? (inv ? -v : v) : NaN });
+    if (mg.NUDGE.includes(key)) track("Map editor nudge", { field: key });
+    // A value typed past the generator's own band is the whole reason the
+    // wider band exists, so it is worth knowing it gets used — and on what.
+    else if (row.classList.contains("wide")) {
+      const s2 = st.spec.segments[st.selected];
+      if (s2) track("Map editor beyond suggested", { piece: s2.type, field: key });
+    }
   });
 
   // Drag and drop: palette pieces into the strip, and chips within it.
@@ -1306,7 +1485,14 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
         flash(body.error || `${res.status} ${res.statusText}`);
         return;
       }
-      track("Map editor build", { pieces: st.spec.segments.length });
+      // What was in it, not just how big: which pieces people actually reach
+      // for is the thing worth knowing after adding ten of them.
+      track("Map editor build", {
+        pieces: st.spec.segments.length,
+        width: st.spec.width,
+        kinds: [...new Set(st.spec.segments.map((x) => x.type))].sort().join(" "),
+        nudged: st.spec.segments.filter((x) => x.shift || x.rotate).length,
+      });
       if (body.job && body.job.token && go) go(`/mapgen/${body.job.token}`);
     } catch (e) {
       flash("Couldn't send it. Please try again.");
@@ -1315,6 +1501,8 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       if (root.isConnected) loadQuota();
     }
   }
+
+  track("Map editor open", { pieces: st.spec.segments.length });
 
   refresh();
   renderCombos();

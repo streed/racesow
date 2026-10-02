@@ -1711,6 +1711,42 @@ tr.tincomplete td { opacity: .5; }
 .mge-goto { margin-right: 8px; background: none; border: 1px solid #ff7a6b; color: #ff9a8e; border-radius: 5px;
   font: inherit; font-size: 12px; padding: 0 6px; }
 .mge-goto:hover { background: rgba(255,90,79,.15); }
+/* A value typed past the band the generator would pick itself: allowed, and
+   marked, so a deliberate choice reads as one and an accident is visible. */
+.mge-row.wide .mge-range { color: var(--gold); }
+.mge-row.wide .mge-range b { color: var(--gold); font-weight: 600; }
+.mge-row.wide .mge-ctl input[type="number"] { border-color: var(--gold); }
+
+/* Offset and rotation: every piece takes them, so they fold away. */
+.mge-nudge { margin: 12px 0 0; border-top: 1px solid var(--line-2); padding-top: 8px; }
+.mge-nudge > summary { cursor: pointer; font-size: 13px; color: var(--muted); list-style: none;
+  display: flex; align-items: center; gap: 8px; }
+.mge-nudge > summary::-webkit-details-marker { display: none; }
+.mge-nudge > summary::before { content: "\25B8"; color: var(--faint); font-size: 11px; }
+.mge-nudge[open] > summary::before { content: "\25BE"; }
+.mge-nudge > summary:hover { color: var(--text); }
+.mge-nudge > summary b { color: var(--cyan); font-variant-numeric: tabular-nums; }
+
+/* The checks that no longer refuse a hand-built course, kept as advice. */
+.mge-notes { margin: 10px 0 0; }
+.mge-notes > summary { cursor: pointer; font-size: 13px; color: var(--gold); }
+.mge-notes > summary:hover { color: #fff; }
+.mge-probs li.advice { border-left-color: var(--gold); background: rgba(255,210,74,.07); }
+.mge-probs li.advice .mge-goto { border-color: rgba(255,210,74,.6); color: var(--gold); }
+.mge-probs li.advice .mge-goto:hover { background: rgba(255,210,74,.15); }
+
+/* Clearing the whole course is the one destructive thing in the menu. */
+.mge-pop button.mge-danger { color: #ff9a8e; }
+.mge-pop button.mge-danger:hover { background: rgba(255,90,79,.14); color: #ffb4a0; }
+.mge-confirm { width: min(440px, calc(100vw - 32px)); }
+
+/* The corridor width takes a slider and a typed number, like every field. */
+.mge-wctl { display: flex; gap: 8px; align-items: center; }
+.mge-wctl input[type="range"] { flex: 1 1 auto; min-width: 0; accent-color: var(--orange); }
+.mge-wctl input[type="number"] { width: 72px; flex: 0 0 auto; background: var(--bg-2); color: var(--text);
+  border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 6px; font: inherit; font-size: 12.5px;
+  font-variant-numeric: tabular-nums; }
+
 .mge-quota { margin: 10px 0 0; font-size: 12.5px; color: var(--muted); }
 .mge-quota code, .mge-note code { font-family: var(--mono); font-size: 12px; color: var(--text); }
 
@@ -1733,7 +1769,8 @@ tr.tincomplete td { opacity: .5; }
   .mge { grid-template-columns: minmax(0, 1fr); grid-template-areas: "bar" "view" "strip" "insp" "pal" "report"; }
   .mge-stage { height: 52vh; min-height: 260px; }
   .mge-actions { margin-left: 0; }
-  .mge-field input[type="text"], .mge-width input { width: 100%; }
+  .mge-field input[type="text"], .mge-width input[type="range"] { width: 100%; }
+  .mge-wctl { width: 100%; }
   .mge-field { flex: 1 1 100%; }
   .mge-hint { display: none; }
   .mge-pal { grid-template-columns: repeat(2, minmax(0, 1fr)); }

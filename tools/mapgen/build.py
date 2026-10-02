@@ -198,10 +198,13 @@ def check_bsp(bsp_bytes, ice=False):
     return problems
 
 
-def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, camera_pads=()):
+def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, camera_pads=(),
+          rules="strict"):
     """spec -> (pk3 path, report dict). Raises LayoutError / BuildError.
-    camera_pads: screenshots.py's overview variant only (layout._camera_pads)."""
-    course = layout.build(spec, camera_pads)
+    camera_pads: screenshots.py's overview variant only (layout._camera_pads).
+    rules: the tier (spec.STRICT / spec.OPEN); the worker builds a course from
+    the map editor with the open one."""
+    course = layout.build(spec, camera_pads, rules=rules)
     q3 = find_q3map2(q3map2)
     if not q3:
         raise BuildError("q3map2 not found: pass --q3map2, set Q3MAP2, or build "
