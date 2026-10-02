@@ -3908,7 +3908,9 @@ class RaceDB {
     return rows.map((r) => ({ ...this._mapgenJobRow(r), requestedBy: r.requested_by }));
   }
 
-  async mapgenSubmit({ identity, day, description, perIdentity, budget, now = Math.floor(Date.now() / 1000) }) {
+  // `spec` is set for a course built in the map editor (/mapgen/editor): the
+  // worker builds it as given instead of planning one from the description.
+  async mapgenSubmit({ identity, day, description, perIdentity, budget, spec = null, now = Math.floor(Date.now() / 1000) }) {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -3944,9 +3946,9 @@ class RaceDB {
       }
       const token = crypto.randomBytes(16).toString("hex");
       await client.query(
-        `INSERT INTO mapgen_job (token, description, quota_day, identity, created_at)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [token, description, day, identity, now]
+        `INSERT INTO mapgen_job (token, description, quota_day, identity, created_at, source, spec)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [token, description, day, identity, now, spec ? "editor" : "describe", spec ? JSON.stringify(spec) : null]
       );
       await client.query("COMMIT");
       return { ok: true, token, used: num(mine.rows[0].used) };
@@ -3973,6 +3975,7 @@ class RaceDB {
     return {
       token: r.token,
       description: r.description,
+      source: r.source || "describe",
       status: r.status,
       mapName: r.map_name || null,
       report: r.report || null,
@@ -3994,7 +3997,9 @@ class RaceDB {
     if (typeof token !== "string" || !/^[0-9a-f]{32}$/.test(token)) return null;
     const r = await this.one("SELECT * FROM mapgen_job WHERE token = $1", [token]);
     if (!r) return null;
-    const job = this._mapgenJobRow(r);
+    // The spec rides along on the job page only (not in lists): it is what the
+    // map editor opens when someone remixes a generated map.
+    const job = { ...this._mapgenJobRow(r), spec: r.spec || null };
     let queue = null;
     if (r.status === "queued") {
       const q = await this.one(

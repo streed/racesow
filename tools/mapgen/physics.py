@@ -26,6 +26,14 @@ ledge higher than any jump reaches: strafing adds speed, never height, so
 they need the wall jump from everyone. A dash drop is longer than a perfect
 run-speed jump: it needs the dash at run speed, but strafe speed can jump it.
 
+Ice (spec "ice": true, surfaceparm slick) changes none of these numbers.
+SURF_SLICK (gameshared/q_collision.h:65, 0x2) is read in exactly one place,
+PM_Friction (gameshared/gs_pmove.c:483), where it skips ground friction.
+Ground acceleration (pm_accelerate, gs_pmove.c:787) and the speed cap are the
+same on ice as off it, so a player still reaches run speed on an icy run-up
+and every gap stays clearable. What ice takes away is braking: a player keeps
+the speed they bring and slides wide through a corner.
+
 The day we want gaps that need strafe speed, this is the wrong tool and the
 headless pmove validator (docs/map-generation-design.md, phase 2) is the
 right one.

@@ -107,6 +107,7 @@ WALLCLIMB_ARC = 96      # how far before a wall climb's ledge the centre line ri
 
 TEX = {
     "floor": "mapgen_v1/floor",
+    "ice": "mapgen_v1/ice",
     "wall": "mapgen_v1/wall",
     "start": "mapgen_v1/start",
     "finish": "mapgen_v1/finish",
@@ -512,7 +513,7 @@ class _Walker:
         self.checkpoint()
         self.x, self.y = here
 
-    def turn(self, direction, angle, radius, walls=True):
+    def turn(self, direction, angle, radius, walls=True, floor_tex="floor"):
         sign = 1.0 if direction == "left" else -1.0
         o, f, l = self.frame()
         cx, cy = o[0] + l[0] * radius * sign, o[1] + l[1] * radius * sign
@@ -528,7 +529,7 @@ class _Walker:
 
         for i in range(n):
             a, b = a0 + step * i, a0 + step * (i + 1)
-            rings = [(r_in, r_out, "floor", self.z - FLOOR_THICK, self.z)]
+            rings = [(r_in, r_out, floor_tex, self.z - FLOOR_THICK, self.z)]
             if walls:
                 rings.append((r_out, r_out + WALL_THICK, "wall", self.z - FLOOR_THICK,
                               self.z + WALL_HEIGHT))
@@ -544,7 +545,7 @@ class _Walker:
                 if sign < 0:
                     poly.reverse()
                 self.c.world.append(Prism.flat(poly, zlo, zhi, tex, mid_heading))
-                if tex == "floor":
+                if tex in ("floor", "ice"):
                     self.c.floor_polys.append((poly, tex))
             ri = max(r_in - WALL_THICK, 0.0)
             hp = [pt(ri, a), pt(r_out + WALL_THICK, a), pt(r_out + WALL_THICK, b), pt(ri, b)]
@@ -579,14 +580,14 @@ class _Walker:
         self.c.length += math.dist(prev[:2], end[:2])
         self.c.route.append(end)
 
-    def slalom(self, length, count):
+    def slalom(self, length, count, tex="floor"):
         """Fins off alternate walls, first from the left, each leaving a
         SLALOM_GATE gate beside it: the line through the gates is a weave."""
         o, f, l = self.frame()
         half = self.w / 2.0
         gate = specmod.SLALOM_GATE
         self.c.landmarks.append(("slalom", (self.x, self.y, self.z), self.heading))
-        self.box_run(length)
+        self.box_run(length, tex=tex)
         spacing = length / (count + 1)
         spots = [spacing * (i + 1) for i in range(count)]
         # Even fins hang off the left wall, so their gate is on the right.
@@ -683,9 +684,12 @@ class _Walker:
         """
         t = seg["type"]
         sides = () if seg.get("open") else (1, -1)
+        # Ice changes only the walking surface's texture, and with it the
+        # surfaceparm slick the compiler bakes into the bsp: never the shape.
+        tex = "ice" if seg.get("ice") else "floor"
         if t == "straight":
             o, f, _ = self.frame()
-            self.box_run(seg["length"], walls=sides)
+            self.box_run(seg["length"], tex=tex, walls=sides)
             self.runup += seg["length"]
             if self.pending and self.pending["turn"] == i - 1:
                 self._shortcut(i)
@@ -695,7 +699,7 @@ class _Walker:
                 self.checkpoint_at(o, f, a)
                 self.c.auto_checkpoints.append((i, a))
         elif t == "ramp":
-            self.box_run(seg["length"], seg["rise"], walls=sides)
+            self.box_run(seg["length"], seg["rise"], tex=tex, walls=sides)
             self.runup = 0.0
         elif t == "turn":
             if seg.get("shortcut"):
@@ -703,14 +707,14 @@ class _Walker:
                 self.pending = {"turn": i, "origin": o, "f": f, "l": l, "z": self.z,
                                 "sign": 1 if seg["direction"] == "left" else -1,
                                 "radius": seg["radius"]}
-            self.turn(seg["direction"], seg["angle"], seg["radius"], walls=bool(sides))
+            self.turn(seg["direction"], seg["angle"], seg["radius"], walls=bool(sides), floor_tex=tex)
             self.runup += math.radians(seg["angle"]) * seg["radius"]
         elif t == "checkpoint":
             self.checkpoint()
         elif t == "gap":
             self._gap(i, seg, segs)
         elif t == "slalom":
-            self.runup = self.slalom(seg["length"], seg["count"])
+            self.runup = self.slalom(seg["length"], seg["count"], tex)
         elif t == "beam":
             self.beam(seg["length"], seg["beam_width"])
             self.runup += seg["length"]
@@ -1137,7 +1141,7 @@ def build(spec, camera_pads=()):
 
 def preview_svg(course, px=900):
     """Top-down plan of the course: what the web form shows before compiling."""
-    colors = {"floor": "#8a8f98", "start": "#3fae5a", "finish": "#d0463c", "platform": "#ff6a1a",
+    colors = {"floor": "#8a8f98", "ice": "#9fdcf0", "start": "#3fae5a", "finish": "#d0463c", "platform": "#ff6a1a",
               "edge": "#e8b923", "beam": "#ff6a1a"}
     (x0, y0, _), (x1, y1, _) = course.bounds
     w, h = x1 - x0, y1 - y0

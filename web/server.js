@@ -33,6 +33,9 @@ import { sendRcon, broadcastRcon, sanitizeCommand, sayCommand } from "./rcon.js"
 import { playerCardCached, liveCardCached, serverCardCached } from "./og-image.js";
 import { cache, invalidate } from "./cache.js";
 import { createSaltStore, identify, SaltUnavailableError } from "./mapgen-identity.js";
+// The generator's course rules, ported (and pinned by test/mapgen-course.test.js)
+// so the map editor and this server refuse what tools/mapgen would refuse.
+import { build as mapgenLayout, normalize as mapgenNormalize, MAX_SEGMENTS as MAPGEN_MAX_SEGMENTS } from "./public/assets/js/mapgen-course.js";
 import {
   BLOG_TAGS,
   isBlogTag,
@@ -644,6 +647,55 @@ api.post("/mapgen", mapgenNoStore, express.json({ limit: "8kb" }), wrap(async (r
     identity: who.id,
     day: who.day,
     description,
+    perIdentity: MAPGEN_PER_IDENTITY,
+    budget: MAPGEN_BUDGET,
+  });
+  if (!r.ok) {
+    res.set("Retry-After", String(Math.max(1, who.resetsAt - Math.floor(Date.now() / 1000))));
+    const error = r.reason === "identity"
+      ? `You've used today's ${MAPGEN_PER_IDENTITY === 1 ? "map" : `${MAPGEN_PER_IDENTITY} maps`}. New ones open at 00:00 UTC.`
+      : "The map generator has made all the maps it can today. Try again after 00:00 UTC.";
+    return res.status(429).json({ error, reason: r.reason, resetsAt: who.resetsAt });
+  }
+  const job = await race.mapgenJob(r.token);
+  const budgetUsed = await race.mapgenBudgetUsed(who.day);
+  res.status(202).json({ job, quota: mapgenQuota(who, r.used, budgetUsed) });
+}));
+
+// A course built by hand in the map editor (/mapgen/editor). The same daily
+// quota and site budget as a description, but no model call: the worker checks
+// the spec and builds it. It is checked here first, with the generator's own
+// rules (public/assets/js/mapgen-course.js), so a course the generator would
+// refuse never costs anyone their map; the worker checks it again anyway,
+// because this endpoint is as public as the form.
+api.post("/mapgen/spec", mapgenNoStore, express.json({ limit: "32kb" }), wrap(async (req, res) => {
+  const raw = req.body && req.body.spec;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Array.isArray(raw.segments)
+      || raw.segments.length > MAPGEN_MAX_SEGMENTS * 2
+      || !raw.segments.every((s) => s && typeof s === "object" && !Array.isArray(s))) {
+    return res.status(400).json({ error: "That isn't a course spec." });
+  }
+  const spec = mapgenNormalize(raw);
+  let problems;
+  try {
+    ({ problems } = mapgenLayout(spec));
+  } catch {
+    problems = ["the course could not be laid out"];
+  }
+  if (problems.length) {
+    return res.status(400).json({ error: "The generator would refuse this course.", problems: problems.slice(0, 20) });
+  }
+  let who;
+  try { who = await mapgenWho(req); } catch (e) { return mapgenFail(res, e); }
+  if (MAPGEN_BUDGET === 0) {
+    return res.status(503).json({ error: "Map requests are switched off right now." });
+  }
+  const r = await race.mapgenSubmit({
+    identity: who.id,
+    day: who.day,
+    // The title passed spec.TITLE_RE (plain words), so it is safe to show.
+    description: `Built in the map editor: ${spec.title}`,
+    spec,
     perIdentity: MAPGEN_PER_IDENTITY,
     budget: MAPGEN_BUDGET,
   });
@@ -4934,14 +4986,21 @@ function assetVersion(rel) {
     return "";
   }
 }
+// The map editor is four modules (mapgen-editor.js imports the other three),
+// so its ?ev= covers all of them: a change to any one re-fetches the editor.
+const EDITOR_V = crypto.createHash("sha1")
+  .update(["mapgen-editor", "mapgen-pieces", "mapgen-course", "mapgen-textures"]
+    .map((m) => assetVersion(`assets/js/${m}.js`)).join(""))
+  .digest("hex").slice(0, 10);
 const INDEX_HTML = readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
   // app.js carries its own hash AND replay.js's (as ?rv=): app.js dynamically
   // imports replay.js from a constant URL, so without this a browser holding an
   // old replay.js never refetches it on a replay-only change. app.js reads the
-  // rv param off its own <script src> and appends it to the import.
+  // rv param off its own <script src> and appends it to the import. ?ev= is the
+  // same for the map editor.
   .replace(
     "/assets/js/app.js",
-    `/assets/js/app.js?v=${assetVersion("assets/js/app.js")}&rv=${assetVersion("assets/js/replay.js")}`
+    `/assets/js/app.js?v=${assetVersion("assets/js/app.js")}&rv=${assetVersion("assets/js/replay.js")}&ev=${EDITOR_V}`
   )
   .replace("/assets/css/style.css", `/assets/css/style.css?v=${assetVersion("assets/css/style.css")}`);
 
@@ -5373,6 +5432,7 @@ const SITEMAP_PAGES = [
   ["/achievements", "0.7"],
   ["/live", "0.5"],
   ["/mapgen", "0.5"],
+  ["/mapgen/editor", "0.5"],
   ["/mapgen/gallery", "0.6"],
   ["/about", "0.4"],
   ["/colors", "0.4"],

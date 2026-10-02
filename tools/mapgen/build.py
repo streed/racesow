@@ -45,11 +45,16 @@ def find_q3map2(explicit=None):
     return None
 
 
+def uses_ice(course):
+    """Whether any brush wears the ice texture, so the pack needs its shader."""
+    return any(p.tex == "ice" for p in course.world)
+
+
 def stage(course, work):
     """Write the .map and the assets into a q3map2 basepath layout."""
     name = course.spec["name"]
     base = os.path.join(work, "base")   # game_qfusion's gamePath (games.cpp)
-    for rel, data in assets.files().items():
+    for rel, data in assets.files(ice=uses_ice(course)).items():
         path = os.path.join(base, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as fh:
@@ -125,11 +130,11 @@ def strip_timestamp(bsp_bytes):
     return bsp_bytes[:on + 4] + b"-" * (end - on - 4) + bsp_bytes[end:]
 
 
-def pack(name, bsp_bytes, out_dir, extra=None):
+def pack(name, bsp_bytes, out_dir, extra=None, ice=False):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name + ".pk3")
     members = {f"maps/{name}.bsp": bsp_bytes}
-    members.update(assets.files())
+    members.update(assets.files(ice=ice))
     if extra:
         members.update(extra)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -141,9 +146,14 @@ def pack(name, bsp_bytes, out_dir, extra=None):
     return path
 
 
-def check_bsp(bsp_bytes):
+SURF_SLICK = 0x2   # gameshared/q_collision.h:65
+
+
+def check_bsp(bsp_bytes, ice=False):
     """Judge the compiled map. Returns a list of problems; empty means raceable
-    as far as static analysis can tell."""
+    as far as static analysis can tell. ice=True: the course has icy floor,
+    and the compiled shaderref for it must carry SURF_SLICK, because that flag
+    (not the texture) is what the engine's movement code reads."""
     problems = []
     try:
         bsp, lump, findings, _ = mapfix.analyse(bsp_bytes, 0.9)
@@ -154,6 +164,15 @@ def check_bsp(bsp_bytes):
     for f in findings:
         if f.severity in (mapfix.BROKEN, mapfix.WARN):
             problems.append(f"mapfix: {f}")
+
+    if ice:
+        want = f"textures/{assets.VERSION}/ice"
+        refs = [(n, fl) for n, fl, _ in bsp.shaderrefs() if n == want]
+        if not refs:
+            problems.append(f"the course has ice but the bsp has no {want} shader")
+        elif not all(fl & SURF_SLICK for _, fl in refs):
+            problems.append(f"{want} compiled without SURF_SLICK: q3map2 did not read "
+                            f"{assets.ICE_SHADER_PATH}, so the ice would have grip")
 
     ents = lump.entities
     by_class = {}
@@ -198,11 +217,12 @@ def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, cam
             bsp_bytes = strip_timestamp(fh.read())
         if len(bsp_bytes) > BSP_MAX_BYTES:
             raise BuildError(f"compiled bsp is {len(bsp_bytes)} bytes; at most {BSP_MAX_BYTES}")
-        problems = check_bsp(bsp_bytes)
+        ice = uses_ice(course)
+        problems = check_bsp(bsp_bytes, ice=ice)
         if problems:
             raise BuildError("compiled map failed its checks:\n  " + "\n  ".join(problems))
         name = spec["name"]
-        pk3 = pack(name, bsp_bytes, out_dir)
+        pk3 = pack(name, bsp_bytes, out_dir, ice=ice)
         if os.path.getsize(pk3) > PK3_MAX_BYTES:
             raise BuildError(f"pack is {os.path.getsize(pk3)} bytes; at most {PK3_MAX_BYTES}")
         with open(os.path.join(out_dir, name + ".svg"), "w") as fh:
@@ -228,6 +248,8 @@ def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, cam
                                            / 320.0, 1),
             # Slaloms, beams and splits, and where the course passes over itself.
             "features": course.features,
+            # Which pieces are floored with slick ice (spec "ice": true).
+            "ice_segments": [i for i, seg in enumerate(spec["segments"]) if seg.get("ice")],
             "overpasses": course.overpasses,
         }
         return pk3, report

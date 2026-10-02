@@ -34,7 +34,9 @@ test("every local module the image runs is copied into it", () => {
     const f = queue.shift();
     if (seen.has(f)) continue;
     seen.add(f);
-    assert.ok(copied.has(f), `${f} is imported by the image's code but not COPY'd in web/Dockerfile`);
+    // A file inside a copied directory (COPY public ./public) is copied too.
+    const covered = copied.has(f) || [...copied].some((d) => f.startsWith(d + path.sep));
+    assert.ok(covered, `${f} is imported by the image's code but not COPY'd in web/Dockerfile`);
     queue.push(...localImports(f));
   }
   assert.ok(seen.has("mapgen-identity.js"), "the walk should reach server.js's imports");

@@ -63,7 +63,7 @@ def brush_lines(prism):
     # Side faces of a floor/sloped piece use the wall texture; only the walking
     # surface carries the floor/start/finish colour.
     side_tex = (layout.TEX["wall"]
-                if prism.tex in ("floor", "start", "finish", "edge", "trim", "checkpoint")
+                if prism.tex in ("floor", "ice", "start", "finish", "edge", "trim", "checkpoint")
                 else tex)
     rot = 0.0 if prism.heading is None else prism.heading + FLOOR_ROT_OFFSET
     poly = prism.poly

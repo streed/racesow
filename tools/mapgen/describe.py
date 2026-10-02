@@ -78,6 +78,11 @@ Segment types (every segment carries every field; set unused ones to 0 / "none" 
 false). Straights, turns, ramps and gaps also take "open": true to drop their side
 walls and float over the void (painted edges; falling off kills the player).
 Open track is harder and faster-looking; walls help the player corner.
+Straights, turns, ramps and slaloms also take "ice": true for a slick, icy floor
+(no ground friction). The player still reaches run speed on ice, so it never
+makes a gap harder, but keeps whatever speed they bring, cannot brake, and slides
+wide through corners. A downhill ice ramp into a sweeping turn is the classic
+use; ask for it when the description mentions ice, snow, slick or sliding.
   straight   length {specmod.STRAIGHT_MIN}-{specmod.STRAIGHT_MAX}
   turn       direction left|right, angle one of {list(specmod.TURN_ANGLES)},
              radius (centre line) >= width/2 + 64 and <= {specmod.TURN_RADIUS_MAX},
