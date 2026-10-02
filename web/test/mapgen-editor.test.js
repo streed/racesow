@@ -88,12 +88,13 @@ test("a refused course costs nothing and says why", async () => {
   assert.equal((await bob.get("/mapgen/quota")).json.used, 0);
 });
 
-test("an accepted course is queued as an editor job, spec and all", async () => {
+test("an accepted course waits for an admin, as an editor job, spec and all", async () => {
   const carol = as("203.0.113.30");
   const r = await carol.post("/mapgen/spec", { spec: { ...ICY, junk: "dropped",
     segments: ICY.segments.map((s) => ({ ...s, also: "dropped" })) } });
   assert.equal(r.status, 202, JSON.stringify(r.json));
-  assert.equal(r.json.job.status, "queued");
+  // Not in the worker's queue: an admin approves it first (/admin/mapgen).
+  assert.equal(r.json.job.status, "review");
   assert.equal(r.json.job.source, "editor");
   assert.equal(r.json.job.description, "Built in the map editor: Glacier Run");
   assert.equal(r.json.quota.remaining, 0);
@@ -102,7 +103,9 @@ test("an accepted course is queued as an editor job, spec and all", async () => 
   assert.equal(page.status, 200);
   assert.deepEqual(page.json.spec, ICY, "only the spec's own keys are kept");
 
-  const row = (await query(dbUrl(), "SELECT source, spec, description FROM mapgen_job WHERE token = $1", [r.json.job.token])).rows[0];
+  assert.equal(page.json.queue, null, "no place in a queue it is not in yet");
+  const row = (await query(dbUrl(), "SELECT source, spec, description, status FROM mapgen_job WHERE token = $1", [r.json.job.token])).rows[0];
+  assert.equal(row.status, "review");
   assert.equal(row.source, "editor");
   assert.deepEqual(row.spec, ICY);
 
@@ -116,6 +119,7 @@ test("a described map is still a 'describe' job, with no spec until it is planne
   const r = await dave.post("/mapgen", { description: "A long icy downhill with one big jump at the end" });
   assert.equal(r.status, 202);
   assert.equal(r.json.job.source, "describe");
+  assert.equal(r.json.job.status, "queued", "described maps need no approval");
   const page = await dave.get(`/mapgen/jobs/${r.json.job.token}`);
   assert.equal(page.json.spec, null);
 });

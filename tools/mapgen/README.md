@@ -139,8 +139,13 @@ sliders, drag pieces to reorder them, and see the course in 3-D with the
 `mapgen_v1` textures (you can also ride its centre line). It imports and
 exports spec JSON (a model's reply, a `spec.json`, or a generated map via
 `?from=<token>`), and "Build it" queues the spec through `POST /api/mapgen/spec`
-under the same daily quota. The worker skips planning for these `source =
-'editor'` jobs: it normalizes the spec, checks it, and builds it.
+under the same daily quota. An editor course then waits in `review` for an
+admin on `/admin/mapgen`, which lists each one with its stats and a link to
+preview it in 3-D. Approve moves it to the worker's queue. Reject turns it down
+with a reason shown on its job page, and gives back the requester's map and
+the site budget slot. Described maps skip this step. The worker skips planning
+for these `source = 'editor'` jobs: it normalizes the spec, checks it, and
+builds it.
 
 It borrows TrackMania's editor loop:
 

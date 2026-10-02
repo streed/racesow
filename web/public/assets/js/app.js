@@ -1282,14 +1282,16 @@ function stopMapgenPoll() {
 }
 
 const MAPGEN_STATUS = {
+  review: ["Awaiting approval", "An admin looks at every hand-built course before it is built."],
   queued: ["Queued", "Waiting for the generator."],
   planning: ["Planning", "Turning your description into a course."],
   building: ["Building", "Compiling and checking the map."],
   publishing: ["Publishing", "Built and checked. Waiting for the game servers to load it."],
   published: ["On the servers", "Vote for it in game."],
   failed: ["Failed", ""],
+  rejected: ["Turned down", ""],
 };
-const MAPGEN_DONE = new Set(["published", "failed"]);
+const MAPGEN_DONE = new Set(["published", "failed", "rejected"]);
 
 // " · 2 slaloms · 1 beam · 3 shortcuts · 4 overpasses" from a build report.
 function mapgenPieces(r) {
@@ -1363,7 +1365,7 @@ function mapgenJobCard(j) {
       </div>
       <p class="mg-desc">${esc(j.description)}</p>
       ${facts}
-      ${j.status === "failed" ? `<p class="mg-err">${esc(j.error || "Something went wrong.")}</p>` : blurb ? `<p class="mg-blurb">${esc(blurb)}</p>` : ""}
+      ${j.status === "failed" || j.status === "rejected" ? `<p class="mg-err">${esc(j.error || "Something went wrong.")}</p>` : blurb ? `<p class="mg-blurb">${esc(blurb)}</p>` : ""}
       ${plan}
       ${j.mapName && j.status === "published" ? `<div class="mg-g-vote">${voteCmdBtn(j.mapName)}</div>` : ""}
       <a class="mg-open" href="/mapgen/${esc(j.token)}" data-nav="/mapgen/${esc(j.token)}">Follow this map →</a>
@@ -1386,18 +1388,26 @@ function mapgenClock(t) {
 }
 
 function mapgenStepper(j) {
-  const at = MAPGEN_STEPS.findIndex(([k]) => k === j.status);
-  const failed = j.status === "failed";
-  // A failed job stopped in planning if it never got a map name, else in building.
-  const stop = failed ? (j.mapName ? 2 : 1) : at;
-  // A map-editor job has its spec already: its "planning" step only checks it.
-  const steps = j.source === "editor" ? MAPGEN_STEPS.map(([k, l]) => [k, k === "planning" ? "Checking" : l]) : MAPGEN_STEPS;
+  // A map-editor job has its spec already: it starts with an admin's approval,
+  // and its "planning" step only checks the spec.
+  const editor = j.source === "editor";
+  const steps = editor
+    ? [["review", "Admin approval"], ...MAPGEN_STEPS.map(([k, l]) => [k, k === "planning" ? "Checking" : l])]
+    : MAPGEN_STEPS;
+  const when = { review: j.createdAt, queued: editor ? j.reviewedAt : j.createdAt, planning: j.startedAt,
+    publishing: j.publishedAt, published: j.liveAt };
+  const at = steps.findIndex(([k]) => k === j.status);
+  const failed = j.status === "failed" || j.status === "rejected";
+  // A rejected job stopped at approval; a failed one in planning if it never
+  // got a map name, else in building.
+  const stop = j.status === "rejected" ? 0
+    : failed ? steps.findIndex(([k]) => k === (j.mapName ? "building" : "planning")) : at;
+  // "On the servers" stays in progress until every active server has it.
+  const everywhere = (j.servers || []).length > 0 && j.servers.every((s) => s.seenAt);
   return `<ol class="mg-steps">${steps.map(([k, label], i) => {
-    // "On the servers" stays in progress until every active server has it.
-    const everywhere = (j.servers || []).length > 0 && j.servers.every((s) => s.seenAt);
     const state = failed ? (i < stop ? "done" : i === stop ? "failed" : "todo")
       : i < at ? "done" : i === at ? (k === "published" && everywhere ? "done" : "now") : "todo";
-    const t = i === 0 ? j.createdAt : i === 1 ? j.startedAt : i === 3 ? j.publishedAt : i === 4 ? j.liveAt : null;
+    const t = when[k];
     return `<li class="mg-step ${state}"><span class="mg-dot" aria-hidden="true"></span>
       <span class="mg-step-label">${esc(label)}</span>
       ${t && state !== "todo" ? `<time>${esc(mapgenClock(t))}</time>` : ""}</li>`;
@@ -1413,6 +1423,11 @@ function mapgenNow(j) {
          <span>${s.seenAt ? `loaded ${esc(mapgenClock(s.seenAt))}` : "waiting for its next map scan"}</span></li>`).join("")}</ul>`
     : "";
   switch (j.status) {
+    case "review":
+      return `<p class="mg-now"><b>Waiting for an admin.</b> Every course built in the map editor is looked at
+        before it is built. Nothing is compiled until it is approved, and if it is turned down you get your map back.</p>`;
+    case "rejected":
+      return `<p class="mg-now mg-err">${esc(j.error || "An admin turned this course down.")}</p>`;
     case "queued": {
       const q = j.queue || { position: 1, ahead: 0, building: 0 };
       return `<p class="mg-now"><b>Number ${esc(String(q.position))} in line.</b>
@@ -1496,7 +1511,7 @@ async function viewMapgenJob(token) {
   };
   // Poll while anything can still change: the job's own steps, then each
   // active server's confirmation.
-  const settled = (j) => j.status === "failed"
+  const settled = (j) => j.status === "failed" || j.status === "rejected"
     || (j.status === "published" && (j.servers || []).length > 0 && j.servers.every((s) => s.seenAt));
   const tick = async () => {
     try {

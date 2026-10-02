@@ -517,7 +517,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
           <button type="button" data-act="save">Save this course</button>
           <div id="mge-lib"></div>
         </div></details>
-        <button type="button" class="btn mg-submit mge-build" data-act="build">Build it</button>
+        <button type="button" class="btn mg-submit mge-build" data-act="build">Send for approval</button>
       </div>
     </div>
     <aside class="mge-pal panel" aria-label="Pieces">
@@ -1021,10 +1021,11 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     const build = $('[data-act="build"]');
     build.disabled = !canBuild;
     build.title = bad ? "Fix the problems listed under the course first" : quota && !quota.open ? "The generator is closed for today"
-      : quota && quota.remaining === 0 ? "You've used today's maps" : "Compile this course and put it on the game servers";
+      : quota && quota.remaining === 0 ? "You've used today's maps"
+        : "Send it to an admin; once approved it is compiled and put on the game servers";
     reportEl.innerHTML = `
       <div class="mge-verdict ${bad ? "no" : "ok"}">${bad ? `${bad} problem${bad === 1 ? "" : "s"} to fix before it can be built`
-        : "Ready to build: the generator accepts this course."}</div>
+        : "Ready to send: the generator accepts this course. An admin approves it before it is built."}</div>
       ${facts}
       ${bad ? `<ul class="mge-probs">${r.problems.map((p) => {
         const m = p.match(/segment (\d+)/);
@@ -1590,7 +1591,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     } catch (e) {
       flash("Couldn't send it. Please try again.");
     } finally {
-      btn.textContent = "Build it";
+      btn.textContent = "Send for approval";
       if (root.isConnected) loadQuota();
     }
   }
