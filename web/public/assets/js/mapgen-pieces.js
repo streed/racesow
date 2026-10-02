@@ -175,3 +175,30 @@ export function adopt(raw) {
   const title = typeof raw.title === "string" && mg.TITLE_RE.test(raw.title) ? raw.title : "My Course";
   return [{ title, width, segments: segs.length ? segs : [{ type: "straight", length: 768 }] }, notes];
 }
+
+// TrackMania's quick inventory: number keys place pieces, in palette order.
+export const HOTBAR = ["straight", "turn", "ramp", "checkpoint", "gap", "dash", "slalom", "beam", "split",
+  "wallclimb", "wallgap"];
+export const HOTKEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-"];
+
+// A piece reflected left to right (TrackMania's mirror): turns bend the other
+// way, a split's fast lane and a kick wall change sides. Everything else is
+// symmetric already.
+export function mirror(seg) {
+  if (seg.direction === "left") return { ...seg, direction: "right" };
+  if (seg.direction === "right") return { ...seg, direction: "left" };
+  return { ...seg };
+}
+
+// What a course IS, for remembering a validation: the width and the pieces
+// (not the title). Any edit gives a new key, so, as in TrackMania, changing a
+// validated course un-validates it. FNV-1a over the normalized JSON.
+export function courseKey(spec) {
+  const text = JSON.stringify([spec.width, mg.normalize({ segments: spec.segments }).segments]);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0") + ":" + text.length;
+}

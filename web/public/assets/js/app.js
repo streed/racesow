@@ -1678,7 +1678,8 @@ async function viewMapgenEditor(params) {
     <div class="page-title">MAP <span class="accent">EDITOR</span></div>
     <p class="page-sub">Lay a race course out piece by piece: straights, turns, ramps, jumps, obstacles and wall jumps,
       with every height, angle and length in game units, and ice wherever you want it slick. It is checked against the
-      game's movement as you go, drawn with the map's own textures, and built by the same generator as a described map.</p>
+      game's movement as you go, drawn with the map's own textures, and built by the same generator as a described map.
+      Press <b>P</b> to test-drive it with the game's own movement and set an author time, TrackMania style.</p>
     <div id="mge-root" class="mge"><div class="loading"><span class="spinner"></span></div></div>`;
   const root = document.getElementById("mge-root");
   try {

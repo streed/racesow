@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as mg from "../public/assets/js/mapgen-course.js";
-import { PIECES, GROUPS, limits, fix, slug, STARTERS, adopt, chipLabel } from "../public/assets/js/mapgen-pieces.js";
+import { PIECES, GROUPS, limits, fix, slug, STARTERS, adopt, chipLabel, HOTBAR, HOTKEYS, mirror, courseKey } from "../public/assets/js/mapgen-pieces.js";
 
 const WIDTHS = [256, 320, 384, 448, 512, 640, 768];
 const between = (seg, width) => ({
@@ -134,4 +134,30 @@ test("chips read at a glance", () => {
   assert.equal(chipLabel({ type: "turn", direction: "right", angle: 135 }), "R 135°");
   assert.equal(chipLabel({ type: "ramp", rise: -256 }), "↓ 256");
   assert.equal(chipLabel({ type: "gap", length: 128, drop: -20 }), "128 ↑20");
+});
+
+test("the hotbar covers every piece once, each with its own key", () => {
+  assert.deepEqual([...HOTBAR].sort(), [...mg.SEGMENT_TYPES].sort());
+  assert.equal(new Set(HOTKEYS).size, HOTBAR.length);
+});
+
+test("mirroring flips sides and nothing else, and twice is the identity", () => {
+  const t = { type: "turn", direction: "left", angle: 90, radius: 512, ice: true };
+  assert.deepEqual(mirror(t), { ...t, direction: "right" });
+  assert.deepEqual(mirror(mirror(t)), t);
+  assert.deepEqual(mirror({ type: "straight", length: 512 }), { type: "straight", length: 512 });
+  // A mirrored course is still buildable, and turns the other way.
+  const s = STARTERS.first_light;
+  const m = { ...s, segments: s.segments.map(mirror) };
+  const a = mg.build({ name: "gen_aa", ...s }).course, b = mg.build({ name: "gen_aa", ...m }).course;
+  assert.ok(Math.abs(a.length - b.length) < 1e-6);
+  const end = (c) => c.route[c.route.length - 1];
+  assert.ok(Math.abs(end(a)[1] + end(b)[1]) < 1e-6, "the route ends reflected across the start line");
+});
+
+test("a course's key changes with any piece, not with its title", () => {
+  const s = STARTERS.first_light;
+  assert.equal(courseKey(s), courseKey({ ...s, title: "Another" }));
+  assert.notEqual(courseKey(s), courseKey({ ...s, segments: [...s.segments, { type: "straight", length: 128 }] }));
+  assert.notEqual(courseKey(s), courseKey({ ...s, width: 400 }));
 });

@@ -4986,10 +4986,10 @@ function assetVersion(rel) {
     return "";
   }
 }
-// The map editor is four modules (mapgen-editor.js imports the other three),
+// The map editor is five modules (mapgen-editor.js imports the other four),
 // so its ?ev= covers all of them: a change to any one re-fetches the editor.
 const EDITOR_V = crypto.createHash("sha1")
-  .update(["mapgen-editor", "mapgen-pieces", "mapgen-course", "mapgen-textures"]
+  .update(["mapgen-editor", "mapgen-pieces", "mapgen-course", "mapgen-textures", "mapgen-drive"]
     .map((m) => assetVersion(`assets/js/${m}.js`)).join(""))
   .digest("hex").slice(0, 10);
 const INDEX_HTML = readFileSync(path.join(__dirname, "public", "index.html"), "utf8")
