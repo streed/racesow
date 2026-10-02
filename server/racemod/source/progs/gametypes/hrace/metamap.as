@@ -20,10 +20,27 @@
 //     Strafing on a dealt tile feels exactly like strafing on the world.
 //   * Brush models are not PVS-culled when drawn (pvsCull = false,
 //     ref_gl/r_surf.c:443), so a tile renders wherever it is put.
-//   * tiles.py gives every tile an "origin" key, so the compiler bakes its
-//     brushes RELATIVE to the tile's own entry point. That is what makes
-//     ent.angles turn a tile about its entry instead of about the far-away
-//     point it happened to be compiled at.
+//   * tiles.py gives every tile a brush wearing the "origin" SHADER, so the
+//     compiler bakes its brushes RELATIVE to the tile's own entry point. That
+//     is what makes ent.angles turn a tile about its entry instead of about
+//     the far-away point it happened to be compiled at. An "origin" KEY does
+//     not do this: that was the first attempt, and every submodel stayed
+//     parked where it was compiled (tools/mapgen/tiles.py _place).
+//
+// The one piece that is not dealt
+// -------------------------------
+// The start platform is WORLDSPAWN: real geometry compiled into the map at a
+// fixed place, with the map's own spawn point standing on it. It used to be a
+// dealt piece like any other, which meant the floor under a player's spawn only
+// existed if the dealer had run — and three separate times it had not. Now a
+// player is on solid ground whatever the deck or the dealer does.
+//
+// This file learns where it is from the manifest's `pad`, `begin` and `spawn`
+// lines, so tools/mapgen/tiles.py remains the one place those numbers are
+// written down. The dealt route starts at `begin`, the platform's far end, and
+// fans out from there; the platform is in none of the dealer's placed-piece
+// arrays, so its box is tested on its own (RACE_MetaBoxClear) — without that, a
+// route folding back over its own start would be dealt straight through it.
 //
 // One route, one seed, everyone on it
 // -----------------------------------
@@ -38,7 +55,7 @@
 // ----------------------------------------------
 // The deck carries no target_starttimer or target_stoptimer — a map-placed
 // timer would fire for whichever lane happened to be built over it. The dealer
-// owns the clock: it puts a start gate at the end of the start tile and a
+// owns the clock: it puts a start gate at the end of the start platform and a
 // finish gate at the front of the finish tile, both trigger entities wearing
 // the deck's one gate model. A run here is never comparable to a run on a
 // fixed map, so completeRace() skips the record path entirely (player.as) and
@@ -48,11 +65,15 @@
 const String META_MAP_NAME = "random_map";
 const String META_DECK_EXT = ".deck";
 
-// Tile flags. Mirrors tiles.py's F_* — keep the two in step.
+// Tile flags. Mirrors tiles.py's F_* — keep the two in step, by VALUE.
+//
+// Bit 8 was META_F_START, from when the start pad was dealt like any other
+// piece. No tile carries it now and it stays retired rather than being reused:
+// a reader that still knew bit 8 would deal whatever wore it from the play box
+// origin, straight through the platform that now stands there.
 const int META_F_OPEN = 1;        // no side walls: leaving it sideways is possible
 const int META_F_DASH = 2;        // needs the dash
 const int META_F_WALLJUMP = 4;    // needs a wall jump
-const int META_F_START = 8;
 const int META_F_FINISH = 16;
 
 // Every tile turns by a whole number of 45-degree steps (spec.TURN_ANGLES), so
@@ -102,7 +123,6 @@ class MetaTile
 }
 
 MetaTile@[] metaDeck;
-int metaStartTile = -1;
 int[] metaFinishTiles;
 int metaGateModel = 0;
 float metaGateDepth = 32.0f;
@@ -112,6 +132,19 @@ float metaGateHeight = 192.0f;
 float metaPlayHalf = 0.0f;      // the play box, from its centre
 float metaPlayUp = 0.0f;
 float metaPlayDown = 0.0f;
+
+// The start platform, from the manifest's `pad`, `begin` and `spawn` lines.
+// Every one of these is already a world number: the platform is compiled into
+// worldspawn at a fixed place, so unlike a tile it never moves and never turns,
+// and nothing here has to be rotated before it is used.
+Vec3 metaPadLo, metaPadHi;      // its box, walls included: the space, not the floor
+bool metaHavePad = false;
+Vec3 metaBegin;                 // where the dealt route starts: the platform's far end
+int metaBeginStep = 0;          // ...and which way it faces, in 45-degree steps
+bool metaHaveBegin = false;
+Vec3 metaSpawnAt;               // the map's own info_player_deathmatch
+int metaSpawnStep = 0;
+bool metaHaveSpawn = false;
 
 bool metaIsMetaMap = false;
 bool metaReady = false;
@@ -169,6 +202,14 @@ bool RACE_IsMetaMapName( const String &in key )
 // LINE at a time rather than on the whole file: over a thousand tokens that is
 // the difference between a linear read and a quadratic one.
 
+// A heading reduced into [0, META_STEPS). The long way round because
+// AngelScript's % keeps the sign of its left operand, so a plain n % 8 can come
+// back negative.
+int RACE_MetaStep( int n )
+{
+    return ( ( n % META_STEPS ) + META_STEPS ) % META_STEPS;
+}
+
 int RACE_MetaParseYaw( float deg, const String &in where )
 {
     float steps = deg / META_STEP_DEG;
@@ -179,14 +220,16 @@ int RACE_MetaParseYaw( float deg, const String &in where )
                 + int( META_STEP_DEG ) + " (tiles must mate face to face)";
         return 0;
     }
-    return ( ( whole % META_STEPS ) + META_STEPS ) % META_STEPS;
+    return RACE_MetaStep( whole );
 }
 
 void RACE_MetaLoadDeck()
 {
     metaDeck.resize( 0 );
     metaFinishTiles.resize( 0 );
-    metaStartTile = -1;
+    metaHavePad = false;
+    metaHaveBegin = false;
+    metaHaveSpawn = false;
     metaReady = false;
     metaLoadError = "";
 
@@ -241,6 +284,33 @@ void RACE_MetaLoadDeck()
             metaGateHalf = line.getToken( 3 ).toFloat();
             metaGateHeight = line.getToken( 4 ).toFloat();
         }
+        // pad <minx> <miny> <minz> <maxx> <maxy> <maxz>
+        else if ( head == "pad" )
+        {
+            metaPadLo = Vec3( line.getToken( 1 ).toFloat(), line.getToken( 2 ).toFloat(),
+                              line.getToken( 3 ).toFloat() );
+            metaPadHi = Vec3( line.getToken( 4 ).toFloat(), line.getToken( 5 ).toFloat(),
+                              line.getToken( 6 ).toFloat() );
+            metaHavePad = true;
+        }
+        // begin <x> <y> <z> <step>. The step arrives already in 45-degree steps
+        // rather than in degrees — it is the lattice the heading tables are
+        // indexed by — so it does not go through RACE_MetaParseYaw.
+        else if ( head == "begin" )
+        {
+            metaBegin = Vec3( line.getToken( 1 ).toFloat(), line.getToken( 2 ).toFloat(),
+                              line.getToken( 3 ).toFloat() );
+            metaBeginStep = RACE_MetaStep( line.getToken( 4 ).toInt() );
+            metaHaveBegin = true;
+        }
+        // spawn <x> <y> <z> <step>
+        else if ( head == "spawn" )
+        {
+            metaSpawnAt = Vec3( line.getToken( 1 ).toFloat(), line.getToken( 2 ).toFloat(),
+                                line.getToken( 3 ).toFloat() );
+            metaSpawnStep = RACE_MetaStep( line.getToken( 4 ).toInt() );
+            metaHaveSpawn = true;
+        }
         else if ( head == "tile" )
         {
             MetaTile tile;
@@ -260,18 +330,35 @@ void RACE_MetaLoadDeck()
             tile.turn = RACE_MetaParseYaw( line.getToken( 7 ).toFloat(), "tile " + tile.name );
             if ( metaLoadError != "" )
                 return;
-            if ( ( tile.flags & META_F_START ) != 0 )
-                metaStartTile = metaDeck.length();
             if ( ( tile.flags & META_F_FINISH ) != 0 )
                 metaFinishTiles.insertLast( metaDeck.length() );
             metaDeck.insertLast( @tile );
         }
+        // No trailing else, deliberately. A head this build does not know costs
+        // one getToken and is dropped in silence, which is how `face` and
+        // `padface` — walkable footprints only a plan of a route needs — ride
+        // along in a manifest a fielded server reads without complaint. It is
+        // also what lets tiles.py put a new line in the grammar before every
+        // server has been redeployed. The `deck` version is the one token that
+        // is NOT absorbed: a bump above is fatal on purpose.
     }
 
+    // A deck with no `begin` was built while the start pad was still a dealt
+    // tile. This build will never deal that tile, so the route would start at
+    // the play box origin above nothing at all — exactly the failure the
+    // permanent platform exists to make impossible — and a guess at where the
+    // platform might be would make it silent instead of loud.
     if ( metaDeck.length() == 0 )
         metaLoadError = "the deck manifest holds no tiles";
-    else if ( metaStartTile < 0 || metaFinishTiles.length() == 0 )
-        metaLoadError = "the deck has no start tile or no finish tile";
+    else if ( metaFinishTiles.length() == 0 )
+        metaLoadError = "the deck has no finish tile";
+    else if ( !metaHaveBegin )
+        metaLoadError = "the deck declares no route origin (no begin line): it was"
+                + " built before the start platform moved into the world."
+                + " Rebuild it with tools/mapgen.";
+    else if ( !metaHavePad || metaPadHi.x <= metaPadLo.x || metaPadHi.y <= metaPadLo.y )
+        metaLoadError = "the deck declares no start platform (no pad box): without it"
+                + " a later piece can be dealt straight through the player's spawn.";
     else if ( metaGateModel <= 0 )
         metaLoadError = "the deck has no gate model";
     else if ( metaPlayHalf <= 0.0f )
@@ -303,7 +390,11 @@ Vec3 metaCursor;                // where the NEXT tile's entry goes
 int metaHeading = 0;            // ...and which way it faces, in 45-degree steps
 float metaDealtRoute = 0.0f;    // centre-line units dealt so far
 bool metaFinishDealt = false;
-int metaProgress = 0;           // furthest tile any racer has reached
+// Furthest DEALT piece any racer has reached, or -1 for none yet. -1 rather
+// than 0 because the start platform left this list: it used to be placement 0,
+// so "nobody has got anywhere" and "index 0" were different numbers, and three
+// separate things below read this as an index base. See RACE_MetaNewRoute.
+int metaProgress = -1;
 
 Entity@[] metaPlaced;           // the route, in the order it was dealt
 Vec3[] metaBoxLo;               // each tile's world bounds, for the overlap test
@@ -313,7 +404,7 @@ Vec3[] metaPreCursor;
 int[] metaPreHeading;
 float[] metaPreRoute;
 bool metaBareFinish = false;    // the route ended on a gate with no run-out
-// Players owing a trip to the start pad, applied from the think loop.
+// Players owing a trip to the start platform, applied from the think loop.
 bool[] metaStartPending( maxClients );
 Entity@ metaStartGate;
 Entity@ metaFinishGate;
@@ -364,27 +455,46 @@ void RACE_MetaTileBox( MetaTile @tile, const Vec3 &in at, int step, Vec3 &out lo
     hi = Vec3( at.x + hix, at.y + hiy, at.z + tile.maxs.z );
 }
 
-// Does this box clash with route already on the ground?
+// Do two boxes leave each other alone? Touching counts as apart, which is what
+// lets consecutive pieces mate face to face.
+bool RACE_MetaBoxesApart( const Vec3 &in lo, const Vec3 &in hi,
+                          const Vec3 &in a, const Vec3 &in b )
+{
+    if ( hi.x <= a.x || lo.x >= b.x || hi.y <= a.y || lo.y >= b.y )
+        return true;                        // clear in plan
+    if ( lo.z >= b.z + META_OVERPASS_CLEAR || hi.z + META_OVERPASS_CLEAR <= a.z )
+        return true;                        // one passes cleanly over the other
+    return false;
+}
+
+// Does this box clash with the start platform, or with route already on the
+// ground?
 //
-// The tile being mated to is skipped and nothing else: its box touches the new
-// one by construction, and a turn's box legitimately contains the piece that
-// leaves it. Skipping two — which is what this did first — leaves a blind spot
-// exactly one tile wide, and a simulation of 600 dealt routes found a clash in
-// 60% of them. Boxes are coarse, so this now errs towards rejecting a placement
-// that would have been fine: the right way round, because the deck always has
-// another tile to offer and an overlap is a route nobody can run.
+// The platform is tested first and always. It is worldspawn, so it appears in
+// none of the arrays below — and it USED to appear in them, as the dealt start
+// tile, which was the only thing stopping a route that folded back over its own
+// start from being dealt through the floor the player spawns on. Nothing is
+// skipped for it: `begin` sits exactly on the platform's far face, so the first
+// dealt piece touches it, and touching is apart.
+//
+// Among dealt pieces the one being mated to is skipped and nothing else: its
+// box touches the new one by construction, and a turn's box legitimately
+// contains the piece that leaves it. Skipping two — which is what this did
+// first — leaves a blind spot exactly one tile wide, and a simulation of 600
+// dealt routes found a clash in 60% of them. Boxes are coarse, so this errs
+// towards rejecting a placement that would have been fine: the right way round,
+// because the deck always has another tile to offer and an overlap is a route
+// nobody can run.
 bool RACE_MetaBoxClear( const Vec3 &in lo, const Vec3 &in hi )
 {
+    if ( metaHavePad && !RACE_MetaBoxesApart( lo, hi, metaPadLo, metaPadHi ) )
+        return false;
+
     int last = int( metaPlaced.length() ) - 1;
     for ( int i = 0; i < last; i++ )
     {
-        Vec3 a = metaBoxLo[i];
-        Vec3 b = metaBoxHi[i];
-        if ( hi.x <= a.x || lo.x >= b.x || hi.y <= a.y || lo.y >= b.y )
-            continue;                       // clear in plan
-        if ( lo.z >= b.z + META_OVERPASS_CLEAR || hi.z + META_OVERPASS_CLEAR <= a.z )
-            continue;                       // one passes cleanly over the other
-        return false;
+        if ( !RACE_MetaBoxesApart( lo, hi, metaBoxLo[i], metaBoxHi[i] ) )
+            return false;
     }
     return true;
 }
@@ -429,7 +539,7 @@ int RACE_MetaPick()
     {
         MetaTile @tile = metaDeck[i];
         if ( tile.weight <= 0 )
-            continue;                       // the start and finish are placed by hand
+            continue;                       // the finish run-outs are placed by hand
 
         Vec3 lo, hi;
         RACE_MetaTileBox( tile, metaCursor, metaHeading, lo, hi );
@@ -599,7 +709,7 @@ void RACE_MetaClearRoute()
         metaFinishGate.freeEntity();
         @metaFinishGate = null;
     }
-    metaProgress = 0;
+    metaProgress = -1;
     metaDealtRoute = 0.0f;
     metaFinishDealt = false;
 }
@@ -759,28 +869,61 @@ void RACE_MetaNewRoute( uint seed )
     for ( int i = 0; i < 8; i++ )
         RACE_MetaNextRandom();
 
-    metaCursor = Vec3( 0.0f, 0.0f, 0.0f );
-    metaHeading = 0;
-    metaProgress = 0;
+    // The route starts at the platform's far end, not at the play box origin:
+    // the platform is world geometry filling the space between the two, so this
+    // is the first point a dealt piece may stand at.
+    //
+    // metaProgress starts at -1, not 0, and that one number is load-bearing in
+    // three places. The platform used to be placement 0, so every dealt piece
+    // sat one index higher than it does now; leaving metaProgress at 0 shifts
+    // META_AHEAD one piece deeper, stops RACE_MetaTrackProgress ever noticing
+    // the first piece (it searches i > metaProgress), and — the one that bites —
+    // raises RACE_MetaRewind's floor by one, so a route whose first piece turns
+    // straight back into the platform cannot back out of it and ends on a bare
+    // gate two pieces long. Over 600 simulated seeds that was 14 collapsed
+    // routes; at -1 it is 3, which is where it was when the pad was dealt.
+    metaCursor = metaBegin;
+    metaHeading = metaBeginStep;
+    metaProgress = -1;
 
-    if ( !RACE_MetaDealTile( metaStartTile ) )
+    // The platform is run-up the player crosses before the clock starts, and as
+    // a dealt tile its length counted towards rs_meta_distance. Seeding it keeps
+    // that cvar — and the unit count shown to players and filed with a time —
+    // meaning what it meant when the pad was dealt, rather than quietly buying
+    // a platform's worth more course. The manifest offers the number as
+    // `begin`'s distance from the origin, which is the platform's length.
+    Vec3 runup = metaBegin;
+    runup.z = 0.0f;
+    metaDealtRoute = runup.length();
+
+    // The start gate sits at the END of the platform, so the clock starts as the
+    // player leaves it with the whole platform of run-up behind them. Its return
+    // is checked, which it did not need to be before: with no start tile to fail
+    // first, a gate model that is not a brush model is now the difference
+    // between a course and a map with no clock on it at all.
+    @metaStartGate = RACE_MetaSpawnGate( metaBegin, metaBeginStep, 0 );
+    if ( @metaStartGate == null )
     {
-        metaLoadError = "the start tile has no inline model in this .bsp";
+        metaLoadError = "gate model " + metaGateModel
+                + " is not an inline brush model in this .bsp";
         metaReady = false;
         return;
     }
-    // The start gate sits at the END of the start pad, so the clock starts as
-    // the player leaves it with a full pad of run-up behind them.
-    @metaStartGate = RACE_MetaSpawnGate( metaCursor, metaHeading, 0 );
     RACE_MetaExtend();
 }
 
-// Where a player begins: on the start pad, facing down it. The route always
-// starts at the play box's origin running along +X with its walking surface at
-// z = 0, and a player's origin sits 24 units above their feet. Kept in step
-// with tiles.SPAWN, which is where the map's own spawn point is placed.
+// Where a player begins: on the start platform, facing down it.
+//
+// Read from the manifest's `spawn` line — the same number tiles.py puts the
+// map's own info_player_deathmatch at — so the position is written down once
+// rather than in two places that have to be kept in step by hand. The literal
+// below is that old hand-kept copy, now only reachable from a deck built before
+// the line existed; if it is ever wrong, RACE_MetaCheckStartPad is what says so,
+// because it measures this against the spawn ENTITY the map actually loaded.
 Vec3 RACE_MetaSpawnSpot()
 {
+    if ( metaHaveSpawn )
+        return metaSpawnAt;
     return Vec3( 96.0f, 0.0f, 32.0f );
 }
 
@@ -807,6 +950,18 @@ void RACE_MetaInit()
     // a known route (and a bug reproduced) without anyone typing /seed.
     Cvar pinned( "rs_meta_seed", "0", 0 );
     RACE_MetaNewRoute( uint( pinned.integer ) );
+    // The deck loaded but the deal did not finish — which since the start pad
+    // became world geometry can only be the gate model, the first thing put on
+    // the ground. Caught here because the green line below would otherwise
+    // report a route that is not there, and because RACE_MetaCheckStartPad now
+    // finds perfectly good floor either way.
+    if ( !metaReady )
+    {
+        G_Print( "^1metamap: " + metaLoadError + " — " + META_MAP_NAME
+                + " has a deck but no route.\n" );
+        RACE_MetaSetStatus( "FAIL_no_route" );
+        return;
+    }
     G_Print( "^2metamap: " + metaDeck.length() + " tiles loaded; seed "
             + metaSeed + ", " + metaPlaced.length() + " pieces dealt.\n" );
     RACE_MetaCheckStartPad();
@@ -820,7 +975,11 @@ void RACE_MetaInit()
 // reliably missing from the logs while being present in a direct rcon reply.
 // A cvar survives the burst and answers in one short read:
 //
-//     rcon rs_meta_status   ->   "ok seed=4242 pieces=7 pad=7 spawn=96,0,32"
+//     rcon rs_meta_status   ->   "ok seed=4242 pieces=7 pad=8 spawn=96,0,32"
+//
+// `pieces` is DEALT pieces, and no longer counts the start platform now that
+// the platform is world geometry; `pad` is still the drop from the spawn point
+// to whatever solid ground is under it.
 //
 // Values are kept to letters, digits and , = _ - so the set command can never
 // be broken by its own argument.
@@ -829,8 +988,16 @@ void RACE_MetaSetStatus( const String &in value )
     G_CmdExecute( "set rs_meta_status \"" + value + "\"\n" );
 }
 
-// Ask the ENGINE whether the start pad is actually under the spawn point — and
-// trace from the spawn ENTITY, not from where we think it is.
+// Ask the ENGINE whether the start platform is actually under the spawn point —
+// and trace from the spawn ENTITY, not from where we think it is.
+//
+// Moving the platform into worldspawn changed what a failure here MEANS. The
+// floor is compiled into the .bsp and is there whether or not the dealer ran, so
+// "nothing solid under the spawn" is no longer a dealer bug at all: it says the
+// MAP is wrong — either this server loaded a .bsp built without the platform, or
+// that .bsp's spawn is not standing on it. The dealer's own failure now looks
+// different, a piece count of nothing on perfectly good floor, which is why the
+// trace below is no longer the last word.
 //
 // The first version of this traced from RACE_MetaSpawnSpot(), a constant, and
 // so it cheerfully confirmed the pad while the spawn itself had been moved out
@@ -877,42 +1044,62 @@ void RACE_MetaCheckStartPad()
     {
         G_Print( "^1metamap: the spawn point has been MOVED to "
                 + int( from.x ) + " " + int( from.y ) + " " + int( from.z )
-                + ", away from the start pad at "
+                + ", away from the start platform at "
                 + int( want.x ) + " " + int( want.y ) + " " + int( want.z )
                 + " — something dropped it to the floor before the route was "
                 + "dealt. The deck's spawn needs spawnflags 1 "
                 + "(tools/mapgen/tiles.py).\n" );
     }
 
+    // Built once, so every verdict below reports the same spawn the same way.
+    String where = " spawn=" + int( from.x ) + "," + int( from.y ) + "," + int( from.z );
+
     Vec3 to = from;
     to.z -= 256.0f;
     Trace tr;
     bool hit = tr.doTrace( from, playerMins, playerMaxs, to, 0, MASK_DEADSOLID );
-    if ( hit && !tr.startSolid )
+    if ( !hit || tr.startSolid )
     {
-        // Only call it the start pad when the spawn is still where the map put
-        // it. A spawn that has drifted is standing on whatever it was dropped
-        // onto — the sky shell, usually — and saying "start pad" about that is
-        // how the first version of this check managed to report success on a
-        // map nobody could play.
-        G_Print( ( moved ? "^1metamap: solid ground is " : "^2metamap: start pad is " )
-                + int( from.z - tr.endPos.z ) + " units under the spawn at "
-                + int( from.x ) + " " + int( from.y ) + " " + int( from.z ) + ".\n" );
-        RACE_MetaSetStatus( ( moved ? "FAIL_spawn_moved" : "ok" )
-                + " seed=" + metaSeed + " pieces=" + metaPlaced.length()
-                + " pad=" + int( from.z - tr.endPos.z )
-                + " spawn=" + int( from.x ) + "," + int( from.y ) + "," + int( from.z ) );
+        G_Print( "^1metamap: NOTHING SOLID under the spawn point at "
+                + int( from.x ) + " " + int( from.y ) + " " + int( from.z )
+                + ( tr.startSolid ? " (spawn is inside solid)" : " (open air)" )
+                + " — players will fall on spawn. The start platform is part of "
+                + "the WORLD, so this is the .bsp and not the dealer: it was "
+                + "built without the platform, or its spawn is not on it "
+                + "(tools/mapgen/tiles.py _start_pad).\n" );
+        RACE_MetaSetStatus( "FAIL_no_floor seed=" + metaSeed
+                + " pieces=" + metaPlaced.length() + where );
         return;
     }
 
-    G_Print( "^1metamap: NOTHING SOLID under the spawn point at "
-            + int( from.x ) + " " + int( from.y ) + " " + int( from.z )
-            + ( tr.startSolid ? " (spawn is inside solid)" : " (open air)" )
-            + " — players will fall on spawn. Check that every deck piece "
-            + "compiled with an ORIGIN BRUSH (tools/mapgen/tiles.py _place).\n" );
-    RACE_MetaSetStatus( "FAIL_no_floor seed=" + metaSeed
-            + " pieces=" + metaPlaced.length()
-            + " spawn=" + int( from.x ) + "," + int( from.y ) + "," + int( from.z ) );
+    int drop = int( from.z - tr.endPos.z );
+
+    // Floor is no longer proof that anything was dealt. The platform stands
+    // whether the dealer ran or not, so a route of nothing leaves a player safe
+    // on it with nowhere to go — and the trace alone would have called that
+    // "ok", which is the one answer this cvar exists to be trusted on. The piece
+    // count is what separates a working map from a standing start and no course.
+    if ( metaPlaced.length() == 0 || @metaStartGate == null )
+    {
+        G_Print( "^1metamap: the start platform is there (" + drop
+                + " units under the spawn) but NOTHING WAS DEALT — there is no "
+                + "route to run. The map is fine; the dealer is not.\n" );
+        RACE_MetaSetStatus( "FAIL_no_route seed=" + metaSeed
+                + " pieces=" + metaPlaced.length() + " pad=" + drop + where );
+        return;
+    }
+
+    // Only call it the start platform when the spawn is still where the map put
+    // it. A spawn that has drifted is standing on whatever it was dropped onto —
+    // the sky shell, usually — and saying "start platform" about that is how the
+    // first version of this check managed to report success on a map nobody
+    // could play.
+    G_Print( ( moved ? "^1metamap: solid ground is " : "^2metamap: start platform is " )
+            + drop + " units under the spawn at "
+            + int( from.x ) + " " + int( from.y ) + " " + int( from.z ) + ".\n" );
+    RACE_MetaSetStatus( ( moved ? "FAIL_spawn_moved" : "ok" )
+            + " seed=" + metaSeed + " pieces=" + metaPlaced.length()
+            + " pad=" + drop + where );
 }
 
 void RACE_MetaThink()
@@ -937,7 +1124,7 @@ void RACE_MetaThink()
     RACE_MetaExtend();
 }
 
-// Mark a spawning player as owing a trip to the start pad.
+// Mark a spawning player as owing a trip to the start platform.
 //
 // Nothing is moved here. GT_PlayerRespawn runs at the END of G_ClientRespawn,
 // and Entity.origin only writes a client's pmove origin once that client has
@@ -947,10 +1134,10 @@ void RACE_MetaThink()
 // ("applied from the think loop once they are a live prerace body",
 // hrace.as / savedstarts.as).
 //
-// The map's own spawn point already sits on the pad, so on a normal spawn this
-// has nothing to correct. It earns its keep after a re-deal (/seed), and it is
-// what puts the pad in the player's prerace slot so every later /kill and
-// /racerestart comes back here too.
+// The map's own spawn point already sits on the platform, so on a normal spawn
+// this has nothing to correct. It earns its keep after a re-deal (/seed), and it
+// is what puts the platform in the player's prerace slot so every later /kill
+// and /racerestart comes back here too.
 void RACE_MetaPlayerSpawn( Player @player )
 {
     if ( !metaIsMetaMap || !metaReady || @player == null )
@@ -961,7 +1148,7 @@ void RACE_MetaPlayerSpawn( Player @player )
     metaStartPending[client.playerNum] = true;
 }
 
-// The deferred half: put the player on the start pad once they are a live
+// The deferred half: put the player on the start platform once they are a live
 // prerace body. One-shot per respawn.
 void RACE_MetaApplyStart( Player @player )
 {
@@ -978,10 +1165,14 @@ void RACE_MetaApplyStart( Player @player )
 
     // Built from currentPosition() so the fresh spawn's health, armour and
     // weapons survive: this is a relocation, not a stored loadout. Writing it
-    // into prerace slot 0 is what makes every later /kill return to the pad.
+    // into prerace slot 0 is what makes every later /kill return to the
+    // platform.
     Position p = player.currentPosition();
     p.location = RACE_MetaSpawnSpot();
-    p.angles = Vec3( 0.0f, 0.0f, 0.0f );
+    // Facing the way the manifest says the map's own spawn faces, off the same
+    // line the position came from, so a re-deal cannot point people somewhere
+    // the map does not.
+    p.angles = Vec3( 0.0f, float( metaSpawnStep ) * META_STEP_DEG, 0.0f );
     p.velocity = Vec3( 0.0f, 0.0f, 0.0f );
     p.saved = true;
     p.recalled = false;

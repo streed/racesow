@@ -33,19 +33,30 @@ const QUIET = { log() {}, warn() {}, error() {} };
 // Whatever tools/mapgen/tiles.py publishes footprints for (its FLOOR_TEX, which
 // is plan_svg's PLAN_TEX): the walkable roles. `wall`, `pylon`, `sky`,
 // `trigger` and `origin` are what must NOT be in the file — a plan drawn with
-// walls in it is a solid block.
+// walls in it is a solid block. `start` is still in the list, but it is now the
+// platform's own `padface` rather than any tile: no tile kind `start` is left.
 const WALKABLE = ["floor", "start", "finish", "checkpoint", "edge", "trim", "platform", "beam"];
 
-// A minimal deck: one start, one finish, one footprint. Everything the loader
-// insists on and nothing else, so a test can break exactly one thing.
+// A minimal deck: the start platform, one piece to deal, one finish to end on,
+// one footprint each. Everything the loader insists on and nothing else, so a
+// test can break exactly one thing.
+//
+// There is deliberately NO start tile. The pad stopped being dealt and became
+// permanent world geometry, so a deck without one is now CORRECT — what the
+// loader refuses instead is a deck with no `begin` (nowhere to start the route)
+// or no `pad` (nothing to keep the route out of).
 const MINIMAL = [
   "// a deck",
   "deck 1 2 384",
   "play 13312 2560 1536",
   "gate 9 32 208 192",
-  "tile 1 8 0 1024 0 0 0 -16 -208 -32 1024 208 256 1024 start start",
+  "pad -16 -208 -32 1024 208 256",
+  "begin 1024 0 0 0",
+  "spawn 96 0 32 0",
+  "padface start 0 4 0 -192 1024 -192 1024 192 0 192",
+  "tile 1 0 10 1024 0 0 0 0 -208 -32 1024 208 256 1024 straight run_1024",
   "tile 2 16 0 1024 0 0 0 0 -208 -32 1040 208 256 1024 finish finish",
-  "face 1 start 0 4 0 -192 1024 -192 1024 192 0 192",
+  "face 1 floor 0 4 0 -192 1024 -192 1024 192 0 192",
   "",
 ].join("\n");
 
@@ -130,8 +141,30 @@ test("reads the shipped pack and agrees with its own header", async (t) => {
 
   assert.ok(deck.play.half > 0 && deck.play.up > 0 && deck.play.down > 0);
   assert.ok(deck.gate.model > 0);
-  assert.ok(deck.tiles[deck.start].flags & DECK_FLAGS.START);
   assert.ok(deck.finishes.length);
+
+  // The start platform arrives as four heads of its own rather than as a dealt
+  // tile, so there is no start index to look up and nothing wears the retired
+  // bit 8 (metamap.as:68 — DECK_FLAGS no longer names it, hence the literal).
+  assert.equal(deck.start, undefined, "the deck should carry no start index");
+  for (const tile of deck.tiles) assert.equal(tile.flags & 8, 0, `${tile.name} wears the retired START bit`);
+  // The numbers tools/mapgen compiles the platform at today. Pinned, not
+  // derived: these are world coordinates the engine, the browser dealer and the
+  // plan all read literally, so a change here has to be a deliberate one.
+  assert.deepEqual(deck.pad, { lo: { x: -16, y: -208, z: -32 }, hi: { x: 1024, y: 208, z: 256 } });
+  assert.deepEqual(deck.begin, { x: 1024, y: 0, z: 0 });
+  assert.equal(deck.beginStep, 0);
+  assert.deepEqual(deck.spawn, { x: 96, y: 0, z: 32 });
+  assert.equal(deck.spawnStep, 0);
+  // `begin` on the platform's far face is what makes the first dealt piece mate
+  // flush onto it — and the dealer seeds its route length from `begin`'s
+  // distance to the origin (metamap.as:894), which is only the platform's
+  // length if the two agree.
+  assert.equal(deck.begin.x, deck.pad.hi.x);
+  assert.equal(deck.padFaces.length, 1);
+  assert.equal(deck.padFaces[0].tex, "start");
+  assert.equal(deck.padFaces[0].top, 0, "the platform's floor is flush with begin.z");
+  assert.equal(deck.padFaces[0].points.length, 4);
   for (const i of deck.finishes) assert.ok(deck.tiles[i].flags & DECK_FLAGS.FINISH);
   // Roomiest finish first: the order the dealer falls down when one will not fit.
   const routes = deck.finishes.map((i) => deck.tiles[i].route);
@@ -157,7 +190,7 @@ test("the browser's reader of the same file makes the same deck", async (t) => {
   assert.deepEqual(mine, browserReader.parseDeck(text));
 });
 
-test("every tile carries a walkable footprint, inside its own box", async (t) => {
+test("every tile — and the platform — carries a walkable footprint in its own box", async (t) => {
   if (!existsSync(SHIPPED_PACK)) return t.skip("build/random_map.pk3 not built");
   const dir = await tmpDir(t);
   await copyFile(SHIPPED_PACK, path.join(dir, "random_map.pk3"));
@@ -179,6 +212,64 @@ test("every tile carries a walkable footprint, inside its own box", async (t) =>
       assert.ok(f.top >= tile.mins.z - 0.5 && f.top <= tile.maxs.z + 0.5, `${tile.name} top ${f.top}`);
     }
   }
+
+  // The platform's footprint rides in padFaces, with no model token and no tile
+  // to belong to. Its points are WORLD coordinates, not local to anything, so
+  // they are bounded against the pad box — which is also the check that would
+  // catch a `padface` mis-read as a `face` (one token fewer shifts every number
+  // along by one, and nothing would land in the box).
+  assert.ok(deck.padFaces.length, "the start platform publishes no footprint");
+  for (const f of deck.padFaces) {
+    assert.ok(WALKABLE.includes(f.tex), `the platform publishes a ${f.tex} face`);
+    assert.ok(f.points.length >= 3, `the platform has a ${f.points.length}-point face`);
+    for (const [x, y] of f.points) {
+      assert.ok(x >= deck.pad.lo.x - 0.5 && x <= deck.pad.hi.x + 0.5, `platform x ${x}`);
+      assert.ok(y >= deck.pad.lo.y - 0.5 && y <= deck.pad.hi.y + 0.5, `platform y ${y}`);
+    }
+    assert.ok(f.top >= deck.pad.lo.z - 0.5 && f.top <= deck.pad.hi.z + 0.5, `platform top ${f.top}`);
+  }
+});
+
+test("a deck with no start tile is a correct deck", () => {
+  // The whole swap, in one test: no start tile is fine, no platform is not.
+  const deck = parseDeck(MINIMAL, { log: QUIET });
+  assert.ok(deck, "a deck with no start tile must parse");
+  assert.equal(deck.start, undefined);
+  assert.equal(deck.tiles.filter((tile) => tile.flags & 8).length, 0);
+  assert.deepEqual(deck.pad, { lo: { x: -16, y: -208, z: -32 }, hi: { x: 1024, y: 208, z: 256 } });
+  assert.deepEqual(deck.begin, { x: 1024, y: 0, z: 0 });
+  assert.equal(deck.beginStep, 0);
+  assert.deepEqual(deck.spawn, { x: 96, y: 0, z: 32 });
+  assert.equal(deck.spawnStep, 0);
+  assert.deepEqual(deck.padFaces, [
+    { tex: "start", top: 0, points: [[0, -192], [1024, -192], [1024, 192], [0, 192]] },
+  ]);
+
+  // A tile wearing the retired bit 8 is just a tile. Nothing may read it back
+  // as "this is the start": it would be dealt from the play box origin, through
+  // the platform standing there.
+  const wearing = parseDeck(MINIMAL.replace("tile 1 0 10", "tile 1 8 10"), { log: QUIET });
+  assert.ok(wearing);
+  assert.equal(wearing.start, undefined);
+  assert.equal(wearing.tiles[0].weight, 10, "it is still a drawable piece");
+
+  // `spawn` is optional: RACE_MetaSpawnSpot falls back to (96, 0, 32) for a deck
+  // built before the line existed, so an absent one is null, not a refusal.
+  const noSpawn = parseDeck(MINIMAL.replace(/^spawn .*$/m, ""), { log: QUIET });
+  assert.ok(noSpawn, "spawn is optional");
+  assert.equal(noSpawn.spawn, null);
+  assert.equal(noSpawn.spawnStep, 0);
+  // So is the footprint — the dealer never reads one, only a plan does.
+  const noPadFace = parseDeck(MINIMAL.replace(/^padface .*$/m, ""), { log: QUIET });
+  assert.ok(noPadFace, "padface is optional");
+  assert.deepEqual(noPadFace.padFaces, []);
+
+  // `begin`'s last token is already a 45-degree STEP, so it is reduced the way
+  // RACE_MetaStep reduces it (the long way round, so -1 lands on 7) and NOT put
+  // through the multiple-of-45 check a tile's yaw gets — which would refuse it.
+  const turned = parseDeck(MINIMAL.replace("begin 1024 0 0 0", "begin 1024 0 0 -1"), { log: QUIET });
+  assert.ok(turned);
+  assert.equal(turned.beginStep, 7);
 });
 
 test("the parse is cached until the pack is republished", async (t) => {
@@ -243,14 +334,24 @@ test("refuses a manifest the servers would refuse, and says why", () => {
   // a preview drawn from one would be drawing a map nobody is playing.
   assert.equal(bad((s) => s.replace("deck 1 2", "deck 2 2")), null);
   assert.equal(bad((s) => s.replace("deck 1 2 384", "deck 1 9 384")), null); // count lies
-  assert.equal(bad((s) => s.replace(/^tile 1 8 .*$/m, "")), null); // no start tile
   assert.equal(bad((s) => s.replace(/^tile 2 16 .*$/m, "")), null); // no finish tile
+  // The two that replaced "no start tile". Without `begin` the route would start
+  // at the play box origin, inside the platform now standing there; without
+  // `pad` a later piece can be dealt through the floor the player spawns on.
+  assert.equal(bad((s) => s.replace(/^begin .*$/m, "")), null); // no route origin
+  assert.equal(bad((s) => s.replace(/^pad .*$/m, "")), null); // no platform box
+  // ...and a pad box with no width is the same failure wearing a line: x and y
+  // only, the two axes metamap.as checks.
+  assert.equal(bad((s) => s.replace("pad -16 -208 -32 1024 208 256", "pad -16 -208 -32 -16 208 256")), null);
   assert.equal(bad((s) => s.replace("gate 9 32 208 192", "gate 0 32 208 192")), null);
   assert.equal(bad((s) => s.replace("play 13312", "play 0")), null);
-  assert.equal(bad((s) => s.replace(" 1024 start start", " 1024 start")), null); // short tile line
-  assert.equal(bad((s) => s.replace("tile 1 8 0 1024 0 0 0 ", "tile 1 8 0 1024 0 0 30 ")), null); // yaw off the 45 grid
-  assert.equal(bad((s) => s.replace("face 1 start 0 4", "face 1 start 0 5")), null); // arity self-check
-  assert.equal(reasons.length, 9, reasons.join(" | "));
+  assert.equal(bad((s) => s.replace(" 1024 straight run_1024", " 1024 straight")), null); // short tile line
+  assert.equal(bad((s) => s.replace("tile 1 0 10 1024 0 0 0 ", "tile 1 0 10 1024 0 0 30 ")), null); // yaw off the 45 grid
+  assert.equal(bad((s) => s.replace("face 1 floor 0 4", "face 1 floor 0 5")), null); // arity self-check
+  // padface counts its own points too, and carries one token fewer, so its
+  // self-check is a different sum (4 + 2n) that has to be the right one.
+  assert.equal(bad((s) => s.replace("padface start 0 4", "padface start 0 5")), null);
+  assert.equal(reasons.length, 12, reasons.join(" | "));
   assert.ok(reasons.every((m) => m.startsWith("random deck: ")), reasons.join(" | "));
 
   assert.ok(parseDeck(MINIMAL, { log: QUIET }), "the unedited fixture must parse");
@@ -261,8 +362,8 @@ test("tolerates what the engine tolerates: unknown heads, extra tile tokens", ()
   // be added to a grammar deployed servers already read. The preview must not
   // be the thing that makes the next addition a breaking change.
   const text = MINIMAL.replace(
-    "face 1 start",
-    "piece 1 something new\ntile 2 16 0 1024 0 0 0 0 -208 -32 1040 208 256 1024 finish finish extra 7\nface 1 start"
+    "face 1 floor",
+    "piece 1 something new\ntile 2 16 0 1024 0 0 0 0 -208 -32 1040 208 256 1024 finish finish extra 7\nface 1 floor"
   ).replace(/^tile 2 16 .*finish finish$/m, "");
   const deck = parseDeck(text, { log: QUIET });
   assert.ok(deck);
@@ -272,6 +373,15 @@ test("tolerates what the engine tolerates: unknown heads, extra tile tokens", ()
   const orphan = parseDeck(MINIMAL + "face 99 floor 0 3 0 0 64 0 64 64\n", { log: QUIET });
   assert.ok(orphan);
   assert.equal(orphan.tiles.reduce((n, t) => n + t.faces.length, 0), 1);
+  // `padface` is a head of its own and must not fall into the `face` branch: it
+  // has no model token, so read as a face it would name model NaN and be counted
+  // an orphan — which is a warning on an otherwise clean parse, and a platform
+  // missing from the plan.
+  const padWarnings = [];
+  const padded = parseDeck(MINIMAL, { log: { log() {}, warn: (m) => padWarnings.push(m), error() {} } });
+  assert.equal(padded.padFaces.length, 1);
+  assert.equal(padded.tiles.reduce((n, tile) => n + tile.faces.length, 0), 1);
+  assert.deepEqual(padWarnings, [], "a clean deck warns about nothing");
   // A comment trailing a data line is eaten, the way COM_Parse eats it.
   const commented = parseDeck(MINIMAL.replace("play 13312 2560 1536", "play 13312 2560 1536 // the arena"), {
     log: QUIET,

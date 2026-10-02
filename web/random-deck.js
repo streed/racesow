@@ -1,6 +1,6 @@
 /* The random_map tile deck, read straight out of the compiled pack.
  *
- * random_map is not a course: it is a deck of 78 pieces compiled into ONE
+ * random_map is not a course: it is a deck of 77 pieces compiled into ONE
  * .bsp, and the gametype (server/racemod .../hrace/metamap.as) deals a route
  * from a seed at map load. To show a player the route a seed produces, the web
  * side needs the same numbers the dealer reads — how big each piece is, where
@@ -16,12 +16,29 @@
  *   deck <version> <tiles> <width>     header; version 1 is the only one
  *   play <half> <up> <down>            the arena the dealer must stay inside
  *   gate <model> <depth> <half> <height>
+ *   pad <minx> <miny> <minz> <maxx> <maxy> <maxz>
+ *   begin <x> <y> <z> <step>           where the dealt route starts
+ *   spawn <x> <y> <z> <step>           the map's own info_player_deathmatch
  *   tile <model> <flags> <weight> <fwd> <lat> <rise> <yaw>
  *        <minx..minz> <maxx..maxz> <route> <kind> <name>
  *   face <model> <tex> <top> <points> <x> <y> ...
+ *   padface <tex> <top> <points> <x> <y> ...
+ *
+ * THE START PLATFORM used to be a dealt piece, and the deck no longer carries a
+ * tile for it: it is permanent world geometry. `pad` is the box it fills, which
+ * is what keeps dealt route out of it; `begin` is the point at its far end where
+ * the dealt route starts; `spawn` is where the player stands. Every number on
+ * those three lines is already a WORLD value — the platform is compiled into
+ * worldspawn at a fixed place, so unlike a tile it never moves and never turns,
+ * and nothing here is rotated before it is used. The last token of `begin` and
+ * `spawn` is a heading already counted in 45-degree STEPS rather than in
+ * degrees, so it does not go through the yaw check a tile's turn does.
+ *
  * `face` lines are the walkable footprints a plan draws, in the TILE'S own
  * frame; they join back to a tile by its inline-model index, the same way the
- * `gate` line names its model.
+ * `gate` line names its model. `padface` is the same footprint for the
+ * platform, and carries no model token because there is no model to name: the
+ * platform is worldspawn, so its points are already in the WORLD frame.
  *
  * The object this hands back is deliberately the same shape as the one
  * public/assets/js/random-dealer.js parses in the browser, so a route can serve
@@ -60,14 +77,27 @@ const LOCAL_BUILD_DIR = fileURLToPath(new URL("../build/", import.meta.url));
 export const deckDirs = () => [process.env.MAPPACK_DIR || "/mappack", LOCAL_BUILD_DIR];
 
 // tile.flags, mirrored by META_F_* in metamap.as and F_* in tools/mapgen. The
-// dealer only reads START/FINISH; the rest describe what the piece asks of the
-// player (OPEN = no side walls, DASH/WALLJUMP = the move it is built around).
-export const DECK_FLAGS = Object.freeze({ OPEN: 1, DASH: 2, WALLJUMP: 4, START: 8, FINISH: 16 });
+// dealer only reads FINISH; the rest describe what the piece asks of the player
+// (OPEN = no side walls, DASH/WALLJUMP = the move it is built around).
+//
+// Bit 8 was START, from when the start pad was dealt like any other piece. No
+// tile carries it now and it stays RETIRED rather than being reused: a reader
+// that still knew bit 8 would deal whatever wore it from the play box origin,
+// straight through the platform that now stands there (metamap.as:68).
+export const DECK_FLAGS = Object.freeze({ OPEN: 1, DASH: 2, WALLJUMP: 4, FINISH: 16 });
 
 // Headings are eighths of a turn everywhere in the dealer, so a yaw that is not
 // a multiple of 45 would round into a different route than the server deals.
 const STEP_DEG = 45.0;
 const STEPS = 8;
+
+// A heading reduced into [0, STEPS), spelled the long way round because that is
+// how the engine spells it (RACE_MetaStep, metamap.as:208): AngelScript's % keeps
+// the sign of its left operand, so a bare n % 8 can come back negative and both
+// sides have to agree on what step -1 means. Applied to `begin` and `spawn`,
+// whose step token is already a step; a tile's yaw is degrees and goes through
+// the multiple-of-45 check instead.
+const stepOf = (n) => ((Math.trunc(n) % STEPS) + STEPS) % STEPS;
 
 const ZIP64_SENTINEL_32 = 0xffffffff;
 
@@ -168,11 +198,19 @@ const finite = (tok) => {
 };
 
 /**
- * Parse the manifest text into { version, width, play, gate, tiles, start,
- * finishes }: `start` and `finishes` are indexes into `tiles`, `finishes` is
- * roomiest first (the order the dealer falls down when a run-out does not fit),
- * and each tile carries its own `faces`. Returns null, with the reason logged,
- * if the text is not a deck this side can draw from.
+ * Parse the manifest text into { version, width, play, gate, pad, begin,
+ * beginStep, spawn, spawnStep, tiles, finishes, padFaces }.
+ *
+ * `finishes` are indexes into `tiles`, roomiest first (the order the dealer
+ * falls down when a run-out does not fit), and each tile carries its own
+ * `faces`. The dealt route starts at `begin` facing `beginStep`: there is no
+ * start tile and no `start` index any more, because the platform the route
+ * starts from is world geometry, described instead by `pad` (the box dealt
+ * pieces must keep out of), `spawn` (where the player stands) and `padFaces`
+ * (its footprint, in world units, which only a plan reads).
+ *
+ * Returns null, with the reason logged, if the text is not a deck this side can
+ * draw from.
  */
 export function parseDeck(text, { log = console, source = "" } = {}) {
   const where = source ? ` (${source})` : "";
@@ -181,7 +219,28 @@ export function parseDeck(text, { log = console, source = "" } = {}) {
     return null;
   };
 
-  const deck = { version: 0, width: 0, play: null, gate: null, tiles: [], start: -1, finishes: [] };
+  const deck = {
+    version: 0,
+    width: 0,
+    play: null,
+    gate: null,
+    // The start platform, in world units. pad and begin are refused below if
+    // they are missing, so they are only ever null on a deck this parser is
+    // about to turn down.
+    pad: null,
+    begin: null,
+    beginStep: 0,
+    // The spawn is NOT required: RACE_MetaSpawnSpot falls back to the literal
+    // (96, 0, 32) for a deck built before the line existed (metamap.as:923), so
+    // an absent `spawn` is null here and a caller does its own fallback.
+    spawn: null,
+    spawnStep: 0,
+    tiles: [],
+    finishes: [],
+    // The platform's walkable footprint, world frame. Optional: the dealer never
+    // reads a footprint, only a plan does.
+    padFaces: [],
+  };
   const byModel = new Map();
   let declared = NaN; // the tile count the header promises
   let orphanFaces = 0;
@@ -207,6 +266,29 @@ export function parseDeck(text, { log = console, source = "" } = {}) {
       if (!Number.isFinite(deck.gate.model + deck.gate.depth + deck.gate.half + deck.gate.height)) {
         return fail(`bad gate at ${at}`);
       }
+    } else if (t[0] === "pad") {
+      // The platform's whole box, walls included: the space it fills, not the
+      // floor it offers. This is what the dealer tests every placement against.
+      if (t.length < 7) return fail(`short pad line at ${at} (${t.length} tokens)`);
+      const v = t.slice(1, 7).map(finite);
+      if (v.some((x) => !Number.isFinite(x))) return fail(`bad pad box at ${at}`);
+      deck.pad = { lo: { x: v[0], y: v[1], z: v[2] }, hi: { x: v[3], y: v[4], z: v[5] } };
+    } else if (t[0] === "begin" || t[0] === "spawn") {
+      // Two lines of the same shape: `begin` is where the dealt route starts
+      // (the platform's far face, which the start gate stands on) and `spawn` is
+      // where the player stands. The fourth number is a 45-degree step already.
+      const head = t[0];
+      if (t.length < 5) return fail(`short ${head} line at ${at} (${t.length} tokens)`);
+      const v = t.slice(1, 5).map(finite);
+      if (v.some((x) => !Number.isFinite(x))) return fail(`bad ${head} at ${at}`);
+      const point = { x: v[0], y: v[1], z: v[2] };
+      if (head === "begin") {
+        deck.begin = point;
+        deck.beginStep = stepOf(v[3]);
+      } else {
+        deck.spawn = point;
+        deck.spawnStep = stepOf(v[3]);
+      }
     } else if (t[0] === "tile") {
       // 17 tokens is the whole line; more is allowed on purpose — getToken is
       // index-addressed, so appending a field to this grammar is the one
@@ -221,7 +303,7 @@ export function parseDeck(text, { log = console, source = "" } = {}) {
       const tile = {
         model: v[0],
         flags: v[1],
-        weight: v[2], // 0 for the start and the finishes: those are placed by hand
+        weight: v[2], // 0 for the finishes: those are placed by hand, not drawn
         // The exit, in the tile's own frame: fwd along the entry heading, lat
         // to its left, rise in z. This is what mates one piece onto the next.
         fwd: v[3],
@@ -237,7 +319,6 @@ export function parseDeck(text, { log = console, source = "" } = {}) {
         name: t[16],
         faces: [],
       };
-      if (tile.flags & DECK_FLAGS.START) deck.start = deck.tiles.length;
       if (tile.flags & DECK_FLAGS.FINISH) deck.finishes.push(deck.tiles.length);
       byModel.set(tile.model, tile);
       deck.tiles.push(tile);
@@ -272,6 +353,29 @@ export function parseDeck(text, { log = console, source = "" } = {}) {
       // tex is the texture role a plan colours by; top is the top plane's
       // HIGHEST point (a ramp's top is a plane, not a height), tile-local.
       tile.faces.push({ tex: t[2], top, points: poly });
+    } else if (t[0] === "padface") {
+      // padface <tex> <top> <points> <x> <y>... — a `face` without the model
+      // token, because the platform is worldspawn and has no inline model to
+      // name. Its points are therefore already WORLD coordinates, where a tile's
+      // are local to the tile. One token fewer shifts the whole line, so the
+      // arity self-check is 4 + 2n and not 5 + 2n; it also must not fall through
+      // to the `face` branch above, which would count it as an orphan footprint.
+      const top = finite(t[2]);
+      const points = finite(t[3]);
+      if (!Number.isFinite(top) || !Number.isInteger(points) || points < 3) {
+        return fail(`bad padface at ${at}`);
+      }
+      if (t.length !== 4 + 2 * points) {
+        return fail(`padface at ${at} declares ${points} points but carries ${t.length - 4} numbers`);
+      }
+      const poly = [];
+      for (let i = 0; i < points; i++) {
+        const x = finite(t[4 + i * 2]);
+        const y = finite(t[5 + i * 2]);
+        if (!Number.isFinite(x + y)) return fail(`bad padface point at ${at}`);
+        poly.push([x, y]);
+      }
+      deck.padFaces.push({ tex: t[1], top, points: poly });
     }
     // No trailing else, exactly like RACE_MetaLoadDeck: a head we do not know
     // is a line written for someone else.
@@ -282,8 +386,28 @@ export function parseDeck(text, { log = console, source = "" } = {}) {
   if (Number.isFinite(declared) && declared !== deck.tiles.length) {
     return fail(`header promises ${declared} tiles, the file carries ${deck.tiles.length}`);
   }
-  if (deck.start < 0) return fail("no start tile");
   if (!deck.finishes.length) return fail("no finish tile");
+  // These two replaced "no start tile", in RACE_MetaLoadDeck's own order
+  // (metamap.as:351, an else-if chain, so the first failure wins). A deck with
+  // no start tile is CORRECT now; a deck with no platform is the broken one.
+  // Without `begin` the route would start at the play box origin, which is
+  // inside the platform now standing there, and a guess at where the platform
+  // might be would make that silent instead of loud. Without `pad` a later piece
+  // can be dealt straight through the floor the player spawns on. The box is
+  // checked in x and y only, the same two axes metamap.as checks: the plan test
+  // is what the dealer leans on, and a flat pad would pass a z check anyway.
+  if (!deck.begin) {
+    return fail(
+      "the deck declares no route origin (no begin line): it was built before the" +
+        " start platform moved into the world. Rebuild it with tools/mapgen."
+    );
+  }
+  if (!deck.pad || !(deck.pad.hi.x > deck.pad.lo.x) || !(deck.pad.hi.y > deck.pad.lo.y)) {
+    return fail(
+      "the deck declares no start platform (no pad box): without it a later piece" +
+        " can be dealt straight through the player's spawn."
+    );
+  }
   if (!deck.gate || !(deck.gate.model > 0)) return fail("no gate model");
   if (!deck.play || !(deck.play.half > 0)) return fail("no play box");
   if (orphanFaces) log.warn?.(`random deck: ${orphanFaces} face(s) name a model with no tile${where}`);

@@ -1239,6 +1239,17 @@ class Tiles(unittest.TestCase):
         deck.models[tiles.GATE_NAME] = len(deck.tiles) + 1
         return deck
 
+    @staticmethod
+    def rows_by_head(text):
+        """head -> [token row], the way a reader walking the lines gets them.
+        Comment lines yield no first token, which is how COM_Parse drops them."""
+        out = {}
+        for ln in text.split("\n"):
+            r = ln.split()
+            if r and not ln.startswith("//"):
+                out.setdefault(r[0], []).append(r)
+        return out
+
     def faces_by_model(self, text):
         """The face block read back the way a plan would read it:
         model -> [(tex, top, [(x, y)])], in the order it was written."""
@@ -1257,8 +1268,10 @@ class Tiles(unittest.TestCase):
 
     def test_every_recipe_lays_cleanly(self):
         # layout's own rules (run-up before a gap, a gap that lands on floor, a
-        # piece that does not run through itself) apply to a tile too.
-        for recipe in tiles.catalogue():
+        # piece that does not run through itself) apply to a tile too — and to
+        # the start platform, which is built by the same code even though it is
+        # not dealt.
+        for recipe in tiles.catalogue() + [tiles.PAD_RECIPE]:
             with self.subTest(recipe["name"]):
                 tiles.lay(recipe)
 
@@ -1285,18 +1298,32 @@ class Tiles(unittest.TestCase):
                 self.assertLessEqual(t.mins[1], eps)
                 self.assertGreaterEqual(t.maxs[1], -eps)
 
-    def test_deck_has_one_start_and_a_finish(self):
-        starts = [t for t in self.tiles if t.flags & tiles.F_START]
+    def test_the_deck_has_no_start_tile_but_still_has_two_finishes(self):
+        # The start platform is world geometry now (tiles._start_pad), so
+        # nothing in the deck is a start: the floor under the spawn is in the
+        # .bsp whether or not the dealer ran, which is the whole point of moving
+        # it. The finish has to land wherever the route ran out, so that end is
+        # still dealt — and there are two, because by then the play box is full
+        # of the route itself.
+        self.assertEqual([t.name for t in self.tiles if t.kind == "start"], [])
+        self.assertEqual([t.name for t in self.tiles if t.flags & 8], [],
+                         "bit 8 was F_START and stays retired: a reader that "
+                         "still knows it would deal whatever wears it from the "
+                         "play box origin, straight through the platform")
         finishes = [t for t in self.tiles if t.flags & tiles.F_FINISH]
-        self.assertEqual(len(starts), 1)
         self.assertGreaterEqual(len(finishes), 2,
                                 "a small finish is the fallback when the roomy one will not fit")
-        for t in starts + finishes:
-            self.assertEqual(t.weight, 0, "the ends are placed by hand, never drawn")
+        for t in finishes:
+            self.assertEqual(t.weight, 0, "the end is placed by hand, never drawn")
+        # The surviving flags are mirrored by VALUE in metamap.as (META_F_*) and
+        # web/random-deck.js (DECK_FLAGS), so renumbering one would change what
+        # an already-deployed reader thinks a tile is.
+        self.assertEqual((tiles.F_OPEN, tiles.F_DASH, tiles.F_WALLJUMP, tiles.F_FINISH),
+                         (1, 2, 4, 16))
 
     def test_drawable_tiles_carry_a_weight(self):
         for t in self.tiles:
-            if t.flags & (tiles.F_START | tiles.F_FINISH):
+            if t.flags & tiles.F_FINISH:
                 continue
             with self.subTest(t.name):
                 self.assertGreater(t.weight, 0)
@@ -1327,6 +1354,9 @@ class Tiles(unittest.TestCase):
         self.assertEqual(len(names), len(placed),
                          "mg_name must be unique: it is the read-back key")
         self.assertIn(tiles.GATE_NAME, names)
+        # The start platform is not among them: it is worldspawn, so it has no
+        # inline model to be placed and no origin brush to be placed by.
+        self.assertNotIn(tiles.PAD_NAME, names)
         for k, brushes in placed:
             self.assertTrue(brushes, k["mg_name"])
             # An origin BRUSH is what makes the compiler express the submodel in
@@ -1337,6 +1367,76 @@ class Tiles(unittest.TestCase):
             self.assertTrue(any(b.tex == "origin" for b in brushes), k["mg_name"])
             self.assertNotIn("origin", k)
 
+    def test_the_start_platform_is_world_geometry(self):
+        """The change this file exists for.
+
+        A dealt start pad only exists if GT_SpawnGametype ran, the manifest
+        loaded and the dealer managed a placement, and three separate rounds of
+        "the player is not on the start platform" came out of that chain. In
+        worldspawn the floor is part of the .bsp's own tree, so it is solid
+        before any gametype code runs and still solid when nothing is dealt.
+        """
+        deck = tiles.build_deck("random_map", "Random Map")
+        # In the world, by identity — not a copy of the same shape somewhere.
+        for p in deck.pad.prisms:
+            self.assertIn(p, deck.course.world)
+        # And not ALSO an entity: an mg_tile's brushes become an inline model,
+        # and an inline model nothing references is invisible and non-solid.
+        for keys, _ in deck.course.entities:
+            self.assertNotEqual(keys.get("mg_name"), tiles.PAD_NAME)
+
+        # A full-width walled corridor from the play box origin along +X, with
+        # its walking surface at z = 0: the frame every dealt piece mates into.
+        floors = [p for p in deck.pad.prisms if p.tex in tiles.FLOOR_TEX]
+        self.assertEqual(len(floors), 1, "one walkable surface, not a staircase")
+        xs = [x for x, _ in floors[0].poly]
+        ys = [y for _, y in floors[0].poly]
+        self.assertEqual((min(xs), max(xs)), (0.0, float(tiles.PAD_LEN)))
+        self.assertEqual(max(ys) - min(ys), float(tiles.TILE_WIDTH))
+        self.assertEqual(floors[0].zmax(), 0.0)
+        # A wall across the back, entirely behind the entry, so a player cannot
+        # run off the end they spawn on.
+        back = [p for p in deck.pad.prisms
+                if p.tex == "wall" and max(x for x, _ in p.poly) <= 0.0]
+        self.assertEqual(len(back), 1)
+        self.assertGreaterEqual(back[0].zmax(), floors[0].zmax() + physics.PLAYER_HEIGHT)
+
+    def test_the_spawn_stands_on_the_platform(self):
+        deck = tiles.build_deck("random_map", "Random Map")
+        spawns = [k for k, _ in deck.course.entities
+                  if k["classname"] == "info_player_deathmatch"]
+        self.assertEqual(len(spawns), 1)
+        self.assertEqual(spawns[0]["origin"], tiles.SPAWN)
+        # Belt-and-braces now that there is real floor under it, but kept: it
+        # holds the spawn exactly where SPAWN says, so the manifest's `spawn`
+        # line and RACE_MetaCheckStartPad's drift test describe the entity the
+        # engine actually has rather than one 7 units lower (G_DropSpawnpointToFloor
+        # moves to trace.endpos + 1 unit of plane normal, game/g_utils.cpp:1950).
+        self.assertEqual(spawns[0]["spawnflags"], 1)
+        # The player's feet are on the surface, or at most one step above it.
+        top = tiles._floor_under(deck.pad, tiles.SPAWN[0], tiles.SPAWN[1])
+        self.assertIsNotNone(top, "the spawn is not over the platform's floor")
+        feet = tiles.SPAWN[2] + physics.PLAYER_MINS[2] - top
+        self.assertGreaterEqual(feet, 0.0)
+        self.assertLessEqual(feet, physics.STEP_SIZE)
+
+    def test_a_spawn_off_the_platform_fails_the_build(self):
+        # SPAWN and the platform are separate numbers, and they disagree
+        # SILENTLY: the map compiles, the platform is there, and the player is
+        # beside it or buried in it. So the build refuses rather than shipping.
+        was = tiles.SPAWN
+        try:
+            for bad in ((was[0], was[1] + tiles.TILE_WIDTH, was[2]),   # beside it
+                        (was[0] + tiles.PAD_LEN * 2, was[1], was[2]),  # past the end
+                        (was[0], was[1], was[2] - 64.0),               # inside the floor
+                        (was[0], was[1], was[2] + 512.0)):             # dropped in
+                tiles.SPAWN = bad
+                with self.subTest(bad):
+                    with self.assertRaises(layout.LayoutError):
+                        tiles.build_deck("random_map", "Random Map")
+        finally:
+            tiles.SPAWN = was
+
     def test_manifest_refuses_a_tile_the_compiler_dropped(self):
         deck = self.compiled_deck()
         tiles.manifest(deck)                      # complete: fine
@@ -1344,11 +1444,90 @@ class Tiles(unittest.TestCase):
         with self.assertRaises(layout.LayoutError):
             tiles.manifest(deck)
 
+    def test_manifest_refuses_a_deck_with_no_platform(self):
+        # Nothing can build one of these today; the check is there because a
+        # manifest that quietly omitted the pad block would leave the dealer
+        # with no route origin and no box to keep clear of, and it would read as
+        # a dealer bug rather than a build one.
+        deck = self.compiled_deck()
+        tiles.manifest(deck)
+        deck.pad = None
+        with self.assertRaises(layout.LayoutError):
+            tiles.manifest(deck)
+
+    def test_the_platform_lines_say_what_the_platform_is(self):
+        deck = self.compiled_deck()
+        rows = self.rows_by_head(tiles.manifest(deck))
+        pad = deck.pad
+
+        # pad: the box a dealt piece must stay out of. The platform's FULL box,
+        # walls included, because it is space and not floor.
+        self.assertEqual(len(rows["pad"]), 1)
+        box = [float(v) for v in rows["pad"][0][1:]]
+        self.assertEqual(len(box), 6)
+        self.assertEqual(tuple(box[:3]), pad.mins)
+        self.assertEqual(tuple(box[3:]), pad.maxs)
+        # ...and it is inside the fence the dealer keeps every placement within.
+        self.assertGreater(box[0], -tiles.PLAY_HALF)
+        self.assertLess(box[3], tiles.PLAY_HALF)
+        self.assertGreater(box[2], -tiles.PLAY_DOWN)
+        self.assertLess(box[5], tiles.PLAY_UP)
+
+        # begin: where the dealer's cursor starts, and which way it faces.
+        self.assertEqual(len(rows["begin"]), 1)
+        begin = rows["begin"][0]
+        self.assertEqual(len(begin), 5)
+        self.assertEqual([float(v) for v in begin[1:4]], [pad.fwd, pad.lat, pad.rise])
+        # The heading is a 45-degree step, not degrees: metamap.as indexes an
+        # exact table by it (META_STEP_DEG) rather than carrying a float.
+        step = int(begin[4])
+        self.assertEqual(step % 8, step)
+        self.assertAlmostEqual(step * 45.0, pad.yaw)
+        # Exactly on the box's far face, so the first dealt piece touches the
+        # platform without overlapping it — which is what a plan-overlap test
+        # like RACE_MetaBoxClear needs to be able to pass.
+        self.assertEqual(float(begin[1]), pad.maxs[0])
+
+        # spawn: the map's own info_player_deathmatch, so nothing downstream
+        # needs a second hand-written copy of the number.
+        self.assertEqual(len(rows["spawn"]), 1)
+        spawn = rows["spawn"][0]
+        self.assertEqual(len(spawn), 5)
+        self.assertEqual([float(v) for v in spawn[1:4]], list(tiles.SPAWN))
+        self.assertEqual(int(spawn[4]), step)
+        placed = [k for k, _ in deck.course.entities
+                  if k["classname"] == "info_player_deathmatch"][0]
+        self.assertEqual(tuple(float(v) for v in spawn[1:4]), tuple(placed["origin"]))
+
+        # padface: the shape a `face` line carries minus the model index, in
+        # world coordinates because the platform never turns or moves.
+        want = tiles.floor_faces(pad)
+        self.assertEqual(len(rows["padface"]), len(want))
+        for r, pr in zip(rows["padface"], want):
+            n = int(r[3])
+            self.assertEqual(len(r), 4 + 2 * n, r)
+            self.assertEqual(r[1], pr.tex)
+            self.assertAlmostEqual(float(r[2]), pr.zmax(), delta=0.5)
+            self.assertEqual(n, len(pr.poly))
+            for i, (px, py) in enumerate(pr.poly):
+                self.assertAlmostEqual(float(r[4 + 2 * i]), px, delta=0.5)
+                self.assertAlmostEqual(float(r[5 + 2 * i]), py, delta=0.5)
+
     def test_manifest_reads_back_the_way_the_dealer_reads_it(self):
         deck = self.compiled_deck()
         text = tiles.manifest(deck)
         rows = [ln.split() for ln in text.split("\n") if ln and not ln.startswith("//")]
-        self.assertEqual({r[0] for r in rows}, {"deck", "play", "gate", "tile", "face"})
+        # pad / begin / spawn / padface are heads RACE_MetaLoadDeck's if-chain
+        # does not know, and it has no trailing else (nor does random-deck.js),
+        # so a server already in the field skips each for one getToken.
+        self.assertEqual({r[0] for r in rows},
+                         {"deck", "play", "gate", "pad", "begin", "spawn", "padface",
+                          "tile", "face"})
+        # The one token an old reader does NOT ignore is the version: a bump is
+        # a fatal error in RACE_MetaLoadDeck and it then deals nothing. Every
+        # new head is additive and no old token changed meaning, so it stays 1.
+        self.assertEqual(rows[0][:2], ["deck", "1"])
+        self.assertEqual(int(rows[0][2]), len(deck.tiles))
         tile_rows = [r for r in rows if r[0] == "tile"]
         self.assertEqual(len(tile_rows), len(deck.tiles))
         for r, t in zip(tile_rows, deck.tiles):
@@ -1547,8 +1726,44 @@ class CompileDeck(unittest.TestCase):
             for t in deck.tiles:
                 self.assertIn(t.name, deck.models, t.name)
             self.assertIn(tiles.GATE_NAME, deck.models)
+            self.assertNotIn(tiles.PAD_NAME, deck.models,
+                             "the start platform is worldspawn: nothing places it")
             self.assertTrue(manifest.startswith("//"))
             self.assertIn("\ndeck 1 ", manifest)
+
+    def test_the_compiled_world_keeps_the_start_platform(self):
+        """worldspawn is where the platform has to survive to.
+
+        A brush the compiler folded away, or one it left as a submodel, is a
+        spawn with nothing under it again — and that failure only shows up when
+        someone stands on the map, which is exactly the loop this change is
+        meant to close. Model 0 is worldspawn, so its brush count is the check.
+        """
+        from bsp import Bsp
+        with tempfile.TemporaryDirectory() as out:
+            pk3, deck, problems, _ = build.build_deck("random_map", "Random Map", out)
+            self.assertEqual(problems, [])
+            with zipfile.ZipFile(pk3) as zf:
+                data = zf.read("maps/random_map.bsp")
+        bsp = Bsp(data)
+        _, _, _, world_brushes = bsp.models()[0]
+        # The sky shell plus the platform. q3map2 splits faces, not brushes, so
+        # the count it writes is the count that went in.
+        self.assertEqual(world_brushes, len(deck.course.world))
+        self.assertGreater(len(deck.pad.prisms), 0)
+        # ...and its walking surface reached the compiled shader table, so the
+        # platform renders rather than being a bare collision brush. _start_pad
+        # is the only thing in the deck that wears the start texture, so the
+        # entry being there at all is the platform's. (q3map2 prefixes the
+        # shader path the .map wrote with "textures/".)
+        self.assertIn("textures/" + layout.TEX["start"],
+                      [n for n, _, _ in bsp.shaderrefs()])
+        # And the spawn the engine will read is the one the manifest published.
+        ents = bsp.entity_text()
+        self.assertIn('"classname" "info_player_deathmatch"', ents)
+        self.assertIn('"origin" "%s"' % " ".join(mapfile._fmt(c) for c in tiles.SPAWN),
+                      ents)
+        self.assertIn('"spawnflags" "1"', ents)
 
     def test_every_piece_compiles_into_its_own_frame(self):
         """The load-bearing one.

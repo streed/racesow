@@ -28,8 +28,8 @@ What makes that work is four engine facts, each checked against the source in
 The corollary that shapes this whole file: a submodel's surfaces are not part
 of worldspawn, so an inline model NOTHING references is invisible and
 non-solid. The compiled deck is therefore a dormant library. The map a player
-loads is an empty sealed arena; every piece of floor they run on is an entity
-the dealer created.
+loads is a sealed arena holding one permanent platform, and every other piece
+of floor they run on is an entity the dealer created.
 
 Layout of the compiled map
 --------------------------
@@ -37,7 +37,13 @@ Layout of the compiled map
             every player on it races that same route together, so there is no
             per-player geometry to keep apart — and a seed on a leaderboard
             means something, because it names a course other people can run.
-            The map's one spawn point sits where the start pad is always dealt.
+    pad     the start platform: worldspawn, at a fixed place in the play box,
+            with the map's one spawn point standing on it. It is the only floor
+            in there that is not dealt, which is the whole reason it exists — a
+            player stands on solid ground before any gametype code runs, and
+            still does when the deck fails to load and nothing is ever dealt.
+            The dealt route begins at the platform's far end, which the
+            manifest publishes so the dealer hard-codes none of this.
     slots   a grid well above the play box holding every tile at the position
             it was compiled and lit. Nothing renders or collides here.
     shell   the sky box sealing all of it, plus a trigger_hurt under the play
@@ -86,11 +92,16 @@ WALL_APRON = specmod.WALL_RUNUP
 # Landing apron: floor after a gap/dash, so the piece that follows starts level.
 LAND_APRON = 384
 
-# Tile flags, mirrored by META_TILE_* in hrace/metamap.as.
+# Tile flags, mirrored by META_F_* in hrace/metamap.as and by DECK_FLAGS in
+# web/random-deck.js — by VALUE, so no bit here can be renumbered or recycled
+# without changing what an already-deployed reader thinks a tile is.
 F_OPEN = 1        # no side walls: the player can leave it sideways
 F_DASH = 2        # needs the dash
 F_WALLJUMP = 4    # needs a wall jump
-F_START = 8       # carries the start pad
+# 8 was F_START, from when the start pad was dealt like any other piece. The
+# platform is worldspawn now (_start_pad), so no tile carries it and the bit
+# stays retired rather than being reused: a reader that still knows bit 8 would
+# deal whatever wore it from the play box origin, straight through the platform.
 F_FINISH = 16     # carries the finish pad
 
 # -- the arena ---------------------------------------------------------------
@@ -110,10 +121,30 @@ PIT_THICK = 256
 SLOT_Z = 4608            # the compile/lighting grid, clear above the play box
 SLOT_PITCH = 3072
 
-# Where a player spawns: on the start tile's pad, 8 units above its floor.
-# The start tile is laid from the play box's origin running along +X with its
-# walking surface at z = 0 (tiles._start_tile), and a player's origin sits 24
-# units above their feet.
+# -- the start platform ------------------------------------------------------
+# How long the permanent platform is, which is also how far along +X the dealt
+# route begins: the dealer's cursor starts at the platform's far end.
+#
+# 1024 is what the old start TILE measured, and keeping that number is half the
+# reason for it. The route's origin moves with the platform's length, so any
+# other value slides every dealt route down the play box and quietly changes
+# which course a seed already sitting on a leaderboard names. The other half is
+# that 1024 is a real run-up on its own terms: physics.MIN_RUNUP is 192 units
+# to reach the 320 ups ground cap, so a player is at full speed several times
+# over before the start gate and still has room to strafe-jump into the first
+# dealt piece. Nothing after the platform leans on that — the mating contract
+# makes every dealt piece carry its own entry apron — so this length is free to
+# be chosen for the player rather than for the geometry.
+PAD_LEN = 1024
+# Not a tile name, and never a key in deck.models: the platform is worldspawn,
+# so the compiler leaves it no inline model to be placed by.
+PAD_NAME = "__pad__"
+
+# Where a player spawns: on the platform, 8 units above its floor. The platform
+# runs from the play box's origin along +X with its walking surface at z = 0
+# (_start_pad), a player's origin sits 24 units above their feet
+# (physics.PLAYER_MINS), and x = 96 is clear of the wall across the back.
+# _spawn_rests_on checks that arithmetic at build time instead of trusting it.
 SPAWN = (96.0, 0.0, 32.0)
 
 SHELL_MARGIN = 768
@@ -130,7 +161,10 @@ GATE_DEPTH = 32
 
 class Tile:
     """One dealt-able piece: its brushes in the tile's own local frame, and the
-    transform that carries the cursor from its entry to its exit."""
+    transform that carries the cursor from its entry to its exit.
+
+    The start platform is built as one of these too — see PAD_RECIPE — purely
+    for that arithmetic. It is the one that is never dealt."""
 
     def __init__(self, name, kind, flags, weight, prisms, exit_xyz, exit_yaw, route):
         self.name = name
@@ -225,13 +259,32 @@ def _dash_len(drop):
     return (lo + hi) // 2
 
 
-def _start_tile(w):
-    """The run-up pad every route begins on: level floor, start-coloured, with
-    the back wall behind the spawn. The dealer puts the start gate at the exit
-    and the player on the pad, so the clock starts when they leave it."""
+def _start_pad(w):
+    """The run-up every route begins on: level floor, start-coloured, with a
+    wall across the back so a player cannot run off behind the spawn. The
+    dealer puts the start gate at the far end, so the clock starts the moment
+    the player leaves the platform.
+
+    This is the old `start` tile's body unchanged — the shape was never the
+    problem, where it lived was. build_deck puts these brushes into WORLDSPAWN
+    rather than into an mg_tile entity, so the floor under the spawn is part of
+    the .bsp's own tree: solid and lit before any gametype code runs.
+    """
     w.seg = 0
     w.end_wall(behind=True)
-    w.box_run(1024, tex="start")
+    w.box_run(PAD_LEN, tex="start")
+
+
+# The platform goes through lay() even though it is not a tile, because lay()
+# is where the mating contract's arithmetic lives: the bounds a dealt piece has
+# to keep clear of, and the exit cursor that BECOMES the route's origin, are
+# then computed by exactly the code that computes them for the pieces that must
+# fit onto it. A lay()-built piece's frame has its origin at (0, 0, 0) and
+# heading 0, which for the platform is not a local frame at all — it is the
+# play box's own — so the prisms go into the world untranslated and every
+# number the manifest publishes about the platform is read straight off the
+# Tile.
+PAD_RECIPE = {"name": PAD_NAME, "kind": "pad", "build": _start_pad, "weight": 0}
 
 
 def _finish_tile(w, length=1024):
@@ -263,9 +316,10 @@ def catalogue():
         R.append({"name": name, "kind": kind, "segments": segments,
                   "weight": weight, "flags": flags})
 
-    # -- the two fixed ends --------------------------------------------------
-    R.append({"name": "start", "kind": "start", "build": _start_tile,
-              "weight": 0, "flags": F_START})
+    # -- the one fixed end ---------------------------------------------------
+    # Only the finish is a tile. The start platform cannot move, so it is not
+    # dealt and is not in the deck at all (_start_pad, build_deck); the finish
+    # has to land wherever the route ran out, so it still travels with it.
     R.append({"name": "finish", "kind": "finish", "build": _finish_tile,
               "weight": 0, "flags": F_FINISH})
     R.append({"name": "finish_short", "kind": "finish", "build": _finish_tile_short,
@@ -410,6 +464,7 @@ class Deck:
         self.course = layout.Course({"name": name, "title": title,
                                      "width": TILE_WIDTH, "segments": []})
         self.tiles = []
+        self.pad = None       # the start platform, laid straight into worldspawn
         self.gate = None
         # name -> inline model index, filled in from the COMPILED bsp.
         self.models = {}
@@ -498,36 +553,45 @@ def build_deck(name, title):
     _place(deck, GATE_NAME, [deck.gate],
            x0 + (i % cols) * SLOT_PITCH, y0 + (i // cols) * SLOT_PITCH, SLOT_Z)
 
-    # -- the spawn point, ON the start pad.
+    # -- the start platform, in WORLDSPAWN.
     #
-    # The route always begins at the play box's origin, so the start pad always
-    # lands in the same place and the map's own spawn can simply sit on it. The
-    # first version put the spawn in a lobby off to the side and had the
+    # This is the point of the whole arrangement. Three separate rounds of "the
+    # player is not on the start platform" came out of a spawn whose floor only
+    # existed if GT_SpawnGametype had run AND the manifest had loaded AND the
+    # dealer had managed to place a piece. World geometry cannot fail to arrive.
+    deck.pad = lay(PAD_RECIPE)
+    deck.course.world += deck.pad.prisms
+
+    # -- the spawn point, ON the platform.
+    #
+    # The first version put the spawn in a lobby off to the side and had the
     # gametype move the player onto the route; that move silently does nothing
     # on the FIRST spawn after a map change, because Entity.origin only writes
     # a client's pmove origin once the client reaches CS_SPAWNED
     # (g_ascript.cpp, objectGameEntity_SetOrigin) — so the player stood in the
-    # lobby. Spawning where the pad is needs no move at all, and skips the
+    # lobby. Spawning where the floor is needs no move at all, and skips the
     # one-frame jump across the arena that a think-loop fix leaves behind.
     #
-    # There is deliberately no fallback floor under it. The only way for the
-    # route to be missing is a deck manifest that did not load, which means the
-    # map is unplayable anyway and says so loudly on the server console
-    # (RACE_MetaInit); a pad here could not be protected from a later piece of
-    # route being dealt through it, and a pad the route can eat is worse than
-    # no pad.
-    #
-    # spawnflags 1 is load-bearing. SP_info_player_deathmatch calls
-    # G_DropSpawnpointToFloor (game/g_utils.cpp:1927), which traces 16,000 units
-    # DOWN from the spawn and moves it onto whatever it hits. That runs during
-    # entity spawn — before GT_SpawnGametype deals the route — so there is no
-    # start pad under it yet, the trace falls all the way to the sky shell, and
-    # the spawn is permanently relocated ~3,300 units below where the pad is
-    # about to appear. The flag returns before the move (and after the
-    # inside-solid check, which still applies), which is exactly what a spawn
-    # whose floor is dealt later needs.
+    # spawnflags 1 is belt-and-braces now; it used to be load-bearing.
+    # SP_info_player_deathmatch calls G_DropSpawnpointToFloor
+    # (game/g_utils.cpp:1927), which traces 16,000 units DOWN from the spawn and
+    # puts it on whatever it hits, during entity spawn — before GT_SpawnGametype
+    # deals anything. With the pad dealt there was no floor under the spawn yet,
+    # so the trace fell all the way to the sky shell and the spawn was
+    # permanently relocated ~3,300 units below where the pad was about to
+    # appear. Now the trace lands on the platform and the drop would be
+    # correct — trace.endpos plus one unit of plane normal, so z = 25 instead of
+    # 32 (g_utils.cpp:1950). The flag is kept for the two smaller reasons: it
+    # holds the spawn exactly where SPAWN says it is, which is what lets the
+    # manifest's `spawn` line and RACE_MetaCheckStartPad's 8-unit drift test
+    # describe the entity the engine actually has rather than one 7 units below
+    # it; and it costs nothing, because the check that still matters comes
+    # FIRST — a spawn inside solid is FREED at g_utils.cpp:1941, and the flag
+    # only returns at :1945, after that.
+    _spawn_rests_on(deck.pad)
     deck.course.entities.append(({"classname": "info_player_deathmatch",
-                                  "origin": SPAWN, "angle": 0, "spawnflags": 1}, []))
+                                  "origin": SPAWN, "angle": deck.pad.yaw,
+                                  "spawnflags": 1}, []))
 
     # -- the pit under every lane. Leaving a dealt route is the same mistake as
     # leaving any race map's: trigger_hurt, and the racemod respawns you.
@@ -593,6 +657,44 @@ def floor_faces(tile):
     return [p for p in tile.prisms if p.tex in FLOOR_TEX]
 
 
+def _over(poly, x, y, eps=1e-6):
+    """Is (x, y) on this footprint? Every polygon layout lays down is convex and
+    wound counter-clockwise (layout._rect, and the turn wedges built from it),
+    so "left of every edge" is the whole test."""
+    for i, (x1, y1) in enumerate(poly):
+        x2, y2 = poly[(i + 1) % len(poly)]
+        if (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1) < -eps:
+            return False
+    return True
+
+
+def _floor_under(piece, x, y):
+    """The highest walkable top plane over (x, y), or None if there is no
+    walkable surface there at all."""
+    tops = [p.top_at(x, y) for p in floor_faces(piece) if _over(p.poly, x, y)]
+    return max(tops) if tops else None
+
+
+def _spawn_rests_on(pad):
+    """SPAWN, PAD_LEN and layout's own floor thickness are separate numbers that
+    have to agree, and the way they disagree is silent: the map compiles, the
+    platform is there, and the player is standing beside it or inside it. So
+    they are checked here rather than left to whoever edits one of them next."""
+    top = _floor_under(pad, SPAWN[0], SPAWN[1])
+    if top is None:
+        raise layout.LayoutError([f"the spawn at {SPAWN[0]:g}, {SPAWN[1]:g} is not over "
+                                  f"the start platform's floor"])
+    # The player's feet relative to the surface: on it, or at most one step
+    # above. Below it is a spawn inside solid, which G_DropSpawnpointToFloor
+    # FREES outright (game/g_utils.cpp:1941) leaving the map with no spawn at
+    # all; well above it is a drop on arrival, which reads as a bug.
+    feet = SPAWN[2] + physics.PLAYER_MINS[2] - top
+    if not 0.0 <= feet <= physics.STEP_SIZE:
+        raise layout.LayoutError([f"the spawn stands {feet:.0f} units over the start "
+                                  f"platform; it has to be between 0 and "
+                                  f"{physics.STEP_SIZE:.0f}"])
+
+
 def manifest(deck):
     """The text the dealer reads (hrace/metamap.as, via G_LoadFile).
 
@@ -601,10 +703,19 @@ def manifest(deck):
     indices come from deck.models, read back out of the compiled bsp — never
     predicted from the order entities were written.
 
-    Two blocks: the `tile` lines the dealer fits together, then the `face`
-    lines that say what each tile LOOKS like. RACE_MetaLoadDeck's head dispatch
-    has no trailing else, so a head it does not know is skipped in silence —
-    `face` costs a deployed server one getToken per line and nothing else.
+    Three blocks: what the permanent start platform is and where it hands over
+    to the dealt route, then the `tile` lines the dealer fits together, then the
+    `face` lines that say what each tile LOOKS like.
+
+    RACE_MetaLoadDeck's head dispatch is a plain if/else-if chain ending at
+    `tile` with NO trailing else (metamap.as:222-268), so a head it does not
+    know costs one getToken and is skipped in silence; web/random-deck.js copies
+    that deliberately. That is the licence for `face`, and it is what lets
+    `pad`, `begin`, `spawn` and `padface` be added to a grammar servers in the
+    field already read. The `deck` version stays 1 for the same reason: a bump
+    is the ONE thing an old reader does not ignore (it is a fatal version error
+    and it deals nothing), and nothing here changes the meaning of a token any
+    old reader uses.
     """
     missing = [t.name for t in deck.tiles if t.name not in deck.models]
     if GATE_NAME not in deck.models:
@@ -612,6 +723,16 @@ def manifest(deck):
     if missing:
         raise layout.LayoutError(
             ["the compiler did not keep an inline model for: " + ", ".join(missing)])
+
+    pad = deck.pad
+    if pad is None:
+        raise layout.LayoutError(["the deck has no start platform"])
+    # Where the route begins is the platform's exit, which lay() has already
+    # worked out; the platform's frame IS the world frame, so that exit is a
+    # world point. The heading goes out in the dealer's own unit, an eighth of a
+    # circle (META_STEP_DEG), because that lattice is what its heading table is
+    # indexed by — a yaw in degrees would only be rounded back to this.
+    step = int(round(pad.yaw / 45.0)) % 8
 
     f = mapfile._fmt
     out = [
@@ -622,6 +743,50 @@ def manifest(deck):
         f"play {f(PLAY_HALF)} {PLAY_UP} {PLAY_DOWN}",
         f"gate {deck.models[GATE_NAME]} {GATE_DEPTH} {f(TILE_WIDTH / 2.0 + layout.WALL_THICK)} "
         f"{GATE_HEIGHT}",
+        "",
+        "// The start platform. It is WORLDSPAWN rather than a dealt piece, so it",
+        "// has no inline model and cannot be a tile row — and it is the one piece",
+        "// of floor in the play box that is there whether or not the dealer ran.",
+        "// Every number below is already in world units: it never moves, and it",
+        "// never turns.",
+        "//",
+        "// `pad` is its box, and the dealer needs it because the platform",
+        "// occupies space a later piece must not be dealt into. A route that",
+        "// folded back over its own start used to be stopped by the start TILE",
+        "// sitting in the dealer's placed list; nothing stops it now unless this",
+        "// box is seeded there. Walls included: it is the space, not the floor.",
+        "// pad <minx> <miny> <minz> <maxx> <maxy> <maxz>",
+        f"pad {f(pad.mins[0])} {f(pad.mins[1])} {f(pad.mins[2])} "
+        f"{f(pad.maxs[0])} {f(pad.maxs[1])} {f(pad.maxs[2])}",
+        "// Where the dealt route starts and which way it faces: the platform's",
+        "// far end, as a point and a 45-degree step. The dealer's first placement",
+        "// goes there and the start gate sits on it, so the clock starts when the",
+        "// player leaves the platform. It is exactly on the box's far face, so",
+        "// that first piece touches the platform without overlapping it. The",
+        "// platform's own run-up is this point's distance from the origin, for a",
+        "// dealer that wants to count it toward the route's length.",
+        "// begin <x> <y> <z> <step>",
+        f"begin {f(pad.fwd)} {f(pad.lat)} {f(pad.rise)} {step}",
+        "// The map's own info_player_deathmatch, which stands on the platform.",
+        "// Published so that putting a player back on the platform — on joining,",
+        "// on /kill, after a re-deal — needs no second copy of this number",
+        "// compiled into the gametype.",
+        "// spawn <x> <y> <z> <step>",
+        f"spawn {f(SPAWN[0])} {f(SPAWN[1])} {f(SPAWN[2])} {step}",
+        "// ...and the platform's walkable footprint, so a plan still draws the",
+        "// start now that it is not a tile. A `face` line without the model",
+        "// index, kept apart from the face block below because those points are",
+        "// in their tile's own frame for a plan to turn and move, and these are",
+        "// already in the world's.",
+        "// padface <tex> <top> <points> <x> <y> ... (<points> pairs)",
+    ]
+    for p in floor_faces(pad):
+        out.append("padface {} {} {} {}".format(
+            p.tex, round(p.zmax()), len(p.poly),
+            " ".join(f"{round(x)} {round(y)}" for x, y in p.poly)))
+
+    out += [
+        "",
         "// tile <model> <flags> <weight> <fwd> <lat> <rise> <yaw>"
         " <minx> <miny> <minz> <maxx> <maxy> <maxz> <route> <kind> <name>",
     ]

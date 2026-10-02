@@ -1,10 +1,10 @@
 /* Deal a random_map route, exactly the way a game server deals it.
  *
- * random_map has no course in it. The pack holds a DECK — every piece compiled
- * as a dormant inline brush model plus a manifest of the numbers needed to fit
- * one piece onto the next — and hrace/metamap.as deals a route out of it from
- * a seed. This is a port of that dealer for the browser, so /random can draw
- * the course a seed produces without asking a server.
+ * random_map has no course in it. The pack holds a DECK — 77 pieces compiled as
+ * dormant inline brush models plus a manifest of the numbers needed to fit one
+ * piece onto the next — and hrace/metamap.as deals a route out of it from a
+ * seed. This is a port of that dealer for the browser, so /random can draw the
+ * course a seed produces without asking a server.
  *
  * A preview that draws a route the server would NOT deal is worse than no
  * preview at all, so everything here is arithmetic-for-arithmetic with
@@ -21,6 +21,17 @@
  *   * Tiles are scored in deck order and drawn in proportion to their score,
  *     so the manifest's order is part of the seed too — parseDeck keeps it.
  *
+ * THE START PLATFORM IS NOT DEALT. It used to be piece 0 of every route; it is
+ * now permanent world geometry, and the deck carries no tile for it. The
+ * manifest says where it is instead, and this file uses all three numbers:
+ * the dealt route starts at `begin` (the platform's far face) facing
+ * `beginStep`, the route length starts at the platform's own planar run-up, and
+ * `pad` — the box the platform fills — is tested against every placement, which
+ * is the only thing keeping a route that folds back over its own start from
+ * being dealt through the floor the player spawns on. So MAX_TILES and AHEAD
+ * now count DEALT pieces only, and pieces[0] is the first dealt piece rather
+ * than the pad.
+ *
  * Pinned by web/test/random-dealer.test.js against golden vectors dumped from
  * the Python model of the same dealer over 340 seeds.
  */
@@ -30,7 +41,7 @@
 // face to face, and a fraction of a degree per piece shows as a seam.
 export const STEPS = 8;
 export const STEP_DEG = 45.0;
-export const AHEAD = 6;              // pieces kept dealt ahead of the player
+export const AHEAD = 6;              // dealt pieces kept ahead of the player
 export const MAX_TILES = 44;         // ceiling on a whole route (entity budget)
 export const REWIND_BUDGET = 16;     // placements the dealer may undo per extend
 export const OVERPASS_CLEAR = 96.0;  // room to run under a piece crossing over
@@ -38,16 +49,29 @@ export const FENCE_MARGIN = 384.0;   // slack so a piece never touches the shell
 export const EXIT_ROOM = 640.0;      // room a piece's exit leaves for the next
 export const DEFAULT_TARGET = 16000; // rs_meta_distance's default
 
+// tile.flags, by VALUE, from META_F_* (metamap.as:74) and tools/mapgen's F_*.
+//
+// Bit 8 was F_START, from when the start pad was dealt like any other piece. No
+// tile carries it now and it stays RETIRED rather than being reused: a reader
+// that still knew bit 8 would deal whatever wore it from the play box origin,
+// straight through the platform that now stands there (metamap.as:68).
 export const F_OPEN = 1;
 export const F_DASH = 2;
 export const F_WALLJUMP = 4;
-export const F_START = 8;
 export const F_FINISH = 16;
 
-// META_COS/META_SIN, digit for digit (metamap.as:128).
+// META_COS/META_SIN, digit for digit (metamap.as:161).
 const COS_TABLE = [1.0, 0.70710678, 0.0, -0.70710678, -1.0, -0.70710678, 0.0, 0.70710678];
 const COS = (step) => COS_TABLE[step & 7];
 const SIN = (step) => COS_TABLE[(step + 6) & 7];
+
+// A heading reduced into [0, STEPS), spelled the long way round because that is
+// how the engine spells it (RACE_MetaStep, metamap.as:208): AngelScript's %
+// keeps the sign of its left operand, so a bare n % 8 can come back negative
+// and both sides have to agree on what step -1 means. This is for `begin` and
+// `spawn`, whose last token is already a step; a tile's turn is in DEGREES and
+// goes through parseYaw's multiple-of-45 check instead.
+const stepOf = (n) => ((Math.trunc(n) % STEPS) + STEPS) % STEPS;
 
 /* Where a piece placed at `at` facing `step` hands the route over to the next
  * one: its entry frame turned by the table above and walked to the exit the
@@ -62,10 +86,9 @@ const SIN = (step) => COS_TABLE[(step + 6) & 7];
  * That 1e-12 is not always invisible, which is the thing to know: pieces mate
  * exactly, and the clash test lets boxes touch (<=, not <), so a route folding
  * back on itself regularly puts a candidate's box EXACTLY against an earlier
- * piece — 6% of placements across the golden set have such a decision — and
- * then the last ulp is what decides whether that piece fits. Dealt the other
- * way round, 2 of the 352 golden routes pick a different piece. Which is also
- * why nothing here is allowed to drift "harmlessly".
+ * piece — and against the start platform, whose far face `begin` sits on — and
+ * then the last ulp is what decides whether that piece fits. Which is also why
+ * nothing here is allowed to drift "harmlessly".
  *
  * Note this is the DEALER's rotation, for placements. Brush geometry is a
  * different question: the engine turns a placed piece by its real angles, so
@@ -80,6 +103,22 @@ export function exitOf(at, tile, step) {
 /* ...and which way it leaves, in 45-degree steps. */
 export function headingOf(tile, step) {
   return (step + tile.turn) % STEPS;
+}
+
+/* Do two boxes leave each other alone? RACE_MetaBoxesApart (metamap.as:460).
+ *
+ * Touching counts as apart, which is what lets consecutive pieces mate face to
+ * face — and what lets the first dealt piece sit flush on the start platform,
+ * since `begin` is exactly on the platform's far face.
+ *
+ * Factored out rather than inlined per caller because the engine runs literally
+ * one function here, for the start platform and for every piece already on the
+ * ground. Two copies of this test could drift, and a route dealt through the
+ * platform is a route whose first jump lands in the player's own spawn. */
+export function boxesApart(lo, hi, a, b) {
+  if (hi.x <= a.x || lo.x >= b.x || hi.y <= a.y || lo.y >= b.y) return true;  // clear in plan
+  if (lo.z >= b.z + OVERPASS_CLEAR || hi.z + OVERPASS_CLEAR <= a.z) return true;  // clean overpass
+  return false;
 }
 
 /* xorshift32, the generator metamap.as runs (RACE_MetaNextRandom). Returns a
@@ -125,22 +164,73 @@ function parseYaw(deg, where) {
   if (Math.abs(steps - whole) > 0.01) {
     throw new Error(`${where}: turn of ${deg} degrees is not a multiple of ${STEP_DEG}`);
   }
-  return ((whole % STEPS) + STEPS) % STEPS;
+  return stepOf(whole);
 }
 
-/* Read maps/<map>.deck. Returns { version, width, play, gate, tiles, start,
- * finishes } — `start` and `finishes` are indexes into `tiles`, and `finishes`
- * is roomiest first, because the dealer walks that list and a route that has
- * painted itself into a corner can still end on the small run-out.
+/* Is this deck one the start platform has been written down in? Returns the
+ * reason it is not, or null.
+ *
+ * Shared by parseDeck and dealRoute on purpose. parseDeck only ever sees the
+ * manifest text, but /random hands dealRoute the JSON of a deck parsed on the
+ * server (/api/random/deck), and that response is edge-cached for five minutes
+ * — so for a few minutes after a deploy this file can be handed a deck object
+ * from BEFORE the platform moved into the world. Checking it there too is the
+ * difference between saying so and dealing a route of NaNs from undefined.
+ *
+ * Same two refusals as RACE_MetaLoadDeck (metamap.as:355), in its order, and
+ * the pad box is checked in x and y only — the same two axes the engine checks,
+ * because the plan half of boxesApart is what the dealer leans on. */
+function platformFault(deck) {
+  if (!deck.begin) {
+    return "the deck declares no route origin (no begin line): it was built before"
+      + " the start platform moved into the world, so there is nothing to deal from."
+      + " Rebuild the pack with tools/mapgen (or reload, if a deploy has just landed).";
+  }
+  if (!deck.pad || !(deck.pad.hi.x > deck.pad.lo.x) || !(deck.pad.hi.y > deck.pad.lo.y)) {
+    return "the deck declares no start platform (no pad box): without it a later"
+      + " piece can be dealt straight through the player's spawn.";
+  }
+  return null;
+}
+
+/* Read maps/<map>.deck. Returns { version, width, play, gate, pad, begin,
+ * beginStep, spawn, spawnStep, tiles, finishes, padFaces } — the same shape
+ * web/random-deck.js parses on the server, field for field, so a page can run
+ * the dealer on either the JSON or the raw text.
+ *
+ * `finishes` are indexes into `tiles`, roomiest first, because the dealer walks
+ * that list and a route that has painted itself into a corner can still end on
+ * the small run-out. There is no `start` index: the dealt route starts at
+ * `begin`, and the platform it starts from is world geometry described by `pad`
+ * (the box dealt pieces keep out of), `spawn` (where the player stands, optional
+ * — metamap.as falls back to 96 0 32) and `padFaces` (its footprint, already in
+ * world units, which only a plan reads).
  *
  * Unknown line heads are ignored, which is what metamap.as does (its head ==
  * chain has no trailing else) and the whole reason the manifest can grow new
- * line kinds without stranding deployed servers. `face` rows are the one that
- * exists today: the dealer needs none of them — a tile's box is all it takes
- * to fit one piece onto the next — but they are attached to their tile here so
- * that the manifest has exactly one reader on this side. */
+ * line kinds without stranding deployed servers. `face` and `padface` rows are
+ * that in practice: the dealer needs none of them — a box is all it takes to
+ * fit one piece onto the next — but they are read here so that the manifest has
+ * exactly one reader on this side. */
 export function parseDeck(text) {
-  const deck = { version: 0, width: 0, play: null, gate: null, tiles: [], start: -1, finishes: [] };
+  const deck = {
+    version: 0,
+    width: 0,
+    play: null,
+    gate: null,
+    // The start platform, in world units. The platform is compiled into
+    // worldspawn at a fixed place, so unlike a tile it never moves and never
+    // turns: nothing below is rotated before it is used. pad and begin are
+    // refused at the bottom if they are missing; spawn is not required.
+    pad: null,
+    begin: null,
+    beginStep: 0,
+    spawn: null,
+    spawnStep: 0,
+    tiles: [],
+    finishes: [],
+    padFaces: [],
+  };
   const faces = [];
 
   for (const line of String(text).split("\n")) {
@@ -158,6 +248,30 @@ export function parseDeck(text) {
     } else if (t[0] === "gate") {
       deck.gate = { model: num(t, 1, "gate"), depth: num(t, 2, "gate"),
                     half: num(t, 3, "gate"), height: num(t, 4, "gate") };
+    } else if (t[0] === "pad") {
+      // pad <minx> <miny> <minz> <maxx> <maxy> <maxz> — the platform's whole
+      // box, walls included: the space it fills, not the floor it offers. This
+      // is what every placement is tested against.
+      if (t.length < 7) throw new Error(`pad line has ${t.length} tokens, expected 7: ${line}`);
+      deck.pad = { lo: { x: num(t, 1, "pad"), y: num(t, 2, "pad"), z: num(t, 3, "pad") },
+                   hi: { x: num(t, 4, "pad"), y: num(t, 5, "pad"), z: num(t, 6, "pad") } };
+    } else if (t[0] === "begin" || t[0] === "spawn") {
+      // Two lines of the same shape: `begin` is where the dealt route starts
+      // (the platform's far face, which the start gate stands on) and `spawn` is
+      // the map's own info_player_deathmatch. The fourth number is a 45-degree
+      // STEP already, not degrees, so it does not go through parseYaw
+      // (metamap.as:296).
+      const head = t[0];
+      if (t.length < 5) throw new Error(`${head} line has ${t.length} tokens, expected 5: ${line}`);
+      const point = { x: num(t, 1, head), y: num(t, 2, head), z: num(t, 3, head) };
+      const step = stepOf(num(t, 4, head));
+      if (head === "begin") {
+        deck.begin = point;
+        deck.beginStep = step;
+      } else {
+        deck.spawn = point;
+        deck.spawnStep = step;
+      }
     } else if (t[0] === "tile") {
       if (t.length < 17) throw new Error(`tile line has ${t.length} tokens, expected 17: ${line}`);
       const where = `tile ${t[16]}`;
@@ -170,7 +284,6 @@ export function parseDeck(text) {
         route: num(t, 14, where), kind: t[15], name: t[16],
         faces: [],
       };
-      if (tile.flags & F_START) deck.start = deck.tiles.length;
       if (tile.flags & F_FINISH) deck.finishes.push(deck.tiles.length);
       deck.tiles.push(tile);
     } else if (t[0] === "face") {
@@ -181,11 +294,30 @@ export function parseDeck(text) {
       const pts = [];
       for (let i = 0; i < n; i++) pts.push([num(t, 5 + 2 * i, "face"), num(t, 6 + 2 * i, "face")]);
       faces.push({ model: num(t, 1, "face"), tex: t[2], top: num(t, 3, "face"), points: pts });
+    } else if (t[0] === "padface") {
+      // padface <tex> <top> <points> <x> <y>... — a `face` without the model
+      // token, because the platform is worldspawn and has no inline model to
+      // name. Its points are therefore already WORLD coordinates, where a
+      // tile's are local to the tile. One token fewer shifts the whole line, so
+      // the arity self-check is 4 + 2n and not 5 + 2n — and this must not fall
+      // through to the `face` branch, which would file it as an orphan
+      // footprint for a model no tile claims.
+      const n = num(t, 3, "padface");
+      if (t.length !== 4 + 2 * n) throw new Error(`padface line declares ${n} points but carries ${t.length} tokens`);
+      const pts = [];
+      for (let i = 0; i < n; i++) pts.push([num(t, 4 + 2 * i, "padface"), num(t, 5 + 2 * i, "padface")]);
+      deck.padFaces.push({ tex: t[1], top: num(t, 2, "padface"), points: pts });
     }
   }
 
+  // RACE_MetaLoadDeck's refusals, in its order (metamap.as:351 is an else-if
+  // chain, so the first failure wins). "no start tile" is gone: a deck with no
+  // start tile is the CORRECT one now, and a deck with no platform is the
+  // broken one.
   if (deck.tiles.length === 0) throw new Error("the deck manifest holds no tiles");
-  if (deck.start < 0 || deck.finishes.length === 0) throw new Error("the deck has no start tile or no finish tile");
+  if (deck.finishes.length === 0) throw new Error("the deck has no finish tile");
+  const fault = platformFault(deck);
+  if (fault) throw new Error(fault);
   if (!deck.gate || deck.gate.model <= 0) throw new Error("the deck has no gate model");
   if (!deck.play || deck.play.half <= 0) throw new Error("the deck declares no play box");
 
@@ -211,13 +343,16 @@ export function parseDeck(text) {
  * pick() never reads progress, and the only thing that does — rewind(), which
  * refuses to undo a piece a player has reached — can only ever make the dealer
  * keep a placement it would otherwise have retried. So walking a virtual
- * player down the route, exactly as run() does below, yields the same course
- * the server ends up with.
+ * player down the route, exactly as the loop at the bottom does, yields the
+ * same course the server ends up with.
  *
- * Returns { seed, target, pieces, cursor, heading, length, rewinds, bare,
- * deadEnd, startGate, finishGate }. Each piece is { index, tile, at, step,
- * dealtBefore, lo, hi }: `at` is where its entry goes and `step` which way it
- * faces, in 45-degree steps, so the piece list doubles as the cursor track. */
+ * Returns { seed, target, runup, pieces, cursor, heading, length, rewinds,
+ * bare, deadEnd, startGate, finishGate }. Each piece is { index, tile, at,
+ * step, dealtBefore, lo, hi }: `at` is where its entry goes and `step` which
+ * way it faces, in 45-degree steps, so the piece list doubles as the cursor
+ * track. `pieces` is DEALT pieces — the start platform is world geometry and is
+ * in none of them, which is also what `rs_meta_status`, the seed board and the
+ * piece count filed with a time now mean. */
 export function dealRoute(deck, seed, target = DEFAULT_TARGET) {
   // The engine draws a seed of its own when it is handed 0 (RACE_MetaNewRoute),
   // which a pure function cannot do — and a bad query string reaching here as
@@ -226,19 +361,51 @@ export function dealRoute(deck, seed, target = DEFAULT_TARGET) {
   if (!Number.isInteger(seed) || seed <= 0 || seed > 0xffffffff) {
     throw new Error(`seed must be a whole number from 1 to 4294967295, got ${seed}`);
   }
+  // A deck straight off /api/random/deck has not been through parseDeck, and
+  // that response is edge-cached: say what is wrong with it rather than dealing
+  // a route of NaNs out of undefined arithmetic.
+  const fault = platformFault(deck);
+  if (fault) throw new Error(fault);
+
   const tiles = deck.tiles;
   const fence = deck.play.half - FENCE_MARGIN;
+  const padLo = deck.pad.lo, padHi = deck.pad.hi;
   const rand = xorshift32(seed);
   // A few turns first: xorshift32 started from a small word — 1, 2, 3, the
   // seeds people actually type — takes a handful of rounds before its output
-  // stops looking like its seed (metamap.as:762).
+  // stops looking like its seed (metamap.as:869).
   for (let i = 0; i < 8; i++) rand();
 
-  let cursor = { x: 0.0, y: 0.0, z: 0.0 };
-  let heading = 0;
-  let dealt = 0.0;
+  // The route starts at the platform's far end, not at the play box origin:
+  // the platform is world geometry filling the space between the two, so this
+  // is the first point a dealt piece may stand at. Copied, not aliased —
+  // rewind() restores `at` objects by reference and nothing may write through
+  // one into the shared deck.
+  let cursor = { x: deck.begin.x, y: deck.begin.y, z: deck.begin.z };
+  let heading = deck.beginStep;
+  // The platform is run-up the player crosses before the clock starts, and as a
+  // dealt tile its length counted towards rs_meta_distance. Seeding it keeps
+  // that cvar — and the unit count shown to players and filed with a time —
+  // meaning what it meant when the pad was dealt. The manifest offers the
+  // number as `begin`'s planar distance from the origin, which is the
+  // platform's length (RACE_MetaNewRoute: runup.z = 0, then runup.length()).
+  //
+  // Math.sqrt of the sum of squares, NOT Math.hypot: Vec3::length() and the
+  // Python model the golden vectors come from both spell it this way, and
+  // Math.hypot is differently rounded. A last ulp here is a different course —
+  // see exitOf.
+  const runup = Math.sqrt(deck.begin.x * deck.begin.x + deck.begin.y * deck.begin.y);
+  let dealt = runup;
   let rewinds = 0;
-  let progress = 0;
+  // -1, not 0, and that one number is load-bearing in three places. The
+  // platform used to be placement 0, so every dealt piece sat one index higher
+  // than it does now; at 0 this shifts AHEAD one piece deeper, hides the first
+  // piece from the server's progress search, and — the one that bites — raises
+  // rewind()'s floor by one, so a route whose first piece turns straight back
+  // into the platform cannot back out of it and ends on a bare gate two pieces
+  // long. Over 600 simulated seeds that was 14 collapsed routes; at -1 it is 3,
+  // which is where it was when the pad was dealt (metamap.as:878).
+  let progress = -1;
   let finished = false;
   let bare = false;
   let deadEnd = false;
@@ -271,15 +438,26 @@ export function dealRoute(deck, seed, target = DEFAULT_TARGET) {
     return true;
   }
 
-  // The piece being mated to is skipped and nothing else: its box touches the
-  // new one by construction. Skipping two leaves a blind spot exactly one
-  // piece wide, which put a clash in 60% of simulated routes.
+  /* Does this box clash with the start platform, or with route already on the
+   * ground? RACE_MetaBoxClear (metamap.as:488).
+   *
+   * The platform is tested FIRST and ALWAYS. It is worldspawn, so it is in none
+   * of the placements below — and it USED to be in them, as the dealt start
+   * tile, which was the only thing stopping a route that folded back over its
+   * own start from being dealt through the floor the player spawns on. Nothing
+   * is skipped for it: `begin` sits exactly on the platform's far face, so the
+   * first dealt piece touches it, and touching is apart. It is the same
+   * box-pair test as between pieces, overpass exemption included, so a piece
+   * may legally cross 96 units ABOVE the platform. And it is never fence-tested
+   * — the platform is the world, not a placement.
+   *
+   * Among dealt pieces the one being mated to is skipped and nothing else: its
+   * box touches the new one by construction. Skipping two leaves a blind spot
+   * exactly one piece wide, which put a clash in 60% of simulated routes. */
   function boxClear(lo, hi) {
+    if (!boxesApart(lo, hi, padLo, padHi)) return false;
     for (let i = 0; i < placed.length - 1; i++) {
-      const a = placed[i].lo, b = placed[i].hi;
-      if (hi.x <= a.x || lo.x >= b.x || hi.y <= a.y || lo.y >= b.y) continue;
-      if (lo.z >= b.z + OVERPASS_CLEAR || hi.z + OVERPASS_CLEAR <= a.z) continue;
-      return false;
+      if (!boxesApart(lo, hi, placed[i].lo, placed[i].hi)) return false;
     }
     return true;
   }
@@ -297,7 +475,7 @@ export function dealRoute(deck, seed, target = DEFAULT_TARGET) {
 
     for (let i = 0; i < tiles.length; i++) {
       const tile = tiles[i];
-      if (tile.weight <= 0) continue;          // start and finish are placed by hand
+      if (tile.weight <= 0) continue;          // the finish run-outs are placed by hand
 
       const b = box(tile, cursor, heading);
       if (!insideBox(b.lo, b.hi) || !boxClear(b.lo, b.hi)) continue;
@@ -350,7 +528,9 @@ export function dealRoute(deck, seed, target = DEFAULT_TARGET) {
   }
 
   // Undo the last placement — but only ever one no player has reached, so the
-  // floor is never taken out from under anyone.
+  // floor is never taken out from under anyone. The floor formula is textually
+  // the engine's; with progress starting at -1 it reproduces its behaviour on a
+  // route whose very first dealt piece has to be taken back.
   function rewind() {
     if (placed.length - 1 <= progress + 1) return false;
     const p = placed.pop();
@@ -373,6 +553,10 @@ export function dealRoute(deck, seed, target = DEFAULT_TARGET) {
     return false;
   }
 
+  // MAX_TILES and AHEAD count DEALT pieces: with the platform out of the list a
+  // route can be one dealt piece longer than it used to be (ending fires at 43
+  // dealt, plus the run-out makes 44), and the entity budget is unchanged at 44
+  // pieces plus the two gates.
   function extend() {
     let budget = REWIND_BUDGET;
     while (!finished && placed.length - 1 - progress < AHEAD) {
@@ -407,10 +591,13 @@ export function dealRoute(deck, seed, target = DEFAULT_TARGET) {
     }
   }
 
-  deal(deck.start);
-  // The start gate sits at the END of the start pad, so the clock starts as the
-  // player leaves it with a full pad of run-up behind them.
-  startGate = { at: cursor, step: heading };
+  // The start gate sits AT `begin`, the end of the platform, so the clock starts
+  // as the player leaves it with the whole platform of run-up behind them. It
+  // used to go at the exit of the dealt start pad, which was the same point by
+  // construction; now it is the point the manifest names. The engine checks the
+  // gate came up and refuses to deal without it (metamap.as:904) — there is no
+  // entity to fail here, so this is only ever the position.
+  startGate = { at: { x: deck.begin.x, y: deck.begin.y, z: deck.begin.z }, step: deck.beginStep };
   extend();
   // Walk a player down the route, a piece at a time, until the dealer has
   // nothing left to add. The server does this as people run; here it is what
@@ -424,6 +611,7 @@ export function dealRoute(deck, seed, target = DEFAULT_TARGET) {
   return {
     seed: seed >>> 0,
     target,
+    runup,
     pieces: placed,
     cursor,
     heading,

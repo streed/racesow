@@ -4040,7 +4040,11 @@ async function dealSeedHere(seed, target) {
 
 /* Hue names the kind of piece; lightness carries height, low to high, so an
  * upper deck reads as lighter than what it crosses. Same scheme as the plan the
- * generator draws offline. */
+ * generator draws offline.
+ *
+ * `start` is the odd one out: it is no longer a kind of piece at all. The start
+ * platform is permanent world geometry and is dealt to nobody, so that hue now
+ * paints the one shape in the plan the seed had no part in choosing. */
 const RANDOM_KIND_HUE = {
   start: "#3fae5a", finish: "#d0463c", straight: "#8a8f98", turn: "#4b9fea",
   ramp: "#e8953b", gap: "#ff6a1a", slalom: "#21c2a4", beam: "#c07be0",
@@ -4054,24 +4058,47 @@ function randomPlanSvg(deck, route, px) {
   const faces = [];
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   let zlo = Infinity, zhi = -Infinity;
+  const seen = (x, y) => {
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+  };
+  const add = (pts, z, kind, tex) => {
+    if (z < zlo) zlo = z; if (z > zhi) zhi = z;
+    faces.push({ pts, z, kind, tex });
+  };
+
+  // The start platform goes down FIRST, because it is in none of route.pieces:
+  // it used to be piece 0 of every route and is now permanent world geometry,
+  // so the dealer never reports it and a plan that walked only the pieces would
+  // draw a course that begins in mid-air a platform's length from where the
+  // player actually stands.
+  //
+  // Its footprint needs none of the arithmetic a tile's does. `padface` points
+  // are already WORLD coordinates and its `top` is already a world height — the
+  // platform is compiled into worldspawn at a fixed place, so unlike a piece it
+  // never moves and never turns (tools/mapgen/tiles.py, random-deck.js).
+  // padFaces is [] on a deck with no footprint recorded, which draws no
+  // platform rather than throwing.
+  for (const f of deck.padFaces || []) {
+    add(f.points.map(([wx, wy]) => { seen(wx, wy); return [wx, wy]; }),
+        f.top, "start", f.tex);
+  }
+
   for (const pc of route.pieces) {
     const c = COS(pc.step), sn = SIN(pc.step);
     for (const f of pc.tile.faces || []) {
       const pts = f.points.map(([lx, ly]) => {
         const wx = pc.at.x + lx * c - ly * sn;
         const wy = pc.at.y + lx * sn + ly * c;
-        if (wx < x0) x0 = wx; if (wx > x1) x1 = wx;
-        if (wy < y0) y0 = wy; if (wy > y1) y1 = wy;
+        seen(wx, wy);
         return [wx, wy];
       });
-      const z = pc.at.z + f.top;
-      if (z < zlo) zlo = z; if (z > zhi) zhi = z;
-      faces.push({ pts, z, kind: pc.tile.kind, tex: f.tex });
+      add(pts, pc.at.z + f.top, pc.tile.kind, f.tex);
     }
   }
   if (!faces.length) return "";
-  const pad = 320;
-  x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
+  const margin = 320;
+  x0 -= margin; y0 -= margin; x1 += margin; y1 += margin;
   const w = x1 - x0, h = y1 - y0;
   const scale = Math.min(px / w, (px * 0.62) / h);
   const cw = w * scale, ch = h * scale;
@@ -4090,19 +4117,40 @@ function randomPlanSvg(deck, route, px) {
       + `fill="${base}" fill-opacity="${op}" stroke="#12161c" stroke-width="0.5"/>`;
   }).join("");
 
-  const line = route.pieces.map((pc) => X(pc.at.x) + "," + Y(pc.at.y)).join(" ");
-  const first = route.pieces[0], last = route.pieces[route.pieces.length - 1];
-  const pin = (pc, label, fill) =>
-    `<circle cx="${X(pc.at.x)}" cy="${Y(pc.at.y)}" r="7" fill="${fill}" stroke="#0d1117" stroke-width="2"/>`
-    + `<text x="${X(pc.at.x)}" y="${(parseFloat(Y(pc.at.y)) - 14).toFixed(1)}" class="rpin">${label}</text>`;
+  // Where the player starts is NOT where the dealt route starts, and since the
+  // platform stopped being a dealt piece those are two different points on this
+  // plan. `spawn` is the map's own info_player_deathmatch, standing on the
+  // platform; `begin` is the platform's far face, where the start gate stands
+  // and the first dealt piece goes. So the track is drawn from the spawn, and
+  // its first leg is the platform's run-up — which the route length has always
+  // counted and which would otherwise be missing from the picture.
+  //
+  // A deck with no `spawn` line falls back to the literal the gametype falls
+  // back to (RACE_MetaSpawnSpot, metamap.as) rather than to a point of this
+  // page's invention.
+  const spawn = deck.spawn || { x: 96, y: 0, z: 32 };
+  const begin = (route.startGate && route.startGate.at) || deck.begin;
+  // pieces[0].at IS begin, so the pieces carry the rest of the track. A route
+  // the dealer could not even start has no pieces: the gate alone still ends
+  // such a run, so both the track and the finish pin fall back to it.
+  const track = [spawn].concat(
+    route.pieces.length ? route.pieces.map((pc) => pc.at) : [begin]);
+  const line = track.map((p) => X(p.x) + "," + Y(p.y)).join(" ");
+  const endAt = route.pieces.length
+    ? route.pieces[route.pieces.length - 1].at
+    : (route.finishGate ? route.finishGate.at : begin);
+  const pin = (p, label, fill) =>
+    `<circle cx="${X(p.x)}" cy="${Y(p.y)}" r="7" fill="${fill}" stroke="#0d1117" stroke-width="2"/>`
+    + `<text x="${X(p.x)}" y="${(parseFloat(Y(p.y)) - 14).toFixed(1)}" class="rpin">${label}</text>`;
 
   return `<svg viewBox="0 0 ${cw.toFixed(0)} ${ch.toFixed(0)}" width="100%" `
     + `preserveAspectRatio="xMidYMid meet" role="img" `
-    + `aria-label="Top-down plan of the route dealt from seed ${route.seed}">`
+    + `aria-label="Top-down plan of the start platform and the route dealt from `
+    + `seed ${route.seed}">`
     + `<rect width="100%" height="100%" fill="#0d1117"/>${poly}`
     + `<polyline points="${line}" fill="none" stroke="#ffffff" stroke-opacity="0.55" `
     + `stroke-width="1.5" stroke-dasharray="6 5"/>`
-    + pin(first, "START", "#3fae5a") + pin(last, "FINISH", "#d0463c")
+    + pin(spawn, "START", "#3fae5a") + pin(endAt, "FINISH", "#d0463c")
     + `</svg>`;
 }
 
