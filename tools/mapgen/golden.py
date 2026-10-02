@@ -159,6 +159,21 @@ def cases():
         ("stairs_down", course(S(512), dict(ST, rise=-128), S(512))),
         ("platforms_dropping", course(S(512), dict(PL, drop=192), S(512))),
 
+        # Placement: away, bank and tip, which only the editor's tier allows.
+        ("tilt_roll", course(S(1024), S(768, roll=25), S(1024))),
+        ("tilt_pitch", course(S(1024), S(768, pitch=18), S(1024))),
+        ("tilt_both_ways", course(S(1024), S(768, roll=-30, pitch=-12), S(1024))),
+        ("tilt_a_turn", course(S(1024), T("left", 90, 512, roll=35), S(1024))),
+        ("tilt_hard", course(S(1024), S(768, roll=175, pitch=-170), S(1024))),
+        ("away_gap", course(S(1024), S(768, away=320), S(1024))),
+        ("away_back", course(S(1024), S(768, away=-120), S(1024))),
+        ("placement_all", course(S(1024), S(768, away=200, shift=150, rotate=20,
+                                            roll=25, pitch=-10), S(1024))),
+        ("tilt_a_shape_piece", course(
+            S(1024), {"type": "stairs", "length": 512, "rise": 128, "count": 8, "roll": 20},
+            S(512), {"type": "strafepads", "count": 5, "spacing": 256, "curve": 30,
+                     "pitch": 15}, S(1024))),
+
         # Nudges: sideways, on the spot, and both, inside the strict bounds.
         ("nudge_shift", course(S(1024), S(1024, shift=200), S(1024))),
         ("nudge_shift_right", course(S(1024), S(1024, shift=-200), S(1024))),
@@ -212,8 +227,13 @@ R3 = lambda v: round(v, 3)  # noqa: E731
 
 
 def prism(p):
+    # The CORNERS, not the footprint. A rolled or pitched brush is not its
+    # footprint, so pinning the footprint alone would let the port tilt a
+    # piece differently — or not at all — and still pass.
+    bot, top = p.corners()
     return [p.tex, None if p.heading is None else R3(p.heading), R3(p.zmin), R3(p.top0),
-            R3(p.gx), R3(p.gy), [R3(c) for xy in p.poly for c in xy]]
+            R3(p.gx), R3(p.gy), [R3(c) for xy in p.poly for c in xy],
+            [R3(c) for v in bot + top for c in v]]
 
 
 def value(v):

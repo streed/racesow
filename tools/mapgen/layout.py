@@ -148,12 +148,42 @@ class Prism:
         self.top0, self.gx, self.gy = float(top0), float(gx), float(gy)
         self.tex = tex
         self.heading = heading
+        # A roll/pitch applied to this brush after it was laid flat: (origin,
+        # 3x3 matrix). None for every brush the generator makes, because the
+        # strict tier has no roll or pitch — see _apply_tilt.
+        self.tilt = None
 
     def top_at(self, x, y):
         return self.top0 + self.gx * x + self.gy * y
 
+    def corners(self):
+        """(bottom ring, top ring) in world space, tilt applied.
+
+        This is the ONLY honest answer to "where is this brush". Everything
+        that has to agree with the compiled map — the .map writer, the sky
+        shell, the size limits, the editor's 3-D view — reads it here, because
+        a tilted brush's real corners are not its footprint, and a shell built
+        from footprints would not enclose it (q3map2 calls that a leak and
+        refuses to light the map)."""
+        bot = [(x, y, self.zmin) for x, y in self.poly]
+        top = [(x, y, self.top_at(x, y)) for x, y in self.poly]
+        if self.tilt is None:
+            return bot, top
+        return ([_tilted(self.tilt, v) for v in bot],
+                [_tilted(self.tilt, v) for v in top])
+
     def zmax(self):
-        return max(self.top_at(x, y) for x, y in self.poly)
+        if self.tilt is None:
+            return max(self.top_at(x, y) for x, y in self.poly)
+        bot, top = self.corners()
+        return max(v[2] for v in bot + top)
+
+    def zlow(self):
+        """The lowest point, which is zmin only while the brush is upright."""
+        if self.tilt is None:
+            return self.zmin
+        bot, top = self.corners()
+        return min(v[2] for v in bot + top)
 
     @classmethod
     def flat(cls, poly, zmin, zmax, tex, heading=None):
@@ -195,6 +225,35 @@ def _rect(o, f, l, back, fwd, right, left):
     def p(a, b):
         return (o[0] + f[0] * a + l[0] * b, o[1] + f[1] * a + l[1] * b)
     return [p(back, -right), p(fwd, -right), p(fwd, left), p(back, left)]
+
+
+def _rodrigues(axis, deg):
+    """Rotation matrix about a UNIT axis, counter-clockwise looking along it.
+    Rows, so _rotate() is a plain dot per row."""
+    a = math.radians(deg)
+    c, si = math.cos(a), math.sin(a)
+    x, y, z = axis
+    t = 1.0 - c
+    return ((t * x * x + c, t * x * y - si * z, t * x * z + si * y),
+            (t * x * y + si * z, t * y * y + c, t * y * z - si * x),
+            (t * x * z - si * y, t * y * z + si * x, t * z * z + c))
+
+
+def _matmul(a, b):
+    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3))
+                 for i in range(3))
+
+
+def _rotate(m, v):
+    """A direction through the matrix; no translation, so normals use this."""
+    return tuple(m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2] for i in range(3))
+
+
+def _tilted(tilt, v):
+    """A point through a tilt: rotate about the tilt's own origin."""
+    o, m = tilt
+    d = _rotate(m, (v[0] - o[0], v[1] - o[1], v[2] - o[2]))
+    return (d[0] + o[0], d[1] + o[1], d[2] + o[2])
 
 
 def _area(poly):
@@ -951,29 +1010,85 @@ class _Walker:
                  (o[0] - l[0] * half, o[1] - l[1] * half)], f)
 
     def _nudge(self, seg):
-        """Move the cursor sideways (`shift`, + is left) and turn it on the
-        spot (`rotate`, + is left) before the piece is laid.
+        """Place the piece relative to where the last one left off, before any
+        of it is laid.
 
-        Both are cursor transforms, which is why every piece kind gets them
-        without knowing they exist: frame() is what each piece builds from.
-        The seam they open is bridged by _joint, so a nudge bends the course
-        instead of cutting it in two."""
+        Three cursor transforms, which is why every piece kind gets them
+        without knowing they exist — frame() is what each piece builds from:
+
+          away    along the way it is facing: + leaves a gap between this
+                  piece and the last, - pulls it back over it
+          shift   across that: + is left
+          rotate  turn on the spot: + is left
+
+        `away` deliberately leaves the void it opens alone. Separating two
+        pieces is the whole point of asking for it, so bridging the result
+        would just be a longer corridor; a sideways or turned seam is
+        incidental, so _joint patches that one.
+        """
+        away = seg.get("away") or 0
         shift = seg.get("shift") or 0
         rot = seg.get("rotate") or 0
-        if not shift and not rot:
+        if not away and not shift and not rot:
             return
         before = self._mouth()
-        if shift:
-            _, _, l = self.frame()
-            self.x += l[0] * shift
-            self.y += l[1] * shift
-            # A sideways step is distance the player covers, so the route and
-            # the par time have to carry it.
-            self.c.length += abs(shift)
+        if away or shift:
+            _, f, l = self.frame()
+            self.x += f[0] * away + l[0] * shift
+            self.y += f[1] * away + l[1] * shift
+            # Ground the player covers (or jumps), so the route and the par
+            # time carry it.
+            self.c.length += abs(away) + abs(shift)
             self.c.route.append((self.x, self.y, self.z))
         if rot:
             self.heading = (self.heading + rot) % 360.0
-        self._joint(before)
+        if not away:
+            self._joint(before)
+
+    def _tilt_for(self, seg):
+        """The roll/pitch this piece is built with: (origin, 3x3), or None.
+
+        Rolling banks the piece about the line it runs along; pitching tips it
+        about the line across. Both turn about the cursor at floor level, so a
+        piece pivots where it meets the one before instead of swinging away
+        from it.
+
+        Unlike the cursor transforms these do not move the cursor: the course
+        carries on from where it would have anyway, and the piece is a tilted
+        thing sitting on that line. That is what keeps a banked corner from
+        dragging everything after it off the floor."""
+        roll = seg.get("roll") or 0
+        pitch = seg.get("pitch") or 0
+        if not roll and not pitch:
+            return None
+        _, f, l = self.frame()
+        fwd = (f[0], f[1], 0.0)
+        lat = (l[0], l[1], 0.0)
+        # Pitch first, then roll, both about the piece's entry point.
+        # The pitch angle is negated so that + tips the course UP: rotating
+        # about the LEFT vector by a positive angle would point it down.
+        m = _matmul(_rodrigues(fwd, roll), _rodrigues(lat, -pitch))
+        return ((self.x, self.y, self.z), m)
+
+    def _apply_tilt(self, tilt, mark):
+        """Stamp the tilt on everything the piece just added.
+
+        The brushes are built flat and turned afterwards, which is why a tilt
+        costs no piece any code of its own. A rigid rotation of a convex brush
+        is still a convex brush, so what q3map2 gets is as valid as before —
+        see Prism.corners and mapfile.brush_lines.
+
+        The HULLS are left flat on purpose. They feed the 2-D tests for a
+        course crossing itself and for unintended cuts, which cannot describe
+        a banked piece anyway; in the tier that allows tilting, both are notes
+        rather than refusals (see _note), so an approximate answer there is
+        worth more than no answer."""
+        w0, e0 = mark
+        for p in self.c.world[w0:]:
+            p.tilt = tilt
+        for _, brushes in self.c.entities[e0:]:
+            for b in brushes:
+                b.tilt = tilt
 
     def _joint(self, before):
         """Floor bridging the seam a nudge opened.
@@ -1016,8 +1131,12 @@ class _Walker:
         without a second geometry writer.
         """
         t = seg["type"]
-        # Sideways and on the spot, before anything is laid: see _nudge.
+        # Away, sideways and on the spot, before anything is laid: see _nudge.
         self._nudge(seg)
+        # Roll and pitch are applied to the brushes AFTER the piece is laid,
+        # so no piece needs to know they exist.
+        tilt = self._tilt_for(seg)
+        mark = (len(self.c.world), len(self.c.entities))
         sides = () if seg.get("open") else (1, -1)
         # Ice changes only the walking surface's texture, and with it the
         # surfaceparm slick the compiler bakes into the bsp: never the shape.
@@ -1105,6 +1224,8 @@ class _Walker:
                             tex="ice" if seg.get("ice") else "platform")
             # One pad is all the footing there is.
             self.runup = float(specmod.STRAFE_PAD_LEN)
+        if tilt is not None:
+            self._apply_tilt(tilt, mark)
 
     def run(self):
         s = self.c.spec
@@ -1157,9 +1278,10 @@ class _Walker:
         does not compile, or does not load, or hurts every server that holds
         it. The open tier's are further out (spec.OPEN), not absent."""
         xy, zmax, bmax = self.L.extent_xy, self.L.extent_z, self.L.brushes
-        xs = [x for p in self.c.world for x, _ in p.poly]
-        ys = [y for p in self.c.world for _, y in p.poly]
-        zs = [z for p in self.c.world for z in (p.zmin, p.zmax())]
+        pts = [v for p in self.c.world for ring in p.corners() for v in ring]
+        xs = [v[0] for v in pts]
+        ys = [v[1] for v in pts]
+        zs = [v[2] for v in pts]
         dx, dy, dz = max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs)
         if max(dx, dy) > xy:
             self.problems.append(
@@ -1487,9 +1609,11 @@ class _Walker:
         """
         xs, ys, zs = [], [], []
         for p in self.c.world:
-            for x, y in p.poly:
-                xs.append(x); ys.append(y)
-            zs += [p.zmin, p.zmax()]
+            # Real corners, not the footprint: a tilted brush reaches past it,
+            # and a shell that does not enclose every brush is a leak.
+            for ring in p.corners():
+                for x, y, z in ring:
+                    xs.append(x); ys.append(y); zs.append(z)
         m = SHELL_MARGIN
         x0, x1 = min(xs) - m, max(xs) + m
         y0, y1 = min(ys) - m, max(ys) + m

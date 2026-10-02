@@ -37,7 +37,13 @@ function near(actual, expected, where) {
   }
 }
 
-const prism = (p) => [p.tex, p.heading, p.zmin, p.top0, p.gx, p.gy, p.poly.flat()];
+// The CORNERS, not just the footprint: a rolled or pitched brush is not its
+// footprint, and pinning the footprint alone would let the port tilt a piece
+// differently — or not at all — and still pass.
+const prism = (p) => {
+  const [bot, top] = p.corners();
+  return [p.tex, p.heading, p.zmin, p.top0, p.gx, p.gy, p.poly.flat(), bot.concat(top).flat()];
+};
 
 test("the physics windows match", () => {
   const c = golden.constants;

@@ -213,9 +213,10 @@ export function limits(seg, width, rules = "open") {
       break;
     default:
   }
-  // Every piece may be nudged sideways and turned on the spot.
-  T.shift = [-L.shift, L.shift];
-  T.rotate = [-L.rotate, L.rotate];
+  // Every piece may be placed relative to the one before it. A tier that
+  // forbids one bounds it to [0, 0], which makes the control read-only
+  // rather than absent — the slider shows there is nothing to give.
+  for (const k of mg.NUDGE) T[k] = [-L[k], L[k]];
   return T;
 }
 
@@ -230,7 +231,7 @@ export function fix(seg, width, rules = "open") {
   const out = { ...seg };
   // Order matters: a field that bounds another comes first.
   for (const key of ["drop", "count", "spacing", "curve", "angle", "radius",
-    "length", "rise", "beam_width", "height", "gate", "ledge_width", "shift", "rotate"]) {
+    "length", "rise", "beam_width", "height", "gate", "ledge_width", ...mg.NUDGE]) {
     const L = limits(out, width, rules)[key];
     if (!L) continue;
     // A nudge a piece never asked for stays absent rather than becoming 0.
@@ -279,12 +280,15 @@ export function chipLabel(s) {
   }
 }
 
-// What a nudge adds to a chip's label, so a shifted or turned piece reads as
-// one at a glance instead of only in the inspector.
+// What a placement adds to a chip's label, so a piece that has been moved or
+// tilted reads as one at a glance instead of only in the inspector.
 export function nudgeLabel(s) {
   const bits = [];
+  if (s.away) bits.push(`${s.away > 0 ? "⇥" : "⇤"}${fmt(Math.abs(s.away))}`);
   if (s.shift) bits.push(`${s.shift > 0 ? "←" : "→"}${fmt(Math.abs(s.shift))}`);
   if (s.rotate) bits.push(`${s.rotate > 0 ? "↺" : "↻"}${Math.abs(s.rotate)}°`);
+  if (s.roll) bits.push(`${s.roll > 0 ? "↷" : "↶"}${Math.abs(s.roll)}°`);
+  if (s.pitch) bits.push(`${s.pitch > 0 ? "↗" : "↘"}${Math.abs(s.pitch)}°`);
   return bits.join(" ");
 }
 
@@ -350,7 +354,10 @@ export function mirror(seg) {
   const out = { ...seg };
   if (out.direction === "left") out.direction = "right";
   else if (out.direction === "right") out.direction = "left";
-  for (const k of ["shift", "rotate", "curve"]) if (out[k]) out[k] = -out[k];
+  // Reflected left to right: a sideways nudge, a turn, a bank and a pad run's
+  // curve all change hand. `away` runs along the course and `pitch` tips it
+  // up or down, so neither has a left or a right to swap.
+  for (const k of ["shift", "rotate", "roll", "curve"]) if (out[k]) out[k] = -out[k];
   return out;
 }
 

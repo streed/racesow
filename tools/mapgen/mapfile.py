@@ -68,16 +68,21 @@ def brush_lines(prism):
     rot = 0.0 if prism.heading is None else prism.heading + FLOOR_ROT_OFFSET
     poly = prism.poly
     n = len(poly)
-    top = [(x, y, prism.top_at(x, y)) for x, y in poly]
-    bot = [(x, y, prism.zmin) for x, y in poly]
+    # The real corners: a rolled or pitched brush is not its footprint, and
+    # a rigid rotation of a convex brush is still a convex brush, so what
+    # q3map2 gets here is as valid as the upright version.
+    bot, top = prism.corners()
+    # The outward hints only orient each face's winding (the plane itself comes
+    # from the three points), so they have to turn with the brush.
+    turn = (lambda d: d) if prism.tilt is None else (lambda d: layout._rotate(prism.tilt[1], d))
     faces = [
-        _face(bot[0], bot[1], bot[2], (0, 0, -1), side_tex),
-        _face(top[0], top[1], top[2], (0, 0, 1), tex, rot),
+        _face(bot[0], bot[1], bot[2], turn((0, 0, -1)), side_tex),
+        _face(top[0], top[1], top[2], turn((0, 0, 1)), tex, rot),
     ]
     for i in range(n):
         a, b = poly[i], poly[(i + 1) % n]
         # CCW footprint: the outward normal of edge a->b is (dy, -dx).
-        out = (b[1] - a[1], -(b[0] - a[0]), 0)
+        out = turn((b[1] - a[1], -(b[0] - a[0]), 0))
         faces.append(_face(bot[i], bot[(i + 1) % n], top[i], out, side_tex))
     return ["{"] + faces + ["}"]
 

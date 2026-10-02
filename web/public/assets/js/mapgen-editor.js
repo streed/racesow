@@ -129,22 +129,27 @@ function addPrism(buckets, p) {
   const sideKind = SIDES_AS_WALL.has(p.tex) ? "wall" : kind;
   const seg = p.seg === null ? -9 : p.seg;
   const bucket = (k) => buckets.get(k) || buckets.set(k, new Bucket()).get(k);
-  const top = p.poly.map(([x, y]) => [x, y, p.topAt(x, y)]);
-  const bot = p.poly.map(([x, y]) => [x, y, p.zmin]);
+  // The brush's real corners: a rolled or pitched piece is not its footprint,
+  // and a preview drawn from the footprint would show something the compiler
+  // will not build — which makes the control a trap rather than a tool.
+  const [bot, top] = p.corners();
+  // Every normal turns with the brush, or the lighting lies about the shape.
+  const turn = p.tilt ? (d) => mg.rotateDir(p.tilt[1], d) : (d) => d;
   const n = p.poly.length;
   // Top: the plane's own normal (sloped on a ramp).
   const tl = Math.hypot(p.gx, p.gy, 1);
-  const tn = [-p.gx / tl, -p.gy / tl, 1 / tl];
+  const tn = turn([-p.gx / tl, -p.gy / tl, 1 / tl]);
   const rot = p.heading === null ? 0 : p.heading - 90;
   let uv = texAxes(tn, rot);
   for (let i = 1; i < n - 1; i++) bucket(kind).tri(top[0], top[i], top[i + 1], tn, uv, seg);
-  uv = texAxes([0, 0, -1], 0);
-  for (let i = 1; i < n - 1; i++) bucket(sideKind).tri(bot[0], bot[i + 1], bot[i], [0, 0, -1], uv, seg);
+  const bn = turn([0, 0, -1]);
+  uv = texAxes(bn, 0);
+  for (let i = 1; i < n - 1; i++) bucket(sideKind).tri(bot[0], bot[i + 1], bot[i], bn, uv, seg);
   for (let i = 0; i < n; i++) {
     const j = (i + 1) % n;
     const [ax, ay] = p.poly[i], [bx, by] = p.poly[j];
     const L = Math.hypot(by - ay, bx - ax) || 1;
-    const out = [(by - ay) / L, -(bx - ax) / L, 0];
+    const out = turn([(by - ay) / L, -(bx - ax) / L, 0]);
     uv = texAxes(out, 0);
     const b = bucket(sideKind);
     b.tri(bot[i], bot[j], top[j], out, uv, seg);
@@ -326,9 +331,8 @@ class View {
     if (!this.course) return box;
     for (const p of this.course.world) {
       if (p.tex === "sky" || p.tex === "trigger" || (seg !== null && p.seg !== seg)) continue;
-      for (const [x, y] of p.poly) {
-        box.expandByPoint(new THREE.Vector3(...q2t(x, y, p.zmin)));
-        box.expandByPoint(new THREE.Vector3(...q2t(x, y, p.topAt(x, y))));
+      for (const ring of p.corners()) {
+        for (const [x, y, z] of ring) box.expandByPoint(new THREE.Vector3(...q2t(x, y, z)));
       }
     }
     return box;
@@ -854,7 +858,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
           draggable="true" data-i="${i}" tabindex="0" role="button" aria-pressed="${i === st.selected}"
           title="${esc(PIECES[s.type].name)} (piece ${i})">
           <em>${i}</em>${icon(s.type)}<span><b>${esc(PIECES[s.type].name)}</b><small>${esc(chipLabel(s))}${s.ice ? " ❄" : ""}${
-            s.shift || s.rotate ? ` ${esc(nudgeLabel(s))}` : ""}</small></span></li>`).join("") +
+            mg.NUDGE.some((k) => s[k]) ? ` ${esc(nudgeLabel(s))}` : ""}</small></span></li>`).join("") +
       `<li class="mge-chip end finish" aria-label="Finish room">${icon("checkpoint")}<span>Finish</span></li>`;
   }
 
@@ -868,17 +872,28 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     const h = invert ? [-hard[1], -hard[0]] : hard;
     const s0 = soft && soft[key] ? (invert ? [-soft[key][1], -soft[key][0]] : soft[key]) : h;
     const v = invert ? -val : val;
-    const band = [Math.max(h[0], Math.min(s0[0], v)), Math.min(h[1], Math.max(s0[1], v))];
-    return { hard: h, soft: s0, band, outside: v < s0[0] || v > s0[1] };
+    let band = [Math.max(h[0], Math.min(s0[0], v)), Math.min(h[1], Math.max(s0[1], v))];
+    // A field the generator never uses has a zero-wide suggested band, which
+    // would leave a slider with nothing to drag; give it the whole range.
+    if (band[0] === band[1] && h[0] !== h[1]) band = [h[0], h[1]];
+    // A field the generator never uses is not "beyond" anything — the hint
+    // already says whose control it is, and flagging every use of it would
+    // make the warning permanent and therefore worthless.
+    const editorOnly = s0[0] === 0 && s0[1] === 0;
+    return { hard: h, soft: s0, band, outside: !editorOnly && (v < s0[0] || v > s0[1]) };
   }
 
   function slider(key, label, val, hard, { step = 1, unit = "", note = "", invert = false, soft = null } = {}) {
     const b = bands(key, val, hard, soft, invert);
     const v = invert ? -val : val;
     const fixed = b.hard[0] === b.hard[1];
-    const hint = b.soft[0] === b.hard[0] && b.soft[1] === b.hard[1]
-      ? `${fmt(b.hard[0])} – ${fmt(b.hard[1])} ${esc(unit)}`
-      : `${fmt(b.soft[0])} – ${fmt(b.soft[1])} suggested · up to ${fmt(b.hard[0])} – ${fmt(b.hard[1])} ${esc(unit)}`;
+    // A suggested band of exactly zero is not a narrow range — it means the
+    // generator never does this at all, and the control is the editor's own.
+    const hint = b.soft[0] === 0 && b.soft[1] === 0
+      ? `the generator never does this · ${fmt(b.hard[0])} – ${fmt(b.hard[1])} ${esc(unit)} here`
+      : b.soft[0] === b.hard[0] && b.soft[1] === b.hard[1]
+        ? `${fmt(b.hard[0])} – ${fmt(b.hard[1])} ${esc(unit)}`
+        : `${fmt(b.soft[0])} – ${fmt(b.soft[1])} suggested · up to ${fmt(b.hard[0])} – ${fmt(b.hard[1])} ${esc(unit)}`;
     return `<div class="mge-row${b.outside ? " wide" : ""}" data-key="${key}" data-invert="${invert ? 1 : 0}">
       <label><span>${esc(label)}</span><output data-out="${key}">${esc(note)}</output></label>
       <div class="mge-ctl">
@@ -932,10 +947,16 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       case "curve":
         return !seg.curve ? "straight"
           : `${Math.abs(seg.curve)}° to the ${seg.curve > 0 ? "left" : "right"}`;
+      case "away": return !seg.away ? "touching"
+        : seg.away > 0 ? `${fmt(seg.away)} gap to jump` : `${fmt(-seg.away)} back over it`;
       case "shift": return !seg.shift ? "in line"
         : `${fmt(Math.abs(seg.shift))} to the ${seg.shift > 0 ? "left" : "right"}`;
       case "rotate": return !seg.rotate ? "square on"
         : `${Math.abs(seg.rotate)}° to the ${seg.rotate > 0 ? "left" : "right"}`;
+      case "roll": return !seg.roll ? "level"
+        : `${Math.abs(seg.roll)}° banked, ${seg.roll > 0 ? "left" : "right"} side up`;
+      case "pitch": return !seg.pitch ? "flat"
+        : `far end ${Math.abs(seg.pitch)}° ${seg.pitch > 0 ? "up" : "down"}`;
       default: return "";
     }
   }
@@ -1030,13 +1051,19 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     // own group rather than among the fields that differ piece to piece; it
     // opens by itself once a piece has been nudged, so the setting is never
     // hidden from the person who made it.
-    const nudged = Boolean(s.shift || s.rotate);
+    const nudged = mg.NUDGE.some((k) => s[k]);
     const nudge = `<details class="mge-nudge"${nudged ? " open" : ""}>
-      <summary>Offset and rotation${nudged ? ` <b>${esc(nudgeLabel(s))}</b>` : ""}</summary>
-      <p class="mge-note">Move this piece off the line the one before it left, and turn it on the
-        spot. The floor between them is bridged for you, so pieces need not line up.</p>
+      <summary>Placement${nudged ? ` <b>${esc(nudgeLabel(s))}</b>` : ""}</summary>
+      <p class="mge-note">Where this piece sits relative to the one before it. The first three move
+        the course itself; the last two tilt only this piece, so what comes after carries on
+        from where it would have anyway.</p>
+      ${slider("away", "Away from the piece before (back ← → away)", s.away ?? 0, L.away, { step: 8, unit: "units", soft: SOFT, note: readout(s, "away") })}
       ${slider("shift", "Sideways (right ← → left)", s.shift ?? 0, L.shift, { step: 8, unit: "units", soft: SOFT, note: readout(s, "shift") })}
       ${slider("rotate", "Turn on the spot (right ← → left)", s.rotate ?? 0, L.rotate, { unit: "°", soft: SOFT, note: readout(s, "rotate") })}
+      ${slider("roll", "Bank (right side up ← → left side up)", s.roll ?? 0, L.roll, { unit: "°", soft: SOFT, note: readout(s, "roll") })}
+      ${slider("pitch", "Tip (far end down ← → far end up)", s.pitch ?? 0, L.pitch, { unit: "°", soft: SOFT, note: readout(s, "pitch") })}
+      ${s.away ? `<p class="mge-note">A gap is left as a gap — nothing is bridged across it, because
+        separating two pieces is the point of asking.</p>` : ""}
       ${nudged ? `<div class="mge-iact"><button type="button" class="btn" data-act="unnudge">Back in line</button></div>` : ""}
     </details>`;
 
@@ -1081,9 +1108,11 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       }
       row.classList.toggle("wide", b.outside);
       row.querySelector(".mge-range").innerHTML =
-        (b.soft[0] === b.hard[0] && b.soft[1] === b.hard[1]
-          ? `${fmt(b.hard[0])} – ${fmt(b.hard[1])} units`
-          : `${fmt(b.soft[0])} – ${fmt(b.soft[1])} suggested · up to ${fmt(b.hard[0])} – ${fmt(b.hard[1])} units`)
+        (b.soft[0] === 0 && b.soft[1] === 0
+          ? `the generator never does this · ${fmt(b.hard[0])} – ${fmt(b.hard[1])} here`
+          : b.soft[0] === b.hard[0] && b.soft[1] === b.hard[1]
+            ? `${fmt(b.hard[0])} – ${fmt(b.hard[1])} units`
+            : `${fmt(b.soft[0])} – ${fmt(b.soft[1])} suggested · up to ${fmt(b.hard[0])} – ${fmt(b.hard[1])} units`)
         + (b.outside ? " · <b>beyond the suggested range</b>" : "");
     });
   }
@@ -1225,7 +1254,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       case "unnudge": {
         if (st.selected === null) return;
         track("Map editor nudge", { field: "cleared" });
-        return setFields(st.selected, { shift: 0, rotate: 0 });
+        return setFields(st.selected, Object.fromEntries(mg.NUDGE.map((k) => [k, 0])));
       }
       case "close": return dlg.close();
       case "doimport": return doImport();

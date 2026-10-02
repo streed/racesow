@@ -227,6 +227,9 @@ export const STRAFE_GAP_MIN = 32;
 export const CHICANE_ANGLE = [10, 90];
 export const SHIFT_MAX = 4096;
 export const ROTATE_MAX = 180;
+export const AWAY_MAX = 8192;
+export const ROLL_MAX = 180;
+export const PITCH_MAX = 180;
 export const STRICT_SHIFT_MAX = 256;
 export const STRICT_ROTATE_MAX = 30;
 
@@ -279,6 +282,12 @@ export const STRICT = {
   hazard: [HAZARD_MIN, null],
   shift: STRICT_SHIFT_MAX,
   rotate: STRICT_ROTATE_MAX,
+  // Forbidden in this tier: `away` opens the unclearable gap every physics
+  // rule here exists to prevent, and roll/pitch leave the upright, 2-D world
+  // that the cut and self-intersection answers are computed in.
+  away: 0,
+  roll: 0,
+  pitch: 0,
   extentXY: 16384,
   extentZ: 8192,
   brushes: 1500,
@@ -329,6 +338,9 @@ export const OPEN = {
   hazard: [HAZARD_MIN, 8192],
   shift: SHIFT_MAX,
   rotate: ROTATE_MAX,
+  away: AWAY_MAX,
+  roll: ROLL_MAX,
+  pitch: PITCH_MAX,
   extentXY: 30000,
   extentZ: 16000,
   brushes: 6000,
@@ -393,8 +405,9 @@ const KEEP = {
   hazard: ["length", "open"],
   strafepads: ["count", "spacing", "curve", "ice"],
 };
-// Every piece may be nudged sideways and turned on the spot.
-export const NUDGE = ["shift", "rotate"];
+// Every piece may be placed relative to the one before it: three that move
+// the cursor and two that turn the piece's brushes. See spec.PLACEMENT.
+export const NUDGE = ["away", "shift", "rotate", "roll", "pitch"];
 // The fields each piece type uses, for the editor's inspector.
 export const FIELDS = KEEP;
 
@@ -503,9 +516,10 @@ export function validate(spec, rules = "strict") {
         "(a piece with no walking surface has nothing to be slick)");
     }
 
-    // Every piece may be nudged sideways and turned on the spot.
-    if ("shift" in seg) num("shift", -L.shift, L.shift);
-    if ("rotate" in seg) num("rotate", -L.rotate, L.rotate);
+    // Every piece may be placed relative to the one before it. A tier that
+    // forbids one of these bounds it to [0, 0], so the message says so
+    // rather than pretending the field is unknown.
+    for (const key of NUDGE) if (key in seg) num(key, -L[key], L[key]);
 
     const side = (what = "the side of the kick wall") => {
       if (seg.direction !== "left" && seg.direction !== "right") {
@@ -753,9 +767,24 @@ export class Prism {
     this.tex = tex;
     this.heading = heading;
     this.seg = null;   // the editor's addition: which segment laid it
+    // A roll/pitch applied after this brush was laid flat: [origin, 3x3].
+    this.tilt = null;
   }
   topAt(x, y) { return this.top0 + this.gx * x + this.gy * y; }
-  zmax() { return Math.max(...this.poly.map(([x, y]) => this.topAt(x, y))); }
+  // [bottom ring, top ring] in world space, tilt applied. The only honest
+  // answer to "where is this brush": everything that has to agree with the
+  // compiled map reads it here, because a tilted brush is not its footprint.
+  corners() {
+    const bot = this.poly.map(([x, y]) => [x, y, this.zmin]);
+    const top = this.poly.map(([x, y]) => [x, y, this.topAt(x, y)]);
+    if (!this.tilt) return [bot, top];
+    return [bot.map((v) => tiltPoint(this.tilt, v)), top.map((v) => tiltPoint(this.tilt, v))];
+  }
+  zmax() {
+    if (!this.tilt) return Math.max(...this.poly.map(([x, y]) => this.topAt(x, y)));
+    const [bot, top] = this.corners();
+    return Math.max(...bot.concat(top).map((v) => v[2]));
+  }
   static flat(poly, zmin, zmax, tex, heading = null) {
     return new Prism(poly, zmin, zmax, 0.0, 0.0, tex, heading);
   }
@@ -772,6 +801,44 @@ function rect(o, f, l, back, fwd, right, left) {
   return [p(back, -right), p(fwd, -right), p(fwd, left), p(back, left)];
 }
 const band = (o, f, l, back, fwd, lo, hi) => rect(o, f, l, back, fwd, -lo, hi);
+
+// Rotation matrix about a UNIT axis, counter-clockwise looking along it.
+// Rows, so rotateDir() is a plain dot per row. Mirrors layout._rodrigues.
+export function rodrigues(axis, deg) {
+  const a = radians(deg);
+  const c = Math.cos(a), si = Math.sin(a);
+  const [x, y, z] = axis;
+  const t = 1.0 - c;
+  return [[t * x * x + c, t * x * y - si * z, t * x * z + si * y],
+    [t * x * y + si * z, t * y * y + c, t * y * z - si * x],
+    [t * x * z - si * y, t * y * z + si * x, t * z * z + c]];
+}
+
+export function matmul(a, b) {
+  const out = [];
+  for (let i = 0; i < 3; i++) {
+    const row = [];
+    for (let j = 0; j < 3; j++) {
+      let v = 0;
+      for (let k = 0; k < 3; k++) v += a[i][k] * b[k][j];
+      row.push(v);
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+// A direction through the matrix; no translation, so normals use this.
+export function rotateDir(m, v) {
+  return [0, 1, 2].map((i) => m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2]);
+}
+
+// A point through a tilt: rotate about the tilt's own origin.
+export function tiltPoint(tilt, v) {
+  const [o, m] = tilt;
+  const d = rotateDir(m, [v[0] - o[0], v[1] - o[1], v[2] - o[2]]);
+  return [d[0] + o[0], d[1] + o[1], d[2] + o[2]];
+}
 
 // Twice the signed area of a footprint, unsigned; mirrors layout._area.
 function polyArea(poly) {
@@ -1453,24 +1520,57 @@ class Walker {
       [o[0] - l[0] * half, o[1] - l[1] * half]], this.frame()[1]];
   }
 
-  // Move the cursor sideways (`shift`, + is left) and turn it on the spot
-  // (`rotate`, + is left) before the piece is laid. Both are cursor
-  // transforms, which is why every piece kind gets them without knowing they
-  // exist: frame() is what each piece builds from.
+  // Place the piece relative to where the last one left off, before any of
+  // it is laid. Three cursor transforms — `away` along the way it is facing
+  // (+ opens a gap to the piece before), `shift` across that (+ is left),
+  // `rotate` on the spot (+ is left) — so the course itself goes somewhere
+  // different. `away` leaves the void it opens alone: separating two pieces
+  // is the point of asking for it, while a sideways or turned seam is
+  // incidental and gets patched by joint().
   nudge(seg) {
+    const away = seg.away || 0;
     const shift = seg.shift || 0;
     const rot = seg.rotate || 0;
-    if (!shift && !rot) return;
+    if (!away && !shift && !rot) return;
     const before = this.mouth();
-    if (shift) {
-      const [, , l] = this.frame();
-      this.x += l[0] * shift;
-      this.y += l[1] * shift;
-      this.c.length += Math.abs(shift);
+    if (away || shift) {
+      const [, f, l] = this.frame();
+      this.x += f[0] * away + l[0] * shift;
+      this.y += f[1] * away + l[1] * shift;
+      this.c.length += Math.abs(away) + Math.abs(shift);
       this.c.route.push([this.x, this.y, this.z]);
     }
     if (rot) this.heading = pymod(this.heading + rot, 360.0);
-    this.joint(before);
+    if (!away) this.joint(before);
+  }
+
+  // The roll/pitch this piece is built with: [origin, 3x3], or null. Both
+  // turn about the cursor at floor level, and neither MOVES the cursor — the
+  // course carries on from where it would have anyway and the piece is a
+  // tilted thing sitting on that line, which is what stops a banked corner
+  // dragging everything after it off the floor.
+  tiltFor(seg) {
+    const roll = seg.roll || 0;
+    const pitch = seg.pitch || 0;
+    if (!roll && !pitch) return null;
+    const [, f, l] = this.frame();
+    // Pitch first, then roll. The pitch angle is negated so + tips the course
+    // UP: about the LEFT vector, a positive angle would point it down.
+    const m = matmul(rodrigues([f[0], f[1], 0], roll), rodrigues([l[0], l[1], 0], -pitch));
+    return [[this.x, this.y, this.z], m];
+  }
+
+  // Stamp the tilt on everything the piece just added. The brushes are built
+  // flat and turned afterwards, which is why a tilt costs no piece any code
+  // of its own. Hulls stay flat on purpose — they feed the 2-D tests for a
+  // course crossing itself and for cuts, which cannot describe a banked piece
+  // anyway, and in the tier that allows tilting both are notes.
+  applyTilt(tilt, mark) {
+    const [w0, e0] = mark;
+    for (let i = w0; i < this.c.world.length; i++) this.c.world[i].tilt = tilt;
+    for (let i = e0; i < this.c.entities.length; i++) {
+      for (const b of this.c.entities[i][1]) b.tilt = tilt;
+    }
   }
 
   // Floor bridging the seam a nudge opened. Both cross-sections are extruded
@@ -1494,8 +1594,11 @@ class Walker {
 
   laySegment(i, seg, segs, auto) {
     const t = seg.type;
-    // Sideways and on the spot, before anything is laid: see nudge().
+    // Away, sideways and on the spot, before anything is laid: see nudge().
     this.nudge(seg);
+    // Roll and pitch are applied to the brushes AFTER the piece is laid.
+    const tilt = this.tiltFor(seg);
+    const mark = [this.c.world.length, this.c.entities.length];
     const sides = seg.open ? [] : [1, -1];
     const tex = seg.ice ? "ice" : "floor";
     if (t === "straight") {
@@ -1579,6 +1682,7 @@ class Walker {
       // One pad is all the footing there is.
       this.runup = STRAFE_PAD_LEN;
     }
+    if (tilt) this.applyTilt(tilt, mark);
   }
 
   run() {
@@ -1618,10 +1722,13 @@ class Walker {
     const { extentXY, extentZ, brushes: bmax } = this.L;
     let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
     for (const p of this.c.world) {
-      for (const [x, y] of p.poly) {
-        x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+      for (const ring of p.corners()) {
+        for (const [x, y, z] of ring) {
+          x0 = Math.min(x0, x); x1 = Math.max(x1, x);
+          y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+          z0 = Math.min(z0, z); z1 = Math.max(z1, z);
+        }
       }
-      z0 = Math.min(z0, p.zmin); z1 = Math.max(z1, p.zmax());
     }
     const dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
     if (Math.max(dx, dy) > extentXY) {
@@ -1845,10 +1952,15 @@ class Walker {
   shell() {
     let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
     for (const p of this.c.world) {
-      for (const [x, y] of p.poly) {
-        x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+      // Real corners, not the footprint: a tilted brush reaches past it, and
+      // a shell that does not enclose every brush is a leak.
+      for (const ring of p.corners()) {
+        for (const [x, y, z] of ring) {
+          x0 = Math.min(x0, x); x1 = Math.max(x1, x);
+          y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+          z0 = Math.min(z0, z); z1 = Math.max(z1, z);
+        }
       }
-      z0 = Math.min(z0, p.zmin); z1 = Math.max(z1, p.zmax());
     }
     const m = SHELL_MARGIN;
     x0 -= m; x1 += m; y0 -= m; y1 += m; z0 -= PIT_DEPTH; z1 += m;

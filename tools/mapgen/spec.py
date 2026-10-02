@@ -200,15 +200,40 @@ STRAFE_GAP_MIN = 32      # a pad run with no gap between pads is just a floor
 # pointing the way it came in, offset sideways. Its bounds are a turn's.
 CHICANE_ANGLE = (10, 90)
 
-# -- shifting and rotating a piece ------------------------------------------
-# Every piece may carry `shift` (sideways, + is left) and `rotate` (degrees,
-# + is left) applied BEFORE it is laid. They are cursor transforms, which is
-# why they work on every piece kind without any piece knowing about them, and
-# layout._joint bridges the seam they open so a modest nudge stays walkable.
-# The strict tier keeps both small: a described course should read as a course,
-# not as pieces scattered near each other.
+# -- placing a piece relative to the one before -----------------------------
+# Every piece may carry five of these. Three move the cursor BEFORE the piece
+# is laid, so the course itself goes somewhere different:
+#
+#   away    along the way it is facing: + opens a gap to the piece before
+#   shift   across that: + is left
+#   rotate  turn on the spot: + is left
+#
+# ...and two turn the piece's BRUSHES after it is laid, leaving the course's
+# own line alone (layout._tilt_for), which is what stops a banked corner
+# dragging everything after it off the floor:
+#
+#   roll    bank about the line it runs along: + lifts the left side
+#   pitch   tip about the line across it: + raises the far end
+#
+# All five work on every piece kind without any piece knowing they exist.
+PLACEMENT = ("away", "shift", "rotate", "roll", "pitch")
 SHIFT_MAX = 4096
 ROTATE_MAX = 180
+AWAY_MAX = 8192
+ROLL_MAX = 180
+PITCH_MAX = 180
+# The strict tier keeps the two cursor turns small — a described course should
+# read as a course, not as pieces scattered near each other — and forbids the
+# other three outright:
+#
+#   away  opens a floorless gap between two pieces, which is precisely the
+#         unclearable jump every physics rule in this tier exists to prevent;
+#   roll and pitch leave the upright, 2-D world the rest of this tier reasons
+#         in. Whether a course crosses itself, what a jump lands on and where
+#         a player can cut the route are all answered from footprints, and a
+#         banked piece has no honest footprint. The editor may have them
+#         because there those answers are notes for a person to weigh, not
+#         guarantees made on nobody's behalf.
 STRICT_SHIFT_MAX = 256
 STRICT_ROTATE_MAX = 30
 
@@ -291,6 +316,9 @@ STRICT = Tier(
     hazard=(HAZARD_MIN, None),         # None: physics.max_gap(0), it is jumped
     shift=STRICT_SHIFT_MAX,
     rotate=STRICT_ROTATE_MAX,
+    away=0,
+    roll=0,
+    pitch=0,
     # The laid-out course's ceilings. This is where they are written down;
     # layout.EXTENT_MAX_XY and friends are aliases of these three.
     extent_xy=16384,
@@ -346,6 +374,9 @@ OPEN = Tier(
     hazard=(HAZARD_MIN, 8192),
     shift=SHIFT_MAX,
     rotate=ROTATE_MAX,
+    away=AWAY_MAX,
+    roll=ROLL_MAX,
+    pitch=PITCH_MAX,
     # Further out, and still the compile-and-load limits rather than taste: a
     # 30,000-unit spread keeps a centred course inside the compiler's own
     # +-16,384 half-world, and 6,000 brushes builds in seconds and loads like
@@ -493,13 +524,13 @@ def normalize(spec):
         clean = {"type": t}
         # Every piece may be nudged sideways and turned on the spot, so these
         # two survive normalize whatever the piece is.
-        for k in keep.get(t, ()) + ("shift", "rotate"):
+        for k in keep.get(t, ()) + PLACEMENT:
             if k in seg:
                 clean[k] = seg[k]
         for flag in ("shortcut", "open", "ice"):
             if clean.get(flag) is False:
                 del clean[flag]     # the default; keep stored specs short
-        for z in ("shift", "rotate"):
+        for z in PLACEMENT:
             if clean.get(z) == 0:
                 del clean[z]        # likewise: no nudge is the normal case
         out["segments"].append(clean)
@@ -594,11 +625,12 @@ def validate(spec, rules="strict"):
             errs.append(f"{where}: only {', '.join(ICEABLE)} can be ice "
                         "(a piece with no walking surface has nothing to be slick)")
 
-        # Every piece may be nudged sideways and turned on the spot.
-        if "shift" in seg:
-            num("shift", -L.shift, L.shift)
-        if "rotate" in seg:
-            num("rotate", -L.rotate, L.rotate)
+        # Every piece may be placed relative to the one before it. A tier
+        # that forbids one of these bounds it to [0, 0], so the message says
+        # so rather than pretending the field is unknown.
+        for key in PLACEMENT:
+            if key in seg:
+                num(key, -getattr(L, key), getattr(L, key))
 
         def side(what="the side of the kick wall"):
             if seg.get("direction") not in ("left", "right"):
