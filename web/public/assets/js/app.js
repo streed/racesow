@@ -1705,7 +1705,17 @@ async function viewMapgenEditor(params) {
     <div id="mge-root" class="mge"><div class="loading"><span class="spinner"></span></div></div>`;
   const root = document.getElementById("mge-root");
   try {
-    const mod = await import("/assets/js/mapgen-editor.js" + (EDITOR_V ? "?v=" + EDITOR_V : ""));
+    // The version goes in the PATH, not a query. The editor statically imports
+    // its three sibling modules by relative name, and a relative import
+    // resolves against the importing module's URL with the query DROPPED — so
+    // a ?v= on this URL alone left the siblings unversioned, and a browser
+    // holding one of them from before a deploy would pair it with the new
+    // editor ("does not provide an export named ..."). A versioned directory
+    // is inherited by every relative import inside it, so the four can only
+    // ever load as a set.
+    const mod = await import(EDITOR_V
+      ? `/assets/js/v${EDITOR_V}/mapgen-editor.js`
+      : "/assets/js/mapgen-editor.js");
     if (!root.isConnected) return;   // navigated away while it loaded
     disposeEditor = await mod.mountEditor(root, { initial, initialNote: note, go, track });
   } catch (e) {

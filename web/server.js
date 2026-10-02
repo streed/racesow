@@ -5073,7 +5073,9 @@ function assetVersion(rel) {
   }
 }
 // The map editor is four modules (mapgen-editor.js imports the other three),
-// so its ?ev= covers all of them: a change to any one re-fetches the editor.
+// so this hash covers all of them: a change to any one re-fetches the editor.
+// It is served as a PATH segment (/assets/js/v<hash>/…), not a query, so the
+// relative sibling imports inherit it — see the route near express.static.
 const EDITOR_V = crypto.createHash("sha1")
   .update(["mapgen-editor", "mapgen-pieces", "mapgen-course", "mapgen-textures"]
     .map((m) => assetVersion(`assets/js/${m}.js`)).join(""))
@@ -5659,6 +5661,30 @@ app.get("/robots.txt", (req, res) => {
 });
 
 app.get("/", (req, res) => sendShell(res, defaultShell(req)));
+
+// The map editor's modules, under a directory named for their shared hash.
+//
+// The editor statically imports its three siblings by relative name, and a
+// relative import resolves against the importing module's URL with the query
+// string DROPPED. So versioning only the editor's own URL (?v=) left
+// /assets/js/mapgen-pieces.js unversioned, and a browser holding it from
+// before a deploy paired an OLD sibling with the NEW editor — which fails as
+// "does not provide an export named …" and sticks until that cache entry
+// expires. A versioned DIRECTORY is inherited by every relative import inside
+// it, so the four modules can only ever load as a matched set.
+//
+// Above express.static, which would 404 this path (the directory does not
+// exist on disk) and drop it into the SPA fallback.
+const EDITOR_MODULE = /^[a-z0-9-]+\.js$/;
+app.get("/assets/js/v:ver/:file", (req, res, next) => {
+  if (!EDITOR_MODULE.test(req.params.file)) return next();
+  const file = path.join(__dirname, "public", "assets", "js", req.params.file);
+  // The hash names the content, so any URL that resolves is immutable.
+  res.sendFile(file, {
+    headers: { "Cache-Control": "public, max-age=604800, immutable",
+               "Content-Type": "application/javascript; charset=utf-8" },
+  }, (err) => { if (err) next(err.status === 404 ? undefined : err); });
+});
 
 // Static frontend. The 3D replay model/vendor assets are large and stable, so
 // give them a long browser cache (repeat replay views load the pig instantly);

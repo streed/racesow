@@ -6,7 +6,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -73,6 +73,28 @@ const ICY = {
     { type: "straight", length: 640 },
   ],
 };
+
+test("the editor's four modules are served as one versioned set", async () => {
+  // The editor imports its siblings by relative name, and a relative import
+  // drops the query string — so a ?v= on the editor alone left the siblings
+  // on a bare, cacheable path and a stale one could pair with a fresh editor.
+  // The version is a directory instead, which every sibling inherits.
+  const shell = await (await fetch(`${base}/mapgen/editor`)).text();
+  const ev = (shell.match(/[?&]ev=([a-f0-9]+)/) || [])[1];
+  assert.ok(ev, "the shell must carry the editor hash");
+  for (const m of ["mapgen-editor", "mapgen-pieces", "mapgen-course", "mapgen-textures"]) {
+    const r = await fetch(`${base}/assets/js/v${ev}/${m}.js`);
+    assert.equal(r.status, 200, m);
+    assert.match(r.headers.get("content-type") || "", /javascript/, m);
+    // The hash names the content, so the URL is safe to cache forever.
+    assert.match(r.headers.get("cache-control") || "", /immutable/, m);
+    assert.ok((await r.text()).length > 100, m);
+  }
+  // Only flat .js siblings; nothing else is reachable through the prefix.
+  for (const bad of ["server.js", "nope.txt", "..%2f..%2fserver.js", "Mapgen-Editor.js"]) {
+    assert.equal((await fetch(`${base}/assets/js/v${ev}/${bad}`)).status, 404, bad);
+  }
+});
 
 test("a refused course costs nothing and says why", async () => {
   const bob = as("203.0.113.20");
@@ -149,6 +171,16 @@ test("an accepted course waits for an admin, as an editor job, spec and all", as
 // is deleted hashes to nothing and a module left OUT never busts the cache at
 // all — a browser keeps the editor it already has. Walk the editor's own
 // imports instead of trusting the list.
+// Every relative import, in any of its spellings. `from "./x.js"` alone misses
+// a bare `import "./x.js";` and a dynamic `import("./x.js")` — a module
+// reached only that way would be served off an unversioned path and could go
+// stale against the rest of the set. The from-clause is matched with [^"';] so
+// it cannot run past the end of its own statement and swallow the next one.
+const RELATIVE_IMPORTS = [
+  /(?:^|[\s(;])(?:import|export)(?:\s+[^"';]*?\s+from)?\s*["'](\.\/[\w-]+)\.js["']/gm,
+  /import\s*\(\s*["'](\.\/[\w-]+)\.js["']/g,
+];
+
 test("?ev= hashes exactly the modules the editor imports", () => {
   const src = readFileSync(SERVER_JS, "utf8");
   const m = src.match(/\.update\((\[[^\]]*\])\s*\n\s*\.map\(\(m\) => assetVersion/);
@@ -158,11 +190,31 @@ test("?ev= hashes exactly the modules the editor imports", () => {
   const stack = ["mapgen-editor"];
   while (stack.length) {
     const mod = stack.pop();
-    for (const hit of readFileSync(path.join(dir, `${mod}.js`), "utf8").matchAll(/from "\.\/([\w-]+)\.js"/g)) {
-      if (!seen.has(hit[1])) { seen.add(hit[1]); stack.push(hit[1]); }
+    const file = path.join(dir, `${mod}.js`);
+    assert.ok(existsSync(file), `${mod}.js is imported but does not exist`);
+    const text = readFileSync(file, "utf8");
+    for (const re of RELATIVE_IMPORTS) {
+      for (const hit of text.matchAll(re)) {
+        const name = hit[1].slice(2);
+        if (!seen.has(name)) { seen.add(name); stack.push(name); }
+      }
     }
   }
   assert.deepEqual(JSON.parse(m[1]).sort(), [...seen].sort());
+});
+
+test("the editor is loaded by versioned path, so its siblings inherit it", () => {
+  // A relative import resolves against the importing module's URL with the
+  // QUERY DROPPED. So versioning only the editor's own URL (?v=) left
+  // /assets/js/mapgen-pieces.js bare and cacheable, and a browser holding one
+  // from before a deploy paired it with the new editor — "does not provide an
+  // export named …", stuck until that cache entry expired. A versioned
+  // DIRECTORY is inherited by every relative import inside it.
+  const app = readFileSync(path.join(__dirname, "..", "public", "assets", "js", "app.js"), "utf8");
+  assert.match(app, /\/assets\/js\/v\$\{EDITOR_V\}\/mapgen-editor\.js/,
+    "the editor must be imported from a versioned directory");
+  assert.doesNotMatch(app, /mapgen-editor\.js\?v=/,
+    "a query-versioned editor URL leaves its siblings unversioned");
 });
 
 test("a described map is still a 'describe' job, with no spec until it is planned", async () => {
