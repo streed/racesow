@@ -99,7 +99,7 @@ step 18, and the player box. Every gap is sized so a player running at a
 plain 320 ups clears it, with a 20% margin. Strafing makes a generated course
 faster, but it is never required. That is the static guarantee.
 
-Two things are **not** proven yet: that a bot can actually drive the route
+Two things are **not** proven yet: that a bot can actually run the route
 (the design doc's phase 2, a headless pmove bot), and that the *server* loads
 the map. The e2e CI lane covers the second: it builds this toolchain and boots
 the real `warsow-race` image on `examples/gen_first_light.json` through
@@ -136,48 +136,29 @@ an empty leaderboard.
 `/mapgen/editor` builds the same spec in the browser. You pick pieces from a
 palette, set lengths, heights, angles, directions, open/ice flags with
 sliders, drag pieces to reorder them, and see the course in 3-D with the
-`mapgen_v1` textures (you can also ride its centre line). It imports and
-exports spec JSON (a model's reply, a `spec.json`, or a generated map via
-`?from=<token>`), and "Build it" queues the spec through `POST /api/mapgen/spec`
-under the same daily quota. An editor course then waits in `review` for an
-admin on `/admin/mapgen`, which lists each one with its stats and a link to
-preview it in 3-D. Approve moves it to the worker's queue. Reject turns it down
-with a reason shown on its job page, and gives back the requester's map and
-the site budget slot. Described maps skip this step. The worker skips planning
-for these `source = 'editor'` jobs: it normalizes the spec, checks it, and
-builds it.
+`mapgen_v1` textures. It imports and exports spec JSON (a model's reply, a
+`spec.json`, or a generated map via `?from=<token>`), and "Send for approval"
+queues the spec through `POST /api/mapgen/spec` under the same daily quota. An
+editor course then waits in `review` for an admin on `/admin/mapgen`, which
+lists each one with its stats and a link to preview it in 3-D. Approve moves it
+to the worker's queue. Reject turns it down with a reason shown on its job
+page, and gives back the requester's map and the site budget slot. Described
+maps skip this step. The worker skips planning for these `source = 'editor'`
+jobs: it normalizes the spec, checks it, and builds it.
 
-It borrows TrackMania's editor loop:
+The tools:
 
-- **Test drive (P).** Drive the course first person with
-  `mapgen-drive.js`, a port of the servers' `gs_pmove.c` (ground and air
-  acceleration, bunny-hop air control, slick ice, steps, ramps, dash and wall
-  jump) and of the box-against-brush trace, over the same brushes. It has a
-  clock from the start line, checkpoint splits against your best, respawn on
-  the last checkpoint (Enter), and restart (Backspace). The physics is
-  approximate in one place: no edge bevels, so a turn's outside corner can
-  catch a hair early.
-- **Validation and medals.** Your best finish is the author time. Gold,
-  silver and bronze are 6%, 20% and 50% slower, and the best run is shown as a
-  ghost the next time you drive. Any edit to the pieces un-validates the
-  course. Validations are kept in the browser and are not sent with a build.
-- **Ghost cursor.** Hovering a palette piece or macro shows it see-through
+- **Piece preview.** Hovering a palette piece or a combo shows it see-through
   where it will attach, and an arrow marks the attach point.
 - **Hotbar.** `1`–`0` and `-` place pieces.
-- **Selection, copy and paste.** Shift-click or Shift+←/→ selects a run of
+- **Selection, copy and paste.** Shift-click or Shift+←/→ selects a stretch of
   pieces; Ctrl+C, Ctrl+X and Ctrl+V copy, cut and paste it.
 - **Mirror (M)** flips the selection, or the whole course, left to right.
-- **Macros.** Save a selected run as a macro and place it again from the
-  palette.
+- **Combos.** Save a selected stretch of pieces as a combo and place it again
+  from the palette.
 - **Paint (B)** switches to a brush: click pieces to make them ice or grip.
   `I` toggles ice on the selection.
 - **My courses.** Save several courses in this browser and reopen them.
-
-`web/test/mapgen-drive.test.js` drives the port with scripted input. It checks
-that run speed comes in under a quarter second, that ice coasts while grip
-brakes, that walls hold, that every legal gap (drop −36 to 512) is cleared
-from run speed, and that an autopilot finishes First Light and Serpent Cut
-with every checkpoint in order.
 
 The page lays the course out with `web/public/assets/js/mapgen-course.js`, a
 port of `physics.py`, `spec.py` and `layout.py`, and draws it with

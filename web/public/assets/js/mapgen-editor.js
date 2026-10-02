@@ -7,8 +7,9 @@
 // is laid out in the page by mapgen-course.js, the generator's own layout
 // ported and pinned to it, so what you see is the brush set q3map2 will
 // compile and the problems listed are the ones the generator would refuse it
-// for. "Build it" sends the spec to the same queue a described map goes
-// through, minus the language model.
+// for. "Send for approval" puts the spec in the same queue a described map
+// goes through, minus the language model: an admin approves it, then the
+// worker compiles it.
 //
 // Lazily imported by app.js. mountEditor() returns a cleanup function that
 // frees the WebGL context, the animation loop and every listener.
@@ -17,8 +18,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 import * as mg from "./mapgen-course.js";
 import * as tx from "./mapgen-textures.js";
-import { PIECES, GROUPS, limits, fix, chipLabel, slug, STARTERS, adopt, HOTBAR, HOTKEYS, mirror, courseKey } from "./mapgen-pieces.js";
-import { makeWorld, Run, medals, fmtMs, FRAME_MSEC, VIEWHEIGHT } from "./mapgen-drive.js";
+import { PIECES, GROUPS, limits, fix, chipLabel, slug, STARTERS, adopt, HOTBAR, HOTKEYS, mirror } from "./mapgen-pieces.js";
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const fmt = (n) => Math.round(n).toLocaleString("en-US");
@@ -42,7 +42,7 @@ const ICONS = {
   brush: '<path d="M14 4l6 6-8 8-6-6z" /><path d="M6 12l-2 6 6-2" /><path d="M4 21h5" opacity=".6"/>',
   mirror: '<path d="M12 3v18" stroke-dasharray="2 2"/><path d="M9 7L4 12l5 5zM15 7l5 5-5 5z" />',
   copy: '<rect x="8" y="8" width="12" height="12" rx="2" /><path d="M4 16V6a2 2 0 0 1 2-2h10" />',
-  macro: '<rect x="3" y="9" width="6" height="6" rx="1" /><rect x="9" y="9" width="6" height="6" rx="1" /><rect x="15" y="9" width="6" height="6" rx="1" />',
+  combo: '<rect x="3" y="9" width="6" height="6" rx="1" /><rect x="9" y="9" width="6" height="6" rx="1" /><rect x="15" y="9" width="6" height="6" rx="1" />',
 };
 const icon = (k) => `<svg class="mge-ico" viewBox="0 0 24 24" aria-hidden="true">${ICONS[k] || ""}</svg>`;
 
@@ -200,11 +200,12 @@ class View {
     this.scene.add(this.group);
     this.extras = new THREE.Group();
     this.scene.add(this.extras);
-    // TrackMania's ghost cursor: the piece about to be placed, see-through,
-    // where it will go, and an arrow at the point the next piece attaches.
-    this.ghostGroup = new THREE.Group();
-    this.scene.add(this.ghostGroup);
-    this.ghostMat = new THREE.MeshBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.32, depthWrite: false });
+    // The piece preview: what is about to be placed, see-through, where it
+    // will go, and an arrow at the point the next piece attaches. Not called a
+    // ghost: in racesow a ghost is a recorded run.
+    this.previewGroup = new THREE.Group();
+    this.scene.add(this.previewGroup);
+    this.previewMat = new THREE.MeshBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.32, depthWrite: false });
     this.cursor = new THREE.Group();
     const arrow = new THREE.Mesh(new THREE.ConeGeometry(40, 110, 4), new THREE.MeshBasicMaterial({ color: 0x22d3ee }));
     arrow.rotation.z = -Math.PI / 2;   // point along +x before the heading turns it
@@ -214,10 +215,8 @@ class View {
     this.cursor.add(arrow, ring);
     this.cursor.visible = false;
     this.scene.add(this.cursor);
-    this.onTick = null;   // set while test-driving
     this.meshes = [];
     this.course = null;
-    this.ride = null;
     this.framed = false;
 
     this.ray = new THREE.Raycaster();
@@ -226,11 +225,11 @@ class View {
     let down = null;
     this.onDown = (e) => { down = [e.clientX, e.clientY]; };
     this.onUp = (e) => {
-      if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 5 || this.ride || this.onTick) return;
+      if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 5) return;
       this.onPick(this.pick(e), e);
     };
     this.onMove = (e) => {
-      if (e.buttons || this.ride || this.onTick) return;
+      if (e.buttons) return;
       const s = this.pick(e);
       if (s !== this.hovered) { this.hovered = s; this.onHover(s); }
     };
@@ -248,10 +247,8 @@ class View {
       const raw = Math.max(0, (t - this.last) / 1000);
       const dt = Math.min(0.1, raw);
       this.last = t;
-      if (this.ride) this.stepRide(dt);
       if (this.fly) this.stepFly(dt);
-      if (this.onTick) this.onTick(Math.min(0.25, raw));   // the race clock keeps real time
-      if ((!this.onTick && this.controls.update()) || this.needs || this.ride || this.fly || this.onTick) {
+      if (this.controls.update() || this.needs || this.fly) {
         this.needs = false;
         this.renderer.render(this.scene, this.camera);
       }
@@ -376,67 +373,25 @@ class View {
 
   // The see-through preview of pieces about to be placed (prisms of a
   // preview layout), or nothing.
-  setGhost(prisms) {
-    for (const m of this.ghostGroup.children) m.geometry.dispose();
-    this.ghostGroup.clear();
+  setPreview(prisms) {
+    for (const m of this.previewGroup.children) m.geometry.dispose();
+    this.previewGroup.clear();
     if (prisms && prisms.length) {
       const buckets = new Map();
       for (const p of prisms) if (p.tex !== "trigger" && p.tex !== "sky") addPrism(buckets, p);
-      for (const b of buckets.values()) this.ghostGroup.add(new THREE.Mesh(b.geometry(), this.ghostMat));
+      for (const b of buckets.values()) this.previewGroup.add(new THREE.Mesh(b.geometry(), this.previewMat));
     }
     this.dirty();
   }
 
   // The arrow where the next piece attaches: { x, y, z, heading } or null.
   setCursor(pose) {
-    this.cursor.visible = !!pose && !this.onTick;
+    this.cursor.visible = !!pose;
     if (pose) {
       this.cursor.position.set(...q2t(pose.x, pose.y, pose.z + 70));
       this.cursor.rotation.y = (pose.heading * Math.PI) / 180;
     }
     this.dirty();
-  }
-
-  // Ride the centre line at a strafing racer's pace, eyes at player height.
-  startRide(onEnd, speed = 900) {
-    if (!this.course || this.course.route.length < 2) return;
-    const pts = this.course.route.map(([x, y, z]) => new THREE.Vector3(...q2t(x, y, z + 56)));
-    const at = [0];
-    for (let i = 1; i < pts.length; i++) at.push(at[i - 1] + pts[i].distanceTo(pts[i - 1]));
-    this.saved = { pos: this.camera.position.clone(), target: this.controls.target.clone() };
-    this.controls.enabled = false;
-    this.ride = { pts, at, d: 0, speed, onEnd, look: null };
-  }
-  rideAt(d) {
-    const { pts, at } = this.ride;
-    d = clamp(d, 0, at[at.length - 1]);
-    let i = 1;
-    while (i < at.length - 1 && at[i] < d) i++;
-    const k = (d - at[i - 1]) / Math.max(1e-6, at[i] - at[i - 1]);
-    return pts[i - 1].clone().lerp(pts[i], k);
-  }
-  stepRide(dt) {
-    const r = this.ride;
-    r.d += r.speed * dt;
-    const total = r.at[r.at.length - 1];
-    const eye = this.rideAt(r.d);
-    const ahead = this.rideAt(r.d + 360);
-    r.look = r.look ? r.look.lerp(ahead, Math.min(1, dt * 6)) : ahead;
-    this.camera.position.copy(eye);
-    this.camera.lookAt(r.look);
-    if (r.onProgress) r.onProgress(r.d / total);
-    if (r.d >= total) this.stopRide();
-  }
-  stopRide() {
-    if (!this.ride) return;
-    const { onEnd } = this.ride;
-    this.ride = null;
-    this.controls.enabled = true;
-    this.camera.position.copy(this.saved.pos);
-    this.controls.target.copy(this.saved.target);
-    this.camera.lookAt(this.controls.target);
-    this.dirty();
-    if (onEnd) onEnd();
   }
 
   dispose() {
@@ -447,8 +402,8 @@ class View {
     el.removeEventListener("pointerup", this.onUp);
     el.removeEventListener("pointermove", this.onMove);
     this.setCourse(null);
-    this.setGhost(null);
-    this.ghostMat.dispose();
+    this.setPreview(null);
+    this.previewMat.dispose();
     this.controls.dispose();
     for (const m of this.materials.values()) { m.map.dispose(); m.dispose(); }
     this.renderer.dispose();
@@ -472,10 +427,13 @@ const store = {
   get(key, dflt) { try { const v = JSON.parse(localStorage.getItem(key) || "null"); return v ?? dflt; } catch { return dflt; } },
   set(key, v) { try { localStorage.setItem(key, JSON.stringify(v)); return true; } catch { return false; } },
 };
-const MACROS_KEY = "racesow.mapgen.editor.macros";
+// A combo is a saved stretch of pieces, placed again from the palette. Its
+// storage key and the mge-macro* class names keep the older spelling: renaming
+// the key would drop what a browser has already saved, and the classes are
+// style.css's.
+const COMBOS_KEY = "racesow.mapgen.editor.macros";
 const LIBRARY_KEY = "racesow.mapgen.editor.library";
 const CLIP_KEY = "racesow.mapgen.editor.clipboard";
-const VALID_KEY = "racesow.mapgen.editor.validated";
 
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -492,7 +450,6 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
   // selected: the piece the inspector edits (and the anchor of a range);
   // rangeEnd: the other end of a shift-selected range, or null.
   const st = { spec, selected: null, rangeEnd: null, surface: "grip", paint: false, undo: [], redo: [], result: null, quota: null };
-  let drive = null;   // the test-drive session, while one runs
 
   root.innerHTML = `
     <div class="mge-bar panel">
@@ -534,7 +491,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
         <button type="button" class="mge-piece" draggable="true" data-add="${k}" title="${esc(PIECES[k].hint)}">
           ${icon(k)}<span><b>${esc(PIECES[k].name)}</b><small>${esc(PIECES[k].hint)}</small></span>
           <kbd>${esc(HOTKEYS[HOTBAR.indexOf(k)])}</kbd></button>`).join("")).join("")}
-      <div class="mge-group">My macros</div>
+      <div class="mge-group">My combos</div>
       <div id="mge-macros" class="mge-macros"></div>
     </aside>
     <section class="mge-view panel">
@@ -543,8 +500,6 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
         <button type="button" class="rv-btn" data-act="frame" title="Fit the whole course (F)">Fit</button>
         <button type="button" class="rv-btn" data-act="top" title="Look straight down (T)">Top</button>
         <button type="button" class="rv-btn" data-act="focus" title="Look at the selected piece">Selected</button>
-        <button type="button" class="rv-btn mge-drive" data-act="drive" title="Test drive it yourself, TrackMania style (P)">▶ Drive</button>
-        <button type="button" class="rv-btn mge-ride" data-act="ride" title="Ride the centre line at strafe speed (R)">Ride along</button>
         <span class="mge-hint">Drag to orbit · right-drag to pan · scroll to zoom · click a piece to edit it</span>
       </div>
     </section>
@@ -684,10 +639,10 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     return [Math.min(st.selected, b), Math.max(st.selected, b)];
   };
 
-  /* -- TrackMania's tools: copy/paste, mirror, macroblocks, paint ------- */
+  /* -- piece tools: copy/paste, mirror, combos, paint ------------------- */
   function copySel({ cut = false } = {}) {
     const r = selRange();
-    if (!r) return flash("Select pieces first (shift-click to select a run of them).");
+    if (!r) return flash("Select pieces first (shift-click to select a stretch of them).");
     const clip = st.spec.segments.slice(r[0], r[1] + 1).map((x) => ({ ...x }));
     store.set(CLIP_KEY, clip);
     if (cut) {
@@ -729,25 +684,25 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     if (!!s.ice === ice) return;
     setFields(i, { ice });
   }
-  const macros = () => store.get(MACROS_KEY, []).filter((m) => m && Array.isArray(m.segments));
-  function saveMacro() {
+  const combos = () => store.get(COMBOS_KEY, []).filter((m) => m && Array.isArray(m.segments));
+  function saveCombo() {
     const r = selRange();
-    if (!r) return flash("Select the pieces to save first (shift-click a run of them).");
-    const name = (window.prompt("Name this macro:", `${PIECES[st.spec.segments[r[0]].type].name} combo`) || "").trim().slice(0, 40);
+    if (!r) return flash("Select the pieces to save first (shift-click a stretch of them).");
+    const name = (window.prompt("Name this combo:", `${PIECES[st.spec.segments[r[0]].type].name} combo`) || "").trim().slice(0, 40);
     if (!name) return;
-    const list = [{ name, segments: st.spec.segments.slice(r[0], r[1] + 1) }, ...macros()].slice(0, 30);
-    if (!store.set(MACROS_KEY, list)) return flash("This browser won't store macros (private window?).");
-    renderMacros();
-    flash(`Saved "${name}" to My macros.`);
+    const list = [{ name, segments: st.spec.segments.slice(r[0], r[1] + 1) }, ...combos()].slice(0, 30);
+    if (!store.set(COMBOS_KEY, list)) return flash("This browser won't store combos (private window?).");
+    renderCombos();
+    flash(`Saved "${name}" to My combos.`);
   }
-  function renderMacros() {
+  function renderCombos() {
     const el = $("#mge-macros");
-    const list = macros();
+    const list = combos();
     el.innerHTML = list.length ? list.map((m, k) => `<div class="mge-macro">
-        <button type="button" class="mge-piece" data-macro="${k}" title="Insert ${esc(m.name)}">${icon("macro")}
+        <button type="button" class="mge-piece" data-combo="${k}" title="Insert ${esc(m.name)}">${icon("combo")}
           <span><b>${esc(m.name)}</b><small>${m.segments.length} piece${m.segments.length === 1 ? "" : "s"}</small></span></button>
-        <button type="button" class="mge-x" data-delmacro="${k}" aria-label="Delete ${esc(m.name)}">×</button></div>`).join("")
-      : `<p class="mge-note">Select a run of pieces (shift-click) and save it as a macro to reuse it.</p>`;
+        <button type="button" class="mge-x" data-delcombo="${k}" aria-label="Delete ${esc(m.name)}">×</button></div>`).join("")
+      : `<p class="mge-note">Select a stretch of pieces (shift-click) and save it as a combo to place again.</p>`;
   }
   const library = () => store.get(LIBRARY_KEY, []).filter((c) => c && c.spec && Array.isArray(c.spec.segments));
   function saveToLibrary() {
@@ -765,16 +720,16 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       : `<p class="mge-note">Nothing saved yet.</p>`;
   }
 
-  // The ghost cursor: what pieces would be placed, see-through, where.
-  function ghost(pieces) {
-    if (!pieces || drive) return view.setGhost(null);
+  // The piece preview: what pieces would be placed, see-through, where.
+  function showPreview(pieces) {
+    if (!pieces) return view.setPreview(null);
     const r = selRange();
     const i = r ? r[1] + 1 : st.spec.segments.length;
     const segs = [...st.spec.segments];
     segs.splice(i, 0, ...pieces.map((x) => fix(x, st.spec.width)));
     const g = mg.preview({ ...fullSpec(), segments: segs.slice(0, mg.MAX_SEGMENTS) });
-    if (!g.course) return view.setGhost(null);
-    view.setGhost(g.course.world.filter((p) => p.seg !== null && p.seg >= i && p.seg < i + pieces.length));
+    if (!g.course) return view.setPreview(null);
+    view.setPreview(g.course.world.filter((p) => p.seg !== null && p.seg >= i && p.seg < i + pieces.length));
   }
   function updateCursor() {
     const c = st.result && st.result.course;
@@ -830,7 +785,6 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     const geo = mg.preview(full);
     const words = mg.validate(full).filter((p) => p.startsWith("name ") || p.startsWith("title "));
     st.result = { problems: [...words, ...geo.problems], course: geo.course };
-    if (drive) stopDrive();   // the course changed under the car
     if (geo.course) view.setCourse(geo.course);
     view.highlight({ range: selRange(), bad: badSegs() });
     updateCursor();
@@ -910,14 +864,14 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       const segs = st.spec.segments.slice(r[0], r[1] + 1);
       const iceable = segs.filter((x) => mg.ICEABLE.includes(x.type));
       const len = segs.reduce((n, x) => n + mg.routeLength(x), 0);
-      inspEl.innerHTML = `<div class="mge-ihead">${icon("macro")}<div><div class="mge-h">${segs.length} pieces <em>#${r[0]}–${r[1]}</em></div>
+      inspEl.innerHTML = `<div class="mge-ihead">${icon("combo")}<div><div class="mge-h">${segs.length} pieces <em>#${r[0]}–${r[1]}</em></div>
           <small>${fmt(len)} units · ${secs(len)} at run speed</small></div></div>
-        <p class="mge-note">Shift-click or Shift+←/→ to change the run. Like TrackMania's copy and macroblocks: copy it,
-          mirror it, or save it to reuse.</p>
+        <p class="mge-note">Shift-click or Shift+←/→ to change how many pieces are selected. Copy them,
+          mirror them, or save them as a combo to place again.</p>
         <div class="mge-iact">
           <button type="button" class="btn" data-act="copysel" title="Ctrl+C">${icon("copy")} Copy</button>
           <button type="button" class="btn" data-act="mirror" title="M">${icon("mirror")} Mirror</button>
-          <button type="button" class="btn" data-act="savemacro">${icon("macro")} Save as macro</button>
+          <button type="button" class="btn" data-act="savecombo">${icon("combo")} Save as combo</button>
         </div>
         ${iceable.length ? `<div class="mge-iact">
           <button type="button" class="btn" data-act="iceon">${icon("ice")} All ice</button>
@@ -1031,29 +985,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
         const m = p.match(/segment (\d+)/);
         return `<li>${m ? `<button type="button" class="mge-goto" data-goto="${m[1]}">#${m[1]}</button>` : ""}${esc(p)}</li>`;
       }).join("")}</ul>` : ""}
-      ${validationLine()}
       ${quota ? `<p class="mge-quota">${esc(quotaLine(quota))} · map name <code>${esc(slug(st.spec.title))}_…</code></p>` : ""}`;
-  }
-
-  // TrackMania validates a track by driving it: the author's best time is the
-  // author medal, and gold, silver and bronze follow from it. Here it is a
-  // guide for the author, kept in this browser; any edit to the pieces
-  // un-validates the course, as in TrackMania.
-  const validations = () => store.get(VALID_KEY, {});
-  const validation = () => validations()[courseKey(st.spec)] || null;
-  function validationLine() {
-    if (!st.result.course) return "";
-    const v = validation();
-    if (!v) {
-      return `<p class="mge-valid no">${icon("dash")} <b>Not validated.</b> Drive it (<kbd>P</kbd>) to set the author time,
-        like TrackMania: gold, silver and bronze follow from it.</p>`;
-    }
-    const m = medals(v.author);
-    return `<p class="mge-valid ok"><b>Validated.</b>
-      <span class="medal author">Author ${fmtMs(m.author)}</span>
-      <span class="medal gold">Gold ${fmtMs(m.gold)}</span>
-      <span class="medal silver">Silver ${fmtMs(m.silver)}</span>
-      <span class="medal bronze">Bronze ${fmtMs(m.bronze)}</span></p>`;
   }
 
   const quotaLine = (q) => !q.open && q.remaining > 0 ? "The generator has built all the maps it can today."
@@ -1082,12 +1014,12 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     const t = e.target.closest("button, [data-add], [data-goto]");
     if (!t || !root.contains(t)) return;
     if (t.dataset.add) return addPiece(t.dataset.add);
-    if (t.dataset.macro !== undefined) return insertPieces((macros()[Number(t.dataset.macro)] || {}).segments, null, "Placed");
-    if (t.dataset.delmacro !== undefined) {
-      const list = macros();
-      list.splice(Number(t.dataset.delmacro), 1);
-      store.set(MACROS_KEY, list);
-      return renderMacros();
+    if (t.dataset.combo !== undefined) return insertPieces((combos()[Number(t.dataset.combo)] || {}).segments, null, "Placed");
+    if (t.dataset.delcombo !== undefined) {
+      const list = combos();
+      list.splice(Number(t.dataset.delcombo), 1);
+      store.set(COMBOS_KEY, list);
+      return renderCombos();
     }
     if (t.dataset.lib !== undefined) {
       const c = library()[Number(t.dataset.lib)];
@@ -1132,8 +1064,6 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       case "frame": view.framed = true; return view.frame();
       case "top": return view.frame(true);
       case "focus": return st.selected !== null ? view.focus(st.selected) : flash("Select a piece first.");
-      case "ride": return toggleRide();
-      case "drive": return drive ? stopDrive() : startDrive();
       case "paint":
         st.paint = !st.paint;
         flash(st.paint ? `Paint: click pieces to make them ${st.surface === "ice" ? "ice" : "grip"}. B or Esc to stop.` : "Paint off.");
@@ -1141,7 +1071,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       case "save": t.closest("details").open = false; return saveToLibrary();
       case "copysel": return copySel();
       case "mirror": return mirrorSel();
-      case "savemacro": return saveMacro();
+      case "savecombo": return saveCombo();
       case "iceon": return surfaceSel(true);
       case "iceoff": return surfaceSel(false);
       case "delsel": {
@@ -1167,23 +1097,23 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     if (st.paint) return paint(Number(c.dataset.i));
     select(Number(c.dataset.i), { extend: e.shiftKey });
   });
-  // The ghost cursor follows the pointer over the palette.
+  // The piece preview follows the pointer over the palette.
   on(root, "pointerover", (e) => {
-    const b = e.target.closest("[data-add], [data-macro]");
+    const b = e.target.closest("[data-add], [data-combo]");
     if (!b) return;
     if (b.dataset.add) {
       const p = PIECES[b.dataset.add];
-      if (p.needs && p.needs(st.spec.width)) return ghost(null);
+      if (p.needs && p.needs(st.spec.width)) return showPreview(null);
       const seg = p.make(st.spec.width);
       if (st.surface === "ice" && mg.ICEABLE.includes(b.dataset.add)) seg.ice = true;
-      ghost([seg]);
+      showPreview([seg]);
     } else {
-      ghost((macros()[Number(b.dataset.macro)] || {}).segments || null);
+      showPreview((combos()[Number(b.dataset.combo)] || {}).segments || null);
     }
   });
   on(root, "pointerout", (e) => {
-    const b = e.target.closest("[data-add], [data-macro]");
-    if (b && !b.contains(e.relatedTarget)) ghost(null);
+    const b = e.target.closest("[data-add], [data-combo]");
+    if (b && !b.contains(e.relatedTarget)) showPreview(null);
   });
   on(chipsEl, "dblclick", (e) => {
     const c = e.target.closest("[data-i]");
@@ -1257,7 +1187,7 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
   });
 
   on(document, "keydown", (e) => {
-    if (!root.isConnected || dlg.open || drive) return;   // a test drive owns the keyboard
+    if (!root.isConnected || dlg.open) return;
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement && document.activeElement.tagName)
       && document.activeElement.type !== "range" && document.activeElement.type !== "checkbox";
     const mod = e.ctrlKey || e.metaKey;
@@ -1265,7 +1195,6 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     if (mod && k === "z" && !typing) { e.preventDefault(); return e.shiftKey ? travel(st.redo, st.undo) : travel(st.undo, st.redo); }
     if (mod && k === "y" && !typing) { e.preventDefault(); return travel(st.redo, st.undo); }
     if (typing) return;
-    if (e.key === "Escape" && view.ride) return view.stopRide();
     if (e.key === "Escape" && st.paint) { st.paint = false; return refresh({ inspector: false }); }
     if (mod && k === "d") { e.preventDefault(); return duplicate(st.selected); }
     if (mod && k === "c") { e.preventDefault(); return copySel(); }
@@ -1290,14 +1219,12 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       }
       return select(st.selected === null ? (d > 0 ? 0 : n - 1) : clamp(st.selected + d, 0, n - 1));
     }
-    // TrackMania's quick inventory: number keys place a piece.
+    // The hotbar: number keys place a piece, in palette order.
     const hot = HOTKEYS.indexOf(e.key);
     if (hot >= 0) { e.preventDefault(); return addPiece(HOTBAR[hot]); }
     if (e.key === "Escape") return select(null);
     if (k === "f") { view.framed = true; return view.frame(); }
     if (k === "t") return view.frame(true);
-    if (k === "r") return toggleRide();
-    if (k === "p") return startDrive();
     if (k === "m") return mirrorSel();
     if (k === "b") return $('[data-act="paint"]').click();
     if (k === "i" && selRange()) {
@@ -1306,213 +1233,6 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       return surfaceSel(anyGrip);
     }
   });
-
-  function toggleRide() {
-    const btn = $(".mge-ride");
-    if (view.ride) return view.stopRide();
-    if (!st.result.course) return flash("Fix the course first.");
-    btn.textContent = "■ Stop";
-    view.startRide(() => { btn.textContent = "Ride along"; });
-    track("Map editor ride");
-  }
-
-  /* -- test drive (TrackMania's "test" button) --------------------------- */
-  // The course's own brushes, the servers' movement code (mapgen-drive.js),
-  // first person. W A S D or arrows to run, the mouse to look, Space to jump
-  // (hold it to bunny-hop), Shift / E / right button for the special key (dash
-  // on the ground, wall jump in the air). Enter respawns on the last
-  // checkpoint, Backspace restarts, Esc leaves.
-  function startDrive() {
-    if (drive) return;
-    const course = st.result && st.result.course;
-    if (!course) return flash("Fix the course first: it has to lay out before it can be driven.");
-    if (view.ride) view.stopRide();
-    const world = makeWorld(course);
-    const key = courseKey(st.spec);
-    const best = validations()[key] || null;
-    const stage = $("#mge-stage");
-    const hud = document.createElement("div");
-    hud.className = "mge-hud";
-    hud.innerHTML = `
-      <div class="mge-hud-time">0.000</div>
-      <div class="mge-hud-cp"></div>
-      <div class="mge-hud-split"></div>
-      <div class="mge-hud-speed"><b>0</b> ups</div>
-      <div class="mge-hud-medals">${best ? (() => { const m = medals(best.author); return `
-        <span class="medal author">${fmtMs(m.author)}</span><span class="medal gold">${fmtMs(m.gold)}</span>
-        <span class="medal silver">${fmtMs(m.silver)}</span><span class="medal bronze">${fmtMs(m.bronze)}</span>`; })()
-        : `<span>Unvalidated · finish to set the author time</span>`}</div>
-      <div class="mge-hud-keys">WASD run · mouse look · Space jump · Shift dash / wall jump · Enter checkpoint · Backspace restart · Esc leave</div>
-      <div class="mge-hud-card" hidden></div>`;
-    stage.appendChild(hud);
-    const $h = (sel) => hud.querySelector(sel);
-    const canvas = view.renderer.domElement;
-    const saved = { pos: view.camera.position.clone(), target: view.controls.target.clone() };
-    view.controls.enabled = false;
-    view.extras.visible = false;
-    view.setGhost(null);
-    view.cursor.visible = false;
-    // The best run, as a see-through ghost to race against.
-    const ghostBox = new THREE.Mesh(new THREE.BoxGeometry(32, 64, 32),
-      new THREE.MeshBasicMaterial({ color: 0xff6a1a, transparent: true, opacity: 0.4, depthWrite: false }));
-    ghostBox.visible = false;
-    view.scene.add(ghostBox);
-
-    const keys = new Set();
-    let run = new Run(world);
-    let yaw = run.p.yaw, pitch = 0, acc = 0, paused = false, splitTimer = 0, rmb = false;
-    let seen = 0;   // run.events already shown
-    const ghostAt = (ms) => {
-      const tr = best && best.trail;
-      if (!tr || !tr.length) return null;
-      let lo = 0, hi = tr.length - 1;
-      if (ms >= tr[hi][0]) return tr[hi];
-      while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (tr[mid][0] <= ms) lo = mid; else hi = mid; }
-      const a = tr[lo], b = tr[hi], k = (ms - a[0]) / Math.max(1, b[0] - a[0]);
-      return [ms, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k, a[3] + (b[3] - a[3]) * k];
-    };
-    const card = (html) => { const c = $h(".mge-hud-card"); c.innerHTML = html; c.hidden = !html; };
-    const lock = () => { try { canvas.requestPointerLock(); } catch { /* not allowed: the keys still work */ } };
-
-    const onKey = (e) => {
-      const down = e.type === "keydown";
-      const k = e.code;
-      if (["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space",
-        "ShiftLeft", "ShiftRight", "KeyE", "Enter", "Backspace", "Escape"].includes(k)) e.preventDefault();
-      if (down && k === "Escape") return stopDrive();
-      if (down && k === "Backspace") { run = new Run(world); yaw = run.p.yaw; pitch = 0; seen = 0; card(""); return; }
-      if (down && k === "Enter") { if (run.finished === null) run.respawn(); return; }
-      if (down) keys.add(k); else keys.delete(k);
-    };
-    const onMouse = (e) => {
-      if (document.pointerLockElement !== canvas || paused) return;
-      yaw -= e.movementX * 0.066;      // m_yaw 0.022 x sensitivity 3
-      pitch = clamp(pitch + e.movementY * 0.066, -89, 89);
-    };
-    const onButton = (e) => {
-      if (e.button === 2) { rmb = e.type === "mousedown"; e.preventDefault(); }
-      if (e.type === "mousedown" && e.button === 0 && document.pointerLockElement !== canvas) lock();
-    };
-    const noMenu = (e) => e.preventDefault();
-    const onLock = () => {
-      paused = document.pointerLockElement !== canvas && run.finished === null;
-      if (paused) card(`<b>Paused</b><p>Click the view to keep driving. Esc leaves the test drive.</p>`);
-      else if (run.finished === null) card("");
-    };
-    window.addEventListener("keydown", onKey, true);
-    window.addEventListener("keyup", onKey, true);
-    document.addEventListener("mousemove", onMouse);
-    canvas.addEventListener("mousedown", onButton);
-    canvas.addEventListener("mouseup", onButton);
-    canvas.addEventListener("contextmenu", noMenu);
-    document.addEventListener("pointerlockchange", onLock);
-    lock();
-
-    function finish() {
-      const t = run.finished;
-      const all = validations();
-      const prev = all[key];
-      let line;
-      if (!prev || t < prev.author) {
-        all[key] = { author: t, splits: run.splits, trail: run.trail, at: Date.now() };
-        // Keep the last twenty courses' validations; a ghost is a few kB.
-        const keep = Object.entries(all).sort((a, b) => (b[1].at || 0) - (a[1].at || 0)).slice(0, 20);
-        store.set(VALID_KEY, Object.fromEntries(keep));
-        line = prev ? `New author time, ${fmtMs(prev.author - t)} faster.` : "Validated: that's the author time.";
-      } else {
-        const m = medals(prev.author);
-        const medal = t <= m.author ? "Author" : t <= m.gold ? "Gold" : t <= m.silver ? "Silver" : t <= m.bronze ? "Bronze" : null;
-        line = medal ? `${medal} medal.` : `No medal: bronze is ${fmtMs(m.bronze)}.`;
-      }
-      card(`<b>Finished ${fmtMs(t)}</b><p>${esc(line)}${run.respawns ? ` (${run.respawns} respawn${run.respawns === 1 ? "" : "s"}: the game would have sent you to the start)` : ""}</p>
-        <p>Backspace to go again · Esc to edit</p>`);
-      track("Map editor finish");
-      renderReport();
-    }
-
-    view.onTick = (dt) => {
-      if (!paused && run.finished === null) {
-        acc += dt * 1000;
-        let steps = 0;
-        while (acc >= FRAME_MSEC && steps++ < 25) {
-          acc -= FRAME_MSEC;
-          const on = (...c) => c.some((x) => keys.has(x));
-          run.step({
-            forward: (on("KeyW", "ArrowUp") ? 1 : 0) - (on("KeyS", "ArrowDown") ? 1 : 0),
-            side: (on("KeyD", "ArrowRight") ? 1 : 0) - (on("KeyA", "ArrowLeft") ? 1 : 0),
-            jump: on("Space"), special: on("ShiftLeft", "ShiftRight", "KeyE") || rmb,
-            yaw, pitch,
-          });
-          if (run.finished !== null) break;
-        }
-        if (acc > 250) acc = 0;   // a stalled tab: drop the backlog rather than fast-forward
-      }
-      for (; seen < run.events.length; seen++) {
-        const ev = run.events[seen];
-        if (ev.kind === "cp") {
-          const ref = best && best.splits && best.splits[ev.n - 1];
-          const d = ref != null ? ev.time - ref : null;
-          const el = $h(".mge-hud-split");
-          el.innerHTML = `CP ${ev.n} · ${fmtMs(ev.time)}${d === null ? "" : ` <span class="${d <= 0 ? "ahead" : "behind"}">${d <= 0 ? "−" : "+"}${fmtMs(Math.abs(d))}</span>`}`;
-          splitTimer = 2.5;
-        } else if (ev.kind === "fall") {
-          $h(".mge-hud-split").textContent = run.lastCp ? "Respawned on the checkpoint" : "Back to the start";
-          splitTimer = 1.5;
-        } else if (ev.kind === "finish") {
-          finish();
-        }
-      }
-      splitTimer -= dt;
-      if (splitTimer <= 0) $h(".mge-hud-split").textContent = "";
-      $h(".mge-hud-time").textContent = fmtMs(run.finished ?? run.time);
-      $h(".mge-hud-speed b").textContent = String(Math.round(run.speed()));
-      $h(".mge-hud-cp").textContent = world.cpOrder.length ? `CP ${run.splits.length} / ${world.cpOrder.length}` : "";
-      // First person: eyes VIEWHEIGHT above the origin, looking along yaw/pitch.
-      const o = run.p.origin;
-      const yr = (yaw * Math.PI) / 180, pr = (pitch * Math.PI) / 180;
-      const look = [Math.cos(pr) * Math.cos(yr), Math.cos(pr) * Math.sin(yr), -Math.sin(pr)];
-      view.camera.position.set(...q2t(o[0], o[1], o[2] + VIEWHEIGHT));
-      view.camera.lookAt(...q2t(o[0] + look[0] * 100, o[1] + look[1] * 100, o[2] + VIEWHEIGHT + look[2] * 100));
-      const g = run.running ? ghostAt(run.time) : null;
-      ghostBox.visible = !!g;
-      if (g) ghostBox.position.set(...q2t(g[1], g[2], g[3] + 8));
-    };
-
-    drive = {
-      stop() {
-        window.removeEventListener("keydown", onKey, true);
-        window.removeEventListener("keyup", onKey, true);
-        document.removeEventListener("mousemove", onMouse);
-        canvas.removeEventListener("mousedown", onButton);
-        canvas.removeEventListener("mouseup", onButton);
-        canvas.removeEventListener("contextmenu", noMenu);
-        document.removeEventListener("pointerlockchange", onLock);
-        if (document.pointerLockElement === canvas) document.exitPointerLock();
-        view.onTick = null;
-        view.scene.remove(ghostBox);
-        ghostBox.geometry.dispose();
-        ghostBox.material.dispose();
-        hud.remove();
-        view.controls.enabled = true;
-        view.extras.visible = true;
-        view.camera.position.copy(saved.pos);
-        view.controls.target.copy(saved.target);
-        view.camera.lookAt(view.controls.target);
-        view.dirty();
-      },
-    };
-    $(".mge-drive").textContent = "■ Stop driving";
-    track("Map editor drive");
-  }
-  function stopDrive() {
-    if (!drive) return;
-    const d = drive;
-    drive = null;
-    d.stop();
-    $(".mge-drive").textContent = "▶ Drive";
-    updateCursor();
-    renderReport();
-  }
 
   /* -- import / export / build ------------------------------------------ */
   async function doImport() {
@@ -1597,13 +1317,12 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
   }
 
   refresh();
-  renderMacros();
+  renderCombos();
   renderLibrary();
   if (notes.length || initialNote) flash([initialNote, ...notes].filter(Boolean).join(" "));
   loadQuota();
 
   return () => {
-    stopDrive();
     for (const fn of cleanups) fn();
     clearTimeout(msgTimer);
     view.dispose();

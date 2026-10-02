@@ -176,23 +176,23 @@ export function adopt(raw) {
   return [{ title, width, segments: segs.length ? segs : [{ type: "straight", length: 768 }] }, notes];
 }
 
-// TrackMania's quick inventory: number keys place pieces, in palette order.
+// The hotbar: number keys place pieces, in palette order.
 export const HOTBAR = ["straight", "turn", "ramp", "checkpoint", "gap", "dash", "slalom", "beam", "split",
   "wallclimb", "wallgap"];
 export const HOTKEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-"];
 
-// A piece reflected left to right (TrackMania's mirror): turns bend the other
-// way, a split's fast lane and a kick wall change sides. Everything else is
-// symmetric already.
+// A piece reflected left to right: turns bend the other way, a split's fast
+// lane and a kick wall change sides. Everything else is symmetric already.
 export function mirror(seg) {
   if (seg.direction === "left") return { ...seg, direction: "right" };
   if (seg.direction === "right") return { ...seg, direction: "left" };
   return { ...seg };
 }
 
-// What a course IS, for remembering a validation: the width and the pieces
-// (not the title). Any edit gives a new key, so, as in TrackMania, changing a
-// validated course un-validates it. FNV-1a over the normalized JSON.
+// A course's identity: the width and the pieces, not the title. Any edit to a
+// piece gives a new key; a rename does not. FNV-1a over the normalized JSON.
+// Nothing in the editor calls this today (it keyed per-course state in the
+// browser); test/mapgen-pieces.test.js pins the rule.
 export function courseKey(spec) {
   const text = JSON.stringify([spec.width, mg.normalize({ segments: spec.segments }).segments]);
   let h = 0x811c9dc5;

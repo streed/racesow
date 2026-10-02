@@ -1640,7 +1640,6 @@ tr.tincomplete td { opacity: .5; }
 .mge-stage canvas { display: block; width: 100%; height: 100%; }
 .mge-vbar { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--line);
   background: var(--panel); flex-wrap: wrap; }
-.mge-ride { border-color: rgba(255,106,26,.5); }
 .mge-hint { font-size: 12px; color: var(--faint); margin-left: auto; }
 .mge-flash { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); z-index: 5; max-width: 90%;
   background: rgba(21,24,36,.94); border: 1px solid var(--orange); color: var(--text); border-radius: 8px;
@@ -1741,7 +1740,7 @@ tr.tincomplete td { opacity: .5; }
   .mge-piece small { display: none; }
 }
 
-/* Map editor: TrackMania-style tools (test drive, ghost cursor, hotbar, macros, paint). */
+/* Map editor: the piece tools — hotbar, combos, paint. */
 .mge-surfrow { display: flex; gap: 6px; align-items: stretch; margin-bottom: 6px; }
 .mge-surfrow .mge-surface { flex: 1 1 auto; margin: 0; }
 .mge-paint { flex: 0 0 auto; background: var(--bg-2); border: 1px solid var(--line); border-radius: 9px; color: var(--muted);
@@ -1750,9 +1749,8 @@ tr.tincomplete td { opacity: .5; }
 .mge-paint[aria-pressed="true"] { border-color: var(--orange); color: var(--orange); background: rgba(255,106,26,.12); }
 .mge-stage.painting canvas { cursor: crosshair; }
 .mge-piece { position: relative; }
-.mge-piece kbd, .mge-valid kbd { font-family: var(--mono); font-size: 10.5px; color: var(--faint); border: 1px solid var(--line-2);
+.mge-piece kbd { font-family: var(--mono); font-size: 10.5px; color: var(--faint); border: 1px solid var(--line-2);
   border-radius: 4px; padding: 0 4px; line-height: 16px; }
-.mge-valid { column-gap: 6px; }
 .mge-piece kbd { position: absolute; top: 5px; right: 6px; }
 .mge-macros { display: flex; flex-direction: column; gap: 4px; }
 .mge-macro, .mge-libitem { display: flex; gap: 4px; align-items: stretch; }
@@ -1764,40 +1762,8 @@ tr.tincomplete td { opacity: .5; }
 .mge-libitem > button:first-child { flex: 1 1 auto; text-align: left; }
 .mge-libitem small { color: var(--faint); }
 .mge-iact .btn .mge-ico { width: 15px; height: 15px; vertical-align: -3px; margin-right: 3px; }
-.mge-drive { border-color: var(--orange); color: var(--orange); font-weight: 700; }
 
-.mge-valid { margin: 10px 0 0; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
-.mge-valid .mge-ico { width: 15px; height: 15px; color: var(--orange); }
-.mge-valid.ok b { color: var(--green); }
-.medal { font-variant-numeric: tabular-nums; padding: 1px 8px; border-radius: 999px; border: 1px solid; font-size: 12.5px; }
-.medal.author { color: #7ee7c9; border-color: rgba(126,231,201,.5); }
-.medal.gold { color: var(--gold); border-color: rgba(255,210,74,.5); }
-.medal.silver { color: var(--silver); border-color: rgba(207,214,230,.45); }
-.medal.bronze { color: var(--bronze); border-color: rgba(214,139,82,.5); }
 
-.mge-hud { position: absolute; inset: 0; pointer-events: none; font-family: var(--cond); color: #fff;
-  text-shadow: 0 1px 3px rgba(0,0,0,.8); }
-.mge-hud::after { content: ""; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px; margin: -2px 0 0 -2px;
-  border-radius: 50%; background: rgba(255,255,255,.8); }
-.mge-hud-time { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); font-size: 34px; font-weight: 800;
-  font-style: italic; font-variant-numeric: tabular-nums; letter-spacing: 1px; }
-.mge-hud-cp { position: absolute; top: 18px; left: 16px; font-size: 16px; color: var(--cyan); }
-.mge-hud-split { position: absolute; top: 34%; left: 50%; transform: translateX(-50%); font-size: 22px; font-variant-numeric: tabular-nums; }
-.mge-hud-split .ahead { color: #6be3ff; }
-.mge-hud-split .behind { color: #ff7a6b; }
-.mge-hud-speed { position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%); font-size: 15px; color: var(--muted); }
-.mge-hud-speed b { font-size: 30px; color: #fff; font-variant-numeric: tabular-nums; }
-.mge-hud-medals { position: absolute; top: 64px; right: 14px; max-width: 40%; text-align: right; display: flex; flex-direction: column; gap: 4px; align-items: flex-end;
-  font-size: 13px; font-family: var(--sans); }
-.mge-hud-medals .medal { background: rgba(10,11,15,.6); }
-.mge-hud-keys { position: absolute; bottom: 10px; left: 0; right: 0; text-align: center; font-size: 12px; color: rgba(255,255,255,.65);
-  font-family: var(--sans); padding: 0 10px; }
-.mge-hud-card { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: rgba(21,24,36,.94);
-  border: 1px solid var(--orange); border-radius: 12px; padding: 16px 22px; text-align: center; font-family: var(--sans);
-  max-width: 86%; box-shadow: var(--shadow); }
-.mge-hud-card b { font-family: var(--cond); font-size: 26px; font-style: italic; }
-.mge-hud-card p { margin: 6px 0 0; font-size: 14px; color: var(--muted); }
 @media (max-width: 700px) {
-  .mge-piece kbd, .mge-hud-keys { display: none; }
-  .mge-hud-time { font-size: 26px; }
+  .mge-piece kbd { display: none; }
 }

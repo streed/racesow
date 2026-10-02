@@ -354,7 +354,7 @@ function tile(num, lbl, variant = "") {
 /* ---- finish feed: every completed run from the finish log (not just PBs). ----
  * Shared by the overview feed and the per-player / per-map finish history.
  * showMap/showPlayer toggle which side is redundant on a scoped page; a run's
- * checkpoint splits ride along in the time cell's tooltip. */
+ * checkpoint splits come with it in the time cell's tooltip. */
 function finishFeed(list, { showMap = true, showPlayer = true, emptyMsg } = {}) {
   if (!list || !list.length)
     return `<div class="muted" style="padding:8px 2px">${esc(emptyMsg || "No finishes recorded yet.")}</div>`;
@@ -1586,7 +1586,7 @@ async function viewMapgen() {
     <a class="panel mg-editor-cta" href="/mapgen/editor" data-nav="/mapgen/editor">
       <b>Or build it yourself in the map editor →</b>
       <span>Place every straight, turn, ramp and jump by hand, set heights and angles, lay ice,
-        and ride it in 3-D before it is built.</span></a>
+        and see the course in 3-D before you send it for approval.</span></a>
     <form class="panel mg-form" id="mg-form">
       <label class="flag-label" for="mg-desc">Your map</label>
       <textarea id="mg-desc" class="mg-input" rows="4" maxlength="500"
@@ -1694,7 +1694,8 @@ async function viewMapgenEditor(params) {
     <p class="page-sub">Lay a race course out piece by piece: straights, turns, ramps, jumps, obstacles and wall jumps,
       with every height, angle and length in game units, and ice wherever you want it slick. It is checked against the
       game's movement as you go, drawn with the map's own textures, and built by the same generator as a described map.
-      Press <b>P</b> to test-drive it with the game's own movement and set an author time, TrackMania style.</p>
+      When the report under the course is clear, send it for approval: an admin looks it over, then it is
+      compiled and put on the game servers.</p>
     <div id="mge-root" class="mge"><div class="loading"><span class="spinner"></span></div></div>`;
   const root = document.getElementById("mge-root");
   try {

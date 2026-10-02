@@ -6,6 +6,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -112,6 +113,27 @@ test("an accepted course waits for an admin, as an editor job, spec and all", as
   // The quota is the same one a description uses.
   const again = await carol.post("/mapgen", { description: "A long icy downhill with one big jump at the end" });
   assert.equal(again.status, 429);
+});
+
+// ?ev= is the editor's cache buster, and it is a hand-kept list: assetVersion()
+// answers "" for a file that is not there, so a name left behind after a module
+// is deleted hashes to nothing and a module left OUT never busts the cache at
+// all — a browser keeps the editor it already has. Walk the editor's own
+// imports instead of trusting the list.
+test("?ev= hashes exactly the modules the editor imports", () => {
+  const src = readFileSync(SERVER_JS, "utf8");
+  const m = src.match(/\.update\((\[[^\]]*\])\s*\n\s*\.map\(\(m\) => assetVersion/);
+  assert.ok(m, "EDITOR_V's module list is not where this test looks for it");
+  const dir = path.join(__dirname, "..", "public", "assets", "js");
+  const seen = new Set(["mapgen-editor"]);
+  const stack = ["mapgen-editor"];
+  while (stack.length) {
+    const mod = stack.pop();
+    for (const hit of readFileSync(path.join(dir, `${mod}.js`), "utf8").matchAll(/from "\.\/([\w-]+)\.js"/g)) {
+      if (!seen.has(hit[1])) { seen.add(hit[1]); stack.push(hit[1]); }
+    }
+  }
+  assert.deepEqual(JSON.parse(m[1]).sort(), [...seen].sort());
 });
 
 test("a described map is still a 'describe' job, with no spec until it is planned", async () => {
