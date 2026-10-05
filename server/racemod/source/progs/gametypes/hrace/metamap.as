@@ -19,7 +19,10 @@
 //     model at the entity's origin AND angles (cgame/cg_predict.cpp:261-280).
 //     Strafing on a dealt tile feels exactly like strafing on the world.
 //   * Brush models are not PVS-culled when drawn (pvsCull = false,
-//     ref_gl/r_surf.c:443), so a tile renders wherever it is put.
+//     ref_gl/r_surf.c:443), so a tile renders wherever it is put — once it is
+//     SENT at all. Every entity starts SVF_NOCLIENT (g_utils.cpp:831) and has
+//     to clear it; a tile that does not is solid server-side and invisible and
+//     unpredicted client-side. See RACE_MetaSpawnPiece.
 //   * tiles.py gives every tile a brush wearing the "origin" SHADER, so the
 //     compiler bakes its brushes RELATIVE to the tile's own entry point. That
 //     is what makes ent.angles turn a tile about its entry instead of about
@@ -619,6 +622,16 @@ Entity@ RACE_MetaSpawnPiece( int model, const Vec3 &in at, int step )
     ent.angles = Vec3( 0.0f, float( step ) * META_STEP_DEG, 0.0f );
     ent.moveType = MOVETYPE_NONE;
     ent.solid = SOLID_YES;
+    // G_InitEdict marks EVERY new entity SVF_NOCLIENT ("mark all entities to
+    // not be sent by default", g_utils.cpp:831) and leaves it to whatever
+    // spawns them to opt in. A tile that never opts in is solid on the server
+    // and does not exist as far as any client is concerned: SNAP_SnapCullEntity
+    // drops it from every snapshot before any other test, so it is never drawn
+    // AND never reaches cg_solidList, which is what the client predicts
+    // against. The player then stands on ground the server knows about and
+    // their own client does not — held up by the server, pulled down by a
+    // prediction that sees open air, which reads as the floor shaking.
+    ent.svflags &= ~SVF_NOCLIENT;
     ent.linkEntity();
     return ent;
 }
