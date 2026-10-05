@@ -125,17 +125,34 @@ SLOT_PITCH = 3072
 # How long the permanent platform is, which is also how far along +X the dealt
 # route begins: the dealer's cursor starts at the platform's far end.
 #
-# 1024 is what the old start TILE measured, and keeping that number is half the
-# reason for it. The route's origin moves with the platform's length, so any
-# other value slides every dealt route down the play box and quietly changes
-# which course a seed already sitting on a leaderboard names. The other half is
-# that 1024 is a real run-up on its own terms: physics.MIN_RUNUP is 192 units
-# to reach the 320 ups ground cap, so a player is at full speed several times
-# over before the start gate and still has room to strafe-jump into the first
-# dealt piece. Nothing after the platform leans on that — the mating contract
-# makes every dealt piece carry its own entry apron — so this length is free to
-# be chosen for the player rather than for the geometry.
-PAD_LEN = 1024
+# 341 is a third of the 1024 this used to be, and the reason it moved is the
+# prejump rule. A start is rejected when a player arrives at the gate having
+# taken more than one jump, dash or walljump since they were last on the ground
+# under 325 ups (RS_QueryPjState, warfork/enginepatches/gs_racesow.c, reset in
+# PM_Move's grounded branch). Nothing about that rule mentions distance — but a
+# hop cycle at the ground cap covers about 260 units, so 1024 handed a player
+# room for three of them, and the second one is already a restart. Starting
+# from the spawn and running the platform the way the platform invites was
+# ALWAYS a "Prejumped!" and a respawn back to x=96. 341 leaves room for one
+# jump and no more.
+#
+# The floor under it: the gate's near face stands at PAD_LEN - GATE_DEPTH/2 and
+# a player's box reaches x=112 at the spawn, so the real run-up is
+# PAD_LEN - 128. physics.MIN_RUNUP is 192 units to reach the 320 ups ground
+# cap, which puts the smallest honest platform at 320; 341 gives 213. Below 129
+# the gate's trigger wraps the spawn and the clock starts on spawn at zero
+# speed, and below 112 the player's box hangs off the lip (_spawn_rests_on only
+# checks the spawn POINT, so it catches neither — it refuses at 95).
+#
+# What changing it costs, because it is not free: the route's origin IS the
+# platform's far end, so every other value slides every dealt route down the
+# play box and re-rolls the weighted draw. A seed already sitting on the
+# random_run board names a DIFFERENT course after a change here (measured at
+# this one: 241 of 340 golden seeds deal a different piece sequence), and every
+# stored route_units is a length off the old run-up. Move this number only with
+# that board in hand. Nothing after the platform leans on the length itself —
+# the mating contract makes every dealt piece carry its own entry apron.
+PAD_LEN = 341
 # Not a tile name, and never a key in deck.models: the platform is worldspawn,
 # so the compiler leaves it no inline model to be placed by.
 PAD_NAME = "__pad__"

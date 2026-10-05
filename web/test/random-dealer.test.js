@@ -14,9 +14,19 @@
 // default distance, four of them re-dealt at three others, and the deck manifest
 // they were dealt from verbatim, so the fixture pins the file as well as the
 // file's reader. Every one of those seeds has to come back piece for piece — a
-// single mismatched piece is a failure, never a tolerance — which also means a
-// deck rebuild that changes a tile is expected to fail here until the vectors
-// are dumped again from the new pack.
+// single mismatched piece is a failure, never a tolerance.
+//
+// That manifest is a FROZEN snapshot, not a read of build/random_map.pk3: these
+// tests parse golden.deck, so rebuilding the pack does not move these vectors
+// and cannot fail this file. It stays frozen on purpose — the vectors pin the
+// dealer's ALGORITHM against the Python model of metamap.as, and the deck is
+// only the data it chews. (Demonstrated when tiles.PAD_LEN went 1024 -> 341:
+// the platform moved, 241 of these 340 seeds deal a different course off the
+// new pack, and every vector here still passed.) The pack's own platform
+// numbers are pinned where they can be read from the pack instead —
+// random-deck.test.js, "reads the shipped pack and agrees with its own header".
+// Re-dump these vectors when the DEALER changes, which needs sim_new.py; it was
+// never committed, so that is a rewrite of the model first.
 //
 // THE START PLATFORM IS NOT A PIECE. It is world geometry now, so `pieces` is
 // dealt pieces only, pieces[0] stands at the manifest's `begin`, the route

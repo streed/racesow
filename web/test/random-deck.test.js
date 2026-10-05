@@ -151,8 +151,13 @@ test("reads the shipped pack and agrees with its own header", async (t) => {
   // The numbers tools/mapgen compiles the platform at today. Pinned, not
   // derived: these are world coordinates the engine, the browser dealer and the
   // plan all read literally, so a change here has to be a deliberate one.
-  assert.deepEqual(deck.pad, { lo: { x: -16, y: -208, z: -32 }, hi: { x: 1024, y: 208, z: 256 } });
-  assert.deepEqual(deck.begin, { x: 1024, y: 0, z: 0 });
+  // 341 is tiles.PAD_LEN, a third of the 1024 the platform used to be: the long
+  // run-up left room for a second jump before the gate, and a second jump above
+  // 325 ups is what the prejump rule rejects (tiles.py, at PAD_LEN). Moving it
+  // moves every dealt route, so this pin is the tripwire against doing that by
+  // accident rather than a restatement of the generator.
+  assert.deepEqual(deck.pad, { lo: { x: -16, y: -208, z: -32 }, hi: { x: 341, y: 208, z: 256 } });
+  assert.deepEqual(deck.begin, { x: 341, y: 0, z: 0 });
   assert.equal(deck.beginStep, 0);
   assert.deepEqual(deck.spawn, { x: 96, y: 0, z: 32 });
   assert.equal(deck.spawnStep, 0);
