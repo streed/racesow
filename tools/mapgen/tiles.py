@@ -468,6 +468,9 @@ class Deck:
         self.gate = None
         # name -> inline model index, filled in from the COMPILED bsp.
         self.models = {}
+        # Short content hash naming the pk3 FILE this deck is packed into
+        # (build.deck_version); the map inside keeps `name`.
+        self.version = ""
 
 
 def _slab(cx, cy, hx, hy, zlo, zhi, tex, heading=None):

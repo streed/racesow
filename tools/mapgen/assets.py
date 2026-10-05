@@ -356,10 +356,16 @@ def hazard():
 TEXTURES = {
     "floor": floor, "wall": wall, "start": start, "finish": finish,
     "checkpoint": checkpoint, "edge": edge, "trim": trim, "pylon": pylon, "kick": kick,
-    "hazard": hazard,
 }
 # Shipped only with a course that uses them (files(ice=True)); see ICE_SHADER.
 ICE_TEXTURES = {"ice": ice}
+# Likewise: only a course with a hazard piece carries its texture. Shipping it
+# with every map would be 192 KB nobody looks at — and worse, it would change
+# the bytes of every pack that did not ask for it. A pk3 whose contents change
+# is a pk3 whose checksum changes, and a client holding the old one is refused
+# at connect with a pk3-mismatch. An asset no course uses must never be able
+# to cause that.
+HAZARD_TEXTURES = {"hazard": hazard}
 
 
 def sky_face(face):
@@ -376,15 +382,19 @@ def sky_face(face):
     return c.tga()
 
 
-def files(ice=False):
-    """{path inside the pk3 / basepath: bytes}. ice=True adds the ice texture
-    and its shader file, for a course with an icy piece."""
+def files(ice=False, hazard=False):
+    """{path inside the pk3 / basepath: bytes}. `ice` adds the ice texture and
+    its shader, `hazard` the hazard texture — each only for a course that uses
+    the piece, so a pack never carries bytes its course does not need."""
     out = {f"scripts/{VERSION}.shader": SHADER.encode()}
     for kind, make in TEXTURES.items():
         out[f"textures/{VERSION}/{kind}.tga"] = make().tga()
     if ice:
         out[ICE_SHADER_PATH] = ICE_SHADER.encode()
         for kind, make in ICE_TEXTURES.items():
+            out[f"textures/{VERSION}/{kind}.tga"] = make().tga()
+    if hazard:
+        for kind, make in HAZARD_TEXTURES.items():
             out[f"textures/{VERSION}/{kind}.tga"] = make().tga()
     for face in ("rt", "lf", "ft", "bk", "up", "dn"):
         out[f"env/{VERSION}/sky_{face}.tga"] = sky_face(face)

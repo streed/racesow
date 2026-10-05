@@ -290,7 +290,8 @@ def texture_hashes():
     """sha256 of each texture's pixels as drawn: RGB, top row first. The
     editor's public/assets/js/mapgen-textures.js must draw the same bytes."""
     out = {}
-    for kind, make in {**assets.TEXTURES, **assets.ICE_TEXTURES}.items():
+    for kind, make in {**assets.TEXTURES, **assets.ICE_TEXTURES,
+                       **assets.HAZARD_TEXTURES}.items():
         out[kind] = hashlib.sha256(bytes(v for px in make().px for v in px)).hexdigest()
     return out
 

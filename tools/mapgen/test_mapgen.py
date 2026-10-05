@@ -705,6 +705,7 @@ class Assets(unittest.TestCase):
         for name in layout.TEX.values():
             kind = name.split("/", 1)[1]
             self.assertTrue(kind in assets.TEXTURES or kind in assets.ICE_TEXTURES
+                            or kind in assets.HAZARD_TEXTURES
                             or kind in ("sky", "trigger", "origin"), name)
 
     def test_walls_are_darker_than_floors(self):
@@ -1875,3 +1876,49 @@ class CompileDeck(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class DeckVersioning(unittest.TestCase):
+    """The deck pk3's FILENAME carries a hash of its contents.
+
+    Updating a deck used to mean overwriting random_map.pk3 with different
+    bytes under the same name, which is exactly what makes a client holding
+    the old one refuse to connect ("pk3 files don't match"). The map inside
+    keeps its name — it is what players vote for and what metamap.as matches
+    on — and only the file carrying it is versioned.
+    """
+
+    def test_the_name_follows_every_byte_in_the_archive(self):
+        a = {"maps/x.bsp": b"geometry", "textures/t.tga": b"pixels"}
+        v = build.members_version(a)
+        self.assertRegex(v, r"^[0-9a-f]{8}$")
+        # Same contents, same name: an unchanged rebuild must not churn.
+        self.assertEqual(v, build.members_version(dict(a)))
+        # ANY member changing gives a new name, not just the map.
+        self.assertNotEqual(v, build.members_version(
+            {**a, "textures/t.tga": b"other pixels"}))
+        self.assertNotEqual(v, build.members_version(
+            {**a, "maps/x.bsp": b"other geometry"}))
+        # ...including one appearing or disappearing, which is how an asset
+        # shipped to a course that never asked for it caused this.
+        self.assertNotEqual(v, build.members_version({**a, "extra.tga": b""}))
+        self.assertNotEqual(v, build.members_version({"maps/x.bsp": b"geometry"}))
+
+    def test_an_unused_texture_is_not_packed(self):
+        # The hazard texture is 192 KB and only a course with a hazard piece
+        # has any use for it. Shipping it regardless changed the bytes of every
+        # pack — including the deck, which has no hazard piece at all.
+        plain = assets.files()
+        self.assertNotIn(f"textures/{assets.VERSION}/hazard.tga", plain)
+        self.assertNotIn(f"textures/{assets.VERSION}/ice.tga", plain)
+        withhaz = assets.files(hazard=True)
+        self.assertEqual(set(withhaz) - set(plain),
+                         {f"textures/{assets.VERSION}/hazard.tga"})
+
+    def test_a_course_that_uses_hazard_carries_it(self):
+        course = layout.build(course_of(
+            {"type": "straight", "length": 512},
+            {"type": "hazard", "length": 128},
+            {"type": "straight", "length": 512}), rules="open")
+        self.assertTrue(build.uses_hazard(course))
+        self.assertFalse(build.uses_hazard(layout.build(example())))

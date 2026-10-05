@@ -13,6 +13,7 @@ does not know: exactly one start timer and one stop timer, each fired by a
 trigger that survived compilation, and a spawn point.
 """
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -50,11 +51,16 @@ def uses_ice(course):
     return any(p.tex == "ice" for p in course.world)
 
 
+def uses_hazard(course):
+    """Whether any brush wears the hazard texture, so the pack needs it."""
+    return any(p.tex == "hazard" for p in course.world)
+
+
 def stage(course, work):
     """Write the .map and the assets into a q3map2 basepath layout."""
     name = course.spec["name"]
     base = os.path.join(work, "base")   # game_qfusion's gamePath (games.cpp)
-    for rel, data in assets.files(ice=uses_ice(course)).items():
+    for rel, data in assets.files(ice=uses_ice(course), hazard=uses_hazard(course)).items():
         path = os.path.join(base, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as fh:
@@ -130,20 +136,46 @@ def strip_timestamp(bsp_bytes):
     return bsp_bytes[:on + 4] + b"-" * (end - on - 4) + bsp_bytes[end:]
 
 
-def pack(name, bsp_bytes, out_dir, extra=None, ice=False):
+def members_version(members):
+    """A short content hash over EVERY byte a pk3 will contain.
+
+    It names the file (pack(versioned=True)), and it has to cover the whole archive
+    rather than just the map: the refusal we are avoiding is a checksum
+    mismatch, and the checksum is of the FILE. Hashing only the bsp would let a
+    changed texture ship under a name a client already has cached, which is the
+    bug with extra steps."""
+    h = hashlib.sha1()
+    for rel in sorted(members):
+        h.update(rel.encode())
+        h.update(b"\0")
+        h.update(members[rel])
+        h.update(b"\0")
+    return h.hexdigest()[:8]
+
+
+def pack(name, bsp_bytes, out_dir, extra=None, ice=False, hazard=False, versioned=False):
+    """Write the pk3 holding maps/<name>.bsp. Returns (path, version).
+
+    `versioned` puts a content hash in the FILENAME while the map inside keeps
+    its own name. That is what makes a deck safe to update: a client holding an
+    older build has it under a different filename, and sv_pure restricts the
+    client to the files the server lists, so the stale one is ignored rather
+    than fought over. Reusing one filename for changing contents is what
+    produces the pk3-mismatch refusal on connect."""
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, name + ".pk3")
     members = {f"maps/{name}.bsp": bsp_bytes}
-    members.update(assets.files(ice=ice))
+    members.update(assets.files(ice=ice, hazard=hazard))
     if extra:
         members.update(extra)
+    version = members_version(members)
+    path = os.path.join(out_dir, (f"{name}_{version}" if versioned else name) + ".pk3")
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
         for rel in sorted(members):
             info = zipfile.ZipInfo(rel, ZIP_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16   # world-readable, like fetch-maps.sh
             zf.writestr(info, members[rel])
-    return path
+    return path, version
 
 
 SURF_SLICK = 0x2   # gameshared/q_collision.h:65
@@ -225,7 +257,7 @@ def build(spec, out_dir, q3map2=None, work=None, fast=True, keep_work=False, cam
         if problems:
             raise BuildError("compiled map failed its checks:\n  " + "\n  ".join(problems))
         name = spec["name"]
-        pk3 = pack(name, bsp_bytes, out_dir, ice=ice)
+        pk3, _ = pack(name, bsp_bytes, out_dir, ice=ice, hazard=uses_hazard(course))
         if os.path.getsize(pk3) > PK3_MAX_BYTES:
             raise BuildError(f"pack is {os.path.getsize(pk3)} bytes; at most {PK3_MAX_BYTES}")
         with open(os.path.join(out_dir, name + ".svg"), "w") as fh:
@@ -360,8 +392,12 @@ def build_deck(name, title, out_dir, q3map2=None, work=None, fast=True, keep_wor
         if problems:
             return None, deck, problems, out
         text = tiles.manifest(deck)
-        pk3 = pack(name, bsp_bytes, out_dir,
-                   extra={f"maps/{name}.deck": text.encode()})
+        # The map keeps its name; the FILE carrying it is versioned, so
+        # updating the deck never asks a client to reconcile two different
+        # pk3s with the same name.
+        pk3, version = pack(name, bsp_bytes, out_dir, versioned=True,
+                            extra={f"maps/{name}.deck": text.encode()})
+        deck.version = version
         return pk3, deck, [], out
     finally:
         if own_work and not keep_work:
