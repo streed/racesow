@@ -664,19 +664,67 @@ void meta_gate_touch( Entity @ent, Entity @other, const Vec3 planeNormal, int su
     player.completeRace();
 }
 
+// The box a gate occupies at `step`, as an AXIS-ALIGNED pair.
+//
+// A gate is a band GATE_DEPTH along the route and GATE_HALF either side of it.
+// On the four square headings that band IS axis-aligned and this is exact; on
+// the four diagonals it is the band's bounding box, which is the closest an
+// axis-aligned volume can come. Headings are eighths of a turn, so the only
+// three cases are "along X", "along Y" and "at 45 degrees" — no trigonometry,
+// and the two square cases stay exactly the width of the corridor.
+void RACE_MetaGateBox( int step, Vec3 &out mins, Vec3 &out maxs )
+{
+    float halfDepth = metaGateDepth * 0.5f;
+    float hx, hy;
+    if ( ( step % 2 ) != 0 )                        // 45, 135, 225, 315
+    {
+        hx = 0.70710678f * ( halfDepth + metaGateHalf );
+        hy = hx;
+    }
+    else if ( ( step % 4 ) == 2 )                   // 90, 270: across X
+    {
+        hx = metaGateHalf;
+        hy = halfDepth;
+    }
+    else                                            // 0, 180: along X
+    {
+        hx = halfDepth;
+        hy = metaGateHalf;
+    }
+    mins = Vec3( -hx, -hy, 0.0f );
+    maxs = Vec3( hx, hy, metaGateHeight );
+}
+
 Entity@ RACE_MetaSpawnGate( const Vec3 &in at, int step, int kind )
 {
     Entity @ent = G_SpawnEntity( "mg_gate" );
-    ent.setupModel( "*" + metaGateModel );
-    if ( !ent.isBrushModel() )
-    {
-        ent.freeEntity();
-        return null;
-    }
+
+    // A BOX, not the compiled brush model, and this is the whole reason the
+    // finish line used to do nothing.
+    //
+    // A trigger fires when GClip_EntityContact says the player overlaps it.
+    // For a brush model that test is a CM_TransformedBoxTrace of a point pair
+    // at the WORLD ORIGIN against the model placed at the entity's origin and
+    // angles, with the player's box passed in as mins/maxs ALREADY IN WORLD
+    // SPACE (g_clip.cpp). The trace rotates the points by the entity's angles;
+    // it cannot rotate the box, because an axis-aligned box has no rotated
+    // form. So the moment a gate is turned, the player's box is tested against
+    // somewhere else entirely and contact is never reported.
+    //
+    // The start gate never showed it: the route begins running along +X, so
+    // its step is 0 and its angles are zero. A finish gate takes whatever
+    // heading the route ended on, which is almost never zero — so the start
+    // worked and the finish silently did not, on every route that turned.
+    //
+    // Without a model the same function falls through to a plain
+    // BoundsIntersect against r.absmin/absmax, which has no orientation to get
+    // wrong. The gate is nodraw either way: it was never drawn, only touched.
+    Vec3 mins, maxs;
+    RACE_MetaGateBox( step, mins, maxs );
+    ent.setSize( mins, maxs );
     ent.origin = at;
-    ent.angles = Vec3( 0.0f, float( step ) * META_STEP_DEG, 0.0f );
     ent.moveType = MOVETYPE_NONE;
-    // A SOLID_TRIGGER brush entity is not networked as solid at all
+    // A SOLID_TRIGGER entity is not networked as solid at all
     // (g_clip.cpp:552-557), so a gate costs nothing on the wire and lives
     // entirely on the server, where its touch is dispatched.
     ent.solid = SOLID_TRIGGER;
