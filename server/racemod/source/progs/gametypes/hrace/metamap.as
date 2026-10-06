@@ -632,6 +632,23 @@ Entity@ RACE_MetaSpawnPiece( int model, const Vec3 &in at, int step )
     // their own client does not — held up by the server, pulled down by a
     // prediction that sees open air, which reads as the floor shaking.
     ent.svflags &= ~SVF_NOCLIENT;
+    // ...and ALWAYS send it, rather than only when the player's own leaf can
+    // see the tile's.
+    //
+    // The arena is one room to look at but not one room to the compiler: the
+    // deck's bsp carries seven vis clusters and they are NOT mutually visible
+    // (cluster 3 sees four of the seven; 2, 4 and 5 cannot see 3 at all). A
+    // route is dealt right across that, so wherever it crossed a boundary the
+    // pieces on the far side were culled out of the snapshot and simply were
+    // not there — the course rendering in parts, which is what this looked
+    // like from inside the game.
+    //
+    // PVS is the wrong question for these. A dealt tile is a piece of the
+    // course the player is running and has to be able to SEE COMING, which is
+    // exactly what vis is entitled to hide. Broadcasting costs almost nothing
+    // here: a tile never moves once placed, so after the frame that introduces
+    // it the delta carries no bytes for it at all.
+    ent.svflags |= SVF_BROADCAST;
     ent.linkEntity();
     return ent;
 }
@@ -693,6 +710,31 @@ void RACE_MetaGateBox( int step, Vec3 &out mins, Vec3 &out maxs )
     }
     mins = Vec3( -hx, -hy, 0.0f );
     maxs = Vec3( hx, hy, metaGateHeight );
+}
+
+// A gate spanning an arbitrary world box.
+//
+// The finish uses this rather than a band across the corridor. A band is 32
+// units deep, and the finish is exactly where a player is fastest: contact is
+// tested once a frame against where they ARE, not swept along where they
+// went, so a thin band can be stepped clean over between two frames. A volume
+// cannot be. It stops the clock at the same place a band did — the player
+// still crosses its near face first — it simply cannot be missed.
+Entity@ RACE_MetaSpawnGateBox( const Vec3 &in lo, const Vec3 &in hi, int kind )
+{
+    Entity @ent = G_SpawnEntity( "mg_gate" );
+    Vec3 mid( ( lo.x + hi.x ) * 0.5f, ( lo.y + hi.y ) * 0.5f, ( lo.z + hi.z ) * 0.5f );
+    // Axis-aligned, and never given angles: a turned trigger is tested against
+    // the wrong place entirely (see RACE_MetaSpawnGate).
+    ent.setSize( Vec3( lo.x - mid.x, lo.y - mid.y, lo.z - mid.z ),
+                 Vec3( hi.x - mid.x, hi.y - mid.y, hi.z - mid.z ) );
+    ent.origin = mid;
+    ent.moveType = MOVETYPE_NONE;
+    ent.solid = SOLID_TRIGGER;
+    ent.style = kind;
+    @ent.touch = meta_gate_touch;
+    ent.linkEntity();
+    return ent;
 }
 
 Entity@ RACE_MetaSpawnGate( const Vec3 &in at, int step, int kind )
@@ -832,7 +874,10 @@ bool RACE_MetaTryFinish()
         RACE_MetaTileBox( tile, metaCursor, metaHeading, lo, hi );
         if ( !RACE_MetaInsideBox( lo, hi ) || !RACE_MetaBoxClear( lo, hi ) )
             continue;
-        @metaFinishGate = RACE_MetaSpawnGate( metaCursor, metaHeading, 1 );
+        // The whole finish piece is the finish. lo/hi is the box this tile is
+        // about to occupy — already axis-aligned and already heading-aware,
+        // because the fit test above needed it that way.
+        @metaFinishGate = RACE_MetaSpawnGateBox( lo, hi, 1 );
         if ( !RACE_MetaDealTile( metaFinishTiles[i] ) )
             return false;
         metaFinishDealt = true;
@@ -885,7 +930,15 @@ void RACE_MetaExtend()
         // drop into the pit, which respawns them — and completeRace was going
         // to respawn them in five seconds anyway. Driving a finish corridor
         // through a corridor already on the ground is the worse answer.
-        @metaFinishGate = RACE_MetaSpawnGate( metaCursor, metaHeading, 1 );
+        // No run-out to fill, so the volume is a cube of the corridor's own
+        // width around the cursor. It reaches back as far as it reaches
+        // forward, so a bare finish can stop the clock marginally early — a
+        // route that ends walled-in is already the worst case, and a finish
+        // that cannot be missed is worth more there than one that is exact.
+        Vec3 blo( metaCursor.x - metaGateHalf, metaCursor.y - metaGateHalf, metaCursor.z );
+        Vec3 bhi( metaCursor.x + metaGateHalf, metaCursor.y + metaGateHalf,
+                  metaCursor.z + metaGateHeight );
+        @metaFinishGate = RACE_MetaSpawnGateBox( blo, bhi, 1 );
         metaFinishDealt = true;
         metaBareFinish = true;
         return;
