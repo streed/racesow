@@ -393,3 +393,52 @@ test("tolerates what the engine tolerates: unknown heads, extra tile tokens", ()
   });
   assert.equal(commented.play.down, 1536);
 });
+
+
+// The pack's filename carries a content hash (build.pack(versioned=True)), so
+// updating the deck never asks a client holding the old one to reconcile two
+// different files under one name. The reader has to follow that, and a box
+// mid-update can briefly hold both — in which case dealing from the OLDER one
+// would show the site a different course than the servers are dealing.
+test("the deck is found under a versioned filename, newest first", async () => {
+  if (!existsSync(SHIPPED_PACK)) return;    // no compiled pack in this checkout
+  const dir = await mkdtemp(path.join(os.tmpdir(), "deckver-"));
+  try {
+    await copyFile(SHIPPED_PACK, path.join(dir, "random_map_abc12345.pk3"));
+    const versioned = await load(dir);
+    assert.ok(versioned, "a versioned pack must be found");
+    assert.equal(versioned.tiles.length, 77);
+
+    // A stale bare pack sitting alongside it must not win.
+    const bare = path.join(dir, "random_map.pk3");
+    await copyFile(SHIPPED_PACK, bare);
+    const old = new Date(Date.now() - 86400000);
+    await utimes(bare, old, old);
+    const both = await load(dir);
+    assert.ok(both, "both present: still found");
+    assert.equal(both.source.file, path.join(dir, "random_map_abc12345.pk3"),
+      "the newer pack must win");
+
+    // ...and a pack built before versioning is still readable, so a box that
+    // has not been updated yet keeps working.
+    const legacyOnly = await mkdtemp(path.join(os.tmpdir(), "decklegacy-"));
+    try {
+      await copyFile(SHIPPED_PACK, path.join(legacyOnly, "random_map.pk3"));
+      assert.ok(await load(legacyOnly), "a bare pack must still be read");
+    } finally {
+      await rm(legacyOnly, { recursive: true, force: true });
+    }
+
+    // Something that merely looks like it is not a pack.
+    const junk = await mkdtemp(path.join(os.tmpdir(), "deckjunk-"));
+    try {
+      await copyFile(SHIPPED_PACK, path.join(junk, "random_map_notahash!.pk3"));
+      await copyFile(SHIPPED_PACK, path.join(junk, "random_mapper.pk3"));
+      assert.equal(await load(junk), null, "only random_map[_<hex>].pk3 counts");
+    } finally {
+      await rm(junk, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

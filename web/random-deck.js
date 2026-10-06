@@ -58,7 +58,7 @@
  * whole parse is refused. A half-read deck would draw a plan that is quietly
  * WRONG, which is worse than no plan at all.
  */
-import { open, stat } from "node:fs/promises";
+import { open, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
@@ -67,7 +67,13 @@ import { fileURLToPath } from "node:url";
 // mismatch), so the preview refuses the same files the servers refuse.
 export const DECK_VERSION = 1;
 
-const PACK_FILE = "random_map.pk3";
+// The pack's FILENAME carries a content hash (build.pack(versioned=True)), so
+// that updating the deck never asks a client holding the old one to reconcile
+// two different files with the same name. The map inside keeps its own name,
+// which is why DECK_ENTRY does not move. The bare form stays matchable because
+// packs built before versioning still carry that name.
+const PACK_RE = /^random_map(?:_[0-9a-f]{6,16})?\.pk3$/;
+const PACK_DESC = "random_map[_<version>].pk3";
 const DECK_ENTRY = "maps/random_map.deck";
 
 // Where the pack lives on the web box: the read-only map-store mount that
@@ -432,13 +438,27 @@ let cached = null; // { key, text, deck }
 
 async function findPack(dirs) {
   for (const dir of dirs) {
-    const file = path.join(dir, PACK_FILE);
+    let names;
     try {
-      const st = await stat(file);
-      if (st.isFile()) return { file, size: st.size, mtimeMs: st.mtimeMs };
+      names = (await readdir(dir)).filter((n) => PACK_RE.test(n));
     } catch {
-      /* not here — try the next candidate */
+      continue;   // not here — try the next candidate
     }
+    // Newest wins. A box mid-update can briefly hold the old pack and the new
+    // one; dealing from the older of the two would hand the site a different
+    // course than the servers are dealing, which is worse than a short 503.
+    let best = null;
+    for (const name of names) {
+      const file = path.join(dir, name);
+      try {
+        const st = await stat(file);
+        if (!st.isFile()) continue;
+        if (!best || st.mtimeMs > best.mtimeMs) best = { file, size: st.size, mtimeMs: st.mtimeMs };
+      } catch {
+        /* vanished between readdir and stat */
+      }
+    }
+    if (best) return best;
   }
   return null;
 }
@@ -451,7 +471,7 @@ async function current({ dirs = deckDirs(), log = console } = {}) {
   let text = null;
   let deck = null;
   if (!found) {
-    log.warn?.(`random deck: no ${PACK_FILE} under ${dirs.join(", ")}`);
+    log.warn?.(`random deck: no ${PACK_DESC} under ${dirs.join(", ")}`);
   } else {
     const raw = await readPackEntry(found.file, DECK_ENTRY);
     if (!raw) log.warn?.(`random deck: ${found.file} carries no ${DECK_ENTRY}`);
