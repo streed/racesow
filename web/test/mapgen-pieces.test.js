@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as mg from "../public/assets/js/mapgen-course.js";
-import { PIECES, GROUPS, limits, fix, slug, STARTERS, adopt, chipLabel, HOTBAR, HOTKEYS, mirror, courseKey } from "../public/assets/js/mapgen-pieces.js";
+import { PIECES, GROUPS, limits, fix, slug, STARTERS, adopt, chipLabel, HOTBAR, HOTKEYS, mirror, courseKey, sliderBand, widthLimits } from "../public/assets/js/mapgen-pieces.js";
 
 const WIDTHS = [256, 320, 384, 448, 512, 640, 768];
 const between = (seg, width) => ({
@@ -147,6 +147,82 @@ test("the open band is wider than the strict one, and both are offered", () => {
     if (PIECES[kind].needs && PIECES[kind].needs(448)) continue;
     assert.deepEqual(mg.validate(between(seg, 448), "strict"), [], `${kind} default is not strict-clean`);
   }
+});
+
+test("a slider's band holds still under a pointer that is holding still", () => {
+  // The bug this pins: the band used to be the suggested one STRETCHED to
+  // reach the current value, and it is re-derived from that value on every
+  // frame of a drag. So the track shrank to end exactly at the thumb, the
+  // browser re-read the parked pointer against the smaller track, the value
+  // dropped, the track shrank again — bank and tip crawled back to zero on
+  // their own, and spacing could not be dragged past the value it had.
+  //
+  // Simulated here: a pointer parked at one spot on the track, the value
+  // re-read from it frame after frame. It has to settle and stay settled.
+  const drag = (val, hard, soft, at) => {
+    const b = sliderBand(val, hard, soft);
+    return Math.round(b.band[0] + at * (b.band[1] - b.band[0]));
+  };
+  const seg = { type: "strafepads", count: 6, spacing: 256, curve: 0 };
+  const hard = limits(seg, 384, "open"), soft = limits(seg, 384, "strict");
+  const cases = [
+    ...["roll", "pitch", "away", "rotate", "shift", "spacing", "curve", "count"]
+      .map((k) => [k, hard[k], soft[k]]),
+    ["width", widthLimits("open"), widthLimits("strict")],
+  ];
+  for (const [key, h, s] of cases) {
+    for (const at of [0, 0.2, 0.4, 0.6, 0.75, 1]) {
+      // From anywhere the value can be: inside the suggested band and past
+      // both ends of it.
+      for (const from of [s[0], s[1], Math.round((s[0] + s[1]) / 2), h[0], h[1]]) {
+        let v = from, settled = null;
+        for (let frame = 0; frame < 12; frame++) {
+          const next = drag(v, h, s, at);
+          // A value that started outside the suggested band moves into it
+          // once, and the band it lands in is the band it keeps: from the
+          // second frame on, a parked pointer may not move the value at all.
+          // (The editor freezes the band for the length of a drag, so even
+          // that one change is only ever seen on release.)
+          if (frame >= 2) assert.equal(next, v, `${key} at ${at} from ${from}: value walked ${v} -> ${next}`);
+          settled = v = next;
+        }
+        assert.ok(Number.isFinite(settled));
+      }
+    }
+    // And there is always somewhere left to drag: a band that ends at the
+    // value pins the thumb to the end of the track.
+    for (const v of [s[0], s[1], h[0], h[1], Math.round((s[1] + h[1]) / 2)]) {
+      const b = sliderBand(v, h, s);
+      assert.ok(b.band[0] <= v && v <= b.band[1], `${key}: ${v} is off its own slider`);
+      if (h[0] !== h[1]) assert.ok(b.band[0] < b.band[1], `${key}: nothing to drag at ${v}`);
+      if (v > s[1] || v < s[0]) assert.deepEqual(b.band, [h[0], h[1]],
+        `${key}: ${v} is outside the suggested band, so the slider spans all of it`);
+    }
+  }
+});
+
+test("a slider spans the suggested band, and the whole band once past it", () => {
+  // Inside the suggested band the slider is that band: fine-grained enough
+  // to be worth dragging, and the hint beside it says so.
+  assert.deepEqual(sliderBand(256, [160, 4096], [160, 296]).band, [160, 296]);
+  assert.equal(sliderBand(256, [160, 4096], [160, 296]).outside, false);
+  // Outside it, the slider is everything allowed, so there is room on both
+  // sides of a value that was deliberately typed.
+  assert.deepEqual(sliderBand(600, [160, 4096], [160, 296]).band, [160, 4096]);
+  assert.equal(sliderBand(600, [160, 4096], [160, 296]).outside, true);
+  // A field the generator never touches has a suggested band of no width:
+  // the whole allowed range, at every value, bank included.
+  for (const v of [0, 1, -45, 180]) {
+    assert.deepEqual(sliderBand(v, [-mg.ROLL_MAX, mg.ROLL_MAX], [0, 0]).band,
+      [-mg.ROLL_MAX, mg.ROLL_MAX], `roll ${v}`);
+  }
+  // No suggested band at all: the allowed one, unchanged.
+  assert.deepEqual(sliderBand(512, [32, 16384], null).band, [32, 16384]);
+  // Shown upside down (a gap's landing height), both bands negate with it.
+  const inv = sliderBand(-64, [-512, 1024], [-256, 512], true);
+  assert.deepEqual([inv.hard, inv.soft, inv.band], [[-1024, 512], [-512, 256], [-512, 256]]);
+  assert.equal(inv.outside, false);
+  assert.deepEqual(sliderBand(-600, [-512, 1024], [-256, 512], true).band, [-1024, 512]);
 });
 
 test("a nudge is kept, bounded, and flips when the piece is mirrored", () => {

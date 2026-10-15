@@ -223,6 +223,33 @@ export function limits(seg, width, rules = "open") {
 // The course width's own band, which is not a per-piece field.
 export const widthLimits = (rules = "open") => mg.tier(rules).width;
 
+// What a slider SPANS, given the two bands and the value it holds now. The
+// number box beside it always spans everything allowed; the slider spans the
+// suggested band, which is fine-grained enough to be worth dragging.
+//
+// The one rule that matters here: the band may not depend on the value in a
+// way that moves the track under the thumb. A band stretched to end exactly
+// at the value pins the thumb to the track's end (so the next drag has
+// nowhere to go), and because the band is re-derived from the value on every
+// frame of a drag, a stretched one collapses towards its own start while the
+// pointer sits still — the value walks back to zero on its own. So a value
+// outside the suggested band gets the whole allowed range instead, which
+// leaves room on both sides and does not move again.
+//
+// `invert` is for a field shown upside down (a gap's landing height reads as
+// "lower is lower"); both bands and the value come back negated together.
+export function sliderBand(val, hard, soft, invert = false) {
+  const h = invert ? [-hard[1], -hard[0]] : hard;
+  const s = soft ? (invert ? [-soft[1], -soft[0]] : soft) : h;
+  const v = invert ? -val : val;
+  const outside = !(v >= s[0] && v <= s[1]);
+  let band = outside ? [h[0], h[1]] : [Math.max(h[0], s[0]), Math.min(h[1], s[1])];
+  // A suggested band of no width at all (a field the generator never uses, so
+  // its band is [0, 0]) would leave a slider with nothing to drag.
+  if (band[0] === band[1] && h[0] !== h[1]) band = [h[0], h[1]];
+  return { hard: h, soft: s, band, outside };
+}
+
 // Pull every field of a piece into range, dependencies first (a gap's drop
 // before its length, a ramp's length before its rise), and drop flags the
 // piece cannot carry. Anything not a number becomes the bottom of its range.

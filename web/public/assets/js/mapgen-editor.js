@@ -18,7 +18,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 import * as mg from "./mapgen-course.js";
 import * as tx from "./mapgen-textures.js";
-import { PIECES, GROUPS, limits, fix, chipLabel, nudgeLabel, slug, STARTERS, adopt, HOTBAR, HOTKEYS, mirror, widthLimits } from "./mapgen-pieces.js";
+import { PIECES, GROUPS, limits, fix, chipLabel, nudgeLabel, slug, STARTERS, adopt, HOTBAR, HOTKEYS, mirror, widthLimits, sliderBand } from "./mapgen-pieces.js";
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 // The rule tier a course built here is held to, and the two bands every
@@ -827,12 +827,16 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     $("#mge-stage").classList.toggle("painting", st.paint);
     if (document.activeElement !== titleIn) titleIn.value = st.spec.title;
     titleIn.classList.toggle("bad", !mg.TITLE_RE.test(st.spec.title) || st.spec.title.includes("  "));
-    widthIn.value = st.spec.width;
-    // The slider spans the suggested band, stretched to hold a width that is
-    // already outside it; the number box spans everything allowed.
-    widthIn.min = Math.min(WIDTH_SOFT[0], st.spec.width);
-    widthIn.max = Math.max(WIDTH_SOFT[1], st.spec.width);
-    if (document.activeElement !== widthN) widthN.value = st.spec.width;
+    // The width slider spans the suggested band, or everything allowed once
+    // the width is outside it; like a piece's sliders it is left alone while
+    // it is the one being dragged. sliderBand() in mapgen-pieces.js says why.
+    if (!held(widthIn)) {
+      const wb = sliderBand(st.spec.width, WIDTH_BAND, WIDTH_SOFT);
+      widthIn.min = wb.band[0];
+      widthIn.max = wb.band[1];
+      widthIn.value = st.spec.width;
+    }
+    if (!held(widthN)) widthN.value = st.spec.width;
     widthV.textContent = `${st.spec.width}`;
     root.querySelectorAll("[data-surface]").forEach((b) => b.setAttribute("aria-checked", String(b.dataset.surface === st.surface)));
     root.querySelectorAll("[data-add]").forEach((b) => {
@@ -864,23 +868,16 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
 
   // Two bands, and the difference is the point: the number box spans
   // everything this piece MAY be, and the slider spans the band it probably
-  // SHOULD be — the generator's own, which is fine-grained enough to be worth
-  // dragging. A value already outside the suggested band stretches the
-  // slider to include it rather than being silently clamped back, so a
-  // deliberate choice survives being touched.
+  // SHOULD be — the generator's own. sliderBand() picks between them; this
+  // wrapper is the per-field lookup and the one piece of editor wording on
+  // top of it.
   function bands(key, val, hard, soft, invert) {
-    const h = invert ? [-hard[1], -hard[0]] : hard;
-    const s0 = soft && soft[key] ? (invert ? [-soft[key][1], -soft[key][0]] : soft[key]) : h;
-    const v = invert ? -val : val;
-    let band = [Math.max(h[0], Math.min(s0[0], v)), Math.min(h[1], Math.max(s0[1], v))];
-    // A field the generator never uses has a zero-wide suggested band, which
-    // would leave a slider with nothing to drag; give it the whole range.
-    if (band[0] === band[1] && h[0] !== h[1]) band = [h[0], h[1]];
+    const b = sliderBand(val, hard, soft && soft[key] ? soft[key] : null, invert);
     // A field the generator never uses is not "beyond" anything — the hint
     // already says whose control it is, and flagging every use of it would
     // make the warning permanent and therefore worthless.
-    const editorOnly = s0[0] === 0 && s0[1] === 0;
-    return { hard: h, soft: s0, band, outside: !editorOnly && (v < s0[0] || v > s0[1]) };
+    const editorOnly = b.soft[0] === 0 && b.soft[1] === 0;
+    return { ...b, outside: !editorOnly && b.outside };
   }
 
   function slider(key, label, val, hard, { step = 1, unit = "", note = "", invert = false, soft = null } = {}) {
@@ -961,7 +958,33 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     }
   }
 
+  // The slider the pointer is on, between pointerdown and pointerup. Focus
+  // alone would be close, but not every browser focuses a range input on a
+  // click, and the drag outlives the pointer leaving the control.
+  let dragging = null;
+  // A control the person is working in right now: the one being dragged, or
+  // whichever has the keyboard. What is held is left alone by a refresh — its
+  // value, and (for a slider) the band it spans.
+  const held = (inp) => !!inp && (inp === dragging || document.activeElement === inp);
+
+  // Rebuilding the inspector replaces every control in it, so hand the
+  // keyboard back to the one that had it. A range input fires `change` on
+  // every arrow press, and that re-renders: without this, the second press
+  // of an arrow key would land on nothing and the slider would look stuck.
   function renderInspector() {
+    const a = document.activeElement;
+    const here = a && inspEl.contains(a) ? a : null;
+    const row = here && here.closest(".mge-row[data-key]");
+    const want = row ? `.mge-row[data-key="${row.dataset.key}"] input[type="${here.type}"]`
+      : here && here.dataset.flag ? `input[data-flag="${here.dataset.flag}"]` : null;
+    // Whatever was being dragged in here is about to be a detached node.
+    if (dragging && inspEl.contains(dragging)) dragging = null;
+    drawInspector();
+    const back = want && inspEl.querySelector(want);
+    if (back && !back.disabled) back.focus({ preventScroll: true });
+  }
+
+  function drawInspector() {
     const i = st.selected;
     const r = selRange();
     if (r && r[1] > r[0]) {
@@ -1085,6 +1108,13 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
 
   // While a slider is dragged only the numbers next to it change; the rest
   // of the inspector (and the slider under the pointer) must stay put.
+  //
+  // "Stay put" includes its own min and max. A range input maps the pointer
+  // onto the track's CURRENT range, so re-scaling the track mid-drag moves
+  // the value under a pointer that has not moved — the control fights back.
+  // A field whose band depends on another (a gap's length on its drop) can
+  // change band legitimately, so the one being held is the one left alone;
+  // it picks the new band up on release.
   function updateInspectorReadouts() {
     const i = st.selected;
     if (i === null) return;
@@ -1099,12 +1129,12 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
       const b = bands(key, s[key], L[key], SOFT, inv);
       const rng = row.querySelector('input[type="range"]');
       const nud = row.querySelector('input[type="number"]');
-      // The slider spans the suggested band (stretched to hold the current
-      // value); the number box spans everything allowed.
-      if (rng) { rng.min = b.band[0]; rng.max = b.band[1]; }
-      if (nud) { nud.min = b.hard[0]; nud.max = b.hard[1]; }
+      // The slider spans the suggested band; the number box spans everything
+      // allowed. See sliderBand() in mapgen-pieces.js.
+      if (rng && !held(rng)) { rng.min = b.band[0]; rng.max = b.band[1]; }
+      if (nud && !held(nud)) { nud.min = b.hard[0]; nud.max = b.hard[1]; }
       for (const inp of row.querySelectorAll("input")) {
-        if (document.activeElement !== inp) inp.value = inv ? -s[key] : s[key];
+        if (!held(inp)) inp.value = inv ? -s[key] : s[key];
       }
       row.classList.toggle("wide", b.outside);
       row.querySelector(".mge-range").innerHTML =
@@ -1324,6 +1354,13 @@ export async function mountEditor(root, { initial = null, initialNote = "", go =
     view.hover(c ? Number(c.dataset.i) : null);
   });
   on(chipsEl, "mouseleave", () => view.hover(null));
+
+  on(inspEl, "pointerdown", (e) => { if (e.target.type === "range") dragging = e.target; });
+  // On window, because a drag that ends off the slider (or off the page)
+  // still ends, and a slider left marked as dragged would never take a new
+  // band again.
+  on(window, "pointerup", () => { dragging = null; });
+  on(window, "pointercancel", () => { dragging = null; });
 
   // Inspector inputs: sliders and number boxes stay in step; flags toggle.
   on(inspEl, "input", (e) => {
